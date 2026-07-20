@@ -25,6 +25,14 @@ three index-encoding modes.
 | `NVFP4_CB_S{k}` | FP4 / E2M1 | positive half-grid + explicit signs | W4A4 | group-16 E4M3, **in the weight bytes** | `k/8 + 0.5` (v1) |
 | `FP8_CB_K{k}` | FP8 / E4M3 | E4M3 grid, `‖·‖ ≤ 448` | W8A8 | **none in weight bytes** — per-output-channel FP32, separate tensor | `k/8` |
 
+> **Naming.** The dtype in a family name (`NVFP4`, `FP8`) names the **grid the
+> codebook's values live on — not the storage width**. Storage is the k-bit
+> vector index: `FP8_CB_K32` stores 4.0 bits per weight, and what those 4 bits
+> reconstruct is an exact `float8_e4m3fn` value. The grid constraint is what
+> makes decoded tiles **native-kernel-compatible**: an expanded FP8-CB weight is
+> a standard per-channel fp8 tensor (stock fp8 tensor-core GEMMs consume it
+> directly), and a decoded NVFP4-CB tile is bit-compatible NVFP4.
+
 A decoded FP4 tile is **bit-compatible NVFP4**: E2M1 codes plus an NVFP4 group-16
 E4M3 scale plane. A conforming FP4-CB decode therefore produces exactly what a
 standard NVFP4 tensor-core GEMM consumes. This property is the reason the family

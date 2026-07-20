@@ -8,8 +8,12 @@
 
 `cbq` defines a small family of **product vector-quantized (product-VQ) weight
 formats** — **NVFP4-CB** (4-bit grid) and **FP8-CB** (8-bit grid) — and ships an
-**out-of-tree vLLM plugin** that serves them. The formats are designed around a
-single property:
+**out-of-tree vLLM plugin** that serves them. The dtype in each name is the
+**grid the codebook's values live on, not the storage width**: storage is a
+k-bit index per 8-weight vector, so `FP8_CB_K32` is a 4.0-bit/weight encoding
+whose reconstructed values are exact fp8 numbers, and `NVFP4_CB_K16` is a
+~2.3-bit/weight encoding reconstructing exact NVFP4 codes. The formats are
+designed around a single property:
 
 > **A decoded codebook tile is bit-compatible with a standard hardware format**
 > (NVFP4 / FP8). So a codebook weight is never "decoded to a learned vector and
