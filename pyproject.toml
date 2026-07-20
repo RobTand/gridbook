@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-prismaquant"
+version = "0.0.1"
+description = "Out-of-tree vLLM plugin for PrismaQuant NVFP4-CB / FP8-CB codebook formats (prototype (i): correctness-first Triton serving, INV-2 waived)."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = ["torch", "triton", "safetensors"]
+
+[project.entry-points."vllm.general_plugins"]
+prismaquant = "vllm_prismaquant:register"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_prismaquant*"]

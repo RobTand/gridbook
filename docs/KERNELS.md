@@ -1,0 +1,199 @@
+# Serving kernels
+
+This document describes how a `cbq` artifact is served fast. It is a design and
+status document, not an API reference; the normative decode semantics are in
+[`SPEC.md`](SPEC.md).
+
+Terminology used below: **GEMM** = matrix-matrix multiply (prefill / large batch);
+**GEMV** = matrix-vector multiply (decode / batch-1 or small batch); **M** = the
+number of activation rows (tokens) in a matmul; **MMA** = a tensor-core
+matrix-multiply-accumulate instruction; **QDQ** = quantize-then-dequantize the
+activations; **smem** = GPU shared memory; **TTFT** = time to first token
+(prefill latency).
+
+## The two invariants everything is built around
+
+- **INV-1 — no resident expansion.** The resident weight is always the packed
+  `cb_qweight` (indices + scale plane) plus the small shared codebook. The dense
+  weight is **never** materialized in memory. Decoding happens in registers/smem
+  per tile, or into a per-layer scratch buffer that is freed after the matmul.
+  This is what makes a smaller-on-disk artifact also smaller in memory — the
+  reason the format fits large models on one box. A resident-footprint assertion
+  is a load-time gate, not a nicety.
+- **INV-2 — native tensor cores for prefill.** The production prefill decodes CB
+  indices into native FP4/FP8 codes and feeds the hardware tensor-core GEMM — the
+  same path a plain NVFP4/FP8 layer uses. A decode-to-BF16-then-`torch`-matmul
+  kernel is a correctness/fallback tool only; it does not meet the prefill goal.
+
+## Target hardware
+
+The reference target is the **NVIDIA GB10 / DGX Spark**: Blackwell **`sm_121`**
+(the `sm_120` consumer family — **not** the `sm_100a` datacenter family, so the
+`tcgen05` MMA instructions do not exist here; the FP4 path is the `sm_120/121`
+block-scaled `mma` family). 128 GB unified memory (~121 GB usable), ~273 GB/s.
+Toolchain: `nvcc` 13.0. Opt-in smem is **99 KB per block** — a flat FP4 codebook
+is `2^k × 4` bytes, so a flat table is comfortable to `k ≤ 13`, marginal at
+`k = 14`, and impossible at `k ≥ 15` (those rungs need a structured/computed
+codebook — see [`SPEC.md`](SPEC.md) §8).
+
+---
+
+## Decode path (small M): bandwidth-bound fused GEMV
+
+Decode is where a codebook format *should* win: fewer bytes per weight means less
+HBM traffic, and at batch-1 the tensor cores are idle anyway, so there is no MMA
+disadvantage. The decode kernel streams the packed indices, expands each group in
+registers, multiplies by the group scale, and accumulates against the few
+activation rows — **never** materializing the full weight (INV-1).
+
+- **FP8-CB decode** uses a CUDA dequant-GEMV with a **fused activation QDQ**, an
+  E4M3-byte scale lookup, and a warp-per-superblock decomposition. On the 27B
+  artifact this took decode from 4.2 tok/s (the initial Triton path) to **~10.3
+  tok/s — at/above the native NVFP4/FP8 baseline** (10.26). At matched body bytes
+  that parity *is* the ceiling: decode is bandwidth-bound at ~250-355 GB/s
+  effective, and both artifacts move the same bytes.
+- **FP4-CB two-tier (v2) decode** reads the **9-byte** scale plane instead of 16
+  and **composes the E4M3 scale in-register**: a nibble indexes a 16-entry
+  multiplier table (in registers/constant memory), then `× 2^(E-127)` via an
+  exponent add (FP32-exact; `exp2`/`ldexp`-style bit math). That is ~3-5 extra ALU
+  ops per 16 weights on a kernel whose cost is memory, so the smaller scale plane
+  (−44% scale bytes, −8.75% total stream at k=16) makes v2 decode neutral-to-faster
+  than v1. The E4M3 plane is never reconstructed resident (INV-1 for v2).
+
+**Dispatch.** The path is M-gated: a CUDA GEMV for the smallest M, a Triton GEMV
+for a middle band, and the transient-expand prefill path (below) above that. See
+the CUDA-graph section for why this host-side branch matters.
+
+---
+
+## Prefill path (large M): transient-expand + native GEMM
+
+The default prefill **expands one layer's weight tile transiently** into a scratch
+buffer — decode CB → native FP4/FP8 codes + the (composed) E4M3 scale plane — then
+runs the stock native tensor-core GEMM on it, and frees the buffer. Memory stays
+bounded (INV-1); the tensor cores do the matmul (INV-2). For FP4-CB the expander
+emits an FP4-packed tile plus the swizzled E4M3 scale layout the block-scaled MMA
+expects, then calls the native FP4 GEMM; for FP8-CB it expands **directly to FP8**
+(the codebook values are already on the E4M3 grid), skipping any BF16 intermediate.
+
+The honest limitation of transient-expand is **memory traffic**: the tile is
+written to HBM and then read back by the GEMM, so prefill moves roughly 2× the
+bytes of a resident-weight GEMM. Tuning the expander (a CUDA expander at ~2× the
+Triton one, FP8-direct output) narrowed but cannot remove this — on the 27B
+artifact prefill went 1.62 s → 1.08 s TTFT versus the native baseline's 0.75 s, a
+residual ~1.44× set by the doubled traffic. Only a kernel that **never
+materializes the tile** closes it fully.
+
+### Fused decode-in-prologue (the 1× fix)
+
+A fused collective mainloop that **decodes CB indices inside the GEMM's
+global→shared prologue** — never writing the expanded tile to HBM — exists and is
+**bit-exact** against the transient path (a forked `sm_120` block-scaled MMA
+collective, packed-B TMA load + consumer-side smem decode). Its honest status:
+
+- It **wins at medium M** — roughly 1.04× / 1.26× / 1.45× at M = 32 / 64 / 128.
+- It **loses at large M** (≈0.22× at M≈1400). This is *structural, not a bug*:
+  every M-tile CTA re-decodes the same weight (B) tiles, so decode work scales with
+  `ceil(M / tile)` while the transient path expands each tile exactly once.
+- Large-M parity therefore requires a **weight-stationary / persistent-N schedule**
+  (decode each weight tile once, loop M inside the CTA) — a kernel-layer
+  restructure beyond the collective fork. Until that lands, the serial transient
+  path is the default for large-M prefill.
+
+A **baseline-parity gate** precedes all fork work: a plain `sm_120` block-scaled
+GEMM built from vendored CUTLASS headers matches the runtime's native
+`cutlass_scaled_mm` to within 0.91-0.99×, proving the toolchain and the tile-layout
+understanding before touching the mainloop. Note the fork uses a **fixed-config**
+GEMM: the runtime's `cutlass_scaled_mm` reconfigures on narrow N and is not
+bit-exact across configs, so an N-chunked expand+GEMM overlap was tried and
+**rejected** (0.46× and not bit-exact).
+
+---
+
+## MoE path: grouped (token, expert) GEMV
+
+A fused Mixture-of-Experts layer packs many experts into stacked 3-D weights
+(`(E, out, in)`; see [`SPEC.md`](SPEC.md) §4). The naive serving loop decodes and
+matmuls **per expert**, which on a 256-expert model means a launch/sync storm
+(~10k host operations per token) and cripples decode.
+
+The production decode kernel is a **grouped GEMV**: **one launch per projection**
+covers *all* routed `(token, expert)` pairs for that projection. On the 35B MoE
+artifact this took decode from 3.5 tok/s (per-expert loop) to **~33 tok/s** (9.4×)
+— **faster than BF16** (28.4) and within 8% of the native baseline (35.9), at 3×
+smaller and −43% ALL-KL. For the FP4 two-tier grid there is a dedicated grouped
+GEMV that composes the two-tier scale in-register per the decode rules above.
+
+The **correctness-first per-expert loop is retained** as the prefill and fallback
+path, and its numerics are pinned bit-identical to the grouped kernel by a
+regression test. MoE **prefill** is still that per-expert loop today (a per-expert
+launch storm dominates TTFT); a batched-expert transient expand + grouped GEMM is
+the remaining piece. Even so, the per-expert prefill already beats the GGUF IQ
+comparison at 295B (see [`BENCHMARKS.md`](BENCHMARKS.md)).
+
+---
+
+## Triton fallbacks
+
+Every path has a **Triton fallback** used for correctness and CI, and where a CUDA
+kernel is not available for a particular grid/mode combination. Triton **cannot
+emit the Blackwell block-scaled FP4 MMA**, so a Triton kernel can do the smem
+codebook lookup but only reaches BF16 MMA — it violates INV-2 and is therefore a
+correctness/decode tool, **not** a production prefill target. The package installs
+and its numerics verify on machines without the CUDA extension via these
+fallbacks; do not mistake a working Triton prefill for a production-eligible one.
+
+---
+
+## CUDA-graph safety rules
+
+CUDA-graph capture removes per-kernel launch overhead, but it is fragile against
+data-dependent control flow. The kernels follow these rules:
+
+1. **Every kernel is a registered custom op** with a `fake`/meta implementation
+   (`direct_register_custom_op` + `fake_impl`). This makes each kernel opaque to
+   `torch.compile`/Dynamo (no graph break inside it) and lets compiled and eager
+   serving produce identical output.
+2. **No host-side branching on tensor values inside a captured region**, and fixed
+   shapes. Bit-exactness with capture **off** must always hold (capture-on ==
+   capture-off logits).
+3. **All device-side constants are precomputed once per device.** A real bug this
+   caught: an activation-QDQ kernel built its FP4/E2M1 grid on the CPU and
+   H2D-copied it *every call* — a hidden sync in eager mode and a hard error under
+   capture. The grid is now cached per device.
+4. **The M-gated decode dispatch is a host branch, so it is capture-hostile.** Two
+   consequences, both learned the hard way:
+   - Naively serving without `--enforce-eager` made decode **worse**, not better:
+     the server pads captured decode batches above the prefill-M threshold, so every
+     graphed decode step takes the *expand* path per token. Launch overhead was not
+     the decode bottleneck — the kernel's own throughput was. Keep `--enforce-eager`
+     for the M-gated path.
+   - Where a path has **no** host branching (e.g. the dense/MoE FP4-v2 grouped
+     kernels), a `FULL_DECODE_ONLY` graph capture with `torch.compile` disabled over
+     the plugin is safe and helped (+24% decode on the 295B artifact). A production
+     decode kernel should key off the true token count, not a padded batch size, to
+     be capture-clean.
+
+## A measurement side-effect worth knowing
+
+Loading *any* additional CUDA extension into the serving process shifts the
+allocator's addresses, which changes alignment-sensitive kernel dispatch elsewhere
+in the model and perturbs floating-point reduction order. On the 27B artifact this
+produced a **±17%** swing in the confident-KL *evaluation* (both readings still far
+better than the baseline). It is not a bug in the CB kernels — both prefill paths
+are bit-identical offline — but it is the concrete mechanism behind
+cross-session KL drift. When running an A/B, **match extension residency across
+arms** or the comparison is confounded. This matters more for benchmarking than
+serving; it is documented in [`BENCHMARKS.md`](BENCHMARKS.md) too.
+
+## Status summary
+
+| Path | Status |
+|---|---|
+| FP8-CB decode (dense) | **Shipped**, at/above native parity |
+| FP4-CB v2 decode (dense) | **Shipped** (Triton, in-register two-tier compose; a bit-matched CUDA GEMV variant has landed) — a full-parity dense FP4-v2 CUDA decode kernel is in progress |
+| MoE grouped decode GEMV | **Shipped**, faster than BF16, ~8% under native |
+| Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
+| Fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — needs a persistent-N schedule for large-M parity |
+| MoE prefill | Per-expert loop (correctness path); batched-expert grouped GEMM is future work |
+| Triton fallbacks | **Shipped** for every path (correctness/CI; not INV-2-eligible) |
