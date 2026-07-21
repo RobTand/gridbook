@@ -155,19 +155,29 @@ correct generation (e.g. `17×24=408`, `60 mi / 1.5 h = 40 mph`, `60 mi / 2 gal 
 |---|---|---|---|
 | GGUF IQ 2.8 bpp (CUDA-core dequant) | 42 | ~17-18 | 87 (129/148) |
 | GGUF k-quant | — | ~18-19 | 86 |
-| **CB 2.9 bpp (ours, native tensor core)** | **89** | ~9-13 | **87 (129/148)** |
+| **gridbook 2.9 bpp (native tensor core, final)** | **~109** | 14.6 base / **16.1 with MTP spec** | 85–87 band* |
 
-- **Prefill 89 tok/s vs the GGUF IQ build's 42 — ~2.1× faster.** This is the CB
-  lane's reason to exist, proven at 300B class: the native-tile design removes the
-  prefill dequant tax that IQ pays on general CUDA cores. (Subsequent perf levers
-  pushed CB prefill toward ~115 and decode toward ~13 tok/s; the 2.1× figure is the
-  locked serve-verdict number and the conservative one to cite.)
-- **Decode currently *trails* the GGUF build here — honestly.** CB decode is
-  ~10 tok/s (toward ~13 with levers) against the GGUF build's ~18. The dense FP4
-  two-tier path still decodes through Triton on this artifact; a dense FP4-v2 CUDA
-  decode kernel (the MoE routed-expert grouped kernel already exists) is the pending
-  lever. So the 295B advantage is **prefill + single-box fit + MTP-head capability**,
-  not decode. Decode-at-parity comes with that kernel.
+\* Same artifact bytes measured 85–87 across serving configs (4/74 scenario
+flips between configs — churn at the capability plateau, same class as the
+GGUF IQ-vs-k comparison's 12/74). GGUF's own band is 86–87. No directional
+quality claim either way at matched bytes.
+
+- **Prefill ~109 tok/s vs the GGUF IQ build's 42 — ~2.6× faster.** This is the
+  format's reason to exist, proven at 300B class: the native-tile design removes
+  the prefill dequant tax IQ pays on general CUDA cores.
+- **Base decode still *trails* the GGUF build — honestly.** After three kernel
+  rounds (dense FP4-v2 CUDA GEMV; a +50% w2 grouped schedule; double-buffered
+  fp8 dense), base batch-1 decode is 14.6 vs the GGUF build's ~18. The wall is
+  measured, not guessed: the fp4-CB decode chain is **compute-bound at GEMV
+  shapes** (ncu: SM 71% vs memory 44%) under the bit-exact decode contract —
+  not a bandwidth problem better staging can fix. **MTP speculative decoding
+  (which GGUF cannot carry) closes most of the gap on natural text: 16.1
+  tok/s** with the FP8-CB K44 draft at k=1, and becomes a straight multiplier
+  once vLLM captures drafter CUDA graphs.
+- The joint-menu allocation experiment is also worth citing: offered vanilla
+  NVFP4 and FP8 alongside the codebook rungs, the measured allocator gave 36
+  Linears to vanilla FP8 and **zero to vanilla NVFP4** — at matched bits the
+  codebook dominates the fixed grid on every unit of a 295B.
 - **ToolEvalBench 87/100 (129/148) — an exact tie with the GGUF IQ build** (87,
   129/148) and above k-quant (86), under the identical protocol below. Zero errors,
   all 74 scenarios ran. Honest reading: at matched body bytes, tool-use quality is

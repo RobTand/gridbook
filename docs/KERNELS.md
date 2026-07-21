@@ -191,9 +191,10 @@ serving; it is documented in [`BENCHMARKS.md`](BENCHMARKS.md) too.
 | Path | Status |
 |---|---|
 | FP8-CB decode (dense) | **Shipped**, at/above native parity |
-| FP4-CB v2 decode (dense) | **Shipped** (Triton, in-register two-tier compose; a bit-matched CUDA GEMV variant has landed) — a full-parity dense FP4-v2 CUDA decode kernel is in progress |
-| MoE grouped decode GEMV | **Shipped**, faster than BF16, ~8% under native |
+| FP4-CB v2 decode (dense) | **Shipped**: bit-matched CUDA GEMV (13/13 parity vs Triton + expand reference). The decode chain is compute-bound at GEMV shapes (ncu SM 71%/mem 44%) under the bit-exact contract — the measured ceiling, not a staging problem |
+| MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
-| Fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — needs a persistent-N schedule for large-M parity |
-| MoE prefill | Per-expert loop (correctness path); batched-expert grouped GEMM is future work |
+| Fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — persistent-N is the answer |
+| Persistent-N large-M prefill | **Measured GO, deferred**: expand is 23–38% of serial time at real prefill M (ceiling 1.3–1.6×); a plain-CUDA reference kernel validates the decode-once schedule (6/6 parity); the tensor-core CUTLASS build is the roadmap's next kernel |
+| MoE prefill | Per-expert loop (shipping); a batched-expert grouped path passes 27/27 small-scale parity but crashed at 1.4k-token scale (chunk transients) — opt-in pending a memory-bounded gate |
 | Triton fallbacks | **Shipped** for every path (correctness/CI; not INV-2-eligible) |
