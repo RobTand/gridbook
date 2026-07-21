@@ -2,7 +2,7 @@
 
 > **Naming.** The project is **gridbook**: codebooks whose entries live on a
 > hardware grid, so decoded tiles feed native tensor-core kernels. The Python
-> import name is currently `vllm_prismaquant` (the vLLM plugin module) and the
+> import name is currently `gridbook` (the vLLM plugin module) and the
 > vLLM quantization registry key is `"prismaquant"` — both kept for
 > compatibility with published artifacts; an import-name rename is a pre-1.0
 > roadmap item.

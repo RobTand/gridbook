@@ -3,7 +3,7 @@
 Prototype (i) of docs/nvfp4-cb-plan/serving-kernel.md: a correctness-first,
 Triton-based serving path (INV-1 honored, INV-2 waived). Not production-eligible.
 
-``register`` is lazy so ``import vllm_prismaquant.kernels`` (the correctness
+``register`` is lazy so ``import gridbook.kernels`` (the correctness
 tests) works without vLLM installed.
 """
 

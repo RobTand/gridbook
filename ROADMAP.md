@@ -44,7 +44,7 @@ decode kernel) is the remaining MoE serving piece.
 ## Package / repository naming decision
 
 RESOLVED (2026-07-20): the project name is **gridbook** (Robert). The PyPI
-package name is `gridbook`; the Python import name stays `vllm_prismaquant`
+package name is `gridbook`; the Python import name stays `gridbook`
 until the pre-1.0 import rename (with a compatibility shim); the vLLM registry
 key `"prismaquant"` is permanent (baked into published artifact configs).
 

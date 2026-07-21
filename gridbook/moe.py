@@ -46,6 +46,33 @@ def _row_bytes(in_features: int, type_size: int) -> int:
     return (in_features // codec.SUPERBLOCK) * type_size
 
 
+# torch._grouped_mm — the single-launch ragged grouped GEMM (2d×3d: mat_a
+# [P,K] × mat_b [G,K,N] with cumulative-end offsets [G] -> [P,N]) that collapses
+# the batched-prefill per-expert-segment GEMMs into ONE kernel. Opt-in
+# (PRISMAQUANT_CB_PREFILL_GROUPED_MM=1) because its ragged-offset / B-layout
+# constraints on sm_121 are unproven in this tree; the segmented fallback is the
+# correctness-first default. Availability + first-use viability are cached so a
+# reject degrades to segmented once, not per forward.
+_GROUPED_MM_OK: bool | None = None
+
+
+def _grouped_mm_available() -> bool:
+    global _GROUPED_MM_OK
+    if _GROUPED_MM_OK is None:
+        _GROUPED_MM_OK = hasattr(torch, "_grouped_mm")
+    return _GROUPED_MM_OK
+
+
+def _disable_grouped_mm(exc) -> None:
+    global _GROUPED_MM_OK
+    if _GROUPED_MM_OK:
+        import sys
+        print(f"[prismaquant-cb] torch._grouped_mm unusable for CB prefill "
+              f"({type(exc).__name__}: {exc}); using the segmented GEMM.",
+              file=sys.stderr, flush=True)
+    _GROUPED_MM_OK = False
+
+
 class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
     """CB decode for RoutedExperts (FusedMoE) — one uniform CB format per layer."""
 
@@ -233,12 +260,48 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             return self._apply_grouped_decode(
                 layer, x, topk_weights, topk_ids, act)
 
+        # Prefill / fallback (num_tokens > 16, or no grouped-CUDA decode path).
+        # Two implementations, env-selected via PRISMAQUANT_CB_PREFILL:
+        #
+        #   'batched' (DEFAULT) — _apply_prefill_batched. Round-1 cost model of
+        #     the loop it replaces: on Hy3 (192 experts, ~all hit at prefill) the
+        #     per-expert loop pays, PER HIT EXPERT, one act-QDQ + TWO Triton
+        #     transient expands (w13/w2, ~192×2 launches/layer) + two F.linear +
+        #     an index_add_ — the Triton-expand and QDQ launches are the dominant
+        #     remaining prefill structure cost (~112 tok/s). The batched path
+        #     issues ONE act-QDQ over all tokens and ONE expand per projection
+        #     per expert-CHUNK (the dense expander over a reshaped [(C*out),
+        #     bytes] view), collapsing those E expands + E QDQ passes to
+        #     E/chunk launches; the GEMM stays grouped/segmented bf16.
+        #
+        #   'loop' — _apply_prefill_loop, kept verbatim for A/B bisection. Its
+        #     hit-expert list already costs ONE host sync (the pre-fix per-expert
+        #     `sel.any()` cost E syncs — the dominant share of the 3.5 s TTFT);
+        #     the batched path preserves that one-sync property.
+        #
+        # Numerics: the two paths use BIT-IDENTICAL weights (same expander) and
+        # BIT-IDENTICAL per-token QDQ (QDQ is a per-row op — see
+        # _apply_prefill_batched); only the GEMM accumulation and the
+        # cross-expert combine reassociate (REASSOCIATION-CLASS), held to the
+        # tolerance contract by tests/test_moe_batched_prefill.py and gated by
+        # the served logprob A/B before adoption. Prefill is eager/uncaptured
+        # (FULL_DECODE_ONLY), so this path needs no CUDA-graph capture-safety.
+        if os.environ.get("PRISMAQUANT_CB_PREFILL", "batched") == "loop":
+            return self._apply_prefill_loop(
+                layer, x, topk_weights, topk_ids, act)
+        return self._apply_prefill_batched(
+            layer, x, topk_weights, topk_ids, act)
+
+    # -- prefill: per-expert loop (bisection reference) ---------------------
+    def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
+        """Original per-expert prefill loop (PRISMAQUANT_CB_PREFILL=loop): the
+        validated-numerics reference the batched path must match. Per hit expert,
+        QDQ that expert's rows, decode its w13/w2 to a bounded bf16 transient
+        (_decode_expert, INV-1 one expert live), two F.linear (bf16 MMA), and a
+        router-weighted index_add_ combine in expert-ascending order."""
         out = torch.zeros_like(x)
-        # Prefill / fallback: grouped by expert — decode each routed expert
-        # once (transient), matmul its tokens, combine with the router
-        # weight. bf16 MMA. The hit-expert list is computed with ONE host
-        # sync (the old per-expert `bool(sel.any())` cost E syncs per layer
-        # per forward — the dominant share of the 3.5 s TTFT).
+        # ONE host sync for the hit-expert list (the pre-fix per-expert
+        # `bool(sel.any())` cost E syncs per layer per forward).
         hit = torch.bincount(
             topk_ids.reshape(-1), minlength=layer._cb_E) > 0
         hit_experts = hit.nonzero(as_tuple=True)[0].tolist()   # one sync
@@ -263,6 +326,161 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             oe = oe * topk_weights[tok_idx, slot][:, None].to(oe.dtype)
             out.index_add_(0, tok_idx, oe.to(out.dtype))
         return out
+
+    # -- prefill: batched-expert path (default) -----------------------------
+    def _apply_prefill_batched(self, layer, x, topk_weights, topk_ids, act, *,
+                               use_grouped_mm=None, chunk=None):
+        """Batched prefill (PRISMAQUANT_CB_PREFILL=batched). Replaces the
+        per-expert loop's E Triton expands + E QDQ passes with ONE act-QDQ over
+        all tokens and ONE expand per projection per expert-CHUNK, then a
+        grouped/segmented bf16 GEMM over the per-expert token groups.
+
+        INV-1: the transient weight tile is bounded to ONE chunk of experts
+        (PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK, default 64 — ~1.6 GB for Hy3's
+        3072×4096 w13, vs ~7.2 GB for all 192 at once), expanded right before
+        its GEMM and freed right after; w13 is freed before w2 is expanded, so
+        peak is one chunk's LARGER projection, not their sum.
+
+        Numerics vs _apply_prefill_loop: weights are bit-identical (same
+        expander, same per-(expert,out) scale) and the per-token QDQ is
+        bit-identical because BOTH fp8-dynamic and fp4-group16 activation QDQ are
+        PER-TOKEN-ROW operations — codec.fp8_dynamic_act_qdq /
+        fp4_group16_act_qdq reshape to rows and quantise each row from its own
+        amax with no cross-row coupling, so QDQ(x)[sel] == QDQ(x[sel])
+        row-for-row (test_qdq_once_equals_per_selection). One act-QDQ over all
+        tokens therefore reproduces the loop's per-expert QDQ(x[tok_idx]) on the
+        same rows. Only the GEMM accumulation and cross-expert combine
+        reassociate (REASSOCIATION-CLASS)."""
+        if use_grouped_mm is None:
+            use_grouped_mm = os.environ.get(
+                "PRISMAQUANT_CB_PREFILL_GROUPED_MM", "0") == "1"
+        if chunk is None:
+            chunk = int(os.environ.get(
+                "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", "64"))
+        chunk = max(1, chunk)
+        T = x.shape[0]
+        topk = topk_ids.shape[-1]
+        dev = x.device
+        out = torch.zeros_like(x)
+
+        # ONE activation QDQ over ALL token rows (per-row op — see docstring).
+        xq = (codec.fp4_group16_act_qdq(x) if self.is_fp4
+              else codec.fp8_dynamic_act_qdq(x)).to(torch.bfloat16)
+
+        # (token, expert, weight) pairs from the full topk grid, sorted
+        # expert-ascending and STABLE so within-expert row order stays
+        # token-major — exactly the loop's torch.where(topk_ids==e) order (the
+        # per-segment GEMM then bit-matches the loop; only the combine
+        # reassociates). pair p = t*topk + j -> expert topk_ids[t,j].
+        pair_expert = topk_ids.reshape(-1)                     # [P] = T*topk
+        pair_token = torch.arange(T, device=dev, dtype=torch.long) \
+            .repeat_interleave(topk)                            # [P]
+        pair_weight = topk_weights.reshape(-1)                 # [P]
+        order = torch.argsort(pair_expert, stable=True)
+        ptok_sorted = pair_token[order]
+        pw_sorted = pair_weight[order]
+
+        counts = torch.bincount(pair_expert, minlength=layer._cb_E)   # [E]
+        hit_experts_t = counts.nonzero(as_tuple=True)[0]              # ascending
+        hit_offsets_t = torch.cat([
+            counts.new_zeros(1),
+            torch.cumsum(counts[hit_experts_t], 0)])                 # [n_hit+1]
+        # Two O(1) host syncs (NOT O(E)): the hit-expert ids and their
+        # sorted-array segment boundaries. Everything above stays GPU-resident.
+        hit_experts = hit_experts_t.tolist()
+        hit_offsets = hit_offsets_t.tolist()
+        n_hit = len(hit_experts)
+
+        for c0 in range(0, n_hit, chunk):
+            c1 = min(n_hit, c0 + chunk)
+            these = hit_experts[c0:c1]                         # python ids
+            p0, p1 = hit_offsets[c0], hit_offsets[c1]
+            if p1 == p0:
+                continue
+            # local per-expert segment bounds within this chunk's [p0, p1).
+            bounds = [hit_offsets[c0 + i] - p0 for i in range(c1 - c0 + 1)]
+            xrows = xq[ptok_sorted[p0:p1]]                     # [Pc, hidden]
+
+            # stage 1: gate_up = xrows @ W13[e]^T (grouped).
+            W13 = self._expand_expert_stack(layer, "w13", these)  # [C,2i,hidden]
+            gate_up = self._grouped_gemm(xrows, W13, bounds, use_grouped_mm)
+            del W13, xrows
+            d = gate_up.shape[-1] // 2
+            a = torch.empty(gate_up.shape[:-1] + (d,), dtype=gate_up.dtype,
+                            device=dev)
+            apply_moe_activation(act, a, gate_up)             # silu(gate)*up
+            del gate_up
+            aq = (codec.fp4_group16_act_qdq(a) if self.is_fp4
+                  else codec.fp8_dynamic_act_qdq(a)).to(torch.bfloat16)
+            del a
+
+            # stage 2: y = aq @ W2[e]^T (grouped).
+            W2 = self._expand_expert_stack(layer, "w2", these)    # [C,hidden,i]
+            y = self._grouped_gemm(aq, W2, bounds, use_grouped_mm)  # [Pc,hidden]
+            del W2, aq
+
+            y = y * pw_sorted[p0:p1, None].to(y.dtype)        # router weight
+            out.index_add_(0, ptok_sorted[p0:p1], y.to(out.dtype))
+            del y
+        return out
+
+    def _expand_expert_stack(self, layer, which: str, experts) -> torch.Tensor:
+        """Decode a CHUNK of experts' CB weights to a stacked bf16 tile
+        ``[C, out, in]`` in ONE Triton launch: the dense expander runs over the
+        reshaped ``[(C*out), row_bytes]`` view. Every expert-row is an
+        independent decode keyed only by its own packed bytes + the shared
+        per-layer codebook at offset 0 — exactly what ``_decode_expert`` does per
+        expert — so the stacked tile is BIT-IDENTICAL to stacking
+        ``_decode_expert`` over ``experts`` (test_batched_expand_matches_decode).
+        INV-1: bounded to one chunk; the caller frees it after the GEMM."""
+        packed = getattr(layer, f"{which}_cb_qweight")[experts]   # [C,out,bytes]
+        C, out_f = packed.shape[0], packed.shape[1]
+        in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
+        qwp = codec.pad_qweight(packed.reshape(C * out_f, -1).contiguous())
+        row0 = torch.zeros(C * out_f, dtype=torch.int32, device=packed.device)
+        if self.is_fp4:                                        # fp4 two-tier v2
+            W = expand_fp4_v2_to_weight(
+                qwp, layer._cb_flat, row0, layer._cb_compose,
+                C * out_f, in_f, self.k, self.n_sub, self.type_size)
+        else:                                                  # fp8
+            val = expand_cb_to_value(qwp, layer._cb_flat, row0, C * out_f, in_f,
+                                     self.k, self.n_sub, self.type_size,
+                                     is_fp4=False)
+            ws = getattr(layer, f"{which}_weight_scale")[experts].reshape(
+                C * out_f).to(torch.float32)
+            W = (val.float() * ws[:, None]).to(torch.bfloat16)
+        return W.view(C, out_f, in_f)
+
+    def _grouped_gemm(self, x, w_stack, bounds, use_grouped_mm):
+        """Grouped bf16 GEMM: ``out[bounds[g]:bounds[g+1]] = x[seg] @ w_stack[g]^T``.
+
+        Default = segmented — one ``F.linear`` per group over the pre-expanded
+        chunk weights, BIT-IDENTICAL per segment to the loop's per-expert
+        ``F.linear(xe, W)`` (same cuBLAS call, same stable row order). Opt-in
+        ``PRISMAQUANT_CB_PREFILL_GROUPED_MM=1`` collapses the groups into ONE
+        ``torch._grouped_mm`` launch (reassociation-class vs the loop), degrading
+        to segmented if _grouped_mm is absent or rejects the ragged offsets /
+        transposed-B layout on this build."""
+        P = x.shape[0]
+        out_f = w_stack.shape[1]
+        G = w_stack.shape[0]
+        if use_grouped_mm and _grouped_mm_available():
+            try:
+                offs = torch.tensor(bounds[1:], dtype=torch.int32,
+                                    device=x.device)
+                # 2d×3d: mat_a [P,K] × mat_b [G,K,N] (w_stack^T) -> [P,N]. Cast
+                # to x.dtype so gate_up/y stay bf16 like the loop's F.linear
+                # (grouped_mm may accumulate out to fp32).
+                return torch._grouped_mm(
+                    x, w_stack.transpose(1, 2), offs=offs).to(x.dtype)
+            except Exception as exc:  # noqa: BLE001 — degrade, never crash serve
+                _disable_grouped_mm(exc)
+        y = torch.empty((P, out_f), dtype=x.dtype, device=x.device)
+        for g in range(G):
+            s0, s1 = bounds[g], bounds[g + 1]
+            if s1 > s0:                                        # skip 0-token seg
+                y[s0:s1] = torch.nn.functional.linear(x[s0:s1], w_stack[g])
+        return y
 
     # -- grouped CUDA decode path -------------------------------------------
     def _cuda_moe_ok(self, layer) -> bool:

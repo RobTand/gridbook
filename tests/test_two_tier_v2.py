@@ -4,15 +4,15 @@ from the packed 9 bytes (1 E8M0 super + 8 sub nibble bytes) and must match
 `nvfp4_cb_reconstruct` bit-exactly. Venv (triton + prismaquant, no vLLM); the
 dispatch test is vLLM-guarded.
 
-  PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/vllm_prismaquant \
+  PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/gridbook \
     /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python -m pytest \
-    plugins/vllm_prismaquant/tests/test_two_tier_v2.py -q
+    plugins/gridbook/tests/test_two_tier_v2.py -q
 """
 import pytest
 import torch
 
-codec = pytest.importorskip("vllm_prismaquant.codec")
-kernels = pytest.importorskip("vllm_prismaquant.kernels")
+codec = pytest.importorskip("gridbook.codec")
+kernels = pytest.importorskip("gridbook.kernels")
 fmt = pytest.importorskip("prismaquant.nvfp4_cb_formats")
 
 cb_decode_linear = kernels.cb_decode_linear
@@ -89,7 +89,7 @@ def test_v2_scale_extraction_bitexact():
 def test_v2_transient_weight_matches_reconstruct(k):
     """fp4-v2 transient prefill: the expanded [N,K] bf16 weight (value × composed
     v2 scale) matches nvfp4_cb_reconstruct, so F.linear == reconstruct @ x."""
-    expand = pytest.importorskip("vllm_prismaquant.expand")
+    expand = pytest.importorskip("gridbook.expand")
     import torch.nn.functional as F
     torch.manual_seed(k)
     rows, in_f, M = 128, 512, 40
@@ -118,7 +118,7 @@ def test_v2_dispatch_flag():
     """A scheme with scale_coding.kind=='two_tier' -> is_v2; absence -> v1
     (both must serve; per-layer, so a mixed v1/v2 artifact dispatches each)."""
     pytest.importorskip("vllm")
-    from vllm_prismaquant.linear import PrismaQuantCBLinearMethod
+    from gridbook.linear import PrismaQuantCBLinearMethod
     base = {"grid": "fp4", "mode": "product", "k": 16, "n_sub": 2}
     v1 = dict(base, type_size=80)
     v2 = dict(base, type_size=73, scale_coding={

@@ -7,9 +7,9 @@ Two parts, split by the ``-k`` selector so each runs where it can:
     ``expand_cb_to_value`` decodes the codebook VALUE for every (n, j). It must
     equal ``nvfp4_cb_reconstruct / weight_scale`` (reconstruct = value * scale),
     and the tile must be exactly on the e4m3 grid (so the fp8 cast is lossless).
-      PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/vllm_prismaquant \\
+      PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/gridbook \\
         /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python -m pytest \\
-        plugins/vllm_prismaquant/tests/test_transient_fp8.py -q -k value_expand
+        plugins/gridbook/tests/test_transient_fp8.py -q -k value_expand
 
 * Part B -- ``-k gemm`` (serving container, needs vLLM):
     the full transient GEMM (``scaled_fp8_quant`` + ``cutlass_scaled_mm`` over the
@@ -18,9 +18,9 @@ Two parts, split by the ``-k`` selector so each runs where it can:
       docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
         -v /home/rob/dq-runs/nvfp4-cb-phase0/serve:/artifacts \\
         --entrypoint bash vllm-node:latest -c 'pip install -e \\
-        /repo/plugins/vllm_prismaquant --no-deps -q; \\
-        PYTHONPATH=/repo:/repo/plugins/vllm_prismaquant python3 -m pytest \\
-        /repo/plugins/vllm_prismaquant/tests/test_transient_fp8.py -q -k gemm'
+        /repo/plugins/gridbook --no-deps -q; \\
+        PYTHONPATH=/repo:/repo/plugins/gridbook python3 -m pytest \\
+        /repo/plugins/gridbook/tests/test_transient_fp8.py -q -k gemm'
 """
 import json
 import os
@@ -33,10 +33,10 @@ from safetensors.torch import load_file
 # The plugin sits outside the repo PYTHONPATH and needs triton (present in both
 # the build venv and the serving container). Skip cleanly if unavailable.
 codec = pytest.importorskip(
-    "vllm_prismaquant.codec",
-    reason="vllm_prismaquant plugin not importable (needs the plugin on "
+    "gridbook.codec",
+    reason="gridbook plugin not importable (needs the plugin on "
            "PYTHONPATH + triton)")
-_expand = pytest.importorskip("vllm_prismaquant.expand")
+_expand = pytest.importorskip("gridbook.expand")
 expand_cb_to_value = _expand.expand_cb_to_value
 
 # The independent Part-A reference uses prismaquant's emulation codec. Guard it:

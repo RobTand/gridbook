@@ -4,14 +4,14 @@ CompressedTensorsConfig (serving-kernel.md §2). vLLM-only, so skip-guarded —
 run in the vllm-node container:
 
   docker run --rm --gpus all -v /home/rob/prismaquant:/repo --entrypoint bash \
-    vllm-node:latest -c 'pip install -e /repo/plugins/vllm_prismaquant --no-deps -q; \
-    PYTHONPATH=/repo/plugins/vllm_prismaquant python3 -m pytest \
-    /repo/plugins/vllm_prismaquant/tests/test_delegation.py -q'
+    vllm-node:latest -c 'pip install -e /repo/plugins/gridbook --no-deps -q; \
+    PYTHONPATH=/repo/plugins/gridbook python3 -m pytest \
+    /repo/plugins/gridbook/tests/test_delegation.py -q'
 """
 import pytest
 
 pytest.importorskip("vllm")
-from vllm_prismaquant.config import PrismaQuantConfig  # noqa: E402
+from gridbook.config import PrismaQuantConfig  # noqa: E402
 
 
 def _mixed_config():

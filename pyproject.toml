@@ -12,8 +12,8 @@ requires-python = ">=3.10"
 dependencies = ["torch", "triton", "safetensors"]
 
 [project.entry-points."vllm.general_plugins"]
-prismaquant = "vllm_prismaquant:register"
+gridbook = "gridbook:register"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vllm_prismaquant*"]
+include = ["gridbook*"]

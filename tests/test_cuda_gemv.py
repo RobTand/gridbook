@@ -7,8 +7,8 @@ venv:
   docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
     -v /home/rob/dq-runs/nvfp4-cb-phase0/serve:/artifacts \\
     --entrypoint bash vllm-node:latest -c \\
-    'PYTHONPATH=/repo:/repo/plugins/vllm_prismaquant python3 -m pytest \\
-     /repo/plugins/vllm_prismaquant/tests/test_cuda_gemv.py -v'
+    'PYTHONPATH=/repo:/repo/plugins/gridbook python3 -m pytest \\
+     /repo/plugins/gridbook/tests/test_cuda_gemv.py -v'
 
 The KL-preservation contract: identical weight rounding (bf16(val*scale)),
 bit-exact activation QDQ, fp32 accumulation — only summation order may differ
@@ -23,10 +23,10 @@ import torch
 from safetensors.torch import load_file
 
 codec = pytest.importorskip(
-    "vllm_prismaquant.codec",
-    reason="vllm_prismaquant plugin not importable")
-kernels = pytest.importorskip("vllm_prismaquant.kernels")
-from vllm_prismaquant.cuda_ext import get_ext  # noqa: E402
+    "gridbook.codec",
+    reason="gridbook plugin not importable")
+kernels = pytest.importorskip("gridbook.kernels")
+from gridbook.cuda_ext import get_ext  # noqa: E402
 
 ext = get_ext()
 if ext is None:
@@ -245,7 +245,7 @@ def test_cuda_expand_bitexact_vs_triton(k):
     """The CUDA transient expander must produce byte-identical tiles to the
     Triton expand_cb_to_fp8 (which is itself pinned to the bf16-expand+cast
     reference)."""
-    from vllm_prismaquant.expand import expand_cb_to_fp8
+    from gridbook.expand import expand_cb_to_fp8
     p = _synth(k, N=96, K=768, seed=100 + k)
     ref = expand_cb_to_fp8(p["qwp"], p["cb8"], p["row_off"],
                            p["N"], p["K"], p["k"], 4, p["ts"])
@@ -257,7 +257,7 @@ def test_cuda_expand_bitexact_vs_triton(k):
 
 
 def test_cuda_expand_bitexact_real_artifact():
-    from vllm_prismaquant.expand import expand_cb_to_fp8
+    from gridbook.expand import expand_cb_to_fp8
     p = _prep(PICK[0])
     ref = expand_cb_to_fp8(p["qwp"], p["cb8"], p["row_off"],
                            p["N"], p["K"], p["k"], 4, p["ts"])
@@ -269,7 +269,7 @@ def test_cuda_expand_bitexact_real_artifact():
 def test_full_op_raw_x_matches_triton_path():
     """The registered custom op (raw x in, QDQ fused) equals the Triton path
     (torch QDQ then decode-GEMM) — the exact serving-dispatch equivalence."""
-    from vllm_prismaquant.ops import cb_gemv_fp8 as op
+    from gridbook.ops import cb_gemv_fp8 as op
     p = _prep(PICK[1])
     torch.manual_seed(2)
     x = torch.randn(1, p["K"], dtype=torch.bfloat16, device=DEV)
@@ -388,7 +388,7 @@ def _run_fp4v2_moe_parity(pq, k, E, hidden, inter, T, topk, seed, tag):
     real two-tier bytes with the SAME bf16 codebook + compose table, so they
     agree to reassociation (the loop's bf16 F.linear vs the kernel's warp-sum,
     both f32-accum)."""
-    from vllm_prismaquant.expand import expand_fp4_v2_to_weight
+    from gridbook.expand import expand_fp4_v2_to_weight
     out13 = 2 * inter
     ts = pq.nvfp4_cb_type_size(k, "fp4", "two_tier")
     cb = pq._resolve_codebook(k, "fp4", "product", None, torch.device(DEV))
@@ -517,7 +517,7 @@ def _triton_fp4v2_dense_y(p, xq):
 def _ref_fp4v2_dense_y(p, xq):
     """expand_fp4_v2_to_weight (value × composed scale) + F.linear on the SAME
     xq — the explicit reconstruct reference (bf16 W, f32-accum GEMM)."""
-    from vllm_prismaquant.expand import expand_fp4_v2_to_weight
+    from gridbook.expand import expand_fp4_v2_to_weight
     W = expand_fp4_v2_to_weight(p["qwp"], p["cb_flat"], p["row_off"],
                                 p["compose"], p["N"], p["K"], p["k"],
                                 p["n_sub"], p["ts"])
@@ -612,7 +612,7 @@ def test_dense_fp4v2_registered_op_matches_ext():
     call bit-for-bit — the serving dispatch goes through the op, whose
     register_fake makes it CUDA-graph / torch.compile safe."""
     pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
-    from vllm_prismaquant.ops import cb_gemv_fp4_v2 as op
+    from gridbook.ops import cb_gemv_fp4_v2 as op
     p = _fp4v2_dense_prep(pq, k=16, N=64, K=512, seed=55)
     torch.manual_seed(5)
     x = torch.randn(2, 512, dtype=torch.bfloat16, device=DEV)

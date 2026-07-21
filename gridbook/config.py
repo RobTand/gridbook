@@ -143,7 +143,7 @@ class PrismaQuantConfig(QuantizationConfig):
 
     @classmethod
     def get_name(cls):
-        return "prismaquant"
+        return "gridbook"
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
         return [torch.bfloat16, torch.float16]
@@ -163,11 +163,13 @@ class PrismaQuantConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant, **kwargs):
-        if user_quant == "prismaquant":
-            return "prismaquant"
+        # "gridbook" is the registry key going forward; "prismaquant" is the
+        # legacy key older local artifacts carry — both dispatch here.
+        if user_quant in ("gridbook", "prismaquant"):
+            return "gridbook"
         if hf_quant_cfg is not None and \
-                hf_quant_cfg.get("quant_method") == "prismaquant":
-            return "prismaquant"
+                hf_quant_cfg.get("quant_method") in ("gridbook", "prismaquant"):
+            return "gridbook"
         return None
 
     # -- codebook sidecar (loaded once, shared across all layers) ------------

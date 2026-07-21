@@ -17,8 +17,8 @@ import torch
 
 import types
 
-from vllm_prismaquant import moe_toplevel_loader
-from vllm_prismaquant.moe_toplevel_loader import (
+from gridbook import moe_toplevel_loader
+from gridbook.moe_toplevel_loader import (
     _build_reverse_fusion,
     _load_shared_cb,
     _spec_layer_rename,

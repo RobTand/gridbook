@@ -3,8 +3,8 @@ shapes. Run inside the serving container (needs nvcc):
 
   docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
     --entrypoint bash vllm-node:latest -c \\
-    'PYTHONPATH=/repo:/repo/plugins/vllm_prismaquant \\
-     python3 /repo/plugins/vllm_prismaquant/tests/bench_cuda_gemv.py'
+    'PYTHONPATH=/repo:/repo/plugins/gridbook \\
+     python3 /repo/plugins/gridbook/tests/bench_cuda_gemv.py'
 
 Reports us/call and effective packed-weight GB/s (the bandwidth-bound target:
 GB10 LPDDR5X ~= 273 GB/s peak, ~230-250 achievable).
@@ -14,10 +14,10 @@ import time
 
 import torch
 
-sys.path.insert(0, "/repo/plugins/vllm_prismaquant")
-from vllm_prismaquant import codec  # noqa: E402
-from vllm_prismaquant.cuda_ext import get_ext  # noqa: E402
-from vllm_prismaquant.kernels import cb_decode_linear  # noqa: E402
+sys.path.insert(0, "/repo/plugins/gridbook")
+from gridbook import codec  # noqa: E402
+from gridbook.cuda_ext import get_ext  # noqa: E402
+from gridbook.kernels import cb_decode_linear  # noqa: E402
 
 DEV = "cuda"
 # (name, N, K) — Qwen3.6-27B: fused qkv, o_proj (24*256=6144), gate_up, down.

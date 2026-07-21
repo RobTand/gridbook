@@ -5,8 +5,8 @@ Container-only (JIT-builds two extensions; needs nvcc + /artifacts):
   docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
     -v /home/rob/dq-runs/nvfp4-cb-phase0/serve:/artifacts \\
     --entrypoint bash vllm-node:latest -c \\
-    'pip install -q pytest; PYTHONPATH=/repo:/repo/plugins/vllm_prismaquant \\
-     python3 -m pytest /repo/plugins/vllm_prismaquant/tests/test_fused_prefill.py -v'
+    'pip install -q pytest; PYTHONPATH=/repo:/repo/plugins/gridbook \\
+     python3 -m pytest /repo/plugins/gridbook/tests/test_fused_prefill.py -v'
 
 Contracts pinned:
   * cb_fused_prefill_mm == (cb_expand_fp8 tile -> fork64 passthrough GEMM)
@@ -24,8 +24,8 @@ from pathlib import Path
 import pytest
 import torch
 
-codec = pytest.importorskip("vllm_prismaquant.codec")
-from vllm_prismaquant.cuda_ext import get_ext  # noqa: E402
+codec = pytest.importorskip("gridbook.codec")
+from gridbook.cuda_ext import get_ext  # noqa: E402
 
 gemv_ext = get_ext()
 if gemv_ext is None:

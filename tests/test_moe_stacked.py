@@ -6,9 +6,9 @@ decode (which reuses the dense, separately bit-exact-tested, expand kernels) is
 correct. The vLLM-dependent MoE-method construction/forward test is skip-guarded
 and runs in the container in the post-27B GPU window (resource-discipline hold).
 
-  PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/vllm_prismaquant \
+  PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/gridbook \
     CUDA_VISIBLE_DEVICES= /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python \
-    -m pytest plugins/vllm_prismaquant/tests/test_moe_stacked.py -q
+    -m pytest plugins/gridbook/tests/test_moe_stacked.py -q
 """
 import os
 
@@ -78,7 +78,7 @@ def test_moe_method_buffer_shapes():
     stacked w13/w2 buffer shapes. Deferred to the container (post-27B window)."""
     pytest.importorskip("vllm")
     import types
-    from vllm_prismaquant.moe import PrismaQuantCBMoEMethod, _row_bytes
+    from gridbook.moe import PrismaQuantCBMoEMethod, _row_bytes
 
     E, hidden, inter, k, ts = 8, 512, 1024, 44, 176   # fp8 k44 -> ts=4k=176
     scheme = {"grid": "fp8", "mode": "product", "k": k, "n_sub": 4,

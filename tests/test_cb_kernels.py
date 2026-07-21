@@ -2,9 +2,9 @@
 tensors (docs/nvfp4-cb-plan/serving-kernel.md prototype (i)).
 
 Run:
-  PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/vllm_prismaquant \
+  PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/gridbook \
     /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python -m pytest \
-    plugins/vllm_prismaquant/tests/test_cb_kernels.py -v
+    plugins/gridbook/tests/test_cb_kernels.py -v
 
 Two checks per artifact/Linear:
   * exact-match unpack — the kernel's byte-window codeword extraction is
@@ -27,11 +27,11 @@ from prismaquant.nvfp4_cb_formats import (
 # not necessarily in the build venv. Skip cleanly instead of breaking
 # collection of the main suite.
 codec = pytest.importorskip(
-    "vllm_prismaquant.codec",
-    reason="vllm_prismaquant plugin not importable in this environment "
+    "gridbook.codec",
+    reason="gridbook plugin not importable in this environment "
            "(run inside the serving container / with plugins on PYTHONPATH)",
 )
-kernels = pytest.importorskip("vllm_prismaquant.kernels")
+kernels = pytest.importorskip("gridbook.kernels")
 cb_decode_linear = kernels.cb_decode_linear
 
 SERVE = Path("/home/rob/dq-runs/nvfp4-cb-phase0/serve")

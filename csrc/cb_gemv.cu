@@ -38,10 +38,25 @@
 #include <cuda_fp8.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #define DEVINL __device__ __forceinline__
 
 namespace {
+
+// Host-side env helpers for the (host-only, CUDA-graph-capture-safe) launch-time
+// schedule switches. Reads happen in the launcher at capture time, never on a
+// hot device path.
+inline bool pq_env_is(const char* name, const char* val) {
+  const char* e = std::getenv(name);
+  return e != nullptr && std::strcmp(e, val) == 0;
+}
+inline int pq_env_int(const char* name, int fallback) {
+  const char* e = std::getenv(name);
+  if (e == nullptr || e[0] == '\0') return fallback;
+  return std::atoi(e);
+}
 
 constexpr int kThreads = 256;            // 8 warps
 constexpr int kWarps = kThreads / 32;
@@ -145,7 +160,53 @@ DEVINL float e4m3_to_f32(uint8_t b) {
       __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b, __NV_E4M3));
 }
 
-template <int MT, int WARPS>
+// Decode one superblock's already-read packed words (w0/w1/w2, rem) into wv[8]
+// (e4m3 LUT, Triton-bit-exact rounding) and FMA against x for each active m.
+// Factored out of cb_gemv_fp8_kernel so the single- and double-buffer schedules
+// share IDENTICAL compute — the only difference between the two is when the
+// packed load is issued, so this is the clean bit-identity A/B unit. The word
+// read is left inline in each loop so the DB path can inject its prefetch
+// between the read and this compute (where the overlap lives).
+template <int MT>
+DEVINL void fp8_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
+                           int s, int lane, int M, const uint16_t* x, int64_t K,
+                           const uint16_t* cb16, int64_t cb_base, int k_bits,
+                           int sub_w, uint32_t sub_mask, int sub_entries2,
+                           uint64_t code_mask, float sc_row, float* acc) {
+  const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
+  uint64_t code = lo >> rem;
+  if (rem + k_bits > 64) code |= (uint64_t)w2_ << (64 - rem);
+  code &= code_mask;
+  float wv[8];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t idx = (uint32_t)(code >> (i * sub_w)) & sub_mask;
+    const int64_t elt = cb_base + (int64_t)i * sub_entries2 + (int64_t)idx * 2;
+    const uint16_t pair = __ldg(cb16 + (elt >> 1));
+    wv[2 * i] = bf16_to_f32(
+        f32_to_bf16_rn(e4m3_to_f32((uint8_t)(pair & 0xffu)) * sc_row));
+    wv[2 * i + 1] = bf16_to_f32(
+        f32_to_bf16_rn(e4m3_to_f32((uint8_t)(pair >> 8)) * sc_row));
+  }
+  const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    if (m < M) {
+      const uint4 xv = __ldg(
+          reinterpret_cast<const uint4*>(x + (int64_t)m * K + xbase));
+      const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        acc[m] = fmaf(wv[2 * i],
+                      bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc[m]);
+        acc[m] = fmaf(wv[2 * i + 1],
+                      bf16_to_f32((uint16_t)(xw[i] >> 16)), acc[m]);
+      }
+    }
+  }
+}
+
+template <int MT, int WARPS, bool DB>
 __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
     const uint16_t* __restrict__ x,        // [M, K] bf16 (as u16), QDQ'd
     const uint8_t* __restrict__ qw,        // [N, qw_stride] packed rows
@@ -161,7 +222,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
   const int lane = threadIdx.x & 31;
   const int n_sb = (int)(K >> 8);          // K / 256
 
-  __shared__ __align__(16) uint8_t stage[WARPS][kSlotBytes];
+  __shared__ __align__(16) uint8_t stage[WARPS][DB ? 2 : 1][kSlotBytes];
   __shared__ float red[WARPS][MT > 0 ? MT : 1];
 
   const uint8_t* row = qw + n * qw_stride;
@@ -180,70 +241,65 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
   // pad is 8), so the stage uses 8-byte loads: type_size/8 <= 24 lanes cover
   // one superblock in a single coalesced round.
   const int stage_vecs = type_size >> 3;
+  const int bitpos = lane * k_bits;         // codeword position (fixed per lane)
+  const int b0 = bitpos >> 3;
+  const int rem = ((b0 & 3) << 3) + (bitpos & 7);
+  const int widx = b0 >> 2;
 
-  for (int s = warp; s < n_sb; s += WARPS) {
-    // --- coalesced stage of this superblock's bytes into the warp slot ---
-    // __ldcs (evict-first): the packed stream is read exactly once per token;
-    // keep L2 for the codebook / x / the bf16 floor layers instead.
-    const uint64_t* gsrc =
-        reinterpret_cast<const uint64_t*>(row + (int64_t)s * type_size);
-    uint64_t* gdst = reinterpret_cast<uint64_t*>(stage[warp]);
-    if (lane < stage_vecs) gdst[lane] = __ldcs(gsrc + lane);
-    __syncwarp();
-
-    // --- extract this lane's k-bit codeword (aligned 32-bit smem reads) ---
-    const int bitpos = lane * k_bits;
-    const int b0 = bitpos >> 3;
-    const int rem = ((b0 & 3) << 3) + (bitpos & 7);
-    const uint32_t* s32 = reinterpret_cast<const uint32_t*>(stage[warp]);
-    const int widx = b0 >> 2;
-    const uint32_t w0_ = s32[widx];
-    const uint32_t w1_ = s32[widx + 1];
-    const uint32_t w2_ = s32[widx + 2];
-    // All smem reads of this superblock are done; release the slot for the
-    // next iteration's stage (independent-thread-scheduling hazard).
-    __syncwarp();
-    const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
-    uint64_t code = lo >> rem;
-    if (rem + k_bits > 64) {
-      code |= (uint64_t)w2_ << (64 - rem);
-    }
-    code &= code_mask;
-
-    // --- decode 4 sub-indices -> 8 weights (Triton-bit-exact rounding) ----
-    // The codebook is E4M3 BYTES (the values are e4m3-grid by construction,
-    // so byte -> f32 equals the Triton path's bf16 -> f32 exactly): 16 KB for
-    // k48 instead of 64 KB bf16 — 4x the L1 coverage, half the gather bytes.
-    float wv[8];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const uint32_t idx = (uint32_t)(code >> (i * sub_w)) & sub_mask;
-      const int64_t elt = cb_base + (int64_t)i * sub_entries2 + (int64_t)idx * 2;
-      const uint16_t pair = __ldg(cb16 + (elt >> 1));
-      // Match the Triton kernel bit-for-bit: w = bf16_rn(val * scale) before
-      // the f32 product (tl: (val * sc_row).to(bfloat16) then tl.dot).
-      wv[2 * i] = bf16_to_f32(
-          f32_to_bf16_rn(e4m3_to_f32((uint8_t)(pair & 0xffu)) * sc_row));
-      wv[2 * i + 1] = bf16_to_f32(
-          f32_to_bf16_rn(e4m3_to_f32((uint8_t)(pair >> 8)) * sc_row));
-    }
-
-    // --- FMA against x: one 16-byte load per (m, lane) --------------------
-    const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
-#pragma unroll
-    for (int m = 0; m < MT; ++m) {
-      if (m < M) {
-        const uint4 xv = __ldg(
-            reinterpret_cast<const uint4*>(x + (int64_t)m * K + xbase));
-        const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          acc[m] = fmaf(wv[2 * i],
-                        bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc[m]);
-          acc[m] = fmaf(wv[2 * i + 1],
-                        bf16_to_f32((uint16_t)(xw[i] >> 16)), acc[m]);
+  if constexpr (DB) {
+    // Software-pipelined double buffer: while decoding+FMA'ing the current
+    // superblock, prefetch superblock s+WARPS into the OTHER smem slot so its
+    // evict-first packed load overlaps compute (a win only when this kernel is
+    // latency-exposed — few blocks, e.g. the dense M<=16 GEMV; measured vs the
+    // single-buffer schedule via PRISMAQUANT_CB_FP8_SCHED). ONE __syncwarp/iter
+    // (a slot is not reused for two iterations, so the top-of-loop barrier
+    // serves both the incoming RAW and the outgoing WAR). Bit-identical to the
+    // single-buffer path — only the load schedule changes, not the sum.
+    int s = warp;
+    if (s < n_sb) {
+      const uint64_t* g0 =
+          reinterpret_cast<const uint64_t*>(row + (int64_t)s * type_size);
+      uint64_t* d0 = reinterpret_cast<uint64_t*>(stage[warp][0]);
+      if (lane < stage_vecs) d0[lane] = __ldcs(g0 + lane);
+      int buf = 0;
+      while (s < n_sb) {
+        __syncwarp();
+        const uint32_t* s32 =
+            reinterpret_cast<const uint32_t*>(stage[warp][buf]);
+        const uint32_t w0_ = s32[widx];
+        const uint32_t w1_ = s32[widx + 1];
+        const uint32_t w2_ = s32[widx + 2];
+        const int s_next = s + WARPS;
+        if (s_next < n_sb) {
+          const uint64_t* gN = reinterpret_cast<const uint64_t*>(
+              row + (int64_t)s_next * type_size);
+          uint64_t* dN = reinterpret_cast<uint64_t*>(stage[warp][buf ^ 1]);
+          if (lane < stage_vecs) dN[lane] = __ldcs(gN + lane);
         }
+        fp8_decode_fma<MT>(w0_, w1_, w2_, rem, s, lane, M, x, K, cb16, cb_base,
+                           k_bits, sub_w, sub_mask, sub_entries2, code_mask,
+                           sc_row, acc);
+        s = s_next;
+        buf ^= 1;
       }
+    }
+  } else {
+    // Single-buffer schedule (the original): stage this superblock, read its
+    // words, release the slot, then decode+FMA. Two __syncwarp/iteration.
+    for (int s = warp; s < n_sb; s += WARPS) {
+      const uint64_t* gsrc =
+          reinterpret_cast<const uint64_t*>(row + (int64_t)s * type_size);
+      uint64_t* gdst = reinterpret_cast<uint64_t*>(stage[warp][0]);
+      if (lane < stage_vecs) gdst[lane] = __ldcs(gsrc + lane);
+      __syncwarp();
+      const uint32_t* s32 = reinterpret_cast<const uint32_t*>(stage[warp][0]);
+      const uint32_t w0_ = s32[widx];
+      const uint32_t w1_ = s32[widx + 1];
+      const uint32_t w2_ = s32[widx + 2];
+      __syncwarp();
+      fp8_decode_fma<MT>(w0_, w1_, w2_, rem, s, lane, M, x, K, cb16, cb_base,
+                         k_bits, sub_w, sub_mask, sub_entries2, code_mask,
+                         sc_row, acc);
     }
   }
 
@@ -298,18 +354,26 @@ void launch_gemv(const torch::Tensor& xq, const torch::Tensor& qw,
   // and prefer 8 warps for block-level parallelism.
   const int n_sb = (int)(K >> 8);
   const bool use4 = (n_sb % 8 != 0) && (n_sb % 4 == 0) && (n_sb < 48);
-#define PQ_LAUNCH(W)                                                       \
-  cb_gemv_fp8_kernel<MT, W><<<(unsigned)N, (W)*32, 0, stream>>>(           \
+  // Default: double-buffer (prefetch) schedule — the dense fp8 GEMV is one block
+  // per output row (comparatively few blocks) and thus latency-exposed, so
+  // prefetching the next superblock overlaps its evict-first load with compute.
+  // Both schedules are BIT-IDENTICAL (same partial-sum order); the env switch
+  // PRISMAQUANT_CB_FP8_SCHED=legacy selects the original single-buffer path (for
+  // an interleaved A/B and serving bisection). Read per call: host-only,
+  // CUDA-graph-capture-safe, negligible.
+  const bool fp8_db = !pq_env_is("PRISMAQUANT_CB_FP8_SCHED", "legacy");
+#define PQ_LAUNCH(W, DBFLAG)                                               \
+  cb_gemv_fp8_kernel<MT, W, DBFLAG><<<(unsigned)N, (W)*32, 0, stream>>>(   \
       reinterpret_cast<const uint16_t*>(xq.data_ptr()),                    \
       qw.data_ptr<uint8_t>(),                                              \
       reinterpret_cast<const uint16_t*>(cb.data_ptr()),                    \
       cboff.data_ptr<int32_t>(), scale.data_ptr<float>(),                  \
       reinterpret_cast<uint16_t*>(y.data_ptr()),                           \
       M, N, K, qw.stride(0), k_bits, sub_w, type_size)
-  if (use4) {
-    PQ_LAUNCH(4);
+  if (fp8_db) {
+    if (use4) { PQ_LAUNCH(4, true); } else { PQ_LAUNCH(8, true); }
   } else {
-    PQ_LAUNCH(8);
+    if (use4) { PQ_LAUNCH(4, false); } else { PQ_LAUNCH(8, false); }
   }
 #undef PQ_LAUNCH
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -392,7 +456,56 @@ torch::Tensor cb_gemv_fp8(torch::Tensor x, torch::Tensor qw_padded,
 // NOT fuse the activation QDQ: fp4 group-16 RTN runs OUTSIDE (python
 // codec.fp4_group16_act_qdq), so x arrives already QDQ'd — which keeps the CUDA
 // path bit-aligned with the Triton fp4 path (QDQ is outside there too).
-template <int MT, int WARPS>
+// Shared decode+FMA for the dense fp4-v2 kernel (compose two-tier scale, gather
+// the bf16 sub-codebook, FMA against x) from a superblock's already-read words +
+// scale bytes. Factored so the single- and double-buffer schedules share
+// IDENTICAL compute — only the load schedule differs (the clean bit-identity
+// A/B unit). The word/scale read stays inline so the DB path can inject its
+// prefetch between the read and this compute.
+template <int MT>
+DEVINL void fp4v2_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
+                             uint8_t super_e, uint8_t sub_byte, int grp, int s,
+                             int lane, int M, const uint16_t* x, int64_t K,
+                             const uint16_t* cb_bf16, int64_t cb_base,
+                             int k_bits, int sub_w, uint32_t sub_mask,
+                             int sub_entries4, uint64_t code_mask,
+                             const float* compose, float* acc) {
+  const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
+  uint64_t code = lo >> rem;
+  if (rem + k_bits > 64) code |= (uint64_t)w2_ << (64 - rem);
+  code &= code_mask;
+  const uint32_t code16 = (uint32_t)((sub_byte >> ((grp & 1) * 4)) & 0xFu);
+  const float sc = __ldg(compose + (int)super_e * 16 + (int)code16);
+  float wv[8];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const uint32_t idx = (uint32_t)(code >> (i * sub_w)) & sub_mask;
+    const int64_t elt = cb_base + (int64_t)i * sub_entries4 + (int64_t)idx * 4;
+#pragma unroll
+    for (int local = 0; local < 4; ++local) {
+      const float val = bf16_to_f32(__ldg(cb_bf16 + elt + local));
+      wv[i * 4 + local] = bf16_to_f32(f32_to_bf16_rn(val * sc));
+    }
+  }
+  const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    if (m < M) {
+      const uint4 xv = __ldg(
+          reinterpret_cast<const uint4*>(x + (int64_t)m * K + xbase));
+      const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        acc[m] = fmaf(wv[2 * i],
+                      bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc[m]);
+        acc[m] = fmaf(wv[2 * i + 1],
+                      bf16_to_f32((uint16_t)(xw[i] >> 16)), acc[m]);
+      }
+    }
+  }
+}
+
+template <int MT, int WARPS, bool DB>
 __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
     const uint16_t* __restrict__ x,        // [M, K] bf16 (as u16), QDQ'd
     const uint8_t* __restrict__ qw,        // [N, qw_stride] packed rows
@@ -408,7 +521,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
   const int lane = threadIdx.x & 31;
   const int n_sb = (int)(K >> 8);          // K / 256
 
-  __shared__ __align__(16) uint8_t stage[WARPS][kSlotBytes];
+  __shared__ __align__(16) uint8_t stage[WARPS][DB ? 2 : 1][kSlotBytes];
   __shared__ float red[WARPS][MT > 0 ? MT : 1];
 
   const uint8_t* row = qw + n * qw_stride;
@@ -423,75 +536,66 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
 #pragma unroll
   for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
 
-  for (int s = warp; s < n_sb; s += WARPS) {
-    // Byte-granular coalesced stage (type_size = 4k+9 is odd/unaligned, so no
-    // u64/u32 vector load): each lane copies bytes lane, lane+32, ...; the
-    // superblock is read exactly once (__ldcs, evict-first) and no lane reads
-    // past type_size.
-    const uint8_t* gsrc = row + (int64_t)s * type_size;
-    for (int b = lane; b < type_size; b += 32) stage[warp][b] = __ldcs(gsrc + b);
-    __syncwarp();
+  const int bitpos = lane * k_bits;             // codeword position (per lane)
+  const int b0 = bitpos >> 3;
+  const int rem = ((b0 & 3) << 3) + (bitpos & 7);
+  const int widx = b0 >> 2;
+  const int grp = lane >> 1;                     // group-16 index = codeword/2
+  const int sub_off = scale_off + 1 + (grp >> 1);
 
-    // --- extract this lane's k-bit codeword (aligned 32-bit smem reads) -----
-    const int bitpos = lane * k_bits;
-    const int b0 = bitpos >> 3;
-    const int rem = ((b0 & 3) << 3) + (bitpos & 7);
-    const uint32_t* s32 = reinterpret_cast<const uint32_t*>(stage[warp]);
-    const int widx = b0 >> 2;
-    const uint32_t w0_ = s32[widx];
-    const uint32_t w1_ = s32[widx + 1];
-    const uint32_t w2_ = s32[widx + 2];
-    // --- two-tier scale bytes for this lane's group (read before release) ---
-    const int grp = lane >> 1;                    // group-16 index = codeword/2
-    const uint8_t super_e = stage[warp][scale_off];
-    const uint8_t sub_byte = stage[warp][scale_off + 1 + (grp >> 1)];
-    // All smem reads of this superblock are done; release the slot for the
-    // next iteration's stage (independent-thread-scheduling hazard).
-    __syncwarp();
-    const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
-    uint64_t code = lo >> rem;
-    if (rem + k_bits > 64) {
-      code |= (uint64_t)w2_ << (64 - rem);
-    }
-    code &= code_mask;
-
-    // --- compose the group-16 scale (bit-exact to expand_fp4_v2_to_weight) --
-    const uint32_t code16 = (uint32_t)((sub_byte >> ((grp & 1) * 4)) & 0xFu);
-    const float sc = __ldg(compose + (int)super_e * 16 + (int)code16);
-
-    // --- decode 2 sub-indices -> 8 weights (BF16 codebook, composed scale) --
-    // cb_base is this output row's codebook block (the fused-role offset), on
-    // top of the sub-codebook block base — identical per-row addressing to the
-    // dense fp8 kernel, just a bf16/sub_dim=4 gather instead of the e4m3 pair.
-    float wv[8];
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const uint32_t idx = (uint32_t)(code >> (i * sub_w)) & sub_mask;
-      const int64_t elt = cb_base + (int64_t)i * sub_entries4 + (int64_t)idx * 4;
-#pragma unroll
-      for (int local = 0; local < 4; ++local) {
-        // Match the loop bit-for-bit: w = bf16_rn(f32(cb_value) * f32(scale)).
-        const float val = bf16_to_f32(__ldg(cb_bf16 + elt + local));
-        wv[i * 4 + local] = bf16_to_f32(f32_to_bf16_rn(val * sc));
-      }
-    }
-
-    // --- FMA against x: one 16-byte load per (m, lane) --------------------
-    const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
-#pragma unroll
-    for (int m = 0; m < MT; ++m) {
-      if (m < M) {
-        const uint4 xv = __ldg(
-            reinterpret_cast<const uint4*>(x + (int64_t)m * K + xbase));
-        const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          acc[m] = fmaf(wv[2 * i],
-                        bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc[m]);
-          acc[m] = fmaf(wv[2 * i + 1],
-                        bf16_to_f32((uint16_t)(xw[i] >> 16)), acc[m]);
+  if constexpr (DB) {
+    // Software-pipelined double buffer: prefetch superblock s+WARPS into the
+    // OTHER slot while decoding+FMA'ing the current one (a win only when this
+    // kernel is latency-exposed — one block/row -> few blocks; measured vs the
+    // single-buffer schedule via PRISMAQUANT_CB_FP4V2_SCHED). ONE __syncwarp/iter
+    // (a slot is not reused for two iterations). Bit-identical — only the load
+    // schedule changes.
+    int s = warp;
+    if (s < n_sb) {
+      const uint8_t* g0 = row + (int64_t)s * type_size;
+      for (int b = lane; b < type_size; b += 32)
+        stage[warp][0][b] = __ldcs(g0 + b);
+      int buf = 0;
+      while (s < n_sb) {
+        __syncwarp();
+        const uint32_t* s32 =
+            reinterpret_cast<const uint32_t*>(stage[warp][buf]);
+        const uint32_t w0_ = s32[widx];
+        const uint32_t w1_ = s32[widx + 1];
+        const uint32_t w2_ = s32[widx + 2];
+        const uint8_t super_e = stage[warp][buf][scale_off];
+        const uint8_t sub_byte = stage[warp][buf][sub_off];
+        const int s_next = s + WARPS;
+        if (s_next < n_sb) {
+          const uint8_t* gN = row + (int64_t)s_next * type_size;
+          for (int b = lane; b < type_size; b += 32)
+            stage[warp][buf ^ 1][b] = __ldcs(gN + b);
         }
+        fp4v2_decode_fma<MT>(w0_, w1_, w2_, rem, super_e, sub_byte, grp, s, lane,
+                             M, x, K, cb_bf16, cb_base, k_bits, sub_w, sub_mask,
+                             sub_entries4, code_mask, compose, acc);
+        s = s_next;
+        buf ^= 1;
       }
+    }
+  } else {
+    // Single-buffer schedule (the original): byte-granular stage (type_size =
+    // 4k+9 is odd/unaligned), read words + scale bytes, release, decode+FMA.
+    for (int s = warp; s < n_sb; s += WARPS) {
+      const uint8_t* gsrc = row + (int64_t)s * type_size;
+      for (int b = lane; b < type_size; b += 32)
+        stage[warp][0][b] = __ldcs(gsrc + b);
+      __syncwarp();
+      const uint32_t* s32 = reinterpret_cast<const uint32_t*>(stage[warp][0]);
+      const uint32_t w0_ = s32[widx];
+      const uint32_t w1_ = s32[widx + 1];
+      const uint32_t w2_ = s32[widx + 2];
+      const uint8_t super_e = stage[warp][0][scale_off];
+      const uint8_t sub_byte = stage[warp][0][sub_off];
+      __syncwarp();
+      fp4v2_decode_fma<MT>(w0_, w1_, w2_, rem, super_e, sub_byte, grp, s, lane,
+                           M, x, K, cb_bf16, cb_base, k_bits, sub_w, sub_mask,
+                           sub_entries4, code_mask, compose, acc);
     }
   }
 
@@ -525,18 +629,23 @@ void launch_gemv_fp4_v2(const torch::Tensor& xq, const torch::Tensor& qw,
   // it exactly. Large rows amortize the tail and prefer 8 warps.
   const int n_sb = (int)(K >> 8);
   const bool use4 = (n_sb % 8 != 0) && (n_sb % 4 == 0) && (n_sb < 48);
-#define PQ_LAUNCH_FP4V2(W)                                                  \
-  cb_gemv_fp4_v2_kernel<MT, W><<<(unsigned)N, (W)*32, 0, stream>>>(         \
+  // Default: single-buffer (legacy) — the DENSE fp4-v2 kernel is the same
+  // one-block-per-row (latency-exposed) shape as the dense fp8 kernel, so the
+  // prefetch double buffer is a candidate; it is measured vs legacy via the env
+  // switch and only defaulted on after a served-KL-safe A/B (bit-identical).
+  const bool fp4v2_db = pq_env_is("PRISMAQUANT_CB_FP4V2_SCHED", "db");
+#define PQ_LAUNCH_FP4V2(W, DBFLAG)                                          \
+  cb_gemv_fp4_v2_kernel<MT, W, DBFLAG><<<(unsigned)N, (W)*32, 0, stream>>>( \
       reinterpret_cast<const uint16_t*>(xq.data_ptr()),                    \
       qw.data_ptr<uint8_t>(),                                              \
       reinterpret_cast<const uint16_t*>(cb.data_ptr()),                    \
       cboff.data_ptr<int32_t>(), compose.data_ptr<float>(),                \
       reinterpret_cast<uint16_t*>(y.data_ptr()),                           \
       M, N, K, qw.stride(0), k_bits, sub_w, type_size)
-  if (use4) {
-    PQ_LAUNCH_FP4V2(4);
+  if (fp4v2_db) {
+    if (use4) { PQ_LAUNCH_FP4V2(4, true); } else { PQ_LAUNCH_FP4V2(8, true); }
   } else {
-    PQ_LAUNCH_FP4V2(8);
+    if (use4) { PQ_LAUNCH_FP4V2(4, false); } else { PQ_LAUNCH_FP4V2(8, false); }
   }
 #undef PQ_LAUNCH_FP4V2
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -862,6 +971,150 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp4_v2_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// fp4-v2 grouped MoE decode GEMV — ROWPACK schedule (opt-in; round-3 item A).
+//
+// One block covers RPB consecutive output rows of ONE routed (pair): the pair's
+// activation row x is staged into smem ONCE and reused by ALL RPB rows, whereas
+// the default schedule launches a separate block per (pair, row) that each
+// re-reads x from L2. Each of the RPB warps owns one output row and strides ALL
+// n_sb superblocks of that row's packed weights, so a block runs RPB
+// independent decode streams (deep cross-warp latency hiding) over a single
+// resident x. The bet vs the round-2 default (2 warps, 3 superblocks/warp, one
+// (pair,row) per block): at the LOW rungs (K14/K16) the per-superblock decode is
+// light, so the default is latency- and launch-bound at ~37-41% of peak; RPB=8
+// cuts the block count 8x, hides the evict-first weight-load latency behind 8
+// concurrent rows, and serves every FMA's x from smem (1-cycle) instead of an
+// L2 __ldg.
+//
+// NUMERICS: one warp accumulates its row's n_sb superblocks in ascending order,
+// then a 32-lane tree reduce — a DIFFERENT fp32 partial-sum order than the
+// default 2-warp (or legacy 8-warp) schedule, so outputs REASSOCIATE. Same
+// tolerance contract as the round-2 w2 schedule (<=1 bf16 ULP + norm backstop
+// vs the per-expert loop); gated behind PRISMAQUANT_CB_W2_SCHED=rowpack so a
+// served-KL run can bisect it.
+//
+// Dynamic smem = [x row: K bf16, 16-aligned] ++ [RPB weight stage slots]. For
+// the Hy3 w2 shape (K=1536, RPB=8): 3072 + 8*208 = 4736 B — well under the 48 KB
+// default (the launcher only takes this path when it fits, else falls through).
+template <int RPB>
+__global__ __launch_bounds__(RPB * 32) void cb_moe_gemv_fp4_v2_rowpack_kernel(
+    const uint16_t* __restrict__ x,        // [Xrows, K] bf16 (as u16), QDQ'd
+    const uint8_t* __restrict__ qw,        // [E, out, row_bytes] packed
+    const uint16_t* __restrict__ cb_bf16,  // BF16 flat codebook as u16
+    const float* __restrict__ compose,     // [256*16] fp32 two-tier compose
+    const int32_t* __restrict__ pair_expert,  // [P]
+    const int32_t* __restrict__ pair_xrow,    // [P] row of x per pair
+    uint16_t* __restrict__ y,              // [P, out] bf16 (as u16)
+    const int64_t P, const int64_t Nout, const int64_t K,
+    const int k_bits, const int sub_w, const int type_size) {
+  const int64_t nblk_per_pair = (Nout + RPB - 1) / RPB;
+  const int64_t gb = blockIdx.x;
+  const int64_t p = gb / nblk_per_pair;
+  const int64_t rg = gb % nblk_per_pair;          // row group within the pair
+  const int warp = threadIdx.x >> 5;              // 0..RPB-1 -> row in the group
+  const int lane = threadIdx.x & 31;
+  const int64_t n = rg * RPB + warp;              // this warp's output row
+  const int n_sb = (int)(K >> 8);
+  const int64_t row_bytes = (int64_t)n_sb * type_size;
+
+  // Dynamic smem: [x row (K bf16, 16-aligned)] then [RPB weight stage slots].
+  extern __shared__ __align__(16) uint8_t rp_smem[];
+  uint16_t* x_smem = reinterpret_cast<uint16_t*>(rp_smem);
+  uint8_t* stage_base = rp_smem + (size_t)K * 2;  // K*2 is a 512B multiple -> 16B
+
+  // --- Phase 1: stage this pair's x row into smem ONCE (all threads) --------
+  const uint16_t* xr = x + (int64_t)pair_xrow[p] * K;
+  for (int64_t i = threadIdx.x; i < K; i += blockDim.x) x_smem[i] = xr[i];
+  __syncthreads();
+
+  const uint32_t sub_mask = (1u << sub_w) - 1u;
+  const int sub_entries4 = 4 << sub_w;
+  const uint64_t code_mask =
+      (k_bits >= 64) ? ~0ull : ((1ull << k_bits) - 1ull);
+  const int scale_off = 4 * k_bits;
+
+  // --- Phase 2: this warp computes ONE output row against the shared x -------
+  if (n < Nout) {
+    const int64_t e = (int64_t)pair_expert[p];
+    const uint8_t* row = qw + (e * Nout + n) * row_bytes;
+    uint8_t* slot = stage_base + (size_t)warp * kSlotBytes;
+    float acc = 0.0f;
+    for (int s = 0; s < n_sb; ++s) {
+      // Stage superblock s into this warp's slot (identical to the default
+      // kernel: u64 head-aligned for interior sb, byte path for the last).
+      const uint8_t* gsrc = row + (int64_t)s * type_size;
+      int off8;
+      if (s + 1 < n_sb) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(gsrc);
+        off8 = (int)(a & 7u);
+        const uint64_t* g8 = reinterpret_cast<const uint64_t*>(a - off8);
+        uint64_t* d8 = reinterpret_cast<uint64_t*>(slot);
+        const int nv = (off8 + type_size + 7) >> 3;
+        if (lane < nv) d8[lane] = __ldcs(g8 + lane);
+      } else {
+        off8 = 0;
+        for (int b = lane; b < type_size; b += 32) slot[b] = __ldcs(gsrc + b);
+      }
+      __syncwarp();
+
+      const int bitpos = off8 * 8 + lane * k_bits;
+      const int b0 = bitpos >> 3;
+      const int rem = ((b0 & 3) << 3) + (bitpos & 7);
+      const uint32_t* s32 = reinterpret_cast<const uint32_t*>(slot);
+      const int widx = b0 >> 2;
+      const uint32_t w0_ = s32[widx];
+      const uint32_t w1_ = s32[widx + 1];
+      const uint32_t w2_ = (rem + k_bits > 64) ? s32[widx + 2] : 0u;
+      const int grp = lane >> 1;
+      const uint8_t super_e = slot[off8 + scale_off];
+      const uint8_t sub_byte = slot[off8 + scale_off + 1 + (grp >> 1)];
+      __syncwarp();
+      const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
+      uint64_t code = lo >> rem;
+      if (rem + k_bits > 64) code |= (uint64_t)w2_ << (64 - rem);
+      code &= code_mask;
+
+      const uint32_t code16 = (uint32_t)((sub_byte >> ((grp & 1) * 4)) & 0xFu);
+      const float sc = __ldg(compose + (int)super_e * 16 + (int)code16);
+
+      float wv[8];
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const uint32_t idx = (uint32_t)(code >> (i * sub_w)) & sub_mask;
+        const int64_t elt = (int64_t)i * sub_entries4 + (int64_t)idx * 4;
+        const uint2 quad = __ldg(reinterpret_cast<const uint2*>(cb_bf16 + elt));
+        wv[i * 4 + 0] = bf16_to_f32(
+            f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.x & 0xffffu)) * sc));
+        wv[i * 4 + 1] = bf16_to_f32(
+            f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.x >> 16)) * sc));
+        wv[i * 4 + 2] = bf16_to_f32(
+            f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y & 0xffffu)) * sc));
+        wv[i * 4 + 3] = bf16_to_f32(
+            f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y >> 16)) * sc));
+      }
+
+      // FMA against the SHARED smem x (16-byte LDS.128; no gmem/L2 traffic).
+      // xbase*2 = (s*512 + lane*16) bytes -> 16-aligned for the uint4 read.
+      const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
+      const uint4 xv = *reinterpret_cast<const uint4*>(x_smem + xbase);
+      const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        acc = fmaf(wv[2 * i],
+                   bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc);
+        acc = fmaf(wv[2 * i + 1],
+                   bf16_to_f32((uint16_t)(xw[i] >> 16)), acc);
+      }
+    }
+    // One warp owns the whole row -> 32-lane tree reduce, direct write.
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[p * Nout + n] = f32_to_bf16_rn(acc);
+  }
+}
+
 // Deterministic per-token combine: out[t] = sum over its pairs (pre-sorted
 // ascending-expert, matching the python loop's index_add_ order) of
 // weight[p] * y[p], accumulated in bf16 exactly like the loop's bf16
@@ -969,27 +1222,98 @@ torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
   auto y = torch::empty({P, Nout}, xq.options());
   if (P == 0) return y;
   const int n_sb = (int)(K >> 8);
-  const bool use4 = (n_sb % 8 != 0) && (n_sb % 4 == 0) && (n_sb < 48);
   const int64_t grid = P * Nout;
-  if (use4) {
-    cb_moe_gemv_fp4_v2_kernel<4><<<(unsigned)grid, 128, 0, stream>>>(
-        reinterpret_cast<const uint16_t*>(xq.data_ptr()),
-        qw_stack.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint16_t*>(cb_flat.data_ptr()),
-        compose.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),
-        pair_xrow.data_ptr<int32_t>(),
-        reinterpret_cast<uint16_t*>(y.data_ptr()),
-        P, Nout, K, (int)k_bits, sub_w, (int)type_size);
-  } else {
-    cb_moe_gemv_fp4_v2_kernel<8><<<(unsigned)grid, 256, 0, stream>>>(
-        reinterpret_cast<const uint16_t*>(xq.data_ptr()),
-        qw_stack.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint16_t*>(cb_flat.data_ptr()),
-        compose.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),
-        pair_xrow.data_ptr<int32_t>(),
-        reinterpret_cast<uint16_t*>(y.data_ptr()),
-        P, Nout, K, (int)k_bits, sub_w, (int)type_size);
+
+  // Warp schedule.
+  //   legacy (PRISMAQUANT_CB_W2_SCHED=legacy): the original heuristic — 4 warps
+  //     when n_sb divides 4 but not 8, else 8. For a small n_sb this leaves
+  //     idle warps (w2 n_sb=6 -> 8 warps, 2 idle, ONE superblock/warp) and is
+  //     numerics-preserving (the serving path before this change).
+  //   default: pick the warp count that gives every warp >=2 superblocks when
+  //     n_sb allows (all warps active, more per-warp memory-level parallelism to
+  //     hide the evict-first load latency this kernel is bound on), capped at 8.
+  //     w13 (n_sb=16) -> 8 warps, 2 superblocks/warp -> IDENTICAL block schedule
+  //     to legacy's 8 (BIT-IDENTICAL output). w2 (n_sb=6) -> 3 warps, 2
+  //     superblocks/warp, all active -> this REASSOCIATES the fp32 partial-sum
+  //     order vs legacy's 8 warps, so it is gated by the env switch for serving
+  //     bisection. (PRISMAQUANT_CB_W2_WARPS overrides the count, for retuning.)
+  // Schedule selector (PRISMAQUANT_CB_W2_SCHED). Read per call -> host-only and
+  // CUDA-graph-capture-safe, and lets a bench toggle schedules within one
+  // process:
+  //   legacy  -> original 8/4-warp heuristic (numerics-preserving baseline)
+  //   rowpack -> round-3 item A: RPB rows/block sharing a smem-resident x row
+  //   default (unset / anything else) -> round-2 schedule (~3 superblocks/warp)
+  const bool w2_legacy = pq_env_is("PRISMAQUANT_CB_W2_SCHED", "legacy");
+  const bool w2_rowpack = pq_env_is("PRISMAQUANT_CB_W2_SCHED", "rowpack");
+
+  // --- ROWPACK: one block = RPB output rows of one pair, sharing a smem x ----
+  if (w2_rowpack) {
+    int rpb = pq_env_int("PRISMAQUANT_CB_W2_ROWS", 8);   // rows (= warps) / block
+    if (rpb != 4 && rpb != 8 && rpb != 16) rpb = 8;
+    const size_t rp_smem = (size_t)K * 2 + (size_t)rpb * kSlotBytes;
+    if (rp_smem <= 48 * 1024) {                          // else fall through
+      const int64_t nbp = (Nout + rpb - 1) / rpb;
+      const unsigned rp_grid = (unsigned)(P * nbp);
+#define LAUNCH_FP4V2_ROWPACK(R)                                              \
+  cb_moe_gemv_fp4_v2_rowpack_kernel<R><<<rp_grid, (R) * 32, rp_smem, stream>>>(\
+      reinterpret_cast<const uint16_t*>(xq.data_ptr()),                      \
+      qw_stack.data_ptr<uint8_t>(),                                          \
+      reinterpret_cast<const uint16_t*>(cb_flat.data_ptr()),                 \
+      compose.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),            \
+      pair_xrow.data_ptr<int32_t>(),                                         \
+      reinterpret_cast<uint16_t*>(y.data_ptr()),                             \
+      P, Nout, K, (int)k_bits, sub_w, (int)type_size)
+      switch (rpb) {
+        case 4: LAUNCH_FP4V2_ROWPACK(4); break;
+        case 16: LAUNCH_FP4V2_ROWPACK(16); break;
+        default: LAUNCH_FP4V2_ROWPACK(8); break;
+      }
+#undef LAUNCH_FP4V2_ROWPACK
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return y;
+    }
+    // smem too large for this K -> fall through to the default warp schedule.
   }
+
+  int warps;
+  if (w2_legacy) {
+    const bool use4 = (n_sb % 8 != 0) && (n_sb % 4 == 0) && (n_sb < 48);
+    warps = use4 ? 4 : 8;
+  } else {
+    // Non-w2 shapes keep their legacy warp count (bit-identical): w13 (n_sb=16,
+    // a multiple of 8) -> 8 warps, exactly as before. Only a small n_sb (the w2
+    // case, where 8 warps idle two and run one superblock/warp) is retuned to
+    // ~3 superblocks/warp — the measured Hy3-w2 optimum (n_sb=6 -> 2 warps:
+    // 37-47% of peak vs 25-31% at 8; 2 beats 3 beats 1 across all rungs). This
+    // reassociates the w2 fp32 partial-sum order, hence the env gate above.
+    const bool use4 = (n_sb % 8 != 0) && (n_sb % 4 == 0) && (n_sb < 48);
+    warps = use4 ? 4 : 8;
+    if (n_sb < 8) {
+      warps = (n_sb + 2) / 3;                // ~3 superblocks/warp; n_sb=6 -> 2
+      if (warps < 1) warps = 1;
+    }
+    const int ov = pq_env_int("PRISMAQUANT_CB_W2_WARPS", 0);
+    if (ov >= 1 && ov <= 8) warps = ov;      // tuning override (0 = disabled)
+  }
+  const unsigned tpb = (unsigned)warps * 32;
+#define LAUNCH_FP4V2_MOE(W)                                                  \
+  cb_moe_gemv_fp4_v2_kernel<W><<<(unsigned)grid, tpb, 0, stream>>>(          \
+      reinterpret_cast<const uint16_t*>(xq.data_ptr()),                      \
+      qw_stack.data_ptr<uint8_t>(),                                          \
+      reinterpret_cast<const uint16_t*>(cb_flat.data_ptr()),                 \
+      compose.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),            \
+      pair_xrow.data_ptr<int32_t>(),                                         \
+      reinterpret_cast<uint16_t*>(y.data_ptr()),                             \
+      P, Nout, K, (int)k_bits, sub_w, (int)type_size)
+  switch (warps) {
+    case 1: LAUNCH_FP4V2_MOE(1); break;
+    case 2: LAUNCH_FP4V2_MOE(2); break;
+    case 3: LAUNCH_FP4V2_MOE(3); break;
+    case 4: LAUNCH_FP4V2_MOE(4); break;
+    case 6: LAUNCH_FP4V2_MOE(6); break;
+    default: LAUNCH_FP4V2_MOE(8); break;
+  }
+#undef LAUNCH_FP4V2_MOE
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
 }

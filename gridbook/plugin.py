@@ -60,6 +60,12 @@ def _install_toplevel_cb_expert_loaders() -> None:
 
 def register() -> None:
     try:
+        register_quantization_config("gridbook")(PrismaQuantConfig)
+    except ValueError:
+        pass
+    try:
+        # Legacy key: artifacts exported before the gridbook rename carry
+        # quant_method="prismaquant"; register the same config under it.
         register_quantization_config("prismaquant")(PrismaQuantConfig)
     except ValueError:
         # Already registered (idempotent across repeated plugin loads).
