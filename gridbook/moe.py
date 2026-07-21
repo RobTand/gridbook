@@ -286,7 +286,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # tolerance contract by tests/test_moe_batched_prefill.py and gated by
         # the served logprob A/B before adoption. Prefill is eager/uncaptured
         # (FULL_DECODE_ONLY), so this path needs no CUDA-graph capture-safety.
-        if os.environ.get("PRISMAQUANT_CB_PREFILL", "batched") == "loop":
+        # Default LOOP until the batched path passes its at-scale served gate:
+        # the first 1.4k-token prefill on Hy3 crashed the serve (transient
+        # chunk tiles ~1.6 GB vs the loop's ~56 MB against thin post-KV
+        # slack, 2026-07-20). Batched stays opt-in: PRISMAQUANT_CB_PREFILL=batched.
+        if os.environ.get("PRISMAQUANT_CB_PREFILL", "loop") == "loop":
             return self._apply_prefill_loop(
                 layer, x, topk_weights, topk_ids, act)
         return self._apply_prefill_batched(

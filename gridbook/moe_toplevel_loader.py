@@ -203,8 +203,10 @@ def resolve_shared_cb_target(name: str, params_dict,
     """
     if name.endswith(_CB_QWEIGHT_SUFFIX):
         base = name[: -len(_CB_QWEIGHT_SUFFIX)]
+        is_scale = False
     elif name.endswith(_WEIGHT_SCALE_SUFFIX):
         base = name[: -len(_WEIGHT_SCALE_SUFFIX)]
+        is_scale = True
     else:
         return None
     parent, _, leaf = base.rpartition(".")
@@ -214,11 +216,18 @@ def resolve_shared_cb_target(name: str, params_dict,
         fbase = parent + "." + fused_leaf
         if fbase + _CB_QWEIGHT_SUFFIX in params_dict:
             return None                       # vLLM built a fused CB Linear here
+        # A weight_scale whose OWN param exists is a stock-CT tensor (a joint
+        # menu can put a shared-expert Linear on vanilla fp8: it has .weight AND
+        # .weight_scale params) — never an orphaned CB scale. Defer.
+        if is_scale and fbase + _WEIGHT_SCALE_SUFFIX in params_dict:
+            return None
         if fbase + ".weight" in params_dict:
             return fbase + ".weight", shard   # merged bf16 target (gate|up)
     # Direct (unfused) case: down_proj, or a non-fused projection.
     if base + _CB_QWEIGHT_SUFFIX in params_dict:
         return None                           # vLLM built a CB Linear here
+    if is_scale and base + _WEIGHT_SCALE_SUFFIX in params_dict:
+        return None                           # stock-CT scale with a real home
     if base + ".weight" in params_dict:
         return base + ".weight", 0
     return None                               # target absent on this rank
