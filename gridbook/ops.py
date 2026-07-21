@@ -12,7 +12,7 @@ import torch
 from .kernels import cb_decode_linear
 
 
-@torch.library.custom_op("prismaquant::cb_gemm", mutates_args=())
+@torch.library.custom_op("prismaquant::cb_gemm", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def cb_gemm(x: torch.Tensor, qw_padded: torch.Tensor, cb_flat: torch.Tensor,
             cb_row_offset: torch.Tensor, scale: torch.Tensor,
             compose: torch.Tensor, N: int, K: int,
@@ -29,7 +29,7 @@ def _cb_gemm_fake(x, qw_padded, cb_flat, cb_row_offset, scale, compose, N, K,
     return torch.empty((*x.shape[:-1], N), dtype=x.dtype, device=x.device)
 
 
-@torch.library.custom_op("prismaquant::cb_gemv_fp8", mutates_args=())
+@torch.library.custom_op("prismaquant::cb_gemv_fp8", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def cb_gemv_fp8(x: torch.Tensor, qw_padded: torch.Tensor,
                 cb_flat: torch.Tensor, cb_row_offset: torch.Tensor,
                 scale: torch.Tensor, N: int, K: int, k_bits: int, n_sub: int,
@@ -49,7 +49,7 @@ def _cb_gemv_fp8_fake(x, qw_padded, cb_flat, cb_row_offset, scale, N, K,
     return torch.empty((*x.shape[:-1], N), dtype=x.dtype, device=x.device)
 
 
-@torch.library.custom_op("prismaquant::cb_gemv_fp4_v2", mutates_args=())
+@torch.library.custom_op("prismaquant::cb_gemv_fp4_v2", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def cb_gemv_fp4_v2(xq: torch.Tensor, qw_padded: torch.Tensor,
                    cb_flat: torch.Tensor, cb_row_offset: torch.Tensor,
                    compose: torch.Tensor, N: int, K: int, k_bits: int,
@@ -71,7 +71,7 @@ def _cb_gemv_fp4_v2_fake(xq, qw_padded, cb_flat, cb_row_offset, compose, N, K,
     return torch.empty((*xq.shape[:-1], N), dtype=xq.dtype, device=xq.device)
 
 
-@torch.library.custom_op("prismaquant::cb_expand_fp8", mutates_args=())
+@torch.library.custom_op("prismaquant::cb_expand_fp8", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def cb_expand_fp8(qw_padded: torch.Tensor, cb_flat_fp8: torch.Tensor,
                   cb_row_offset: torch.Tensor, N: int, K: int, k_bits: int,
                   n_sub: int, type_size: int) -> torch.Tensor:
@@ -92,7 +92,7 @@ def _cb_expand_fp8_fake(qw_padded, cb_flat_fp8, cb_row_offset, N, K, k_bits,
                        device=qw_padded.device)
 
 
-@torch.library.custom_op("prismaquant::fp8_act_qdq", mutates_args=())
+@torch.library.custom_op("prismaquant::fp8_act_qdq", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def fp8_act_qdq(x: torch.Tensor) -> torch.Tensor:
     """Fused per-token fp8 dynamic QDQ (bit-exact to codec.fp8_dynamic_act_qdq)
     as a custom op for the compile path."""
@@ -105,7 +105,7 @@ def _fp8_act_qdq_fake(x):
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("prismaquant::cb_moe_gemv_fp4_v2", mutates_args=())
+@torch.library.custom_op("prismaquant::cb_moe_gemv_fp4_v2", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def cb_moe_gemv_fp4_v2(xq: torch.Tensor, qw: torch.Tensor,
                        cb_flat: torch.Tensor, compose: torch.Tensor,
                        pair_expert: torch.Tensor, pair_xrow: torch.Tensor,
@@ -123,7 +123,7 @@ def _cb_moe_gemv_fp4_v2_fake(xq, qw, cb_flat, compose, pair_expert, pair_xrow,
                        device=xq.device)
 
 
-@torch.library.custom_op("prismaquant::cb_moe_gemv_fp8", mutates_args=())
+@torch.library.custom_op("prismaquant::cb_moe_gemv_fp8", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def cb_moe_gemv_fp8(xq: torch.Tensor, qw: torch.Tensor,
                     cb_flat_fp8: torch.Tensor, scale: torch.Tensor,
                     pair_expert: torch.Tensor, pair_xrow: torch.Tensor,
@@ -141,7 +141,7 @@ def _cb_moe_gemv_fp8_fake(xq, qw, cb_flat_fp8, scale, pair_expert, pair_xrow,
                        device=xq.device)
 
 
-@torch.library.custom_op("prismaquant::cb_moe_combine", mutates_args=())
+@torch.library.custom_op("prismaquant::cb_moe_combine", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def cb_moe_combine(y: torch.Tensor, pair_w: torch.Tensor,
                    tok_start: torch.Tensor, T: int) -> torch.Tensor:
     """Router-weighted per-token combine of grouped GEMV outputs."""
