@@ -155,12 +155,17 @@ correct generation (e.g. `17×24=408`, `60 mi / 1.5 h = 40 mph`, `60 mi / 2 gal 
 |---|---|---|---|
 | GGUF IQ 2.8 bpp (CUDA-core dequant) | 42 | ~17-18 | 87 (129/148) |
 | GGUF k-quant | — | ~18-19 | 86 |
-| **gridbook 2.9 bpp (native tensor core, final)** | **~109** | 14.6 base / **16.1 with MTP spec** | 85–87 band* |
+| **gridbook 2.9 bpp (native tensor core, final)** | **~109** | 14.6 base / **16.1 with MTP spec** | **88 (130/148)*** |
 
-\* Same artifact bytes measured 85–87 across serving configs (4/74 scenario
-flips between configs — churn at the capability plateau, same class as the
-GGUF IQ-vs-k comparison's 12/74). GGUF's own band is 86–87. No directional
-quality claim either way at matched bytes.
+\* The final joint-menu artifact scored 88 (130/148) on the ship config —
+the highest of any Hy3 artifact on this box, and strictly above the shipped
+GGUF IQ's 129/148 on the same seed/protocol. Caveat, stated plainly: across
+serving configs of the earlier body, the same bytes measured 85–87 (scenario
+churn at the capability plateau; the GGUF family's own band is 86–87), so a
+single +1-to-+3 point read is at the top of the band, not a proven
+directional gap. The joint artifact does carry genuinely more fidelity in
+sensitive places (36 vanilla-FP8 Linears, fp8-K28 layer-21 experts, an
+FP8-CB K44 MTP draft).
 
 - **Prefill ~109 tok/s vs the GGUF IQ build's 42 — ~2.6× faster.** This is the
   format's reason to exist, proven at 300B class: the native-tile design removes
