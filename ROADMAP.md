@@ -6,10 +6,10 @@ here is a commitment to a date, and priorities may change.
 
 ## Reference encoder
 
-Today, `cbq` artifacts are produced by the authors' offline research quantization
+Today, `gridbook` artifacts are produced by the authors' offline research quantization
 pipeline, which is **not** part of this repository — this repo defines and *serves*
 the format, it does not yet produce artifacts. A **standalone, documented reference
-encoder** is planned, so that anyone can turn a BF16 model into a `cbq` artifact
+encoder** is planned, so that anyone can turn a BF16 model into a `gridbook` artifact
 using only this repository and [`docs/SPEC.md`](docs/SPEC.md): the codebook
 construction (fixed lattice and shared-per-role learned), the weighted product-VQ
 search, the two-tier scale encoder, and the safetensors exporter. Until it lands,
@@ -43,9 +43,10 @@ decode kernel) is the remaining MoE serving piece.
 
 ## Package / repository naming decision
 
-The working title in this repository is **`cbq`**. The final PyPI package name and
-repository name are the maintainer's (Robert Tand's) call and are **not yet fixed** —
-treat every `cbq` in the docs as a placeholder.
+RESOLVED (2026-07-20): the project name is **gridbook** (Robert). The PyPI
+package name is `gridbook`; the Python import name stays `vllm_prismaquant`
+until the pre-1.0 import rename (with a compatibility shim); the vLLM registry
+key `"prismaquant"` is permanent (baked into published artifact configs).
 
 **Independent of that decision, the vLLM quantization-method registry key stays
 `"prismaquant"`.** It is the string baked into every already-published artifact's

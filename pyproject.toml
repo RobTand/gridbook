@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vllm-prismaquant"
+name = "gridbook"
 version = "0.0.1"
 description = "Out-of-tree vLLM plugin for PrismaQuant NVFP4-CB / FP8-CB codebook formats (prototype (i): correctness-first Triton serving, INV-2 waived)."
 readme = "README.md"

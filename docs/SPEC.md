@@ -1,4 +1,4 @@
-# cbq codebook formats — Format Specification
+# gridbook codebook formats — Format Specification
 
 **Status: normative.** This document specifies the on-disk byte layout, tensor
 naming, configuration vocabulary, and decode semantics of the NVFP4-CB and

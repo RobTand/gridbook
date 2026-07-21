@@ -1,6 +1,6 @@
 # Serving kernels
 
-This document describes how a `cbq` artifact is served fast. It is a design and
+This document describes how a `gridbook` artifact is served fast. It is a design and
 status document, not an API reference; the normative decode semantics are in
 [`SPEC.md`](SPEC.md).
 

@@ -22,7 +22,7 @@ independently: round *groups* of weights jointly to the nearest entry in a learn
 cannot. This is what the GGUF "IQ" formats, AQLM, QuIP#, and QTIP all do in
 different ways.
 
-`cbq`'s codewords are **8-dimensional vectors of FP4 (or FP8) grid values** — a
+`gridbook`'s codewords are **8-dimensional vectors of FP4 (or FP8) grid values** — a
 *product* vector quantizer: the `k`-bit index is split into a few sub-indices,
 each selecting from a smaller sub-codebook, and the sub-codewords are concatenated
 into the 8-dim vector. This keeps codebooks small (encode-searchable and
@@ -54,7 +54,7 @@ two-tier scheme (a per-superblock super-scale plus cheap per-group sub-scales) f
 roughly **0.31 bits/weight**. The honest gap is that **~0.19 bits/weight of
 scales** — the reason a naive FP4-CB trails IQ at matched bytes.
 
-`cbq` closes it with a **two-tier scale coding of its own** (format layout v2,
+`gridbook` closes it with a **two-tier scale coding of its own** (format layout v2,
 specified in [`SPEC.md`](SPEC.md) §1.2): a 1-byte E8M0 super-scale per 256 weights
 plus a 4-bit sub-code per group-16, indexing a fixed table of E4M3-exact
 multipliers. It composes back to a bona-fide E4M3 plane **by construction** (no
@@ -98,7 +98,7 @@ forbids resident expansion outright.)
 
 ## The design goal: IQ-class quality at native-kernel speed, on a stock server
 
-`cbq`'s formats are built so the decode is **not** a software detour:
+`gridbook`'s formats are built so the decode is **not** a software detour:
 
 - **A decoded CB tile is a native hardware tile** (bit-compatible NVFP4 / FP8).
   The codebook lookup replaces only the *load* of weight bytes; the scales and the
@@ -127,7 +127,7 @@ comparison is the fair one to make. It is not a strawman:
   throughput tax, most visibly on **prefill** (processing the prompt), where the
   matmul is large and would otherwise be tensor-core-bound.
 
-`cbq` aims squarely at the gap: **IQ-class quality (codebook, sub-3-bit-capable)
+`gridbook` aims squarely at the gap: **IQ-class quality (codebook, sub-3-bit-capable)
 with native-kernel speed (decoded tiles hit the tensor cores).** The clearest
 single data point is on a 295B model at matched bytes: the CB build's prefill runs
 at **~2.1× the throughput** of the equivalent GGUF IQ build, while landing on the
@@ -135,7 +135,7 @@ at **~2.1× the throughput** of the equivalent GGUF IQ build, while landing on t
 the native-tile design removes. Details, numbers, and caveats in
 [`BENCHMARKS.md`](BENCHMARKS.md).
 
-What `cbq` does **not** claim over GGUF: it is Blackwell-specific (the tensor-core
+What `gridbook` does **not** claim over GGUF: it is Blackwell-specific (the tensor-core
 path is `sm_120/121`); it does not interoperate with GGUF files; and at matched
 bytes the *quality* is base-model- and bit-budget-dominated — the win over GGUF is
 **speed at parity quality**, not a quality leap over IQ. The win over uniform

@@ -1,12 +1,13 @@
-# cbq — codebook-quantized weights that serve at native tensor-core speed
+# gridbook — codebook-quantized weights that serve at native tensor-core speed
 
-> **Working title.** `cbq` is a placeholder package/repository name pending the
-> maintainer's final naming decision. The one name that is **fixed** is the vLLM
-> quantization-method key the artifacts carry on disk: `"prismaquant"` (see
-> [Naming](#naming)). Everything else in this README that says `cbq` may be
-> renamed before the first tagged release.
+> **Naming.** The project is **gridbook**: codebooks whose entries live on a
+> hardware grid, so decoded tiles feed native tensor-core kernels. The Python
+> import name is currently `vllm_prismaquant` (the vLLM plugin module) and the
+> vLLM quantization registry key is `"prismaquant"` — both kept for
+> compatibility with published artifacts; an import-name rename is a pre-1.0
+> roadmap item.
 
-`cbq` defines a small family of **product vector-quantized (product-VQ) weight
+`gridbook` defines a small family of **product vector-quantized (product-VQ) weight
 formats** — **NVFP4-CB** (4-bit grid) and **FP8-CB** (8-bit grid) — and ships an
 **out-of-tree vLLM plugin** that serves them. The dtype in each name is the
 **grid the codebook's values live on, not the storage width**: storage is a
@@ -45,7 +46,7 @@ serving path:
   their decode falls to a **slower CUDA-core dequant path** — a *prefill tax* you
   pay on every prompt token.
 
-`cbq` targets **IQ-class quality at native-kernel speed**. Because a decoded CB
+`gridbook` targets **IQ-class quality at native-kernel speed**. Because a decoded CB
 tile *is* an NVFP4/FP8 tile, the serving kernel:
 
 1. **Decode (batch-1 / small M):** a bandwidth-bound fused GEMV streams the packed
@@ -86,7 +87,7 @@ it loads, serves, and generates coherent, arithmetically-correct output on one
 ## Install
 
 ```bash
-pip install cbq          # working-title name; see the banner above
+pip install gridbook          # working-title name; see the banner above
 ```
 
 Requirements:
@@ -111,21 +112,21 @@ can be verified anywhere.
 
 The plugin registers itself through vLLM's `vllm.general_plugins` entry point: on
 `import vllm` it calls `register_quantization_config("prismaquant")`, after which
-vLLM **auto-detects** a `cbq` checkpoint from its `config.json` and needs no extra
+vLLM **auto-detects** a `gridbook` checkpoint from its `config.json` and needs no extra
 flags. There are **zero vLLM-core patches or monkeypatches** on the load path.
 
 ---
 
 ## Quickstart — serve an artifact
 
-A `cbq` artifact is a standard Hugging Face directory: `config.json` +
+A `gridbook` artifact is a standard Hugging Face directory: `config.json` +
 `model.safetensors` (or shards) + a codebook sidecar `cb_codebooks.pqcb` +
 tokenizer files. `config.json` already contains the full quantization config, so
 vLLM auto-detects the method.
 
 ```bash
 # The plugin is discovered via its entry point; no --quantization flag needed.
-vllm serve /path/to/cbq-artifact \
+vllm serve /path/to/gridbook-artifact \
   --enforce-eager \
   --max-model-len 8192 \
   --host 0.0.0.0 --port 8000
@@ -161,7 +162,7 @@ The vLLM registry key is **`"prismaquant"`** — this is the string in every
 published artifact's `config.json` (`"quant_method": "prismaquant"`) and it
 **stays that way** for backward compatibility, regardless of what the Python
 package and repository are ultimately called. It is a plain identifier string,
-not a code dependency on any other project. The `cbq` working title applies only
+not a code dependency on any other project. The `gridbook` name applies
 to the package/repo/CLI names and may change before the first release.
 
 ---
