@@ -39,7 +39,11 @@ from vllm.model_executor.layers.fused_moe.activation import (
 from vllm.model_executor.utils import set_weight_attrs
 
 from . import codec
-from .expand import expand_cb_to_value, expand_fp4_v2_to_weight
+from .expand import (
+    expand_cb_to_fp8,
+    expand_cb_to_value,
+    expand_fp4_v2_to_weight,
+)
 
 
 def _row_bytes(in_features: int, type_size: int) -> int:
@@ -146,8 +150,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # corrupt byte tensors (last dim = row_bytes, never hidden). CB
         # tensors therefore load DIRECTLY into our stacked params; every
         # other tensor delegates to the original loader untouched.
-        if not getattr(layer, "_cb_load_wrapped", False):
-            orig_load = layer.load_weights
+        orig_load = getattr(layer, "load_weights", None)
+        if not getattr(layer, "_cb_load_wrapped", False) and orig_load is not None:
             prefix = self.prefix
             cb_map = {
                 "gate_up_proj.cb_qweight": "w13_cb_qweight",
@@ -290,8 +294,27 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # the first 1.4k-token prefill on Hy3 crashed the serve (transient
         # chunk tiles ~1.6 GB vs the loop's ~56 MB against thin post-KV
         # slack, 2026-07-20). Batched stays opt-in: PRISMAQUANT_CB_PREFILL=batched.
-        if os.environ.get("PRISMAQUANT_CB_PREFILL", "loop") == "loop":
+        #
+        #   'stock' — _apply_prefill_stock. The CAPTURE-SAFE successor to
+        #     'batched' (task 15): transiently expand each expert-CHUNK into a
+        #     HARDWARE format (fp8-CB -> fp8 bytes, fp4-CB-v2 -> bf16) and hand it
+        #     to vLLM's OWN fused-MoE grouped Triton kernel with DEVICE-SIDE
+        #     routing (moe_align_block_size). No host reads of device data
+        #     anywhere (no .tolist/.item/.cpu/nonzero-to-python) and a FIXED
+        #     python trip count (ceil(E/chunk) over ALL experts, empty experts a
+        #     masked pass) — the prerequisite for cudagraph_mode=FULL, which the
+        #     'batched' path's two .tolist() syncs + tensor-derived python bounds
+        #     preclude. Our activation QDQ is preserved: fp8 uses vLLM's per-token
+        #     fp8 dynamic between the two projections (bit-equivalent to
+        #     codec.fp8_dynamic_act_qdq — test_stock_fp8_quant_matches_codec),
+        #     fp4-v2 runs codec.fp4_group16_act_qdq explicitly on the module input
+        #     AND the intermediate. Opt-in: PRISMAQUANT_CB_PREFILL=stock.
+        mode = os.environ.get("PRISMAQUANT_CB_PREFILL", "loop")
+        if mode == "loop":
             return self._apply_prefill_loop(
+                layer, x, topk_weights, topk_ids, act)
+        if mode == "stock":
+            return self._apply_prefill_stock(
                 layer, x, topk_weights, topk_ids, act)
         return self._apply_prefill_batched(
             layer, x, topk_weights, topk_ids, act)
@@ -486,6 +509,238 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 y[s0:s1] = torch.nn.functional.linear(x[s0:s1], w_stack[g])
         return y
 
+    # -- prefill: capture-safe stock-kernel path (task 15) ------------------
+    def _apply_prefill_stock(self, layer, x, topk_weights, topk_ids, act, *,
+                             chunk=None):
+        """Capture-safe batched prefill (PRISMAQUANT_CB_PREFILL=stock): transient
+        expansion of each expert-CHUNK into a HARDWARE format consumed by vLLM's
+        OWN fused-MoE grouped Triton kernel with DEVICE-SIDE routing. The
+        successor to _apply_prefill_batched, which cannot be CUDA-graph captured
+        (its hit-expert list + segment bounds are read to host via two .tolist()
+        syncs and drive python control flow). This path is the prerequisite for
+        cudagraph_mode=FULL (drafter capture + captured decode target).
+
+        CAPTURE-SAFETY CONTRACT (the hard requirement beyond correctness):
+          * NO host reads of device data — no .tolist / .item / .cpu / .nonzero
+            -> python anywhere in the path. Routing is resolved entirely on-device
+            by vLLM's moe_align_block_size (a C++/Triton op vLLM itself captures in
+            its EP decode graphs); num_tokens_post_padded stays a device scalar
+            consumed as a kernel arg, never read back.
+          * FIXED python trip count — the chunk loop runs ceil(E/chunk) times over
+            ALL E experts (never a hit-filtered subset); an empty chunk costs one
+            masked pass. Every loop bound comes from a shape or config int, never
+            from a tensor value, so the unrolled capture is identical every replay.
+          * Per-chunk EP shard — a chunk of ``chunk`` experts is selected by an
+            expert_map (global->local, -1 outside; built from python ints), and
+            moe_align_block_size(..., ignore_invalid_experts=True) produces LOCAL
+            expert_ids for exactly that shard (out-of-chunk pairs excluded). This
+            is vLLM's own expert-parallel mechanism, reused to bound the transient
+            weight tile to ONE chunk (INV-1) instead of all E experts at once.
+
+        TWO-STAGE STRUCTURE (this build exposes only the MONOLITHIC fused_experts,
+        which does its own intermediate quant with no seam for ours — so we call
+        the underlying per-projection kernel dispatch_fused_moe_kernel TWICE with
+        OUR activation QDQ between, mirroring fused_experts_impl exactly): the same
+        moe_align routing tensors serve both projections (stage 1: A=[M,hidden],
+        top_k=T; stage 2: A=[M*T,inter], top_k=1 — the kernel indexes A by
+        offs_token//top_k, so one routing covers both).
+
+        ACTIVATION QDQ — part of the validated numerics, never dropped:
+          * fp8-CB: the stock W8A8 kernel's built-in per-token fp8-dynamic activation
+            quant (moe_kernel_quantize_input) is bit-equivalent to
+            codec.fp8_dynamic_act_qdq (test_stock_fp8_quant_matches_codec) and IS
+            the transient the dense linear.py fp8 prefill already trusts, so it runs
+            the input AND intermediate quant. Weights expand DIRECTLY to fp8 bytes
+            (expand_cb_to_fp8, the dense fp8-direct transient over the [C*out,bytes]
+            stack view) + the per-(expert,out) weight_scale — a plain per-channel
+            fp8 checkpoint, native tensor cores.
+          * fp4-CB-v2: no faithful packed-NVFP4 exists (a CB codebook value is not
+            on the E2M1 grid, so re-quantising to NVFP4 would double-quantise), and
+            this build has no split W4A4 grouped MoE we can wedge our group-16 QDQ
+            into — so we ship the stated FALLBACK: expand to bf16 (exact CB
+            reconstruct, expand_fp4_v2_to_weight) + the stock BF16 grouped kernel,
+            with codec.fp4_group16_act_qdq run EXPLICITLY on the input and the
+            intermediate (still capture-safe, still native Triton).
+
+        Numerics vs _apply_prefill_loop: weights bit-identical (same expanders,
+        fp8-byte gather == the loop's val.to(e4m3)); activation QDQ per-token
+        identical (fp8-dynamic proven; fp4-group16 is ours verbatim). Only the GEMM
+        accumulation (fp8 fp32-accum vs the loop's bf16 F.linear) and the
+        cross-chunk combine reassociate (REASSOCIATION-CLASS), held to the suite's
+        2e-2 tolerance by tests/test_moe_stock_prefill.py and gated by the served
+        logprob A/B before adoption.
+
+        Memory (INV-1): one projection's chunk tile is live at a time (w13 freed
+        before w2 expands); Hy3 (E=192, 2i=3072, hidden=4096) at chunk=16 =>
+        16*3072*4096 = 192 MiB fp8 w13 (~2x for the bf16 fp4 tile), vs the crashed
+        batched path's ~1.6 GB. The chunk env is PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK
+        (default 16)."""
+        # vLLM fused-MoE internals imported lazily: the stable public surface is
+        # at module top; these are version-fragile, and a build lacking them must
+        # fail only this opt-in path, never the module import (CPU codec tests).
+        import triton.language as tl
+        from vllm.platforms import current_platform
+        from vllm.model_executor.layers.fused_moe.config import (
+            _get_config_dtype_str,
+        )
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            dispatch_fused_moe_kernel,
+            try_get_optimal_moe_config,
+        )
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+            moe_align_block_size,
+        )
+        from vllm.model_executor.layers.fused_moe.utils import (
+            moe_kernel_quantize_input,
+        )
+
+        if chunk is None:
+            chunk = int(os.environ.get(
+                "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", "16"))
+        chunk = max(1, chunk)
+        is_fp8 = not self.is_fp4
+        E = layer._cb_E
+        M = x.shape[0]
+        top_k = topk_ids.shape[-1]
+        dev = x.device
+        Kh = layer._cb_hidden                         # hidden (w13 in, w2 out)
+        inter = layer._cb_inter                       # moe intermediate
+        N1 = 2 * inter                                # w13 out (gate_up)
+        d = N1 // 2                                    # silu halves gate_up
+        fp8_dtype = current_platform.fp8_dtype()
+        compute_type = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16,
+                        torch.float32: tl.float32}[x.dtype]
+
+        # Kernel tile config (block sizes) — computed ONCE from shapes/config so
+        # BLOCK_SIZE_M is identical across chunks (moe_align + both dispatches
+        # must agree). E=chunk here only tunes group_m; correctness-independent.
+        cfg_dtype = _get_config_dtype_str(x.dtype, use_fp8_w8a8=is_fp8)
+        config = try_get_optimal_moe_config(
+            (chunk, N1, Kh), (chunk, Kh, inter), top_k, cfg_dtype, M)
+        block_m = config["BLOCK_SIZE_M"]
+
+        topk_ids_i = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.contiguous()
+        out = torch.zeros_like(x)
+
+        # Input activation quant is x-only -> compute ONCE (only the intermediate
+        # a2 is per-chunk). fp8: vLLM per-token fp8 dynamic (== codec, proven);
+        # fp4-v2: our group-16 RTN, run explicitly.
+        if is_fp8:
+            a1, a1s = moe_kernel_quantize_input(
+                x, None, fp8_dtype, per_act_token_quant=True)
+        else:
+            a1 = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+            a1s = None
+
+        for c0 in range(0, E, chunk):                 # FIXED trip = ceil(E/chunk)
+            c1 = min(E, c0 + chunk)
+            expert_map = self._stock_chunk_expert_map(c0, c1, E, dev)
+            # Device-side routing for THIS expert shard (local ids, out-of-chunk
+            # pairs excluded). Shared verbatim by both projections.
+            sorted_ids, expert_ids, num_pad = moe_align_block_size(
+                topk_ids_i, block_m, E, expert_map, ignore_invalid_experts=True)
+
+            # ---- stage 1: gate_up = x @ W13[e]^T -------------------------------
+            W13 = self._expand_stack_slice(layer, "w13", c0, c1, to_fp8=is_fp8)
+            ic1 = torch.empty((M, top_k, N1), dtype=x.dtype, device=dev)
+            b1s = layer.w13_weight_scale[c0:c1] if is_fp8 else None    # [nE, 2i]
+            dispatch_fused_moe_kernel(
+                a1, W13, ic1, a1s, b1s, None, topk_weights, sorted_ids,
+                expert_ids, num_pad, False, top_k, config,
+                compute_type=compute_type, use_fp8_w8a8=is_fp8,
+                use_int8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=False,
+                per_channel_quant=is_fp8, block_shape=None, B_bias=None)
+            del W13
+
+            # silu(gate)*up over the routed rows (garbage in unrouted rows is
+            # never read by stage 2 — same masking as fused_experts_impl).
+            ic2 = torch.empty((M * top_k, d), dtype=x.dtype, device=dev)
+            apply_moe_activation(act, ic2, ic1.view(-1, N1))
+            del ic1
+
+            # ---- intermediate activation QDQ (part of the numerics) -----------
+            if is_fp8:
+                a2, a2s = moe_kernel_quantize_input(
+                    ic2, None, fp8_dtype, per_act_token_quant=True)
+                b2s = layer.w2_weight_scale[c0:c1]            # [nE, hidden]
+            else:
+                a2 = codec.fp4_group16_act_qdq(ic2).to(torch.bfloat16)
+                a2s = b2s = None
+            del ic2
+
+            # ---- stage 2: y = a @ W2[e]^T, router-weighted --------------------
+            W2 = self._expand_stack_slice(layer, "w2", c0, c1, to_fp8=is_fp8)
+            ic3 = torch.empty((M, top_k, Kh), dtype=x.dtype, device=dev)
+            ic3.zero_()                                       # out-of-chunk slots
+            dispatch_fused_moe_kernel(
+                a2, W2, ic3, a2s, b2s, None, topk_weights, sorted_ids,
+                expert_ids, num_pad, True, 1, config,
+                compute_type=compute_type, use_fp8_w8a8=is_fp8,
+                use_int8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=False,
+                per_channel_quant=is_fp8, block_shape=None, B_bias=None)
+            del W2
+            # Combine this shard's top_k contributions and accumulate (the loop's
+            # index_add_ over experts, one expert-partition per chunk).
+            out += ic3.sum(dim=1).to(out.dtype)
+            del ic3
+        return out
+
+    @staticmethod
+    def _stock_chunk_expert_map(c0: int, c1: int, E: int,
+                                dev) -> torch.Tensor:
+        """global->local expert_map for one chunk shard: experts [c0, c1) map to
+        [0, c1-c0), all others -1. Built from python ints only (no tensor read),
+        so it is a constant of the captured graph."""
+        m = torch.full((E,), -1, dtype=torch.int32, device=dev)
+        m[c0:c1] = torch.arange(c1 - c0, dtype=torch.int32, device=dev)
+        return m
+
+    def _expand_stack_slice(self, layer, which: str, c0: int, c1: int, *,
+                            to_fp8: bool) -> torch.Tensor:
+        """Decode a CONTIGUOUS chunk of experts [c0, c1) to a stacked transient
+        ``[nE, out, in]`` in ONE expander launch over the reshaped
+        ``[(nE*out), row_bytes]`` view — identical to stacking _decode_expert over
+        the chunk (test_stock_expand_matches_decode), but slice-indexed (a view,
+        no advanced-index copy) so it never issues an index-tensor H2D sync under
+        capture. ``to_fp8`` picks the fp8-direct byte transient (expand_cb_to_fp8,
+        for the W8A8 kernel); else the bf16 transient (fp4-v2 value x composed
+        scale, or fp8 value x per-channel scale)."""
+        packed = getattr(layer, f"{which}_cb_qweight")[c0:c1]      # view [nE,o,b]
+        nE = c1 - c0
+        out_f = packed.shape[1]
+        in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
+        qwp = codec.pad_qweight(packed.reshape(nE * out_f, -1).contiguous())
+        row0 = torch.zeros(nE * out_f, dtype=torch.int32, device=packed.device)
+        if to_fp8:                                                # fp8 bytes
+            W = expand_cb_to_fp8(
+                qwp, self._stock_cb_flat_fp8(layer), row0, nE * out_f, in_f,
+                self.k, self.n_sub, self.type_size)
+        elif self.is_fp4:                                         # fp4 two-tier v2
+            W = expand_fp4_v2_to_weight(
+                qwp, layer._cb_flat, row0, layer._cb_compose, nE * out_f, in_f,
+                self.k, self.n_sub, self.type_size)
+        else:                                                     # fp8 -> bf16
+            val = expand_cb_to_value(qwp, layer._cb_flat, row0, nE * out_f, in_f,
+                                     self.k, self.n_sub, self.type_size,
+                                     is_fp4=False)
+            ws = getattr(layer, f"{which}_weight_scale")[c0:c1].reshape(
+                nE * out_f).to(torch.float32)
+            W = (val.float() * ws[:, None]).to(torch.bfloat16)
+        return W.view(nE, out_f, in_f)
+
+    @staticmethod
+    def _stock_cb_flat_fp8(layer) -> torch.Tensor:
+        """The per-layer codebook re-encoded to E4M3 bytes for the fp8-direct
+        expand (every CB value is on the e4m3 grid — lossless). Cached on the
+        layer (also built by the CUDA-decode gate); built once, before capture."""
+        cb = getattr(layer, "_cb_flat_fp8", None)
+        if cb is None:
+            cb = layer._cb_flat.to(torch.float8_e4m3fn).view(
+                torch.uint8).contiguous()
+            layer._cb_flat_fp8 = cb
+        return cb
+
     # -- grouped CUDA decode path -------------------------------------------
     def _cuda_moe_ok(self, layer) -> bool:
         ok = getattr(layer, "_cb_moe_cuda_ok", None)
@@ -514,8 +769,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         (fp8 dynamic for fp8-CB v1, fp4 group-16 RTN for fp4-CB v2), weights
         bf16(val*scale), fp32-accum GEMVs, per-add bf16 combine in the loop's
         expert-ascending order."""
-        from .cuda_ext import get_ext
-        ext = get_ext()
+        from . import ops as pq_ops
         T, K_hidden = x.shape
         topk = topk_ids.shape[-1]
         # Pairs sorted (token-major, expert-ascending) — the loop's
@@ -539,13 +793,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # composes the two-tier weight scale in-register from the packed
             # 9-byte section + the resident (256,16) compose table.
             xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
-            gate_up = ext.cb_moe_gemv_fp4_v2(
+            gate_up = pq_ops.cb_moe_gemv_fp4_v2(
                 xq, layer.w13_cb_qweight.data, layer._cb_flat,
                 layer._cb_compose, pair_expert, pair_xrow,
                 self.k, self.n_sub, self.type_size)      # (P, 2*inter)
         else:                                            # fp8-CB v1
-            xq = ext.fp8_act_qdq(x.to(torch.bfloat16))
-            gate_up = ext.cb_moe_gemv_fp8(
+            xq = pq_ops.fp8_act_qdq(x.to(torch.bfloat16))
+            gate_up = pq_ops.cb_moe_gemv_fp8(
                 xq, layer.w13_cb_qweight.data, layer._cb_flat_fp8,
                 layer.w13_weight_scale.data, pair_expert, pair_xrow,
                 self.k, self.n_sub, self.type_size)      # (P, 2*inter)
@@ -557,14 +811,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
         if self.is_fp4:
             aq = codec.fp4_group16_act_qdq(a).to(torch.bfloat16)
-            y_down = ext.cb_moe_gemv_fp4_v2(
+            y_down = pq_ops.cb_moe_gemv_fp4_v2(
                 aq, layer.w2_cb_qweight.data, layer._cb_flat,
                 layer._cb_compose, pair_expert, pair_self,
                 self.k, self.n_sub, self.type_size)      # (P, hidden)
         else:
-            aq = ext.fp8_act_qdq(a)
-            y_down = ext.cb_moe_gemv_fp8(
+            aq = pq_ops.fp8_act_qdq(a)
+            y_down = pq_ops.cb_moe_gemv_fp8(
                 aq, layer.w2_cb_qweight.data, layer._cb_flat_fp8,
                 layer.w2_weight_scale.data, pair_expert, pair_self,
                 self.k, self.n_sub, self.type_size)      # (P, hidden)
-        return ext.cb_moe_combine(y_down, pair_w, tok_start, T)
+        return pq_ops.cb_moe_combine(y_down, pair_w, tok_start, T)

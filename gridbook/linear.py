@@ -341,8 +341,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         if self._cuda_gemv_ok():
             # CUDA expander (stream-bandwidth-bound; the Triton byte-gather
             # ran at 61-86 GB/s and serialized ~half the prefill).
-            from .cuda_ext import get_ext
-            W_e4m3 = get_ext().cb_expand_fp8(
+            from .ops import cb_expand_fp8
+            W_e4m3 = cb_expand_fp8(
                 layer._cb_qw_padded, layer._cb_flat_fp8,
                 layer._cb_row_offset, N, K, self.k, self.n_sub,
                 self.type_size)

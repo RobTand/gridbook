@@ -69,3 +69,86 @@ def cb_gemv_fp4_v2(xq: torch.Tensor, qw_padded: torch.Tensor,
 def _cb_gemv_fp4_v2_fake(xq, qw_padded, cb_flat, cb_row_offset, compose, N, K,
                          k_bits, n_sub, type_size):
     return torch.empty((*xq.shape[:-1], N), dtype=xq.dtype, device=xq.device)
+
+
+@torch.library.custom_op("prismaquant::cb_expand_fp8", mutates_args=())
+def cb_expand_fp8(qw_padded: torch.Tensor, cb_flat_fp8: torch.Tensor,
+                  cb_row_offset: torch.Tensor, N: int, K: int, k_bits: int,
+                  n_sub: int, type_size: int) -> torch.Tensor:
+    """CUDA fp8-direct transient expand (prefill): packed rows -> a native
+    [N, K] e4m3 tile for the stock per-channel fp8 GEMM. Registered as a
+    custom op so vLLM's fullgraph compile (VLLM_COMPILE piecewise — the
+    drafter-capture prerequisite) can trace the prefill path; raw pybind
+    calls are dynamo-unsupported. Caller must check ``cuda_ext.get_ext()``."""
+    from .cuda_ext import get_ext
+    return get_ext().cb_expand_fp8(qw_padded, cb_flat_fp8, cb_row_offset,
+                                   N, K, k_bits, n_sub, type_size)
+
+
+@cb_expand_fp8.register_fake
+def _cb_expand_fp8_fake(qw_padded, cb_flat_fp8, cb_row_offset, N, K, k_bits,
+                        n_sub, type_size):
+    return torch.empty((N, K), dtype=torch.float8_e4m3fn,
+                       device=qw_padded.device)
+
+
+@torch.library.custom_op("prismaquant::fp8_act_qdq", mutates_args=())
+def fp8_act_qdq(x: torch.Tensor) -> torch.Tensor:
+    """Fused per-token fp8 dynamic QDQ (bit-exact to codec.fp8_dynamic_act_qdq)
+    as a custom op for the compile path."""
+    from .cuda_ext import get_ext
+    return get_ext().fp8_act_qdq(x)
+
+
+@fp8_act_qdq.register_fake
+def _fp8_act_qdq_fake(x):
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("prismaquant::cb_moe_gemv_fp4_v2", mutates_args=())
+def cb_moe_gemv_fp4_v2(xq: torch.Tensor, qw: torch.Tensor,
+                       cb_flat: torch.Tensor, compose: torch.Tensor,
+                       pair_expert: torch.Tensor, pair_xrow: torch.Tensor,
+                       k_bits: int, n_sub: int, type_size: int) -> torch.Tensor:
+    """Grouped MoE decode GEMV, fp4-CB two-tier v2 (act-QDQ outside)."""
+    from .cuda_ext import get_ext
+    return get_ext().cb_moe_gemv_fp4_v2(xq, qw, cb_flat, compose, pair_expert,
+                                        pair_xrow, k_bits, n_sub, type_size)
+
+
+@cb_moe_gemv_fp4_v2.register_fake
+def _cb_moe_gemv_fp4_v2_fake(xq, qw, cb_flat, compose, pair_expert, pair_xrow,
+                             k_bits, n_sub, type_size):
+    return torch.empty((pair_expert.shape[0], qw.shape[1]), dtype=xq.dtype,
+                       device=xq.device)
+
+
+@torch.library.custom_op("prismaquant::cb_moe_gemv_fp8", mutates_args=())
+def cb_moe_gemv_fp8(xq: torch.Tensor, qw: torch.Tensor,
+                    cb_flat_fp8: torch.Tensor, scale: torch.Tensor,
+                    pair_expert: torch.Tensor, pair_xrow: torch.Tensor,
+                    k_bits: int, n_sub: int, type_size: int) -> torch.Tensor:
+    """Grouped MoE decode GEMV, fp8-CB v1 (act already fp8-QDQ'd)."""
+    from .cuda_ext import get_ext
+    return get_ext().cb_moe_gemv_fp8(xq, qw, cb_flat_fp8, scale, pair_expert,
+                                     pair_xrow, k_bits, n_sub, type_size)
+
+
+@cb_moe_gemv_fp8.register_fake
+def _cb_moe_gemv_fp8_fake(xq, qw, cb_flat_fp8, scale, pair_expert, pair_xrow,
+                          k_bits, n_sub, type_size):
+    return torch.empty((pair_expert.shape[0], qw.shape[1]), dtype=xq.dtype,
+                       device=xq.device)
+
+
+@torch.library.custom_op("prismaquant::cb_moe_combine", mutates_args=())
+def cb_moe_combine(y: torch.Tensor, pair_w: torch.Tensor,
+                   tok_start: torch.Tensor, T: int) -> torch.Tensor:
+    """Router-weighted per-token combine of grouped GEMV outputs."""
+    from .cuda_ext import get_ext
+    return get_ext().cb_moe_combine(y, pair_w, tok_start, T)
+
+
+@cb_moe_combine.register_fake
+def _cb_moe_combine_fake(y, pair_w, tok_start, T):
+    return torch.empty((T, y.shape[1]), dtype=y.dtype, device=y.device)
