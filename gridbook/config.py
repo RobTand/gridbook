@@ -45,7 +45,22 @@ _MOE_LEAVES = ("gate_up_proj", "down_proj", "gate_proj", "up_proj")
 _FUSED_FALLBACK = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
+    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+    "in_proj_ba": ["in_proj_b", "in_proj_a"],
 }
+
+
+def _canonical_prefix(prefix: str) -> str:
+    """vLLM serving prefix -> canonical target namespace. Some model classes
+    wrap the LM (`language_model.model.layers.*` on Qwen3.5-class VL) while
+    targets are canonical `model.layers.*`; strip the wrapper when the next
+    component is `model.` (measured via PRISMAQUANT_DEBUG_PREFIXES,
+    2026-07-22 — every LM layer resolved no-scheme without this)."""
+    if prefix.startswith("language_model.model."):
+        return prefix[len("language_model."):]
+    if prefix.startswith("language_model."):
+        return "model." + prefix[len("language_model."):]
+    return prefix
 
 
 def _resolve_model_file(model_dir: str, fname: str) -> str:
@@ -197,9 +212,13 @@ class PrismaQuantConfig(QuantizationConfig):
 
     # -- per-prefix scheme resolution (handles vLLM fused qkv/gate_up) -------
     def _is_ignored(self, prefix: str) -> bool:
-        return any(ig in prefix for ig in self.ignore)
+        cp = _canonical_prefix(prefix)
+        return any(ig in prefix or ig in cp for ig in self.ignore)
 
     def _scheme_for_prefix(self, prefix: str) -> dict | None:
+        if prefix in self.target_scheme:
+            return self.target_scheme[prefix]
+        prefix = _canonical_prefix(prefix)
         if prefix in self.target_scheme:
             return self.target_scheme[prefix]
         leaf = prefix.split(".")[-1]
@@ -236,14 +255,21 @@ class PrismaQuantConfig(QuantizationConfig):
             # 1) CB target (has a "scheme") — ours (precise, fused-aware; ahead
             #    of the substring ignore test).
             scheme = self._scheme_for_prefix(prefix)
+            if os.environ.get("PRISMAQUANT_DEBUG_PREFIXES") == "1":
+                import sys
+                print(f"[pq-prefix] {prefix} -> "
+                      f"{'CB' if scheme is not None else 'no-scheme'}",
+                      file=sys.stderr, flush=True)
             if scheme is not None:
                 return PrismaQuantCBLinearMethod(self, scheme, prefix)
             # 2) explicitly-ignored -> BF16 passthrough.
             if self._is_ignored(prefix):
                 return UnquantizedLinearMethod()
-            # 3) stock NVFP4 / FP8_DYNAMIC -> compressed-tensors delegation.
+            # 3) stock NVFP4 / FP8_DYNAMIC -> compressed-tensors delegation
+            #    (canonical prefix — CT targets are serving-namespace names).
             if self.ct_config is not None:
-                return self.ct_config.get_quant_method(layer, prefix)
+                return self.ct_config.get_quant_method(
+                    layer, _canonical_prefix(prefix))
             return UnquantizedLinearMethod()
 
         if isinstance(layer, VocabParallelEmbedding):

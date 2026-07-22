@@ -31,6 +31,10 @@ from .ops import cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op
 _FUSED_FALLBACK = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
+    # Qwen3.5-class hybrid linear attention fuses the recipe's separate
+    # projections into single serving modules (shard order per the class):
+    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+    "in_proj_ba": ["in_proj_b", "in_proj_a"],
 }
 
 # M-gate for the CB dispatch (GGUF's mmvq_safe pattern, quantization/linear.py
@@ -110,10 +114,16 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
 
     # -- shard-role resolution for a (possibly fused) layer -----------------
     def _shard_roles(self):
-        leaf = self.prefix.split(".")[-1]
+        # Serving prefixes may carry a class wrapper (language_model.model.*)
+        # while target_scheme keys are canonical — normalize first (same
+        # bridge as config._scheme_for_prefix; the 0.8B hybrid resolved ZERO
+        # roles here without it and died on the width assert).
+        from .config import _canonical_prefix
+        cprefix = _canonical_prefix(self.prefix)
+        leaf = cprefix.split(".")[-1]
         pmm = getattr(self.quant_config, "packed_modules_mapping", {}) or {}
         shard_leaves = pmm.get(leaf) or _FUSED_FALLBACK.get(leaf) or [leaf]
-        prefixes = [self.prefix[: -len(leaf)] + sl for sl in shard_leaves]
+        prefixes = [cprefix[: -len(leaf)] + sl for sl in shard_leaves]
         # Keep only shards that are actual CB targets (all, for uniform arts).
         return [p for p in prefixes if p in self.quant_config.target_scheme]
 
