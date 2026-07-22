@@ -44,6 +44,7 @@ from .expand import (
     expand_cb_to_value,
     expand_fp4_v2_to_weight,
 )
+from .ops import dispatch_via_op
 
 
 def _row_bytes(in_features: int, type_size: int) -> int:
@@ -209,6 +210,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             f"{exp_w13} (type_size/uniformity mismatch)")
         assert layer.w2_cb_qweight.shape[2] == exp_w2
         layer._cb_E = E
+        from .ops import register_cb_layer
+        layer._cb_layer_id = register_cb_layer(self, layer)
 
     # -- per-expert decode to a bounded transient [out, in] bf16 -------------
     def _decode_expert(self, layer, which: str, e: int) -> torch.Tensor:
@@ -251,6 +254,21 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if layer.apply_router_weight_on_input:
             raise NotImplementedError(
                 "apply_router_weight_on_input unsupported for CB MoE")
+        # M-branch hoist (see ops.py/linear.py): the token-count branch AND
+        # the prefill loop's host syncs live inside ONE opaque custom op, so
+        # compile/capture at decode sizes record the grouped decode kernels
+        # and dynamo never traces the loop (mode-3 no longer needs the stock
+        # prefill path for graph safety). PRISMAQUANT_CB_DISPATCH=inline
+        # restores in-graph dispatch for A/B bisection.
+        # Unregistered layers (synthetic test fixtures that skip
+        # process_weights_after_loading) fall back to inline dispatch.
+        lid = getattr(layer, "_cb_layer_id", None)
+        if lid is not None and dispatch_via_op():
+            from .ops import cb_moe_forward
+            return cb_moe_forward(x, topk_weights, topk_ids, lid)
+        return self._apply_inline(layer, x, topk_weights, topk_ids)
+
+    def _apply_inline(self, layer, x, topk_weights, topk_ids):
         act = MoEActivation.from_str(layer.activation.value)
         num_tokens = x.shape[0]
 

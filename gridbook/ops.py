@@ -177,3 +177,64 @@ def cb_moe_combine(y: torch.Tensor, pair_w: torch.Tensor,
 @cb_moe_combine.register_fake
 def _cb_moe_combine_fake(y, pair_w, tok_start, T):
     return torch.empty((T, y.shape[1]), dtype=y.dtype, device=y.device)
+
+
+# ---------------------------------------------------------------------------
+# M-branch hoist (compile-lane fix, 2026-07-21). torch.compile traces the
+# model ONCE at a prefill-sized example, so an in-graph `M <= threshold`
+# branch bakes the PREFILL path into the single dynamic graph — compiled
+# decode then runs the 2x-heavier transient-expand path (inductor dump:
+# cb_expand_fp8 x3248, cb_gemv_fp8 x0) and the large expand transient sits on
+# the fragile partition boundary that produced the capture corruption. The
+# fix: the ENTIRE per-layer dispatch becomes ONE opaque custom op whose EAGER
+# implementation does the M-branch at call time. Piecewise/full capture at a
+# decode size records the GEMV kernels (the branch resolves correctly at
+# capture time, per captured size); prefill executes the same op eagerly and
+# takes the expand path. The MoE prefill loop's host syncs become invisible
+# to dynamo (they run inside the op), so compile no longer requires the
+# stock prefill path.
+#
+# Layers register themselves here at process_weights_after_loading; the op
+# carries only (tensors..., layer_id) and the impl/fake consult the registry.
+# The id is a python int baked per call site — each layer module passes its
+# own — so the traced graph binds each site to its layer statically.
+_LAYER_REGISTRY: dict = {}
+_DISPATCH_VIA_OP: list = []
+
+
+def dispatch_via_op() -> bool:
+    if not _DISPATCH_VIA_OP:
+        _DISPATCH_VIA_OP.append(
+            os.environ.get("PRISMAQUANT_CB_DISPATCH", "op") != "inline")
+    return _DISPATCH_VIA_OP[0]
+
+
+def register_cb_layer(method, layer) -> int:
+    layer_id = len(_LAYER_REGISTRY)
+    _LAYER_REGISTRY[layer_id] = (method, layer)
+    return layer_id
+
+
+@torch.library.custom_op("prismaquant::cb_linear_forward", mutates_args=())
+def cb_linear_forward(x: torch.Tensor, layer_id: int) -> torch.Tensor:
+    method, layer = _LAYER_REGISTRY[layer_id]
+    return method._apply_inline(layer, x)
+
+
+@cb_linear_forward.register_fake
+def _cb_linear_forward_fake(x, layer_id):
+    _method, layer = _LAYER_REGISTRY[layer_id]
+    return torch.empty((*x.shape[:-1], layer._cb_N), dtype=x.dtype,
+                       device=x.device)
+
+
+@torch.library.custom_op("prismaquant::cb_moe_forward", mutates_args=())
+def cb_moe_forward(x: torch.Tensor, topk_weights: torch.Tensor,
+                   topk_ids: torch.Tensor, layer_id: int) -> torch.Tensor:
+    method, layer = _LAYER_REGISTRY[layer_id]
+    return method._apply_inline(layer, x, topk_weights, topk_ids)
+
+
+@cb_moe_forward.register_fake
+def _cb_moe_forward_fake(x, topk_weights, topk_ids, layer_id):
+    return torch.empty_like(x)

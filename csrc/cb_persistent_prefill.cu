@@ -51,8 +51,26 @@ __global__ __launch_bounds__(THREADS) void persistent_n_fp8_kernel(
     const int64_t M, const int64_t N, const int64_t K,
     const int64_t row_stride, const int k_bits, const int type_size) {
   const int n_sb = (int)(K >> 8);
-  const int sub_w = k_bits >> 2;                     // n_sub = 4
-  const uint32_t sub_mask = (1u << sub_w) - 1u;
+  // Ceil-first per-sub bit split (n_sub = 4), matching the encoder's
+  // _bit_split: sub i holds base + (i < k%4) bits; its table starts at the
+  // cumulative PAIR offset (sub_dim=2 bytes = 1 u16 pair per entry). Even k
+  // reduces to the historical uniform split.
+  int sub_off[4];
+  uint32_t sub_mask4[4];
+  int sub_pairbase[4];
+  {
+    const int base = k_bits >> 2, extra = k_bits & 3;
+    int o = 0, pb = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int w = base + (i < extra ? 1 : 0);
+      sub_off[i] = o;
+      sub_mask4[i] = (1u << w) - 1u;
+      sub_pairbase[i] = pb;
+      o += w;
+      pb += 1 << w;
+    }
+  }
   const uint64_t code_mask =
       (k_bits >= 64) ? ~0ull : ((1ull << k_bits) - 1ull);
   const int tid = (int)threadIdx.x;
@@ -88,8 +106,8 @@ __global__ __launch_bounds__(THREADS) void persistent_n_fp8_kernel(
       uint8_t* dst = sB + (size_t)r * K + (size_t)sb * 256 + (size_t)v * 8;
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
-        const uint32_t idx = (uint32_t)(code >> (s * sub_w)) & sub_mask;
-        const uint16_t pair = __ldg(lut16 + (s << sub_w) + idx);
+        const uint32_t idx = (uint32_t)(code >> sub_off[s]) & sub_mask4[s];
+        const uint16_t pair = __ldg(lut16 + sub_pairbase[s] + idx);
         dst[2 * s] = (uint8_t)(pair & 0xff);
         dst[2 * s + 1] = (uint8_t)(pair >> 8);
       }
@@ -133,7 +151,7 @@ torch::Tensor cb_prefill_persistent_n_fp8(torch::Tensor a, torch::Tensor packed,
                   packed.stride(1) == 1,
               "packed must be [N, row_stride] uint8, row-contiguous");
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8);
-  TORCH_CHECK(K % 256 == 0 && k_bits % 4 == 0);
+  TORCH_CHECK(K % 256 == 0);
   const int type_size = 4 * (int)k_bits;
   const int64_t row_stride = packed.stride(0);
   TORCH_CHECK(row_stride >= (K / 256) * type_size,

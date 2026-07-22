@@ -25,7 +25,7 @@ from vllm.model_executor.parameter import (
 
 from . import codec
 from .expand import expand_cb_to_fp8, expand_fp4_v2_to_weight
-from .ops import cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8
+from .ops import cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op
 
 # Fallback fused mapping if the config's packed_modules_mapping is unset.
 _FUSED_FALLBACK = {
@@ -248,6 +248,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             self._cuda_gemv_ok()
         layer._cb_N = qw.shape[0]
         layer._cb_K = layer._cb_input_size
+        from .ops import register_cb_layer
+        layer._cb_layer_id = register_cb_layer(self, layer)
 
     def _cuda_gemv_ok(self) -> bool:
         """CUDA decode-GEMV eligibility (fp8 n_sub=4 rungs, or fp4 two-tier v2
@@ -266,6 +268,20 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         return ok
 
     def apply(self, layer, x, bias=None):
+        # M-branch hoist (compile lane): dispatch through ONE opaque custom op
+        # so torch.compile never traces the M-branch (which otherwise bakes
+        # the prefill expand path into the decode graph — see ops.py). Eager
+        # serving behavior is identical: the op impl calls _apply_inline.
+        # PRISMAQUANT_CB_DISPATCH=inline restores in-graph branching (A/B).
+        # bias falls back to inline (no served model carries one; the cutlass
+        # path fuses bias and we keep that numerics contract untouched).
+        lid = getattr(layer, "_cb_layer_id", None)
+        if bias is None and lid is not None and dispatch_via_op():
+            from .ops import cb_linear_forward
+            return cb_linear_forward(x, lid)
+        return self._apply_inline(layer, x, bias)
+
+    def _apply_inline(self, layer, x, bias=None):
         N, K = layer._cb_N, layer._cb_K
         M = x.reshape(-1, K).shape[0]
         # Decode regime (M small), plus fp4-v1 which has no transient path yet

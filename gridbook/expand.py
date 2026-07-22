@@ -46,7 +46,10 @@ def _cb_expand_value_kernel(
     stride_wn, stride_wk,      # output [N, K] strides
     K_BITS: tl.constexpr,
     SUB_DIM: tl.constexpr,
-    SUB_W: tl.constexpr,
+    SUB_W0: tl.constexpr, SUB_W1: tl.constexpr,
+    SUB_W2: tl.constexpr, SUB_W3: tl.constexpr,
+    SUB_OFF1: tl.constexpr, SUB_OFF2: tl.constexpr, SUB_OFF3: tl.constexpr,
+    SUB_BASE1: tl.constexpr, SUB_BASE2: tl.constexpr, SUB_BASE3: tl.constexpr,
     TYPE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -67,9 +70,18 @@ def _cb_expand_value_kernel(
     byte_base = (bitpos // 8).to(tl.int64)       # first byte of the codeword
     bit_in_byte = bitpos % 8
     mask_k = (1 << K_BITS) - 1
-    shift_sub = sub * SUB_W
-    mask_sub = (1 << SUB_W) - 1
-    cb_base = sub * ((1 << SUB_W) * SUB_DIM)     # flat-codebook block base
+    # Ceil-first per-sub split (encoder _bit_split); even k reduces to the
+    # historical uniform layout.
+    shift_sub = tl.where(
+        sub == 0, 0, tl.where(sub == 1, SUB_OFF1,
+                              tl.where(sub == 2, SUB_OFF2, SUB_OFF3)))
+    mask_sub = tl.where(
+        sub == 0, (1 << SUB_W0) - 1,
+        tl.where(sub == 1, (1 << SUB_W1) - 1,
+                 tl.where(sub == 2, (1 << SUB_W2) - 1, (1 << SUB_W3) - 1)))
+    cb_base = tl.where(
+        sub == 0, 0, tl.where(sub == 1, SUB_BASE1,
+                              tl.where(sub == 2, SUB_BASE2, SUB_BASE3)))     # flat-codebook block base
 
     # Per-output-row codebook base offset (0 for a single-codebook Linear; a
     # fused qkv/gate_up module points each shard's rows at that role's block of
@@ -109,7 +121,10 @@ def _cb_expand_fp8_kernel(
     stride_wn, stride_wk,      # output [N, K] strides
     K_BITS: tl.constexpr,
     SUB_DIM: tl.constexpr,
-    SUB_W: tl.constexpr,
+    SUB_W0: tl.constexpr, SUB_W1: tl.constexpr,
+    SUB_W2: tl.constexpr, SUB_W3: tl.constexpr,
+    SUB_OFF1: tl.constexpr, SUB_OFF2: tl.constexpr, SUB_OFF3: tl.constexpr,
+    SUB_BASE1: tl.constexpr, SUB_BASE2: tl.constexpr, SUB_BASE3: tl.constexpr,
     TYPE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -133,9 +148,18 @@ def _cb_expand_fp8_kernel(
     byte_base = (bitpos // 8).to(tl.int64)
     bit_in_byte = bitpos % 8
     mask_k = (1 << K_BITS) - 1
-    shift_sub = sub * SUB_W
-    mask_sub = (1 << SUB_W) - 1
-    cb_base = sub * ((1 << SUB_W) * SUB_DIM)
+    # Ceil-first per-sub split (encoder _bit_split); even k reduces to the
+    # historical uniform layout.
+    shift_sub = tl.where(
+        sub == 0, 0, tl.where(sub == 1, SUB_OFF1,
+                              tl.where(sub == 2, SUB_OFF2, SUB_OFF3)))
+    mask_sub = tl.where(
+        sub == 0, (1 << SUB_W0) - 1,
+        tl.where(sub == 1, (1 << SUB_W1) - 1,
+                 tl.where(sub == 2, (1 << SUB_W2) - 1, (1 << SUB_W3) - 1)))
+    cb_base = tl.where(
+        sub == 0, 0, tl.where(sub == 1, SUB_BASE1,
+                              tl.where(sub == 2, SUB_BASE2, SUB_BASE3)))
 
     cb_off = tl.load(cboff_ptr + offs_n_i, mask=mask_n, other=0).to(tl.int64)
 
@@ -163,7 +187,11 @@ def _cb_expand_weight_v2_kernel(
     qw_ptr, cb_ptr, cboff_ptr, compose_ptr, w_ptr,
     N, K,
     stride_qn, stride_wn, stride_wk,
-    K_BITS: tl.constexpr, SUB_DIM: tl.constexpr, SUB_W: tl.constexpr,
+    K_BITS: tl.constexpr, SUB_DIM: tl.constexpr,
+    SUB_W0: tl.constexpr, SUB_W1: tl.constexpr,
+    SUB_W2: tl.constexpr, SUB_W3: tl.constexpr,
+    SUB_OFF1: tl.constexpr, SUB_OFF2: tl.constexpr, SUB_OFF3: tl.constexpr,
+    SUB_BASE1: tl.constexpr, SUB_BASE2: tl.constexpr, SUB_BASE3: tl.constexpr,
     TYPE_SIZE: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     """fp4 two-tier v2 weight expander (spec §4b): decode the codebook value AND
@@ -188,9 +216,18 @@ def _cb_expand_weight_v2_kernel(
     byte_base = (bitpos // 8).to(tl.int64)
     bit_in_byte = bitpos % 8
     mask_k = (1 << K_BITS) - 1
-    shift_sub = sub * SUB_W
-    mask_sub = (1 << SUB_W) - 1
-    cb_base = sub * ((1 << SUB_W) * SUB_DIM)
+    # Ceil-first per-sub split (encoder _bit_split); even k reduces to the
+    # historical uniform layout.
+    shift_sub = tl.where(
+        sub == 0, 0, tl.where(sub == 1, SUB_OFF1,
+                              tl.where(sub == 2, SUB_OFF2, SUB_OFF3)))
+    mask_sub = tl.where(
+        sub == 0, (1 << SUB_W0) - 1,
+        tl.where(sub == 1, (1 << SUB_W1) - 1,
+                 tl.where(sub == 2, (1 << SUB_W2) - 1, (1 << SUB_W3) - 1)))
+    cb_base = tl.where(
+        sub == 0, 0, tl.where(sub == 1, SUB_BASE1,
+                              tl.where(sub == 2, SUB_BASE2, SUB_BASE3)))
     grp16v = tl.arange(0, 16)
     cb_off = tl.load(cboff_ptr + offs_n_i, mask=mask_n, other=0).to(tl.int64)
 
@@ -228,15 +265,24 @@ def _cb_expand_weight_v2_kernel(
              w, mask=mask_n[:, None])
 
 
+def _ceil_first_split(k_bits: int, n_sub: int, sub_dim: int):
+    """Per-sub widths/offsets/table bases (ceil-first, = encoder _bit_split),
+    padded to 4 subs for the constexpr plumbing."""
+    base, extra = divmod(k_bits, n_sub)
+    ws = [base + (1 if i < extra else 0) for i in range(n_sub)] \
+        + [0] * (4 - n_sub)
+    offs = [sum(ws[:i]) for i in range(4)]
+    bases = [sum(sub_dim << w for w in ws[:i] if w) for i in range(4)]
+    return ws, offs, bases
+
+
 def expand_fp4_v2_to_weight(cb_qweight_padded, cb_flat, cb_row_offset, compose,
                             N, K, k_bits, n_sub, type_size):
     """Transient [N,K] bf16 weight (value × composed E4M3 scale) for a fp4 v2
     layer — the prefill counterpart of the decode kernel, amortising the decode
     over M via one cuBLAS bf16 GEMM. Bounded per-layer transient (INV-1)."""
-    if k_bits % n_sub != 0:
-        raise ValueError("expand supports even bit-splits only")
     sub_dim = 8 // n_sub
-    sub_w = k_bits // n_sub
+    ws, offs, bases = _ceil_first_split(k_bits, n_sub, sub_dim)
     dev = cb_qweight_padded.device
     W = torch.empty((N, K), dtype=torch.bfloat16, device=dev)
     n_sb = K // 256
@@ -245,7 +291,11 @@ def expand_fp4_v2_to_weight(cb_qweight_padded, cb_flat, cb_row_offset, compose,
     _cb_expand_weight_v2_kernel[grid](
         cb_qweight_padded, cb_flat, cb_row_offset, compose, W, N, K,
         cb_qweight_padded.stride(0), W.stride(0), W.stride(1),
-        K_BITS=k_bits, SUB_DIM=sub_dim, SUB_W=sub_w, TYPE_SIZE=type_size,
+        K_BITS=k_bits, SUB_DIM=sub_dim,
+        SUB_W0=ws[0], SUB_W1=ws[1], SUB_W2=ws[2], SUB_W3=ws[3],
+        SUB_OFF1=offs[1], SUB_OFF2=offs[2], SUB_OFF3=offs[3],
+        SUB_BASE1=bases[1], SUB_BASE2=bases[2], SUB_BASE3=bases[3],
+        TYPE_SIZE=type_size,
         BLOCK_N=block_n, num_warps=4)
     return W
 
@@ -268,13 +318,10 @@ def expand_cb_to_fp8(
     """
     if cb_flat_fp8.dtype != torch.uint8:
         raise TypeError("expand_cb_to_fp8 wants the E4M3-byte (uint8) codebook")
-    if k_bits % n_sub != 0:
-        raise ValueError("expand supports even bit-splits only "
-                         f"(k={k_bits}, n_sub={n_sub})")
     if K % 256 != 0:
         raise ValueError(f"K={K} must be a multiple of the 256-weight superblock")
     sub_dim = 8 // n_sub
-    sub_w = k_bits // n_sub
+    ws, offs, bases = _ceil_first_split(k_bits, n_sub, sub_dim)
     dev = cb_qweight_padded.device
     W = torch.empty((N, K), dtype=torch.uint8, device=dev)
     n_sb = K // 256
@@ -285,7 +332,11 @@ def expand_cb_to_fp8(
         N, K,
         cb_qweight_padded.stride(0),
         W.stride(0), W.stride(1),
-        K_BITS=k_bits, SUB_DIM=sub_dim, SUB_W=sub_w, TYPE_SIZE=type_size,
+        K_BITS=k_bits, SUB_DIM=sub_dim,
+        SUB_W0=ws[0], SUB_W1=ws[1], SUB_W2=ws[2], SUB_W3=ws[3],
+        SUB_OFF1=offs[1], SUB_OFF2=offs[2], SUB_OFF3=offs[3],
+        SUB_BASE1=bases[1], SUB_BASE2=bases[2], SUB_BASE3=bases[3],
+        TYPE_SIZE=type_size,
         BLOCK_N=block_n,
         num_warps=4,
     )
@@ -317,13 +368,10 @@ def expand_cb_to_value(
             "Blackwell FP4-MMA to be worth expanding (prototype iii / INV-2), "
             "and a decoded fp4 value is not a standalone tensor without its "
             "group-16 scale plane. See docs/nvfp4-cb-plan/serving-kernel.md.")
-    if k_bits % n_sub != 0:
-        raise ValueError("expand supports even bit-splits only "
-                         f"(k={k_bits}, n_sub={n_sub})")
     if K % 256 != 0:
         raise ValueError(f"K={K} must be a multiple of the 256-weight superblock")
     sub_dim = 8 // n_sub
-    sub_w = k_bits // n_sub
+    ws, offs, bases = _ceil_first_split(k_bits, n_sub, sub_dim)
     dev = cb_qweight_padded.device
     W = torch.empty((N, K), dtype=torch.bfloat16, device=dev)
     n_sb = K // 256
@@ -334,7 +382,11 @@ def expand_cb_to_value(
         N, K,
         cb_qweight_padded.stride(0),
         W.stride(0), W.stride(1),
-        K_BITS=k_bits, SUB_DIM=sub_dim, SUB_W=sub_w, TYPE_SIZE=type_size,
+        K_BITS=k_bits, SUB_DIM=sub_dim,
+        SUB_W0=ws[0], SUB_W1=ws[1], SUB_W2=ws[2], SUB_W3=ws[3],
+        SUB_OFF1=offs[1], SUB_OFF2=offs[2], SUB_OFF3=offs[3],
+        SUB_BASE1=bases[1], SUB_BASE2=bases[2], SUB_BASE3=bases[3],
+        TYPE_SIZE=type_size,
         BLOCK_N=block_n,
         num_warps=4,
     )

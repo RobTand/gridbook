@@ -29,7 +29,7 @@ def test_compose_table_matches_reference():
     assert tuple(codec.TWO_TIER_SUB_TABLE) == tuple(fmt.TWO_TIER_SUB_TABLE)
 
 
-@pytest.mark.parametrize("k", [16, 18, 20, 24])
+@pytest.mark.parametrize("k", [13, 16, 17, 18, 20, 24])
 @pytest.mark.parametrize("M", [1, 17])
 def test_v2_decode_matches_reconstruct(k, M):
     """Pack a weight with two-tier v2, decode-GEMM via the kernel's in-kernel
@@ -85,7 +85,7 @@ def test_v2_scale_extraction_bitexact():
     assert torch.equal(got, fields["scales"].to(DEV).float())
 
 
-@pytest.mark.parametrize("k", [16, 24])
+@pytest.mark.parametrize("k", [13, 16, 24])
 def test_v2_transient_weight_matches_reconstruct(k):
     """fp4-v2 transient prefill: the expanded [N,K] bf16 weight (value × composed
     v2 scale) matches nvfp4_cb_reconstruct, so F.linear == reconstruct @ x."""

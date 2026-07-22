@@ -22,8 +22,10 @@ when nvcc is unavailable. See the CUDA kernel-set section below.
 
 ## Scope
 
-- Even-split **product** mode only (NVFP4_CB_K16 → (8,8); FP8_CB_K44 →
-  (11,11,11,11)). Uneven splits and signed/full modes: out of scope here.
+- **Product** mode, ANY integer k: even splits (NVFP4_CB_K16 → (8,8);
+  FP8_CB_K44 → (11,11,11,11)) and ceil-first uneven splits per SPEC §1
+  `bit_split` (K13 → (7,6); FP8 K30 → (8,8,7,7)) — CUDA + Triton paths,
+  encoder-anchored tests. Signed/full modes: not yet served (no CUDA path).
 - Uniform CB artifacts (all target Linears one format). Mixed containers would
   delegate plain NVFP4/FP8 to stock compressed-tensors — stubbed with a clear
   `NotImplementedError`.

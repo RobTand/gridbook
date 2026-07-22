@@ -104,9 +104,12 @@ def _synth(k, N=96, K=768, seed=0):
     n_sb = K // 256
     packed = torch.randint(0, 256, (N, n_sb * ts), generator=g,
                            dtype=torch.uint8).to(DEV)
-    sub_w = k // 4
-    subs = [(torch.randn(1 << sub_w, 2, generator=g) * 4.0)
-            .to(torch.float8_e4m3fn).float().to(DEV) for _ in range(4)]
+    # Ceil-first per-sub widths (= encoder _bit_split): odd/non-mult-4 k gets
+    # uneven sub-table sizes.
+    base, extra = divmod(k, 4)
+    subs = [(torch.randn(1 << (base + (1 if i < extra else 0)), 2,
+                         generator=g) * 4.0)
+            .to(torch.float8_e4m3fn).float().to(DEV) for i in range(4)]
     ws = (torch.rand(N, generator=g).to(DEV) + 0.5) * 0.02
     cb_flat = codec.build_flat_codebook(subs)
     return dict(qwp=codec.pad_qweight(packed), cb_flat=cb_flat,
@@ -175,7 +178,7 @@ def test_gemv_matches_triton_real_artifact(qname, M):
                          f"{qname} M={M}")
 
 
-@pytest.mark.parametrize("k", [36, 40, 44, 48])
+@pytest.mark.parametrize("k", [29, 33, 36, 40, 42, 44, 47, 48])
 @pytest.mark.parametrize("M", [1, 2, 4, 8, 16])
 def test_gemv_matches_triton_all_rungs(k, M):
     p = _synth(k, seed=k)
@@ -240,7 +243,7 @@ def test_fused_row_offset_two_roles():
     _assert_triton_close(_cuda_y(p, xq), _triton_y(p, xq), "fused row-offset")
 
 
-@pytest.mark.parametrize("k", [36, 40, 44, 48])
+@pytest.mark.parametrize("k", [29, 33, 36, 40, 42, 44, 47, 48])
 def test_cuda_expand_bitexact_vs_triton(k):
     """The CUDA transient expander must produce byte-identical tiles to the
     Triton expand_cb_to_fp8 (which is itself pinned to the bf16-expand+cast
@@ -461,7 +464,7 @@ def test_moe_grouped_gemv_fp4_v2_matches_loop():
                           T=2, topk=3, seed=31, tag="fp4-v2 moe k=16")
 
 
-@pytest.mark.parametrize("k", [14, 16, 18, 20])
+@pytest.mark.parametrize("k", [13, 14, 15, 16, 17, 18, 20, 23])
 def test_moe_grouped_gemv_fp4_v2_all_rungs(k):
     """K-rung sweep (k in {14,16,18,20} -> sub_w in {7,8,9,10}); smaller dims
     keep the two-tier sweep-encode fast."""
@@ -524,7 +527,7 @@ def _ref_fp4v2_dense_y(p, xq):
     return torch.nn.functional.linear(xq, W)
 
 
-@pytest.mark.parametrize("k", [14, 16])
+@pytest.mark.parametrize("k", [13, 14, 15, 16])
 @pytest.mark.parametrize("M", [1, 2, 8, 16])
 def test_dense_fp4v2_gemv_matches_triton_and_ref(k, M):
     """Dense fp4-v2 CUDA GEMV == the Triton fp4-v2 decode AND == the explicit
@@ -622,3 +625,41 @@ def test_dense_fp4v2_registered_op_matches_ext():
     y_ext = _cuda_fp4v2_dense_y(p, xq)
     assert torch.equal(y_op.view(torch.uint16), y_ext.view(torch.uint16)), (
         "registered op != raw ext (should be identical)")
+
+
+@pytest.mark.parametrize("k", [29, 30, 33, 42])
+def test_fp8_uneven_split_matches_encoder_reconstruct(k):
+    """ENCODER ANCHOR for uneven fp8 splits: prismaquant encodes a dense fp8-CB
+    weight at an odd / non-multiple-of-4 rung (ceil-first _bit_split); the
+    gridbook Triton value-expand and the CUDA GEMV must reproduce the
+    encoder's own reconstruct. This pins the (sub0-at-LSB, ceil-first) bit
+    convention to the encoder, not merely decoder-vs-decoder agreement."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    from gridbook.expand import expand_cb_to_value
+    torch.manual_seed(k)
+    N, K = 32, 512
+    w = (torch.randn(N, K, device=DEV) * 0.02)
+    cb = pq._resolve_codebook(k, "fp8", "product", None, torch.device(DEV))
+    fields = pq.nvfp4_cb_fields(w, k, grid="fp8", mode="product", codebook=cb)
+    ref = pq.nvfp4_cb_reconstruct(fields, k, grid="fp8", mode="product",
+                                  codebook=cb).float()
+    packed = pq.nvfp4_cb_assemble_bytes(
+        fields, k, grid="fp8", mode="product").reshape(N, -1).contiguous().to(DEV)
+    ws = fields["scales"].to(DEV).float().reshape(-1)
+    assert ws.numel() == N, "fp8 per-output-channel scale expected"
+    ts = 4 * k
+    cb_flat = codec.build_flat_codebook([c.float().to(DEV) for c in cb])
+    cb8 = cb_flat.to(torch.float8_e4m3fn).view(torch.uint8).contiguous()
+    row0 = torch.zeros(N, dtype=torch.int32, device=DEV)
+    qwp = codec.pad_qweight(packed)
+    val = expand_cb_to_value(qwp, cb_flat, row0, N, K, k, 4, ts,
+                             is_fp4=False).float()
+    W = val * ws[:, None]
+    rel = (W - ref.to(DEV)).norm() / ref.norm().clamp_min(1e-6)
+    assert rel <= 1e-6, f"k={k}: expand vs encoder reconstruct rel {rel:.3e}"
+    x = torch.randn(2, K, dtype=torch.bfloat16, device=DEV)
+    xq = codec.fp8_dynamic_act_qdq(x)
+    y_cuda = ext.cb_gemv_fp8(xq, qwp, cb8, row0, ws, N, K, k, 4, ts, False)
+    y_ref = torch.nn.functional.linear(xq.to(torch.bfloat16),
+                                       W.to(torch.bfloat16))
+    _assert_triton_close(y_cuda, y_ref, f"fp8 uneven k={k} gemv-vs-ref")

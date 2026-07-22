@@ -19,9 +19,10 @@ as the production prefill path:
   the FP4 MMA; THIS kernel will fail the perf gate by construction and must not
   be promoted. Comments below say so at each relevant point.
 
-Only the **even-split product** mode is implemented (both shipped rungs are even
-splits: NVFP4_CB_K16 -> (8,8); FP8_CB_K44 -> (11,11,11,11)). Uneven splits
-(e.g. k=13 -> (7,6)) and signed/full modes are out of scope for this prototype.
+**Product** mode is implemented for ANY integer k: even splits (NVFP4_CB_K16
+-> (8,8); FP8_CB_K44 -> (11,11,11,11)) and ceil-first uneven splits (k=13 ->
+(7,6)), matching the encoder's _bit_split. Signed/full modes are out of scope
+for this prototype.
 """
 from __future__ import annotations
 
@@ -41,7 +42,13 @@ def _cb_decode_gemm_kernel(
     K_BITS: tl.constexpr,
     N_SUB: tl.constexpr,
     SUB_DIM: tl.constexpr,
-    SUB_W: tl.constexpr,
+    # Ceil-first per-sub bit widths (encoder _bit_split): sub i occupies
+    # SUB_OFF_i..SUB_OFF_i+SUB_W_i-1 of the codeword, its table at flat-
+    # codebook element SUB_BASE_i. Unused trailing subs carry zeros.
+    SUB_W0: tl.constexpr, SUB_W1: tl.constexpr,
+    SUB_W2: tl.constexpr, SUB_W3: tl.constexpr,
+    SUB_OFF1: tl.constexpr, SUB_OFF2: tl.constexpr, SUB_OFF3: tl.constexpr,
+    SUB_BASE1: tl.constexpr, SUB_BASE2: tl.constexpr, SUB_BASE3: tl.constexpr,
     TYPE_SIZE: tl.constexpr,
     IS_FP4: tl.constexpr,
     LAYOUT_V2: tl.constexpr,   # fp4 two-tier scale plane (9 B, in-kernel compose)
@@ -68,9 +75,17 @@ def _cb_decode_gemm_kernel(
     byte_base_v = ((v * K_BITS) // 8).to(tl.int64)   # first byte of codeword [32]
     bit_in_byte_v = (v * K_BITS) % 8                  # [32]
     mask_k = (1 << K_BITS) - 1
-    shift_sub = sub * SUB_W
-    mask_sub = (1 << SUB_W) - 1
-    cb_base = sub * ((1 << SUB_W) * SUB_DIM)   # flat-codebook block base
+    # Per-column sub-table constants via the (constexpr) ceil-first split.
+    shift_sub = tl.where(
+        sub == 0, 0, tl.where(sub == 1, SUB_OFF1,
+                              tl.where(sub == 2, SUB_OFF2, SUB_OFF3)))
+    mask_sub = tl.where(
+        sub == 0, (1 << SUB_W0) - 1,
+        tl.where(sub == 1, (1 << SUB_W1) - 1,
+                 tl.where(sub == 2, (1 << SUB_W2) - 1, (1 << SUB_W3) - 1)))
+    cb_base = tl.where(
+        sub == 0, 0, tl.where(sub == 1, SUB_BASE1,
+                              tl.where(sub == 2, SUB_BASE2, SUB_BASE3)))
     grp16v = tl.arange(0, 16)                   # 16 distinct group-16 scales [16]
 
     # Per-output-row codebook base offset (0 for a single-codebook Linear; for a
@@ -166,9 +181,14 @@ def cb_decode_linear(
     the decode regime (M<=16), a larger tile for prefill — mirrors GGUF's
     MMVQ/MMQ split (quantization/linear.py:34-57), one Triton kernel either
     way. The dense weight is never materialized (INV-1)."""
-    assert k_bits % n_sub == 0, "prototype supports even bit-splits only"
     sub_dim = 8 // n_sub
-    sub_w = k_bits // n_sub
+    # Ceil-first split (encoder _bit_split): widths, codeword offsets, and
+    # flat-codebook element bases per sub; trailing unused subs zeroed.
+    base, extra = divmod(k_bits, n_sub)
+    ws = [base + (1 if i < extra else 0) for i in range(n_sub)] \
+        + [0] * (4 - n_sub)
+    offs = [sum(ws[:i]) for i in range(4)]
+    bases = [sum(sub_dim << w for w in ws[:i] if w) for i in range(4)]
     orig_shape = x.shape
     x2 = x.reshape(-1, K).contiguous()
     M = x2.shape[0]
@@ -185,7 +205,10 @@ def cb_decode_linear(
         qw_padded.stride(0),
         y.stride(0), y.stride(1),
         stride_sn,
-        K_BITS=k_bits, N_SUB=n_sub, SUB_DIM=sub_dim, SUB_W=sub_w,
+        K_BITS=k_bits, N_SUB=n_sub, SUB_DIM=sub_dim,
+        SUB_W0=ws[0], SUB_W1=ws[1], SUB_W2=ws[2], SUB_W3=ws[3],
+        SUB_OFF1=offs[1], SUB_OFF2=offs[2], SUB_OFF3=offs[3],
+        SUB_BASE1=bases[1], SUB_BASE2=bases[2], SUB_BASE3=bases[3],
         TYPE_SIZE=type_size, IS_FP4=is_fp4, LAYOUT_V2=is_v2,
         BLOCK_M=block_m, BLOCK_N=block_n,
         num_warps=4, num_stages=2,
