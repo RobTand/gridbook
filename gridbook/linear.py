@@ -132,6 +132,12 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         import struct
         from vllm.config import get_current_vllm_config
         model_dir = get_current_vllm_config().model_config.model
+        if not os.path.isdir(model_dir):
+            # Hub repo id: vLLM already downloaded the weights; reuse its
+            # snapshot dir instead of a raw path join (serve-by-id fix).
+            from huggingface_hub import snapshot_download
+            model_dir = snapshot_download(model_dir,
+                                          allow_patterns=["*.safetensors"])
         files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
         cache = {}
         for st in files:

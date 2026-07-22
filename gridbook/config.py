@@ -48,6 +48,19 @@ _FUSED_FALLBACK = {
 }
 
 
+def _resolve_model_file(model_dir: str, fname: str) -> str:
+    """Local path for a sidecar file next to the model. When the model was
+    given as a Hub repo id (``vllm serve rdtand/...``) rather than a local
+    directory, fetch the sidecar from the Hub — vLLM's own loader handles the
+    weights that way, but OUR sidecars (quant_config.json, the .pqcb codebook
+    blob) were opened with a plain path join, which broke every serve-by-id
+    until 2026-07-22."""
+    if os.path.isdir(model_dir):
+        return os.path.join(model_dir, fname)
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download(repo_id=model_dir, filename=fname)
+
+
 class PrismaQuantConfig(QuantizationConfig):
     """Per-layer dispatch: CB decode / stock-CT delegation / unquantized."""
 
@@ -75,7 +88,7 @@ class PrismaQuantConfig(QuantizationConfig):
             cfg_file = cfg.get("config_file", "quant_config.json")
             from vllm.config import get_current_vllm_config
             model_dir = get_current_vllm_config().model_config.model
-            with open(os.path.join(model_dir, cfg_file)) as fh:
+            with open(_resolve_model_file(model_dir, cfg_file)) as fh:
                 cfg = json.load(fh)
             self.codebook_file = cfg.get("codebook_file", self.codebook_file)
         self._full_config = cfg
@@ -178,8 +191,8 @@ class PrismaQuantConfig(QuantizationConfig):
             from safetensors.torch import load_file
             from vllm.config import get_current_vllm_config
             model_dir = get_current_vllm_config().model_config.model
-            self._codebooks = load_file(os.path.join(model_dir,
-                                                     self.codebook_file))
+            self._codebooks = load_file(
+                _resolve_model_file(model_dir, self.codebook_file))
         return self._codebooks
 
     # -- per-prefix scheme resolution (handles vLLM fused qkv/gate_up) -------
