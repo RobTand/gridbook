@@ -372,40 +372,47 @@ def test_moe_grouped_gemv_matches_loop_numerics():
 # encoder (scale_coding="two_tier"), never fabricated. The reference is the
 # per-expert loop chain (moe._decode_expert -> expand_fp4_v2_to_weight).
 # --------------------------------------------------------------------------- #
-def _fp4v2_encode_stack(pq, k, E, out, in_f, cb, seed):
+def _fp4v2_encode_stack(pq, k, E, out, in_f, cb, seed, mode="product"):
     """Encode a random (E, out, in_f) weight stack to fp4 two-tier v2 on-disk
     bytes (E, out, n_sb*type_size) via the REAL encoder — every (super, sub)
-    scale pair is legal (E4M3-exact) by construction."""
+    scale pair is legal (E4M3-exact) by construction. mode='signed' encodes
+    the S-rung layout (8 sign bits + magnitude index, single half-grid
+    table)."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     w = (torch.randn(E, out, in_f, generator=g) * 0.02).to(DEV)
-    fields = pq.nvfp4_cb_fields(w, k, grid="fp4", mode="product", codebook=cb,
+    fields = pq.nvfp4_cb_fields(w, k, grid="fp4", mode=mode, codebook=cb,
                                scale_coding="two_tier", encode_tier="fast")
-    b = pq.nvfp4_cb_assemble_bytes(fields, k, grid="fp4", mode="product")
+    b = pq.nvfp4_cb_assemble_bytes(fields, k, grid="fp4", mode=mode)
     ts = pq.nvfp4_cb_type_size(k, "fp4", "two_tier")            # 4k + 9
     n_sb = in_f // codec.SUPERBLOCK
     return b.reshape(E, out, n_sb * ts).contiguous().to(DEV), ts
 
 
-def _run_fp4v2_moe_parity(pq, k, E, hidden, inter, T, topk, seed, tag):
+def _run_fp4v2_moe_parity(pq, k, E, hidden, inter, T, topk, seed, tag,
+                          cb=None, mode="product"):
     """Grouped fp4-v2 MoE decode vs the per-expert loop; both decode the SAME
     real two-tier bytes with the SAME bf16 codebook + compose table, so they
     agree to reassociation (the loop's bf16 F.linear vs the kernel's warp-sum,
-    both f32-accum)."""
+    both f32-accum). mode='signed' exercises the S-rung layout (n_sub=1)."""
     from gridbook.expand import expand_fp4_v2_to_weight
     out13 = 2 * inter
+    n_sub = 1 if mode == "signed" else 2
     ts = pq.nvfp4_cb_type_size(k, "fp4", "two_tier")
-    cb = pq._resolve_codebook(k, "fp4", "product", None, torch.device(DEV))
-    cb_flat = codec.build_flat_codebook(list(cb))              # bf16 flat cb
+    if cb is None:
+        cb = pq._resolve_codebook(k, "fp4", mode, None, torch.device(DEV))
+    subs = list(cb) if isinstance(cb, (tuple, list)) else [cb]
+    cb_flat = codec.build_flat_codebook(subs)                  # bf16 flat cb
     compose = codec.build_compose_table(codec.TWO_TIER_SUB_TABLE).to(DEV)
-    w13, _ = _fp4v2_encode_stack(pq, k, E, out13, hidden, cb, seed)
-    w2, _ = _fp4v2_encode_stack(pq, k, E, hidden, inter, cb, seed + 100)
+    w13, _ = _fp4v2_encode_stack(pq, k, E, out13, hidden, cb, seed, mode=mode)
+    w2, _ = _fp4v2_encode_stack(pq, k, E, hidden, inter, cb, seed + 100,
+                                mode=mode)
 
     def decode_expert(stack, e, in_f):                        # loop _decode_expert
         out = stack.shape[1]
         qwp = codec.pad_qweight(stack[e].contiguous())
         row0 = torch.zeros(out, dtype=torch.int32, device=DEV)
         return expand_fp4_v2_to_weight(qwp, cb_flat, row0, compose,
-                                       out, in_f, k, 2, ts)
+                                       out, in_f, k, n_sub, ts)
 
     g = torch.Generator(device="cpu").manual_seed(seed + 7)
     x = torch.randn(T, hidden, dtype=torch.bfloat16, device=DEV)
@@ -442,14 +449,14 @@ def _run_fp4v2_moe_parity(pq, k, E, hidden, inter, T, topk, seed, tag):
     tok_start = torch.arange(T + 1, device=DEV, dtype=torch.int32) * topk
     xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
     gu = ext.cb_moe_gemv_fp4_v2(xq, w13, cb_flat, compose,
-                                pair_expert, pair_xrow, k, 2, ts)
+                                pair_expert, pair_xrow, k, n_sub, ts)
     gate, up = gu.chunk(2, dim=-1)
     a = torch.nn.functional.silu(gate) * up
     aq = codec.fp4_group16_act_qdq(a).to(torch.bfloat16)
     pair_self = torch.arange(pair_expert.numel(), device=DEV,
                              dtype=torch.int32)
     y_down = ext.cb_moe_gemv_fp4_v2(aq, w2, cb_flat, compose,
-                                    pair_expert, pair_self, k, 2, ts)
+                                    pair_expert, pair_self, k, n_sub, ts)
     out_got = ext.cb_moe_combine(y_down, pair_w, tok_start, T)
     _assert_triton_close(out_got, out_ref, tag)
 
@@ -483,23 +490,25 @@ def test_moe_grouped_gemv_fp4_v2_all_rungs(k):
 # fabricated. Parity is checked against BOTH the Triton fp4-v2 decode path AND an
 # explicit expand_fp4_v2_to_weight + F.linear reference on the SAME QDQ'd xq.
 # --------------------------------------------------------------------------- #
-def _fp4v2_dense_bytes(pq, k, N, K, cb, seed):
+def _fp4v2_dense_bytes(pq, k, N, K, cb, seed, mode="product"):
     """Dense (N, K) weight -> fp4 two-tier v2 on-disk bytes (N, n_sb*type_size)
     via the REAL encoder (reusing the stack encoder with E=1)."""
-    stack, ts = _fp4v2_encode_stack(pq, k, 1, N, K, cb, seed)
+    stack, ts = _fp4v2_encode_stack(pq, k, 1, N, K, cb, seed, mode=mode)
     return stack[0].contiguous(), ts
 
 
-def _fp4v2_dense_prep(pq, k, N, K, seed, cb=None):
-    """Single-role dense fp4-v2 layer tensors (uniform cb_row_offset=0)."""
+def _fp4v2_dense_prep(pq, k, N, K, seed, cb=None, mode="product"):
+    """Single-role dense fp4-v2 layer tensors (uniform cb_row_offset=0).
+    mode='signed' -> the single magnitude table, n_sub=1."""
     if cb is None:
-        cb = pq._resolve_codebook(k, "fp4", "product", None, torch.device(DEV))
-    packed, ts = _fp4v2_dense_bytes(pq, k, N, K, cb, seed)
+        cb = pq._resolve_codebook(k, "fp4", mode, None, torch.device(DEV))
+    packed, ts = _fp4v2_dense_bytes(pq, k, N, K, cb, seed, mode=mode)
+    subs = list(cb) if isinstance(cb, (tuple, list)) else [cb]
     return dict(qwp=codec.pad_qweight(packed),
-                cb_flat=codec.build_flat_codebook(list(cb)),
+                cb_flat=codec.build_flat_codebook(subs),
                 compose=codec.build_compose_table(codec.TWO_TIER_SUB_TABLE).to(DEV),
                 row_off=torch.zeros(N, dtype=torch.int32, device=DEV),
-                N=N, K=K, k=k, n_sub=2, ts=ts)
+                N=N, K=K, k=k, n_sub=(1 if mode == "signed" else 2), ts=ts)
 
 
 def _cuda_fp4v2_dense_y(p, xq):
@@ -663,3 +672,69 @@ def test_fp8_uneven_split_matches_encoder_reconstruct(k):
     y_ref = torch.nn.functional.linear(xq.to(torch.bfloat16),
                                        W.to(torch.bfloat16))
     _assert_triton_close(y_cuda, y_ref, f"fp8 uneven k={k} gemv-vs-ref")
+
+
+# --------------------------------------------------------------------------- #
+# SIGNED-MODE (S-rung) decode: 8 LSB sign bits + (k-8)-bit magnitude index
+# into ONE non-negative half-grid table (n_sub=1). Same superblock layout and
+# two-tier scale as product v2 — only the codeword->8-values step differs.
+# ENCODER-ANCHORED like the product tests: bytes come from prismaquant's
+# signed encoder, never fabricated; reconstruct is the reference.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("k", [13, 14, 15, 16])
+def test_signed_dense_expand_matches_encoder_reconstruct(k):
+    """Triton v2 expander (SIGNED branch) == pq reconstruct on real signed
+    bytes: sign applied to the magnitude BEFORE the composed scale, bf16
+    rounding identical."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    from gridbook.expand import expand_fp4_v2_to_weight
+    torch.manual_seed(k)
+    N, K = 48, 512
+    cb = pq._resolve_codebook(k, "fp4", "signed", None, torch.device(DEV))
+    g = torch.Generator(device="cpu").manual_seed(k)
+    w = (torch.randn(N, K, generator=g) * 0.02).to(DEV)
+    fields = pq.nvfp4_cb_fields(w, k, grid="fp4", mode="signed", codebook=cb,
+                                scale_coding="two_tier", encode_tier="fast")
+    ref = pq.nvfp4_cb_reconstruct(fields, k, grid="fp4", mode="signed",
+                                  codebook=cb).float().to(DEV)
+    b = pq.nvfp4_cb_assemble_bytes(fields, k, grid="fp4", mode="signed")
+    ts = pq.nvfp4_cb_type_size(k, "fp4", "two_tier")
+    packed = b.reshape(N, -1).contiguous().to(DEV)
+    subs = list(cb) if isinstance(cb, (tuple, list)) else [cb]
+    cb_flat = codec.build_flat_codebook(subs)
+    compose = codec.build_compose_table(codec.TWO_TIER_SUB_TABLE).to(DEV)
+    row0 = torch.zeros(N, dtype=torch.int32, device=DEV)
+    W = expand_fp4_v2_to_weight(codec.pad_qweight(packed), cb_flat, row0,
+                                compose, N, K, k, 1, ts).float()
+    rel = (W - ref).norm() / ref.norm().clamp_min(1e-6)
+    assert rel <= 5e-3, f"S{k}: expand vs reconstruct rel {rel:.4e}"
+
+
+@pytest.mark.parametrize("k", [13, 15, 16])
+@pytest.mark.parametrize("M", [1, 2, 8, 16])
+def test_signed_dense_gemv_matches_triton_and_ref(k, M):
+    """Dense CUDA GEMV signed branch == Triton SIGNED decode == explicit
+    expand+F.linear reference, on real signed-encoder bytes."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    for K in (256, 512):
+        p = _fp4v2_dense_prep(pq, k, 64, K, seed=1000 + k, mode="signed")
+        torch.manual_seed(k * 100 + M)
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+        xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+        y_cuda = _cuda_fp4v2_dense_y(p, xq)
+        y_trit = _triton_fp4v2_dense_y(p, xq)
+        y_ref = _ref_fp4v2_dense_y(p, xq)
+        _assert_triton_close(y_cuda, y_trit, f"S{k} M={M} K={K} cuda-vs-triton")
+        _assert_triton_close(y_cuda, y_ref, f"S{k} M={M} K={K} cuda-vs-ref")
+
+
+@pytest.mark.parametrize("k", [13, 16])
+def test_signed_moe_grouped_matches_loop(k):
+    """Grouped MoE GEMV signed branch == the per-expert loop chain on real
+    signed-encoder expert stacks (same parity harness as product)."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    torch.manual_seed(k)
+    cb = pq._resolve_codebook(k, "fp4", "signed", None, torch.device(DEV))
+    _run_fp4v2_moe_parity(pq, k=k, E=4, hidden=256, inter=256, T=2, topk=2,
+                          seed=500 + k, tag=f"signed moe S{k}", cb=cb,
+                          mode="signed")

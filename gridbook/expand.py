@@ -192,6 +192,7 @@ def _cb_expand_weight_v2_kernel(
     SUB_W2: tl.constexpr, SUB_W3: tl.constexpr,
     SUB_OFF1: tl.constexpr, SUB_OFF2: tl.constexpr, SUB_OFF3: tl.constexpr,
     SUB_BASE1: tl.constexpr, SUB_BASE2: tl.constexpr, SUB_BASE3: tl.constexpr,
+    SIGNED: tl.constexpr,
     TYPE_SIZE: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     """fp4 two-tier v2 weight expander (spec §4b): decode the codebook value AND
@@ -240,10 +241,17 @@ def _cb_expand_weight_v2_kernel(
                     other=0).to(tl.int64)
         code = code | (b << (8 * i))
     code = (code >> bit_in_byte[None, :]) & mask_k
-    sub_idx = (code >> shift_sub[None, :]) & mask_sub
-    gather = (cb_off[:, None] + cb_base[None, :] + sub_idx * SUB_DIM
-              + local[None, :])
-    val = tl.load(cb_ptr + gather).to(tl.float32)                 # [BN,256]
+    if SIGNED:
+        sub_idx = code >> 8
+        gather = cb_off[:, None] + sub_idx * SUB_DIM + local[None, :]
+        val = tl.load(cb_ptr + gather).to(tl.float32)             # [BN,256]
+        neg = ((code >> local[None, :]) & 1) == 1
+        val = tl.where(neg, -val, val)
+    else:
+        sub_idx = (code >> shift_sub[None, :]) & mask_sub
+        gather = (cb_off[:, None] + cb_base[None, :] + sub_idx * SUB_DIM
+                  + local[None, :])
+        val = tl.load(cb_ptr + gather).to(tl.float32)             # [BN,256]
 
     # v2 compose (bit-exact to the decode kernel / reconstruct).
     super_off = s * TYPE_SIZE + 4 * K_BITS
@@ -295,6 +303,7 @@ def expand_fp4_v2_to_weight(cb_qweight_padded, cb_flat, cb_row_offset, compose,
         SUB_W0=ws[0], SUB_W1=ws[1], SUB_W2=ws[2], SUB_W3=ws[3],
         SUB_OFF1=offs[1], SUB_OFF2=offs[2], SUB_OFF3=offs[3],
         SUB_BASE1=bases[1], SUB_BASE2=bases[2], SUB_BASE3=bases[3],
+        SIGNED=(n_sub == 1),
         TYPE_SIZE=type_size,
         BLOCK_N=block_n, num_warps=4)
     return W

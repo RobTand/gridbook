@@ -195,6 +195,29 @@ struct SubSplit {
 // packed load is issued, so this is the clean bit-identity A/B unit. The word
 // read is left inline in each loop so the DB path can inject its prefetch
 // between the read and this compute (where the overlap lives).
+// Shared x-FMA tail for the dense decode helpers: identical for the fp8
+// and fp4-v2 (product AND signed) paths — ONE bit-identical epilogue.
+template <int MT>
+DEVINL void cb_fma_x(int s, int lane, int M, const uint16_t* x, int64_t K,
+                        const float* wv, float* acc) {
+  const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    if (m < M) {
+      const uint4 xv = __ldg(
+          reinterpret_cast<const uint4*>(x + (int64_t)m * K + xbase));
+      const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        acc[m] = fmaf(wv[2 * i],
+                      bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc[m]);
+        acc[m] = fmaf(wv[2 * i + 1],
+                      bf16_to_f32((uint16_t)(xw[i] >> 16)), acc[m]);
+      }
+    }
+  }
+}
+
 template <int MT>
 DEVINL void fp8_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
                            int s, int lane, int M, const uint16_t* x, int64_t K,
@@ -216,22 +239,7 @@ DEVINL void fp8_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
     wv[2 * i + 1] = bf16_to_f32(
         f32_to_bf16_rn(e4m3_to_f32((uint8_t)(pair >> 8)) * sc_row));
   }
-  const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
-#pragma unroll
-  for (int m = 0; m < MT; ++m) {
-    if (m < M) {
-      const uint4 xv = __ldg(
-          reinterpret_cast<const uint4*>(x + (int64_t)m * K + xbase));
-      const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        acc[m] = fmaf(wv[2 * i],
-                      bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc[m]);
-        acc[m] = fmaf(wv[2 * i + 1],
-                      bf16_to_f32((uint16_t)(xw[i] >> 16)), acc[m]);
-      }
-    }
-  }
+  cb_fma_x<MT>(s, lane, M, x, K, wv, acc);
 }
 
 template <int MT, int WARPS, bool DB>
@@ -511,12 +519,32 @@ torch::Tensor cb_gemv_fp8(torch::Tensor x, torch::Tensor qw_padded,
 // IDENTICAL compute — only the load schedule differs (the clean bit-identity
 // A/B unit). The word/scale read stays inline so the DB path can inject its
 // prefetch between the read and this compute.
+// Signed-mode (NVFP4_CB_S*, n_sub==1) codeword decode: 8 LSB sign bits
+// (bit j -> coordinate j negative) + a (k-8)-bit magnitude index into ONE
+// non-negative half-grid table of 8-dim entries. The 8 bf16 magnitudes are a
+// single 16-byte gather (entries are 8-element aligned); the sign is applied
+// by flipping the bf16 sign bit (exact), THEN the two-tier scale multiplies
+// and rounds — bit-exact to nvfp4_cb_reconstruct's signed branch.
+DEVINL void fp4v2_signed_gather(uint64_t code, const uint16_t* cb_bf16,
+                                int64_t cb_base, float sc, float* wv) {
+  const uint32_t sign8 = (uint32_t)(code & 0xffu);
+  const int64_t elt = cb_base + (int64_t)(code >> 8) * 8;
+  const uint4 q = __ldg(reinterpret_cast<const uint4*>(cb_bf16 + elt));
+  const uint32_t qw[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    uint16_t b = (uint16_t)((qw[j >> 1] >> ((j & 1) * 16)) & 0xffffu);
+    b = (uint16_t)(b ^ (((sign8 >> j) & 1u) << 15));   // exact sign flip
+    wv[j] = bf16_to_f32(f32_to_bf16_rn(bf16_to_f32(b) * sc));
+  }
+}
+
 template <int MT>
 DEVINL void fp4v2_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
                              uint8_t super_e, uint8_t sub_byte, int grp, int s,
                              int lane, int M, const uint16_t* x, int64_t K,
                              const uint16_t* cb_bf16, int64_t cb_base,
-                             int k_bits, const SubSplit<2, 4>& sp,
+                             int k_bits, int n_sub, const SubSplit<2, 4>& sp,
                              uint64_t code_mask,
                              const float* compose, float* acc) {
   const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
@@ -526,6 +554,11 @@ DEVINL void fp4v2_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
   const uint32_t code16 = (uint32_t)((sub_byte >> ((grp & 1) * 4)) & 0xFu);
   const float sc = __ldg(compose + (int)super_e * 16 + (int)code16);
   float wv[8];
+  if (n_sub == 1) {                              // signed mode (S-rungs)
+    fp4v2_signed_gather(code, cb_bf16, cb_base, sc, wv);
+    cb_fma_x<MT>(s, lane, M, x, K, wv, acc);
+    return;
+  }
 #pragma unroll
   for (int i = 0; i < 2; ++i) {
     const uint32_t idx = (uint32_t)(code >> sp.off[i]) & sp.mask[i];
@@ -536,22 +569,7 @@ DEVINL void fp4v2_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
       wv[i * 4 + local] = bf16_to_f32(f32_to_bf16_rn(val * sc));
     }
   }
-  const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
-#pragma unroll
-  for (int m = 0; m < MT; ++m) {
-    if (m < M) {
-      const uint4 xv = __ldg(
-          reinterpret_cast<const uint4*>(x + (int64_t)m * K + xbase));
-      const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        acc[m] = fmaf(wv[2 * i],
-                      bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc[m]);
-        acc[m] = fmaf(wv[2 * i + 1],
-                      bf16_to_f32((uint16_t)(xw[i] >> 16)), acc[m]);
-      }
-    }
-  }
+  cb_fma_x<MT>(s, lane, M, x, K, wv, acc);
 }
 
 template <int MT, int WARPS, bool DB>
@@ -564,7 +582,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
     uint16_t* __restrict__ y,              // [M, N] bf16 (as u16)
     const int M, const int64_t N, const int64_t K,
     const int64_t qw_stride,
-    const int k_bits, const int type_size) {
+    const int k_bits, const int n_sub, const int type_size) {
   const int64_t n = blockIdx.x;
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x & 31;
@@ -575,7 +593,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
 
   const uint8_t* row = qw + n * qw_stride;
   const int64_t cb_base = (int64_t)__ldg(cboff + n);
-  const SubSplit<2, 4> sp(k_bits);
+  const SubSplit<2, 4> sp(k_bits);        // unused in signed (n_sub==1) mode
   const uint64_t code_mask =
       (k_bits >= 64) ? ~0ull : ((1ull << k_bits) - 1ull);
   const int scale_off = 4 * k_bits;             // base of the 9-byte scale sec.
@@ -620,7 +638,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
             stage[warp][buf ^ 1][b] = __ldcs(gN + b);
         }
         fp4v2_decode_fma<MT>(w0_, w1_, w2_, rem, super_e, sub_byte, grp, s, lane,
-                             M, x, K, cb_bf16, cb_base, k_bits, sp,
+                             M, x, K, cb_bf16, cb_base, k_bits, n_sub, sp,
                              code_mask, compose, acc);
         s = s_next;
         buf ^= 1;
@@ -642,7 +660,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
       const uint8_t sub_byte = stage[warp][0][sub_off];
       __syncwarp();
       fp4v2_decode_fma<MT>(w0_, w1_, w2_, rem, super_e, sub_byte, grp, s, lane,
-                           M, x, K, cb_bf16, cb_base, k_bits, sp,
+                           M, x, K, cb_bf16, cb_base, k_bits, n_sub, sp,
                            code_mask, compose, acc);
     }
   }
@@ -670,7 +688,7 @@ template <int MT>
 void launch_gemv_fp4_v2(const torch::Tensor& xq, const torch::Tensor& qw,
                         const torch::Tensor& cb, const torch::Tensor& cboff,
                         const torch::Tensor& compose, torch::Tensor& y,
-                        int M, int64_t N, int64_t K, int k_bits,
+                        int M, int64_t N, int64_t K, int k_bits, int n_sub,
                         int type_size, cudaStream_t stream) {
   // Same warp-count heuristic as the fp8 dense kernel: a superblock count that
   // divides 4 but not 8 (K=1024 -> 4) leaves a tail at 8 warps; 4 warps divide
@@ -689,7 +707,7 @@ void launch_gemv_fp4_v2(const torch::Tensor& xq, const torch::Tensor& qw,
       reinterpret_cast<const uint16_t*>(cb.data_ptr()),                    \
       cboff.data_ptr<int32_t>(), compose.data_ptr<float>(),                \
       reinterpret_cast<uint16_t*>(y.data_ptr()),                           \
-      M, N, K, qw.stride(0), k_bits, type_size)
+      M, N, K, qw.stride(0), k_bits, n_sub, type_size)
   if (fp4v2_db) {
     if (use4) { PQ_LAUNCH_FP4V2(4, true); } else { PQ_LAUNCH_FP4V2(8, true); }
   } else {
@@ -712,7 +730,10 @@ torch::Tensor cb_gemv_fp4_v2(torch::Tensor x, torch::Tensor qw_padded,
   TORCH_CHECK(compose.scalar_type() == torch::kFloat32 &&
                   compose.numel() == 256 * 16,
               "compose must be the (256*16,) fp32 two-tier table");
-  TORCH_CHECK(n_sub == 2, "fp4-v2 GEMV supports the n_sub=2 rungs only");
+  TORCH_CHECK(n_sub == 2 || n_sub == 1,
+              "fp4-v2 GEMV: n_sub=2 (product) or n_sub=1 (signed S-rungs)");
+  TORCH_CHECK(n_sub == 2 || k_bits > 8,
+              "signed mode needs k > 8 (8 sign bits + magnitude index)");
   TORCH_CHECK(K % 256 == 0, "K must be a multiple of the 256 superblock");
   TORCH_CHECK(type_size == 4 * k_bits + 9,
               "fp4-v2 type_size must be 4k+9 (E8M0 super + 8 sub-nibble bytes)");
@@ -734,19 +755,24 @@ torch::Tensor cb_gemv_fp4_v2(torch::Tensor x, torch::Tensor qw_padded,
   const int m = (int)M;
   if (M <= 1) {
     launch_gemv_fp4_v2<1>(x2, qw_padded, cb_flat, cb_row_offset, compose, y, m,
-                          N, K, (int)k_bits, (int)type_size, stream);
+                          N, K, (int)k_bits, (int)n_sub, (int)type_size,
+                          stream);
   } else if (M <= 2) {
     launch_gemv_fp4_v2<2>(x2, qw_padded, cb_flat, cb_row_offset, compose, y, m,
-                          N, K, (int)k_bits, (int)type_size, stream);
+                          N, K, (int)k_bits, (int)n_sub, (int)type_size,
+                          stream);
   } else if (M <= 4) {
     launch_gemv_fp4_v2<4>(x2, qw_padded, cb_flat, cb_row_offset, compose, y, m,
-                          N, K, (int)k_bits, (int)type_size, stream);
+                          N, K, (int)k_bits, (int)n_sub, (int)type_size,
+                          stream);
   } else if (M <= 8) {
     launch_gemv_fp4_v2<8>(x2, qw_padded, cb_flat, cb_row_offset, compose, y, m,
-                          N, K, (int)k_bits, (int)type_size, stream);
+                          N, K, (int)k_bits, (int)n_sub, (int)type_size,
+                          stream);
   } else {
     launch_gemv_fp4_v2<16>(x2, qw_padded, cb_flat, cb_row_offset, compose, y, m,
-                           N, K, (int)k_bits, (int)type_size, stream);
+                           N, K, (int)k_bits, (int)n_sub, (int)type_size,
+                           stream);
   }
 
   sizes.back() = N;
@@ -897,7 +923,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp4_v2_kernel(
     const int32_t* __restrict__ pair_xrow,    // [P] row of x per pair
     uint16_t* __restrict__ y,              // [P, out] bf16 (as u16)
     const int64_t P, const int64_t Nout, const int64_t K,
-    const int k_bits, const int type_size) {
+    const int k_bits, const int n_sub, const int type_size) {
   const int64_t gb = blockIdx.x;
   const int64_t p = gb / Nout;
   const int64_t n = gb % Nout;
@@ -982,6 +1008,9 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp4_v2_kernel(
     // __floats2bfloat162_rn round was tried and is bit-identical but slower
     // here — the extra pack/unpack outweighs the halved conversions.)
     float wv[8];
+    if (n_sub == 1) {                          // signed mode (S-rungs)
+      fp4v2_signed_gather(code, cb_bf16, 0, sc, wv);
+    } else {
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const uint32_t idx = (uint32_t)(code >> sp.off[i]) & sp.mask[i];
@@ -996,6 +1025,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp4_v2_kernel(
           f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y & 0xffffu)) * sc));
       wv[i * 4 + 3] = bf16_to_f32(
           f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y >> 16)) * sc));
+    }
     }
 
     // --- FMA against x: one 16-byte load per lane -------------------------
@@ -1061,7 +1091,7 @@ __global__ __launch_bounds__(RPB * 32) void cb_moe_gemv_fp4_v2_rowpack_kernel(
     const int32_t* __restrict__ pair_xrow,    // [P] row of x per pair
     uint16_t* __restrict__ y,              // [P, out] bf16 (as u16)
     const int64_t P, const int64_t Nout, const int64_t K,
-    const int k_bits, const int type_size) {
+    const int k_bits, const int n_sub, const int type_size) {
   const int64_t nblk_per_pair = (Nout + RPB - 1) / RPB;
   const int64_t gb = blockIdx.x;
   const int64_t p = gb / nblk_per_pair;
@@ -1132,6 +1162,9 @@ __global__ __launch_bounds__(RPB * 32) void cb_moe_gemv_fp4_v2_rowpack_kernel(
       const float sc = __ldg(compose + (int)super_e * 16 + (int)code16);
 
       float wv[8];
+      if (n_sub == 1) {                        // signed mode (S-rungs)
+        fp4v2_signed_gather(code, cb_bf16, 0, sc, wv);
+      } else {
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
         const uint32_t idx = (uint32_t)(code >> sp.off[i]) & sp.mask[i];
@@ -1145,6 +1178,7 @@ __global__ __launch_bounds__(RPB * 32) void cb_moe_gemv_fp4_v2_rowpack_kernel(
             f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y & 0xffffu)) * sc));
         wv[i * 4 + 3] = bf16_to_f32(
             f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y >> 16)) * sc));
+      }
       }
 
       // FMA against the SHARED smem x (16-byte LDS.128; no gmem/L2 traffic).
@@ -1257,7 +1291,9 @@ torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
               "compose must be the (256*16,) fp32 two-tier table");
   TORCH_CHECK(pair_expert.scalar_type() == torch::kInt32);
   TORCH_CHECK(pair_xrow.scalar_type() == torch::kInt32);
-  TORCH_CHECK(n_sub == 2, "fp4-v2 GEMV supports the n_sub=2 rungs only");
+  TORCH_CHECK(n_sub == 2 || n_sub == 1,
+              "fp4-v2 MoE GEMV: n_sub=2 (product) or n_sub=1 (signed)");
+  TORCH_CHECK(n_sub == 2 || k_bits > 8, "signed mode needs k > 8");
   TORCH_CHECK(type_size == 4 * k_bits + 9,
               "fp4-v2 type_size must be 4k+9 (E8M0 super + 8 sub-nibble bytes)");
   TORCH_CHECK(type_size <= kSlotBytes, "type_size exceeds the smem stage slot");
@@ -1313,7 +1349,7 @@ torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
       compose.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),            \
       pair_xrow.data_ptr<int32_t>(),                                         \
       reinterpret_cast<uint16_t*>(y.data_ptr()),                             \
-      P, Nout, K, (int)k_bits, (int)type_size)
+      P, Nout, K, (int)k_bits, (int)n_sub, (int)type_size)
       switch (rpb) {
         case 4: LAUNCH_FP4V2_ROWPACK(4); break;
         case 16: LAUNCH_FP4V2_ROWPACK(16); break;
@@ -1355,7 +1391,7 @@ torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
       compose.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),            \
       pair_xrow.data_ptr<int32_t>(),                                         \
       reinterpret_cast<uint16_t*>(y.data_ptr()),                             \
-      P, Nout, K, (int)k_bits, (int)type_size)
+      P, Nout, K, (int)k_bits, (int)n_sub, (int)type_size)
   switch (warps) {
     case 1: LAUNCH_FP4V2_MOE(1); break;
     case 2: LAUNCH_FP4V2_MOE(2); break;

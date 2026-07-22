@@ -49,6 +49,7 @@ def _cb_decode_gemm_kernel(
     SUB_W2: tl.constexpr, SUB_W3: tl.constexpr,
     SUB_OFF1: tl.constexpr, SUB_OFF2: tl.constexpr, SUB_OFF3: tl.constexpr,
     SUB_BASE1: tl.constexpr, SUB_BASE2: tl.constexpr, SUB_BASE3: tl.constexpr,
+    SIGNED: tl.constexpr,      # S-rungs: 8 LSB sign bits + (k-8)-bit magnitude
     TYPE_SIZE: tl.constexpr,
     IS_FP4: tl.constexpr,
     LAYOUT_V2: tl.constexpr,   # fp4 two-tier scale plane (9 B, in-kernel compose)
@@ -118,10 +119,21 @@ def _cb_decode_gemm_kernel(
         # reshape [BN,32,8]->[BN,256] maps column kcol -> codeword kcol//8.
         code = tl.reshape(tl.broadcast_to(code32[:, :, None],
                                           (BLOCK_N, 32, 8)), (BLOCK_N, 256))
-        sub_idx = (code >> shift_sub[None, :]) & mask_sub          # [BN,256]
-        gather = (cb_off[:, None] + cb_base[None, :]
-                  + sub_idx * SUB_DIM + local[None, :])
-        val = tl.load(cb_ptr + gather).to(tl.float32)             # [BN,256]
+        if SIGNED:
+            # signed mode: magnitude index above the 8 sign bits; ONE 8-dim
+            # non-negative table (SUB_DIM==8, sub==0). Sign applied to the
+            # magnitude BEFORE the scale multiply (exact negation), matching
+            # nvfp4_cb_reconstruct's signed branch bit-for-bit.
+            sub_idx = code >> 8
+            gather = cb_off[:, None] + sub_idx * SUB_DIM + local[None, :]
+            val = tl.load(cb_ptr + gather).to(tl.float32)         # [BN,256]
+            neg = ((code >> local[None, :]) & 1) == 1
+            val = tl.where(neg, -val, val)
+        else:
+            sub_idx = (code >> shift_sub[None, :]) & mask_sub      # [BN,256]
+            gather = (cb_off[:, None] + cb_base[None, :]
+                      + sub_idx * SUB_DIM + local[None, :])
+            val = tl.load(cb_ptr + gather).to(tl.float32)         # [BN,256]
 
         if IS_FP4:
             # 16 distinct group-16 scales per superblock, broadcast across their
@@ -209,6 +221,7 @@ def cb_decode_linear(
         SUB_W0=ws[0], SUB_W1=ws[1], SUB_W2=ws[2], SUB_W3=ws[3],
         SUB_OFF1=offs[1], SUB_OFF2=offs[2], SUB_OFF3=offs[3],
         SUB_BASE1=bases[1], SUB_BASE2=bases[2], SUB_BASE3=bases[3],
+        SIGNED=(n_sub == 1),
         TYPE_SIZE=type_size, IS_FP4=is_fp4, LAYOUT_V2=is_v2,
         BLOCK_M=block_m, BLOCK_N=block_n,
         num_warps=4, num_stages=2,

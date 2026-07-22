@@ -768,7 +768,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # in-kernel from the packed 9-byte section). fp4-v1 (bare e4m3
             # plane) has no grouped path yet.
             fmt_ok = ((self.n_sub == 4 and not self.is_fp4)
-                      or (self.n_sub == 2 and self.is_fp4 and self.is_v2))
+                      or (self.n_sub in (1, 2) and self.is_fp4
+                          and self.is_v2))
             ok = (fmt_ok and os.environ.get(
                 "PRISMAQUANT_CB_DECODE", "cuda") == "cuda")
             if ok:
