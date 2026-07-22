@@ -195,6 +195,38 @@ struct SubSplit {
 // packed load is issued, so this is the clean bit-identity A/B unit. The word
 // read is left inline in each loop so the DB path can inject its prefetch
 // between the read and this compute (where the overlap lives).
+// DECODE CONTRACT v2 (PRISMAQUANT_CB_DECODE_CONTRACT, default v1 until the
+// served A/B gate): the per-weight bf16(val*scale) round is REMOVED and the
+// scale hoisted out of the hot loop — per-channel scales multiply once per
+// output row at write-out (fp8), per-group-16 scales once per lane-partial
+// (fp4 two-tier: each lane's 8 weights share one group scale). Removes 1-2
+// ops/weight from a chain ncu showed compute-bound (SM 71% vs mem 44%).
+// Mathematically sc*Σ(val*x) == Σ((val*sc)*x) in f32; only v1's per-weight
+// bf16 round differs (ulp-class). The expand/prefill paths already apply
+// scales in the GEMM epilogue, so v2 makes serving MORE self-consistent.
+// cb_fma_x_scaled: per-m 8-weight partial, then acc += sc*partial.
+template <int MT>
+DEVINL void cb_fma_x_scaled(int s, int lane, int M, const uint16_t* x,
+                            int64_t K, const float* wv, float sc,
+                            float* acc) {
+  const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    if (m < M) {
+      const uint4 xv = __ldg(
+          reinterpret_cast<const uint4*>(x + (int64_t)m * K + xbase));
+      const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+      float p = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        p = fmaf(wv[2 * i], bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), p);
+        p = fmaf(wv[2 * i + 1], bf16_to_f32((uint16_t)(xw[i] >> 16)), p);
+      }
+      acc[m] = fmaf(sc, p, acc[m]);
+    }
+  }
+}
+
 // Shared x-FMA tail for the dense decode helpers: identical for the fp8
 // and fp4-v2 (product AND signed) paths — ONE bit-identical epilogue.
 template <int MT>
@@ -223,12 +255,27 @@ DEVINL void fp8_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
                            int s, int lane, int M, const uint16_t* x, int64_t K,
                            const uint16_t* cb16, int64_t cb_base, int k_bits,
                            const SubSplit<4, 2>& sp,
-                           uint64_t code_mask, float sc_row, float* acc) {
+                           uint64_t code_mask, float sc_row, int v2,
+                           float* acc) {
   const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
   uint64_t code = lo >> rem;
   if (rem + k_bits > 64) code |= (uint64_t)w2_ << (64 - rem);
   code &= code_mask;
   float wv[8];
+  if (v2) {
+    // contract v2: raw e4m3 values; sc_row multiplies ONCE at row write-out
+    // (the caller's epilogue), not per weight, and no per-weight round.
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const uint32_t idx = (uint32_t)(code >> sp.off[i]) & sp.mask[i];
+      const int64_t elt = cb_base + sp.elt[i] + (int64_t)idx * 2;
+      const uint16_t pair = __ldg(cb16 + (elt >> 1));
+      wv[2 * i] = e4m3_to_f32((uint8_t)(pair & 0xffu));
+      wv[2 * i + 1] = e4m3_to_f32((uint8_t)(pair >> 8));
+    }
+    cb_fma_x<MT>(s, lane, M, x, K, wv, acc);
+    return;
+  }
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     const uint32_t idx = (uint32_t)(code >> sp.off[i]) & sp.mask[i];
@@ -252,7 +299,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
     uint16_t* __restrict__ y,              // [M, N] bf16 (as u16)
     const int M, const int64_t N, const int64_t K,
     const int64_t qw_stride,
-    const int k_bits, const int type_size) {
+    const int k_bits, const int type_size, const int v2) {
   const int64_t n = blockIdx.x;
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x & 31;
@@ -316,7 +363,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
           if (lane < stage_vecs) dN[lane] = __ldcs(gN + lane);
         }
         fp8_decode_fma<MT>(w0_, w1_, w2_, rem, s, lane, M, x, K, cb16, cb_base,
-                           k_bits, sp, code_mask, sc_row, acc);
+                           k_bits, sp, code_mask, sc_row, v2, acc);
         s = s_next;
         buf ^= 1;
       }
@@ -334,7 +381,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
         const uint32_t w2_ = s32[widx + 2];
         __syncwarp();
         fp8_decode_fma<MT>(w0_, w1_, w2_, rem, s, lane, M, x, K, cb16, cb_base,
-                           k_bits, sp, code_mask, sc_row, acc);
+                           k_bits, sp, code_mask, sc_row, v2, acc);
       }
     }
   } else {
@@ -357,7 +404,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
       const uint32_t w2_ = s32[widx + 2];
       __syncwarp();
       fp8_decode_fma<MT>(w0_, w1_, w2_, rem, s, lane, M, x, K, cb16, cb_base,
-                         k_bits, sp, code_mask, sc_row, acc);
+                         k_bits, sp, code_mask, sc_row, v2, acc);
     }
   }
 
@@ -376,6 +423,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
     float total = 0.0f;
 #pragma unroll
     for (int w = 0; w < WARPS; ++w) total += red[w][lane];
+    if (v2) total *= sc_row;               // contract v2: scale in epilogue
     y[(int64_t)lane * N + n] = f32_to_bf16_rn(total);
   }
 }
@@ -420,6 +468,7 @@ void launch_gemv(const torch::Tensor& xq, const torch::Tensor& qw,
   // an interleaved A/B and serving bisection). Read per call: host-only,
   // CUDA-graph-capture-safe, negligible.
   const bool fp8_db = !pq_env_is("PRISMAQUANT_CB_FP8_SCHED", "legacy");
+  const int v2 = pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2") ? 1 : 0;
 #define PQ_LAUNCH(W, DBFLAG)                                               \
   cb_gemv_fp8_kernel<MT, W, DBFLAG><<<(unsigned)N, (W)*32, 0, stream>>>(   \
       reinterpret_cast<const uint16_t*>(xq.data_ptr()),                    \
@@ -427,7 +476,7 @@ void launch_gemv(const torch::Tensor& xq, const torch::Tensor& qw,
       reinterpret_cast<const uint16_t*>(cb.data_ptr()),                    \
       cboff.data_ptr<int32_t>(), scale.data_ptr<float>(),                  \
       reinterpret_cast<uint16_t*>(y.data_ptr()),                           \
-      M, N, K, qw.stride(0), k_bits, type_size)
+      M, N, K, qw.stride(0), k_bits, type_size, v2)
   if (fp8_db) {
     if (use4) { PQ_LAUNCH(4, true); } else { PQ_LAUNCH(8, true); }
   } else {
@@ -526,7 +575,7 @@ torch::Tensor cb_gemv_fp8(torch::Tensor x, torch::Tensor qw_padded,
 // by flipping the bf16 sign bit (exact), THEN the two-tier scale multiplies
 // and rounds — bit-exact to nvfp4_cb_reconstruct's signed branch.
 DEVINL void fp4v2_signed_gather(uint64_t code, const uint16_t* cb_bf16,
-                                int64_t cb_base, float sc, float* wv) {
+                                int64_t cb_base, float sc, int v2, float* wv) {
   const uint32_t sign8 = (uint32_t)(code & 0xffu);
   const int64_t elt = cb_base + (int64_t)(code >> 8) * 8;
   const uint4 q = __ldg(reinterpret_cast<const uint4*>(cb_bf16 + elt));
@@ -535,7 +584,10 @@ DEVINL void fp4v2_signed_gather(uint64_t code, const uint16_t* cb_bf16,
   for (int j = 0; j < 8; ++j) {
     uint16_t b = (uint16_t)((qw[j >> 1] >> ((j & 1) * 16)) & 0xffffu);
     b = (uint16_t)(b ^ (((sign8 >> j) & 1u) << 15));   // exact sign flip
-    wv[j] = bf16_to_f32(f32_to_bf16_rn(bf16_to_f32(b) * sc));
+    // v2: raw signed magnitude — the group scale multiplies the lane
+    // PARTIAL once (cb_fma_x_scaled), not each weight, and no round.
+    wv[j] = v2 ? bf16_to_f32(b)
+               : bf16_to_f32(f32_to_bf16_rn(bf16_to_f32(b) * sc));
   }
 }
 
@@ -546,7 +598,7 @@ DEVINL void fp4v2_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
                              const uint16_t* cb_bf16, int64_t cb_base,
                              int k_bits, int n_sub, const SubSplit<2, 4>& sp,
                              uint64_t code_mask,
-                             const float* compose, float* acc) {
+                             const float* compose, int v2, float* acc) {
   const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
   uint64_t code = lo >> rem;
   if (rem + k_bits > 64) code |= (uint64_t)w2_ << (64 - rem);
@@ -555,8 +607,9 @@ DEVINL void fp4v2_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
   const float sc = __ldg(compose + (int)super_e * 16 + (int)code16);
   float wv[8];
   if (n_sub == 1) {                              // signed mode (S-rungs)
-    fp4v2_signed_gather(code, cb_bf16, cb_base, sc, wv);
-    cb_fma_x<MT>(s, lane, M, x, K, wv, acc);
+    fp4v2_signed_gather(code, cb_bf16, cb_base, sc, v2, wv);
+    if (v2) cb_fma_x_scaled<MT>(s, lane, M, x, K, wv, sc, acc);
+    else cb_fma_x<MT>(s, lane, M, x, K, wv, acc);
     return;
   }
 #pragma unroll
@@ -566,10 +619,14 @@ DEVINL void fp4v2_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
 #pragma unroll
     for (int local = 0; local < 4; ++local) {
       const float val = bf16_to_f32(__ldg(cb_bf16 + elt + local));
-      wv[i * 4 + local] = bf16_to_f32(f32_to_bf16_rn(val * sc));
+      // v2: raw codebook value; the lane's 8 weights share ONE group-16
+      // scale, applied once to the partial in cb_fma_x_scaled.
+      wv[i * 4 + local] = v2 ? val
+                             : bf16_to_f32(f32_to_bf16_rn(val * sc));
     }
   }
-  cb_fma_x<MT>(s, lane, M, x, K, wv, acc);
+  if (v2) cb_fma_x_scaled<MT>(s, lane, M, x, K, wv, sc, acc);
+  else cb_fma_x<MT>(s, lane, M, x, K, wv, acc);
 }
 
 template <int MT, int WARPS, bool DB>
@@ -582,7 +639,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
     uint16_t* __restrict__ y,              // [M, N] bf16 (as u16)
     const int M, const int64_t N, const int64_t K,
     const int64_t qw_stride,
-    const int k_bits, const int n_sub, const int type_size) {
+    const int k_bits, const int n_sub, const int type_size, const int v2) {
   const int64_t n = blockIdx.x;
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x & 31;
@@ -639,7 +696,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
         }
         fp4v2_decode_fma<MT>(w0_, w1_, w2_, rem, super_e, sub_byte, grp, s, lane,
                              M, x, K, cb_bf16, cb_base, k_bits, n_sub, sp,
-                             code_mask, compose, acc);
+                             code_mask, compose, v2, acc);
         s = s_next;
         buf ^= 1;
       }
@@ -661,7 +718,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
       __syncwarp();
       fp4v2_decode_fma<MT>(w0_, w1_, w2_, rem, super_e, sub_byte, grp, s, lane,
                            M, x, K, cb_bf16, cb_base, k_bits, n_sub, sp,
-                           code_mask, compose, acc);
+                           code_mask, compose, v2, acc);
     }
   }
 
@@ -700,6 +757,7 @@ void launch_gemv_fp4_v2(const torch::Tensor& xq, const torch::Tensor& qw,
   // prefetch double buffer is a candidate; it is measured vs legacy via the env
   // switch and only defaulted on after a served-KL-safe A/B (bit-identical).
   const bool fp4v2_db = pq_env_is("PRISMAQUANT_CB_FP4V2_SCHED", "db");
+  const int v2 = pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2") ? 1 : 0;
 #define PQ_LAUNCH_FP4V2(W, DBFLAG)                                          \
   cb_gemv_fp4_v2_kernel<MT, W, DBFLAG><<<(unsigned)N, (W)*32, 0, stream>>>( \
       reinterpret_cast<const uint16_t*>(xq.data_ptr()),                    \
@@ -707,7 +765,7 @@ void launch_gemv_fp4_v2(const torch::Tensor& xq, const torch::Tensor& qw,
       reinterpret_cast<const uint16_t*>(cb.data_ptr()),                    \
       cboff.data_ptr<int32_t>(), compose.data_ptr<float>(),                \
       reinterpret_cast<uint16_t*>(y.data_ptr()),                           \
-      M, N, K, qw.stride(0), k_bits, n_sub, type_size)
+      M, N, K, qw.stride(0), k_bits, n_sub, type_size, v2)
   if (fp4v2_db) {
     if (use4) { PQ_LAUNCH_FP4V2(4, true); } else { PQ_LAUNCH_FP4V2(8, true); }
   } else {
@@ -798,7 +856,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp8_kernel(
     const int32_t* __restrict__ pair_xrow,    // [P] row of x per pair
     uint16_t* __restrict__ y,              // [P, out] bf16 (as u16)
     const int64_t P, const int64_t Nout, const int64_t K,
-    const int k_bits, const int type_size) {
+    const int k_bits, const int type_size, const int v2) {
   const int64_t g = blockIdx.x;
   const int64_t p = g / Nout;
   const int64_t n = g % Nout;
@@ -859,10 +917,15 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp8_kernel(
       const uint32_t idx = (uint32_t)(code >> sp.off[i]) & sp.mask[i];
       const int64_t elt = sp.elt[i] + (int64_t)idx * 2;
       const uint16_t pair2 = __ldg(cb16 + (elt >> 1));
-      wv[2 * i] = bf16_to_f32(
-          f32_to_bf16_rn(e4m3_to_f32((uint8_t)(pair2 & 0xffu)) * sc_row));
-      wv[2 * i + 1] = bf16_to_f32(
-          f32_to_bf16_rn(e4m3_to_f32((uint8_t)(pair2 >> 8)) * sc_row));
+      if (v2) {                     // contract v2: raw values, sc in epilogue
+        wv[2 * i] = e4m3_to_f32((uint8_t)(pair2 & 0xffu));
+        wv[2 * i + 1] = e4m3_to_f32((uint8_t)(pair2 >> 8));
+      } else {
+        wv[2 * i] = bf16_to_f32(
+            f32_to_bf16_rn(e4m3_to_f32((uint8_t)(pair2 & 0xffu)) * sc_row));
+        wv[2 * i + 1] = bf16_to_f32(
+            f32_to_bf16_rn(e4m3_to_f32((uint8_t)(pair2 >> 8)) * sc_row));
+      }
     }
 
     const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
@@ -887,6 +950,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp8_kernel(
     float total = 0.0f;
 #pragma unroll
     for (int w = 0; w < WARPS; ++w) total += red[w];
+    if (v2) total *= sc_row;               // contract v2: scale in epilogue
     y[p * Nout + n] = f32_to_bf16_rn(total);
   }
 }
@@ -923,7 +987,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp4_v2_kernel(
     const int32_t* __restrict__ pair_xrow,    // [P] row of x per pair
     uint16_t* __restrict__ y,              // [P, out] bf16 (as u16)
     const int64_t P, const int64_t Nout, const int64_t K,
-    const int k_bits, const int n_sub, const int type_size) {
+    const int k_bits, const int n_sub, const int type_size, const int v2) {
   const int64_t gb = blockIdx.x;
   const int64_t p = gb / Nout;
   const int64_t n = gb % Nout;
@@ -1009,13 +1073,19 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp4_v2_kernel(
     // here — the extra pack/unpack outweighs the halved conversions.)
     float wv[8];
     if (n_sub == 1) {                          // signed mode (S-rungs)
-      fp4v2_signed_gather(code, cb_bf16, 0, sc, wv);
+      fp4v2_signed_gather(code, cb_bf16, 0, sc, v2, wv);
     } else {
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const uint32_t idx = (uint32_t)(code >> sp.off[i]) & sp.mask[i];
       const int64_t elt = sp.elt[i] + (int64_t)idx * 4;
       const uint2 quad = __ldg(reinterpret_cast<const uint2*>(cb_bf16 + elt));
+      if (v2) {            // contract v2: raw values, sc scales the partial
+        wv[i * 4 + 0] = bf16_to_f32((uint16_t)(quad.x & 0xffffu));
+        wv[i * 4 + 1] = bf16_to_f32((uint16_t)(quad.x >> 16));
+        wv[i * 4 + 2] = bf16_to_f32((uint16_t)(quad.y & 0xffffu));
+        wv[i * 4 + 3] = bf16_to_f32((uint16_t)(quad.y >> 16));
+      } else {
       // Match the loop bit-for-bit: w = bf16_rn(f32(cb_value) * f32(scale)).
       wv[i * 4 + 0] = bf16_to_f32(
           f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.x & 0xffffu)) * sc));
@@ -1025,6 +1095,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp4_v2_kernel(
           f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y & 0xffffu)) * sc));
       wv[i * 4 + 3] = bf16_to_f32(
           f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y >> 16)) * sc));
+      }
     }
     }
 
@@ -1032,12 +1103,24 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp4_v2_kernel(
     const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
     const uint4 xv = __ldg(reinterpret_cast<const uint4*>(xr + xbase));
     const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+    if (v2) {
+      float ppart = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        ppart = fmaf(wv[2 * i],
+                     bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), ppart);
+        ppart = fmaf(wv[2 * i + 1],
+                     bf16_to_f32((uint16_t)(xw[i] >> 16)), ppart);
+      }
+      acc = fmaf(sc, ppart, acc);
+    } else {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       acc = fmaf(wv[2 * i],
                  bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc);
       acc = fmaf(wv[2 * i + 1],
                  bf16_to_f32((uint16_t)(xw[i] >> 16)), acc);
+    }
     }
   }
 
@@ -1091,7 +1174,7 @@ __global__ __launch_bounds__(RPB * 32) void cb_moe_gemv_fp4_v2_rowpack_kernel(
     const int32_t* __restrict__ pair_xrow,    // [P] row of x per pair
     uint16_t* __restrict__ y,              // [P, out] bf16 (as u16)
     const int64_t P, const int64_t Nout, const int64_t K,
-    const int k_bits, const int n_sub, const int type_size) {
+    const int k_bits, const int n_sub, const int type_size, const int v2) {
   const int64_t nblk_per_pair = (Nout + RPB - 1) / RPB;
   const int64_t gb = blockIdx.x;
   const int64_t p = gb / nblk_per_pair;
@@ -1163,13 +1246,19 @@ __global__ __launch_bounds__(RPB * 32) void cb_moe_gemv_fp4_v2_rowpack_kernel(
 
       float wv[8];
       if (n_sub == 1) {                        // signed mode (S-rungs)
-        fp4v2_signed_gather(code, cb_bf16, 0, sc, wv);
+        fp4v2_signed_gather(code, cb_bf16, 0, sc, v2, wv);
       } else {
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
         const uint32_t idx = (uint32_t)(code >> sp.off[i]) & sp.mask[i];
         const int64_t elt = sp.elt[i] + (int64_t)idx * 4;
         const uint2 quad = __ldg(reinterpret_cast<const uint2*>(cb_bf16 + elt));
+        if (v2) {
+          wv[i * 4 + 0] = bf16_to_f32((uint16_t)(quad.x & 0xffffu));
+          wv[i * 4 + 1] = bf16_to_f32((uint16_t)(quad.x >> 16));
+          wv[i * 4 + 2] = bf16_to_f32((uint16_t)(quad.y & 0xffffu));
+          wv[i * 4 + 3] = bf16_to_f32((uint16_t)(quad.y >> 16));
+        } else {
         wv[i * 4 + 0] = bf16_to_f32(
             f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.x & 0xffffu)) * sc));
         wv[i * 4 + 1] = bf16_to_f32(
@@ -1178,6 +1267,7 @@ __global__ __launch_bounds__(RPB * 32) void cb_moe_gemv_fp4_v2_rowpack_kernel(
             f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y & 0xffffu)) * sc));
         wv[i * 4 + 3] = bf16_to_f32(
             f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y >> 16)) * sc));
+        }
       }
       }
 
@@ -1186,12 +1276,24 @@ __global__ __launch_bounds__(RPB * 32) void cb_moe_gemv_fp4_v2_rowpack_kernel(
       const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
       const uint4 xv = *reinterpret_cast<const uint4*>(x_smem + xbase);
       const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+      if (v2) {
+        float ppart = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          ppart = fmaf(wv[2 * i],
+                       bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), ppart);
+          ppart = fmaf(wv[2 * i + 1],
+                       bf16_to_f32((uint16_t)(xw[i] >> 16)), ppart);
+        }
+        acc = fmaf(sc, ppart, acc);
+      } else {
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         acc = fmaf(wv[2 * i],
                    bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc);
         acc = fmaf(wv[2 * i + 1],
                    bf16_to_f32((uint16_t)(xw[i] >> 16)), acc);
+      }
       }
     }
     // One warp owns the whole row -> 32-lane tree reduce, direct write.
@@ -1252,6 +1354,7 @@ torch::Tensor cb_moe_gemv_fp8(torch::Tensor xq, torch::Tensor qw_stack,
   if (P == 0) return y;
   const int n_sb = (int)(K >> 8);
   const bool use4 = (n_sb % 8 != 0) && (n_sb % 4 == 0) && (n_sb < 48);
+  const int v2 = pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2") ? 1 : 0;
   const int64_t grid = P * Nout;
   if (use4) {
     cb_moe_gemv_fp8_kernel<4><<<(unsigned)grid, 128, 0, stream>>>(
@@ -1261,7 +1364,7 @@ torch::Tensor cb_moe_gemv_fp8(torch::Tensor xq, torch::Tensor qw_stack,
         scale.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),
         pair_xrow.data_ptr<int32_t>(),
         reinterpret_cast<uint16_t*>(y.data_ptr()),
-        P, Nout, K, (int)k_bits, (int)type_size);
+        P, Nout, K, (int)k_bits, (int)type_size, v2);
   } else {
     cb_moe_gemv_fp8_kernel<8><<<(unsigned)grid, 256, 0, stream>>>(
         reinterpret_cast<const uint16_t*>(xq.data_ptr()),
@@ -1270,7 +1373,7 @@ torch::Tensor cb_moe_gemv_fp8(torch::Tensor xq, torch::Tensor qw_stack,
         scale.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),
         pair_xrow.data_ptr<int32_t>(),
         reinterpret_cast<uint16_t*>(y.data_ptr()),
-        P, Nout, K, (int)k_bits, (int)type_size);
+        P, Nout, K, (int)k_bits, (int)type_size, v2);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
@@ -1331,6 +1434,7 @@ torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
   //   rowpack -> round-3 item A: RPB rows/block sharing a smem-resident x row
   //   default (unset / anything else) -> round-2 schedule (~3 superblocks/warp)
   const bool w2_legacy = pq_env_is("PRISMAQUANT_CB_W2_SCHED", "legacy");
+  const int v2 = pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2") ? 1 : 0;
   const bool w2_rowpack = pq_env_is("PRISMAQUANT_CB_W2_SCHED", "rowpack");
 
   // --- ROWPACK: one block = RPB output rows of one pair, sharing a smem x ----
@@ -1349,7 +1453,7 @@ torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
       compose.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),            \
       pair_xrow.data_ptr<int32_t>(),                                         \
       reinterpret_cast<uint16_t*>(y.data_ptr()),                             \
-      P, Nout, K, (int)k_bits, (int)n_sub, (int)type_size)
+      P, Nout, K, (int)k_bits, (int)n_sub, (int)type_size, v2)
       switch (rpb) {
         case 4: LAUNCH_FP4V2_ROWPACK(4); break;
         case 16: LAUNCH_FP4V2_ROWPACK(16); break;
@@ -1391,7 +1495,7 @@ torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
       compose.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),            \
       pair_xrow.data_ptr<int32_t>(),                                         \
       reinterpret_cast<uint16_t*>(y.data_ptr()),                             \
-      P, Nout, K, (int)k_bits, (int)n_sub, (int)type_size)
+      P, Nout, K, (int)k_bits, (int)n_sub, (int)type_size, v2)
   switch (warps) {
     case 1: LAUNCH_FP4V2_MOE(1); break;
     case 2: LAUNCH_FP4V2_MOE(2); break;
