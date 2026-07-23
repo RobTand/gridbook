@@ -54,6 +54,18 @@ def _install_toplevel_cb_expert_loaders() -> None:
     else:
         install_toplevel_cb_expert_loader(HYV3MTP)
 
+    # poolside Laguna (S/XS 2.x) — 48-layer 256-expert MoE; vLLM's class maps
+    # experts per-expert (`experts.{eid}.gate_proj`) at the top level, so the
+    # stacked-CB tensors (`experts.gate_up_proj.cb_qweight`) need the same
+    # wrap as Hy3. The DFlash drafter is a separate vLLM class; add it here
+    # when a CB-quantized drafter ships.
+    try:
+        from vllm.model_executor.models.laguna import LagunaForCausalLM
+    except ImportError:
+        pass
+    else:
+        install_toplevel_cb_expert_loader(LagunaForCausalLM)
+
     # DSv4-class and any future top-level-expert-mapping MoE arch: add a guarded
     # import + install_toplevel_cb_expert_loader(<cls>) line here.
 

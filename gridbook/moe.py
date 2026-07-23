@@ -327,7 +327,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         #     codec.fp8_dynamic_act_qdq — test_stock_fp8_quant_matches_codec),
         #     fp4-v2 runs codec.fp4_group16_act_qdq explicitly on the module input
         #     AND the intermediate. Opt-in: PRISMAQUANT_CB_PREFILL=stock.
-        mode = os.environ.get("PRISMAQUANT_CB_PREFILL", "loop")
+        # Default: fp8-CB rides 'stock' (vLLM's own fused-MoE grouped kernel
+        # over CUDA-expanded e4m3 chunks — measured 5.5x the loop on
+        # Laguna-256E, 2026-07-23, with the slack-gate discipline bounding
+        # the ~1.6 GB chunk transient). fp4-CB keeps 'loop' until its stock
+        # variant (bf16 expand) gets the same at-scale measurement.
+        mode = os.environ.get("PRISMAQUANT_CB_PREFILL") or (
+            "stock" if not self.is_fp4 else "loop")
         if mode == "loop":
             return self._apply_prefill_loop(
                 layer, x, topk_weights, topk_ids, act)
@@ -401,7 +407,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 "PRISMAQUANT_CB_PREFILL_GROUPED_MM", "0") == "1"
         if chunk is None:
             chunk = int(os.environ.get(
-                "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", "64"))
+                "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK") or "64")
         chunk = max(1, chunk)
         T = x.shape[0]
         topk = topk_ids.shape[-1]
@@ -614,7 +620,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
         if chunk is None:
             chunk = int(os.environ.get(
-                "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", "16"))
+                "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK") or "256")
         chunk = max(1, chunk)
         is_fp8 = not self.is_fp4
         E = layer._cb_E
@@ -644,40 +650,63 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # Input activation quant is x-only -> compute ONCE (only the intermediate
         # a2 is per-chunk). fp8: vLLM per-token fp8 dynamic (== codec, proven);
         # fp4-v2: our group-16 RTN, run explicitly.
+        _timing = os.environ.get("PRISMAQUANT_CB_PREFILL_TIMING") == "1"
+        if _timing:
+            torch.cuda.synchronize()
+            _t = {"qdq": 0.0, "align": 0.0, "expand": 0.0, "gemm": 0.0,
+                  "act": 0.0, "combine": 0.0}
+            import time as _time
+            _tw0 = _time.time()
+            _t0 = _time.time()
         if is_fp8:
             a1, a1s = moe_kernel_quantize_input(
                 x, None, fp8_dtype, per_act_token_quant=True)
         else:
             a1 = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
             a1s = None
+        if _timing:
+            torch.cuda.synchronize(); _t["qdq"] += _time.time() - _t0
 
         for c0 in range(0, E, chunk):                 # FIXED trip = ceil(E/chunk)
             c1 = min(E, c0 + chunk)
             expert_map = self._stock_chunk_expert_map(c0, c1, E, dev)
             # Device-side routing for THIS expert shard (local ids, out-of-chunk
             # pairs excluded). Shared verbatim by both projections.
+            if _timing: _t0 = _time.time()
             sorted_ids, expert_ids, num_pad = moe_align_block_size(
                 topk_ids_i, block_m, E, expert_map, ignore_invalid_experts=True)
+            if _timing:
+                torch.cuda.synchronize(); _t["align"] += _time.time() - _t0
 
             # ---- stage 1: gate_up = x @ W13[e]^T -------------------------------
+            if _timing: _t0 = _time.time()
             W13 = self._expand_stack_slice(layer, "w13", c0, c1, to_fp8=is_fp8)
+            if _timing:
+                torch.cuda.synchronize(); _t["expand"] += _time.time() - _t0
             ic1 = torch.empty((M, top_k, N1), dtype=x.dtype, device=dev)
             b1s = layer.w13_weight_scale[c0:c1] if is_fp8 else None    # [nE, 2i]
+            if _timing: _t0 = _time.time()
             dispatch_fused_moe_kernel(
                 a1, W13, ic1, a1s, b1s, None, topk_weights, sorted_ids,
                 expert_ids, num_pad, False, top_k, config,
                 compute_type=compute_type, use_fp8_w8a8=is_fp8,
                 use_int8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=False,
                 per_channel_quant=is_fp8, block_shape=None, B_bias=None)
+            if _timing:
+                torch.cuda.synchronize(); _t["gemm"] += _time.time() - _t0
             del W13
 
             # silu(gate)*up over the routed rows (garbage in unrouted rows is
             # never read by stage 2 — same masking as fused_experts_impl).
             ic2 = torch.empty((M * top_k, d), dtype=x.dtype, device=dev)
+            if _timing: _t0 = _time.time()
             apply_moe_activation(act, ic2, ic1.view(-1, N1))
+            if _timing:
+                torch.cuda.synchronize(); _t["act"] += _time.time() - _t0
             del ic1
 
             # ---- intermediate activation QDQ (part of the numerics) -----------
+            if _timing: _t0 = _time.time()
             if is_fp8:
                 a2, a2s = moe_kernel_quantize_input(
                     ic2, None, fp8_dtype, per_act_token_quant=True)
@@ -685,23 +714,40 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             else:
                 a2 = codec.fp4_group16_act_qdq(ic2).to(torch.bfloat16)
                 a2s = b2s = None
+            if _timing:
+                torch.cuda.synchronize(); _t["qdq"] += _time.time() - _t0
             del ic2
 
             # ---- stage 2: y = a @ W2[e]^T, router-weighted --------------------
+            if _timing: _t0 = _time.time()
             W2 = self._expand_stack_slice(layer, "w2", c0, c1, to_fp8=is_fp8)
+            if _timing:
+                torch.cuda.synchronize(); _t["expand"] += _time.time() - _t0
             ic3 = torch.empty((M, top_k, Kh), dtype=x.dtype, device=dev)
             ic3.zero_()                                       # out-of-chunk slots
+            if _timing: _t0 = _time.time()
             dispatch_fused_moe_kernel(
                 a2, W2, ic3, a2s, b2s, None, topk_weights, sorted_ids,
                 expert_ids, num_pad, True, 1, config,
                 compute_type=compute_type, use_fp8_w8a8=is_fp8,
                 use_int8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=False,
                 per_channel_quant=is_fp8, block_shape=None, B_bias=None)
+            if _timing:
+                torch.cuda.synchronize(); _t["gemm"] += _time.time() - _t0
             del W2
             # Combine this shard's top_k contributions and accumulate (the loop's
             # index_add_ over experts, one expert-partition per chunk).
+            if _timing: _t0 = _time.time()
             out += ic3.sum(dim=1).to(out.dtype)
             del ic3
+            if _timing:
+                torch.cuda.synchronize(); _t["combine"] += _time.time() - _t0
+        if _timing:
+            _tot = _time.time() - _tw0
+            _acc = sum(_t.values())
+            print(f"[cb-prefill-timing] M={M} total={_tot*1000:.0f}ms "
+                  + " ".join(f"{k}={v*1000:.0f}ms" for k, v in _t.items())
+                  + f" other={(_tot-_acc)*1000:.0f}ms", flush=True)
         return out
 
     @staticmethod
@@ -728,17 +774,35 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         nE = c1 - c0
         out_f = packed.shape[1]
         in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
-        qwp = codec.pad_qweight(packed.reshape(nE * out_f, -1).contiguous())
         row0 = torch.zeros(nE * out_f, dtype=torch.int32, device=packed.device)
         if to_fp8:                                                # fp8 bytes
-            W = expand_cb_to_fp8(
-                qwp, self._stock_cb_flat_fp8(layer), row0, nE * out_f, in_f,
-                self.k, self.n_sub, self.type_size)
+            # CUDA expander (2.1x the Triton one, byte-identical) on the RAW
+            # slice view: the kernel stages exactly type_size bytes per
+            # superblock into smem, so it needs neither the +8 row pad nor
+            # the .contiguous() copy the Triton path required — that pair
+            # cost ~26 ms/layer of pure memcpy on Laguna-256E prefill.
+            # PRISMAQUANT_CB_EXPAND=triton restores the old path (bisection).
+            if os.environ.get("PRISMAQUANT_CB_EXPAND") == "triton":
+                qwp = codec.pad_qweight(
+                    packed.reshape(nE * out_f, -1).contiguous())
+                W = expand_cb_to_fp8(
+                    qwp, self._stock_cb_flat_fp8(layer), row0, nE * out_f,
+                    in_f, self.k, self.n_sub, self.type_size)
+            else:
+                from . import ops as pq_ops
+                W = pq_ops.cb_expand_fp8(
+                    packed.reshape(nE * out_f, -1),
+                    self._stock_cb_flat_fp8(layer), row0, nE * out_f, in_f,
+                    self.k, self.n_sub, self.type_size)
         elif self.is_fp4:                                         # fp4 two-tier v2
+            qwp = codec.pad_qweight(
+                packed.reshape(nE * out_f, -1).contiguous())
             W = expand_fp4_v2_to_weight(
                 qwp, layer._cb_flat, row0, layer._cb_compose, nE * out_f, in_f,
                 self.k, self.n_sub, self.type_size)
         else:                                                     # fp8 -> bf16
+            qwp = codec.pad_qweight(
+                packed.reshape(nE * out_f, -1).contiguous())
             val = expand_cb_to_value(qwp, layer._cb_flat, row0, nE * out_f, in_f,
                                      self.k, self.n_sub, self.type_size,
                                      is_fp4=False)
