@@ -28,6 +28,10 @@ from typing import NamedTuple
 
 _MB = 1024 * 1024
 
+#: Candidate/mode name, shared by ``PRISMAQUANT_CB_PREFILL`` and the R3 tuner
+#: so an operator pins and a measurement reports the SAME string.
+L2_PIPELINE = "l2_pipeline"
+
 
 class L2Plan(NamedTuple):
     """The per-(layer, stage-set) scratch plan.
@@ -119,6 +123,72 @@ def cb_l2_plan(num_experts: int, expert_bytes: int, cap_bytes: int,
     buf = gs * int(expert_bytes)
     return L2Plan(group_size=gs, groups=groups, buffer_bytes=buf,
                   arena_bytes=2 * buf)
+
+
+#: Rows below which the R4 pipeline is pure overhead and MUST fall through.
+#: It is the mid-M upper bound the rest of this plugin already uses as the
+#: boundary between "one GEMM per expert is amortised" and "launch/bookkeeping
+#: dominates". A per-EXPERT pipeline at a couple of dozen rows issues 2 launches
+#: per live group to move a handful of rows, so no L2 residency can pay for it.
+#: The R3 auto-tuner never proposes R4 below M>=1024, but
+#: ``PRISMAQUANT_CB_PREFILL=l2_pipeline`` (the DIRECT mode a measurement session
+#: uses) bypasses the tuner entirely — a live serve took that mode and drove a
+#: 17-row prefill straight into the pipeline. The floor therefore belongs in the
+#: path, not in the tuner.
+CB_L2_DEFAULT_MIN_M = 128
+
+
+def cb_l2_min_m(env_value=None) -> int:
+    """Minimum token rows for the R4 path (``PRISMAQUANT_CB_L2_MIN_M``).
+
+    An unparseable or negative override falls back to the default rather than
+    disabling the floor: a typo must not re-open the regime the floor exists to
+    close. ``0`` is honoured (explicitly "no floor") because the GPU parity
+    tests run tiny shapes on purpose.
+    """
+    if env_value is None or env_value == "":
+        return CB_L2_DEFAULT_MIN_M
+    try:
+        v = int(env_value)
+    except (TypeError, ValueError):
+        return CB_L2_DEFAULT_MIN_M
+    return v if v >= 0 else CB_L2_DEFAULT_MIN_M
+
+
+def cb_l2_pin_action(current_key, new_key):
+    """Pin-window lifecycle as a PURE decision, so it is testable without CUDA.
+
+    ``cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize)`` and
+    ``cudaCtxResetPersistingL2Cache`` are DEVICE-WIDE and implicitly
+    synchronizing. Calling them per layer per forward (the round-4 original)
+    put ~2 device syncs on every layer of every forward — a
+    throughput-to-zero mechanism on its own, independent of any L2 benefit.
+
+    So the window is pinned ONCE per ``(arena address, stream)`` and remembered.
+    Returns ``(unpin_first, pin)``:
+
+      * key unchanged  -> ``(False, False)`` — the steady state, zero CUDA calls.
+      * key changed    -> ``(True, True)``  — release the stale window (its
+        address range no longer exists / no longer belongs to this stream)
+        before claiming the new one.
+      * first pin      -> ``(False, True)``.
+      * ``new_key is None`` (arena released) -> ``(True, False)``.
+
+    TRADEOFF, stated explicitly: leaving the carve-out set for the life of the
+    serve is a real cost to every other kernel on the device, because the
+    persisting reservation shrinks the L2 available to normal accesses. It is
+    accepted here because the reservation SIZE is bounded by the same derived
+    cap for every layer (``cb_l2_cap_bytes``, at most half the device's
+    persisting capacity) and every layer's arena is pinned by this same
+    mechanism, so the steady state is "one bounded carve-out, re-aimed at
+    whichever arena is live" rather than an accumulation. The alternative —
+    unpin in a per-forward ``finally`` — is what wedged the serve.
+    """
+    if new_key is None:
+        return (current_key is not None, False)
+    if current_key == new_key:
+        return (False, False)
+    return (current_key is not None, True)
 
 
 def cb_l2_live_groups(groups, bounds):

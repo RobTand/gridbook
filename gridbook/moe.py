@@ -46,6 +46,14 @@ from .expand import (
     expand_fp4_v2_to_weight,
 )
 from .moe_autotune import STOCK as _AUTO_STOCK, cb_prefill_auto
+from .moe_l2 import (
+    L2_PIPELINE,
+    cb_l2_cap_bytes,
+    cb_l2_live_groups,
+    cb_l2_min_m,
+    cb_l2_pin_action,
+    cb_l2_plan,
+)
 from .moe_routing import cb_grouped_pad_routing
 from .ops import dispatch_via_op
 
@@ -361,6 +369,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # Promotion reverted per the two-model ladder rule; grouped_fused
         # stays opt-in.
         #
+        #   'l2_pipeline' — _apply_prefill_l2_pipeline (round 4). Decodes into
+        #     an L2-PINNED rotating scratch pair instead of a fresh HBM tile,
+        #     attacking the decoded-weight round-trip the earlier rounds left
+        #     (~17 of ~42 ms/layer on a large-expert MoE). Falls through to
+        #     'stock' when the build/format/window cap misses. It is also a
+        #     candidate of 'auto' — no promotion is decided in code.
+        #
         #   'auto' — _apply_prefill_auto (OPT-IN until a two-model gate clears
         #     it). The principled end state: MEASURE stock and grouped_fused (at
         #     each compiled TileM) once per layer on the layer's own real inputs
@@ -373,6 +388,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # on the tuning call). Two-model gate 2026-07-26: 35B 4,405 vs best
         # fixed 4,285; Laguna-class 2,063 vs best fixed 1,821 — auto >= best
         # fixed mode on both. Composed paths are individually KL-gated.
+        # NOTE: l2_pipeline is DIAGNOSTIC-ONLY (2026-07-27): wedged the live
+        # serve three times (overlapped: stream/capture deadlock; serial:
+        # still wedges despite non-default-stream test battery green). The
+        # L2-residency hypothesis remains unmeasured; do not add it to auto
+        # candidates until a live serve survives a full prefill battery.
         mode = os.environ.get("PRISMAQUANT_CB_PREFILL") or (
             "auto" if not self.is_fp4 else "loop")
         if mode == "auto":
@@ -386,6 +406,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             if out is None:
                 out = self._apply_prefill_grouped_fused(
                     layer, x, topk_weights, topk_ids, act)
+            if out is not None:
+                return out
+            return self._apply_prefill_stock(
+                layer, x, topk_weights, topk_ids, act)
+        if mode == "l2_pipeline":
+            out = self._apply_prefill_l2_pipeline(
+                layer, x, topk_weights, topk_ids, act)
             if out is not None:
                 return out
             return self._apply_prefill_stock(
@@ -896,7 +923,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
     def _l2_arena(self, layer, plan):
         """Allocate the arena ONCE per layer and cache it on the layer.
 
-        ONE contiguous e4m3 block; the two halves are slices of it, so a SINGLE
+        ONE contiguous RAW-BYTE (uint8) block — the expander's ``out`` contract
+        — reinterpreted as e4m3 per unit; the two halves are slices of it, so a
+        SINGLE
         pinning window covers both (a persisting window is one address range per
         stream — two separate allocations could not both be covered). It is
         never freed: re-allocating per forward would move the address out from
@@ -905,21 +934,44 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         """
         buf = getattr(layer, "_cb_l2_scratch", None)
         if buf is None or buf.numel() < plan.arena_bytes:
-            buf = torch.empty(plan.arena_bytes, dtype=torch.float8_e4m3fn,
+            buf = torch.empty(plan.arena_bytes, dtype=torch.uint8,
                               device=layer.w13_cb_qweight.device)
             layer._cb_l2_scratch = buf
         return buf
 
-    def _l2_stream(self):
-        if not hasattr(self, "_l2_side_stream"):
-            self._l2_side_stream = torch.cuda.Stream()
-        return self._l2_side_stream
+    def _l2_stream(self, main):
+        """A side stream for the DIAGNOSTIC overlapped variant, cached per
+        ``(device, current stream)``.
+
+        The round-4 original cached ONE ``torch.cuda.Stream()`` on ``self`` for
+        the life of the process. That handle then got reused under whatever
+        stream happened to be current at the next call — and vLLM serves on its
+        own non-default stream, not the default stream every synthetic test ran
+        on. Keying the cache on the CURRENT stream makes a handle usable only in
+        the exact context it was created for, so a stream captured under one
+        serving context can never be replayed against another. (Creating one per
+        forward would also be correct, but a CUDA stream create/destroy per
+        layer per forward is itself a heavyweight driver call; the keyed cache
+        keeps the steady state free.)
+        """
+        cache = getattr(self, "_l2_side_streams", None)
+        if cache is None:
+            cache = self._l2_side_streams = {}
+        key = (main.device, main.cuda_stream)
+        s = cache.get(key)
+        if s is None:
+            s = cache[key] = torch.cuda.Stream(device=main.device)
+        return s
 
     def _l2_pin(self, arena, nbytes, streams) -> bool:
-        """Pin the arena as a persisting-access window on EVERY stream that
-        touches it. The window is a per-STREAM attribute, so pinning only the
-        main stream would leave the side stream's decode writes streaming past
-        L2 — exactly the traffic this round exists to keep resident."""
+        """Claim the persisting-access window on every stream that touches the
+        arena. The window is a per-STREAM attribute, so a stream whose accesses
+        are not covered streams its traffic past L2 — exactly the traffic this
+        round exists to keep resident.
+
+        NOT called per forward — see ``_l2_pin_window`` for the lifecycle and
+        ``moe_l2.cb_l2_pin_action`` for why (these calls are device-wide and
+        implicitly synchronizing)."""
         ok = True
         for s in streams:
             with torch.cuda.stream(s):
@@ -928,13 +980,38 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         return ok
 
     def _l2_unpin(self, streams) -> None:
-        """Release the window on both streams. Per-layer pin/unpin rather than
-        pin-once: the attribute is global to the stream, so a layer that left
-        its arena pinned would deny the window to the next layer's (different)
-        arena for the rest of the forward."""
+        """Release the window on the given streams."""
         for s in streams:
             with torch.cuda.stream(s):
                 self._l2_ext_call("l2_unpin")
+
+    def _l2_pin_window(self, layer, arena, nbytes, streams) -> bool:
+        """Idempotent pin: do the device-wide work only when the
+        ``(arena address, streams)`` key actually changes.
+
+        The decision itself is ``moe_l2.cb_l2_pin_action`` (pure, CPU-tested);
+        this method is only its CUDA effect plus the per-layer memo. There is
+        deliberately NO per-forward unpin: the reset call is device-wide and
+        synchronizing, and paying it twice per layer per forward is what drove a
+        live serve's throughput to zero.
+        """
+        key = (int(arena.data_ptr()), int(nbytes),
+               tuple(int(s.cuda_stream) for s in streams))
+        cur = getattr(layer, "_cb_l2_pinned_key", None)
+        unpin_first, pin = cb_l2_pin_action(cur, key)
+        if unpin_first:
+            # The old key's streams are the ones recorded with it; releasing on
+            # the CURRENT streams would leave a stale window on a stream we no
+            # longer touch, so the streams travel with the memo.
+            self._l2_unpin(getattr(layer, "_cb_l2_pinned_streams", streams))
+            layer._cb_l2_pinned_key = None
+        if not pin:
+            return cur is not None
+        ok = self._l2_pin(arena, nbytes, streams)
+        if ok:
+            layer._cb_l2_pinned_key = key
+            layer._cb_l2_pinned_streams = tuple(streams)
+        return ok
 
     def _apply_prefill_l2_pipeline(self, layer, x, topk_weights, topk_ids,
                                    act):
@@ -954,30 +1031,37 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         UNIT SEQUENCE. The work is a flat list of DECODE UNITS, two per live
         expert group: ``[(g0,w13), (g0,w2), (g1,w13), (g1,w2), ...]``. Unit ``u``
         decodes into ``arena[u % 2]``, so the alternation is uniform across the
-        stage boundary and the event proof below does not have to special-case
-        it. Groups no token routed to are dropped from the list using only the
-        E+1 offsets the routing already fetched (``cb_l2_live_groups``), so an
-        empty group costs neither a launch nor window residency.
+        stage boundary. Groups no token routed to are dropped from the list using
+        only the E+1 offsets the routing already fetched
+        (``cb_l2_live_groups``), so an empty group costs neither a launch nor
+        window residency.
 
-        EVENT STRUCTURE (a missed dependency here is a silent WRONG ANSWER, not
-        a crash, so it is spelled out). Two event pairs, indexed by buffer:
+        SERIAL IS THE DEFAULT (and the only path a serve takes). Decode unit
+        ``u`` into its half, then GEMM from that half — all on the CURRENT
+        stream, with no side stream, no events and no ``wait_stream``. Two
+        reasons, one structural and one measured:
 
-          * ``dec_done[i]`` recorded on the SIDE stream after the decode that
-            fills buffer ``i``; the MAIN stream waits on it before any GEMM that
-            reads buffer ``i``  — RAW (produce-then-consume).
-          * ``gemm_done[i]`` recorded on the MAIN stream after the LAST GEMM
-            that reads buffer ``i``; the SIDE stream waits on it before the next
-            decode that overwrites buffer ``i`` — WAR (the reuse hazard, and the
-            one a naive double-buffer forgets).
+          * STRUCTURAL. vLLM serves on its own non-default stream and may run a
+            small batch inside a CUDA-graph capture. Cross-stream event waits
+            against a stream that is not part of the capture are illegal there
+            and HANG rather than error — which is exactly what the overlapped
+            variant did on its first qualifying prefill (throughput -> 0, request
+            stuck Running, no OOM, no watchdog line). Every synthetic test ran on
+            the DEFAULT stream, which is why the suite was green.
+          * MEASURED. There is no overlap win to give up. ``csrc/cb_fused_gemm.cu``
+            records chunked-expand + GEMM overlap at 0.74-0.79x of SERIAL speed
+            on this part: unified memory at ~273 GB/s leaves the expander no
+            spare bandwidth for the GEMM to hide behind, so the two streams
+            contend instead of overlapping.
 
-        The loop issues the decode of unit ``u+1`` (into buffer ``j=(u+1)%2``)
-        BEFORE the GEMMs of unit ``u`` (buffer ``i=u%2``) — that is the whole
-        overlap. Buffer ``j`` was last read by unit ``u-1``, so the side stream
-        first waits ``gemm_done[j]`` (skipped at ``u==0``, where nothing has read
-        it yet). ``side.wait_stream(main)`` at entry orders the first decode
-        after the routing/QDQ prologue AND after any prior layer's use of this
-        arena; ``main.wait_stream(side)`` at exit leaves no side-stream work
-        outstanding when the arena's next user arrives.
+        The rotating pair is KEPT in the serial path: it is what the arena
+        sizing and the single pinned window are built around, and one stream
+        already orders decode-before-GEMM and GEMM-before-overwrite, so no
+        cross-buffer synchronization is needed at all. Buffer reuse is safe by
+        program order.
+
+        The overlapped variant survives behind ``PRISMAQUANT_CB_L2_OVERLAP=1``
+        (``_l2_units_overlapped``) for diagnosis only.
 
         NUMERICS. Weight bytes are bit-identical to stock (same expander kernel,
         same packed rows, only the destination differs). Activations use the
@@ -994,10 +1078,21 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         rotation of that pair could keep a tile resident, so paying the
         pipeline's bookkeeping would be dishonest. If ``l2_pin_region`` reports
         the window unavailable we still RUN (rather than fall through): the
-        rotating pair is a real structural change on its own — bounded transient,
-        decode/GEMM overlap — and the R3 tuner is what decides whether it wins.
-        Falling through there would hide a candidate the tuner exists to judge.
+        rotating pair is a real structural change on its own — a bounded,
+        reused transient in place of stock's per-chunk allocation — and the R3
+        tuner is what decides whether it wins. Falling through there would hide
+        a candidate the tuner exists to judge. (It is NOT overlap that carries
+        this path: the default is serial by construction, and overlap measured
+        as a LOSS on this part — see the serial-default note above.)
         """
+        if x.shape[0] < cb_l2_min_m(
+                os.environ.get("PRISMAQUANT_CB_L2_MIN_M")):
+            # TINY-M FLOOR. Below the mid-M boundary the per-expert pipeline is
+            # pure bookkeeping: 2 launches per live group plus a pinned window,
+            # to move a handful of rows. The R3 tuner would never propose R4
+            # here (its own guard is M>=1024), but the DIRECT env mode bypasses
+            # the tuner, so the floor has to live in the path.
+            return None
         if not self._l2_ok(layer):
             return None
         plan = self._l2_plan(layer)
@@ -1047,8 +1142,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         halves = [arena[:plan.buffer_bytes],
                   arena[plan.buffer_bytes:2 * plan.buffer_bytes]]
         main = torch.cuda.current_stream()
-        side = self._l2_stream()
-        streams = (main, side)
+        overlap = os.environ.get("PRISMAQUANT_CB_L2_OVERLAP") == "1"
+        if overlap and torch.cuda.is_current_stream_capturing():
+            # Cross-stream waits against a non-captured stream are not legal
+            # inside a graph capture; the driver hangs instead of erroring.
+            # Refuse rather than risk it — stock is capture-clean.
+            return None
+        side = self._l2_stream(main) if overlap else None
+        streams = (main, side) if overlap else (main,)
         # Row-offset vector for the expander: zeros, one per decoded row, sized
         # once for the worst unit and sliced — allocating it per unit would put
         # a fresh H2D-shaped allocation on the hot path for a constant.
@@ -1079,79 +1180,133 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             n_e = e1 - e0
             out_f = N1 if which == "w13" else Kh
             in_f = Kh if which == "w13" else inter
-            return halves[buf_idx][:n_e * out_f * in_f].view(n_e, out_f, in_f)
+            # Raw bytes ARE the e4m3 tile (the expander writes e4m3 bit
+            # patterns); reinterpret, never convert.
+            return (halves[buf_idx][:n_e * out_f * in_f]
+                    .view(torch.float8_e4m3fn).view(n_e, out_f, in_f))
 
-        dec_done = [torch.cuda.Event() for _ in range(2)]
-        gemm_done = [torch.cuda.Event() for _ in range(2)]
-        pinned = False
-        try:
-            pinned = self._l2_pin(arena, plan.arena_bytes, streams)
-            side.wait_stream(main)               # arena free; prologue visible
+        # The intermediate activations of the w13 unit, consumed by the w2 unit
+        # of the SAME group. A one-slot holder rather than a closure-local, so
+        # both drivers below share one definition of the GEMM work.
+        carry = [None]
 
-            def _decode_on(u, b):
-                with torch.cuda.stream(side):
-                    _decode(units[u], b)
-                dec_done[b].record(side)
+        def _gemm_unit(unit, buf_idx):
+            which, e0, e1, _p0, _p1 = unit
+            W = _weights(unit, buf_idx)
+            if which == "w13":
+                group_a2 = []
+                for e in range(e0, e1):
+                    q0, q1 = bounds[e], bounds[e + 1]
+                    if q1 == q0:
+                        group_a2.append(None)
+                        continue
+                    rows = ptok_sorted[q0:q1]
+                    ae = a1.index_select(0, rows).contiguous()
+                    ase = a1s.index_select(0, rows).contiguous()
+                    gate_up = vllm_ops.cutlass_scaled_mm(
+                        ae, W[e - e0].t(), ase,
+                        layer.w13_weight_scale[e].reshape(1, N1).to(
+                            torch.float32),
+                        torch.bfloat16)
+                    a = torch.empty((gate_up.shape[0], d),
+                                    dtype=gate_up.dtype, device=dev)
+                    apply_moe_activation(act, a, gate_up)
+                    del gate_up
+                    a2, a2s = moe_kernel_quantize_input(
+                        a, None, fp8_dtype, per_act_token_quant=True)
+                    group_a2.append((a2.contiguous(),
+                                     a2s.reshape(-1, 1).to(torch.float32)))
+                carry[0] = group_a2
+            else:
+                for e in range(e0, e1):
+                    q0, q1 = bounds[e], bounds[e + 1]
+                    got = carry[0][e - e0]
+                    if got is None:
+                        continue
+                    a2, a2s = got
+                    y = vllm_ops.cutlass_scaled_mm(
+                        a2, W[e - e0].t(), a2s,
+                        layer.w2_weight_scale[e].reshape(1, Kh).to(
+                            torch.float32),
+                        torch.bfloat16)
+                    rows = ptok_sorted[q0:q1]
+                    y = y * pw_sorted[q0:q1, None].to(y.dtype)
+                    out.index_add_(0, rows, y.to(out.dtype))
+                carry[0] = None
 
-            _decode_on(0, 0)
-            group_a2 = None
+        # PIN. Idempotent and off the per-forward path: the reservation/reset
+        # pair is device-wide and implicitly synchronizing, so re-issuing it per
+        # layer per forward is a throughput sink by itself. Skipped entirely
+        # under graph capture, where a device-limit call is not legal; the rest
+        # of the serial path is capture-clean (one stream, no events, no host
+        # sync beyond the routing sync the caller already performs).
+        if not torch.cuda.is_current_stream_capturing():
+            self._l2_pin_window(layer, arena, plan.arena_bytes, streams)
+
+        if overlap:
+            self._l2_units_overlapped(units, _decode, _gemm_unit, main, side)
+        else:
+            # SERIAL (default). One stream orders decode-before-GEMM and the
+            # next decode after the GEMMs that read that half, so the rotation
+            # needs no events at all. The rotation is kept because the arena
+            # sizing and the single pinned window are defined over the pair.
             for u, unit in enumerate(units):
                 i = u % 2
-                main.wait_event(dec_done[i])     # RAW: decode -> GEMM
-                if u + 1 < len(units):
-                    j = (u + 1) % 2
-                    if u >= 1:
-                        # WAR: buffer j was last READ by unit u-1.
-                        side.wait_event(gemm_done[j])
-                    _decode_on(u + 1, j)
-
-                which, e0, e1, _p0, _p1 = unit
-                W = _weights(unit, i)
-                if which == "w13":
-                    group_a2 = []
-                    for e in range(e0, e1):
-                        q0, q1 = bounds[e], bounds[e + 1]
-                        if q1 == q0:
-                            group_a2.append(None)
-                            continue
-                        rows = ptok_sorted[q0:q1]
-                        ae = a1.index_select(0, rows).contiguous()
-                        ase = a1s.index_select(0, rows).contiguous()
-                        gate_up = vllm_ops.cutlass_scaled_mm(
-                            ae, W[e - e0].t(), ase,
-                            layer.w13_weight_scale[e].reshape(1, N1).to(
-                                torch.float32),
-                            torch.bfloat16)
-                        a = torch.empty((gate_up.shape[0], d),
-                                        dtype=gate_up.dtype, device=dev)
-                        apply_moe_activation(act, a, gate_up)
-                        del gate_up
-                        a2, a2s = moe_kernel_quantize_input(
-                            a, None, fp8_dtype, per_act_token_quant=True)
-                        group_a2.append((a2.contiguous(),
-                                         a2s.reshape(-1, 1).to(torch.float32)))
-                else:
-                    for e in range(e0, e1):
-                        q0, q1 = bounds[e], bounds[e + 1]
-                        got = group_a2[e - e0]
-                        if got is None:
-                            continue
-                        a2, a2s = got
-                        y = vllm_ops.cutlass_scaled_mm(
-                            a2, W[e - e0].t(), a2s,
-                            layer.w2_weight_scale[e].reshape(1, Kh).to(
-                                torch.float32),
-                            torch.bfloat16)
-                        rows = ptok_sorted[q0:q1]
-                        y = y * pw_sorted[q0:q1, None].to(y.dtype)
-                        out.index_add_(0, rows, y.to(out.dtype))
-                    group_a2 = None
-                gemm_done[i].record(main)        # WAR release for buffer i
-            main.wait_stream(side)               # nothing outstanding on side
-        finally:
-            if pinned:
-                self._l2_unpin(streams)
+                _decode(unit, i)
+                _gemm_unit(unit, i)
         return out
+
+    @staticmethod
+    def _l2_units_overlapped(units, decode, gemm_unit, main, side):
+        """DIAGNOSTIC-ONLY overlapped driver (``PRISMAQUANT_CB_L2_OVERLAP=1``).
+
+        KNOWN TO HANG A LIVE SERVE. It is retained unchanged because its hazard
+        logic is correct and worth keeping for later analysis; what is not safe
+        is the CONTEXT — vLLM's non-default current stream and possible graph
+        capture, where cross-stream waits against a non-captured stream hang.
+        Do not put this on a serving path.
+
+        EVENT STRUCTURE (a missed dependency is a silent WRONG ANSWER, not a
+        crash, so it is spelled out). Two event pairs, indexed by buffer:
+
+          * ``dec_done[i]`` recorded on the SIDE stream after the decode that
+            fills buffer ``i``; the MAIN stream waits on it before any GEMM that
+            reads buffer ``i`` — RAW (produce-then-consume).
+          * ``gemm_done[i]`` recorded on the MAIN stream after the LAST GEMM
+            that reads buffer ``i``; the SIDE stream waits on it before the next
+            decode that overwrites buffer ``i`` — WAR (the reuse hazard a naive
+            double-buffer forgets).
+
+        The loop issues the decode of unit ``u+1`` (buffer ``j=(u+1)%2``) BEFORE
+        the GEMMs of unit ``u`` (buffer ``i=u%2``) — that is the whole overlap.
+        Buffer ``j`` was last read by unit ``u-1``, so the side stream first
+        waits ``gemm_done[j]`` (skipped at ``u==0``). ``side.wait_stream(main)``
+        at entry orders the first decode after the prologue and after any prior
+        use of the arena; ``main.wait_stream(side)`` at exit leaves nothing
+        outstanding.
+        """
+        dec_done = [torch.cuda.Event() for _ in range(2)]
+        gemm_done = [torch.cuda.Event() for _ in range(2)]
+        side.wait_stream(main)                   # arena free; prologue visible
+
+        def _decode_on(u, b):
+            with torch.cuda.stream(side):
+                decode(units[u], b)
+            dec_done[b].record(side)
+
+        _decode_on(0, 0)
+        for u, unit in enumerate(units):
+            i = u % 2
+            main.wait_event(dec_done[i])         # RAW: decode -> GEMM
+            if u + 1 < len(units):
+                j = (u + 1) % 2
+                if u >= 1:
+                    # WAR: buffer j was last READ by unit u-1.
+                    side.wait_event(gemm_done[j])
+                _decode_on(u + 1, j)
+            gemm_unit(unit, i)
+            gemm_done[i].record(main)            # WAR release for buffer i
+        main.wait_stream(side)                   # nothing outstanding on side
 
     # -- prefill: MEASURED per-layer path selection -------------------------
     def _prefill_candidates(self, layer, x, topk_weights, topk_ids, act):
@@ -1170,11 +1325,32 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                     # loop variable and time the last tile N times.
                     (lambda t: lambda: self._apply_prefill_grouped_fused_v2(
                         layer, x, topk_weights, topk_ids, act, tile_m=t))(tm)))
+        # Round 4 is just another candidate: it returns None (-> disqualified,
+        # like every other gate here) when the build/format/window cap misses,
+        # so no promotion decision is taken in code — the tuner MEASURES it
+        # against stock on this layer's own inputs.
+        #
+        # ...but it is OPT-IN inside auto (PRISMAQUANT_CB_L2_AUTOTUNE=1) until
+        # its GPU gates have actually RUN. 'auto' is now the shipping default,
+        # so anything in this list is reachable by a default serve; l2_pipeline
+        # is the only candidate here whose parity, ragged/zero-row and
+        # buffer-rotation RACE tests have never executed (they are skip-only
+        # while the box is under the wedge quarantine). An unmeasured path that
+        # the default can silently select is exactly the promotion-without-
+        # evidence this repo forbids. PRISMAQUANT_CB_PREFILL=l2_pipeline still
+        # selects it directly, which is how the GPU session measures it; drop
+        # this gate once those tests are green on real hardware.
+        if (os.environ.get("PRISMAQUANT_CB_L2_AUTOTUNE") == "1"
+                and self._l2_ok(layer) and self._l2_plan(layer) is not None):
+            cands.append((L2_PIPELINE, lambda: self._apply_prefill_l2_pipeline(
+                layer, x, topk_weights, topk_ids, act)))
         return cands
 
     def _apply_prefill_auto(self, layer, x, topk_weights, topk_ids, act):
-        """MEASURED per-layer prefill selection (``PRISMAQUANT_CB_PREFILL=auto``,
-        opt-in until a two-model gate clears it). Thin adapter: the policy —
+        """MEASURED per-layer prefill selection (``PRISMAQUANT_CB_PREFILL=auto``
+        — the fp8-CB DEFAULT since the two-model gate cleared it in 3062fbf:
+        35B 4,405 tok/s vs stock 3,932, Laguna-class 2,063 vs stock 1,821).
+        Thin adapter: the policy —
         threshold, per-layer caching, determinism, forcing — lives in
         ``moe_autotune.cb_prefill_auto``, which is torch-only so it is testable
         without vLLM/CUDA. This method only supplies the candidates."""

@@ -65,7 +65,13 @@ _CONFIGS = {
 
 
 def _require_stack():
+    # Probe the submodule the MoE path actually imports, not just "vllm":
+    # test_target_namespace_compat installs STUB vllm modules into sys.modules
+    # at collection time when real vLLM is absent, so a bare importorskip
+    # passes in a full build-venv suite run and the real import then explodes
+    # inside the test — a missing dependency wearing a regression's clothes.
     pytest.importorskip("vllm")
+    pytest.importorskip("vllm.model_executor.layers.fused_moe.config")
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for the stock-prefill forward tests")
 
