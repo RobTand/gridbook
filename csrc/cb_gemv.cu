@@ -1601,9 +1601,17 @@ __global__ __launch_bounds__(WARPS * 32) void cb_expand_fp8_kernel(
   }
 }
 
-torch::Tensor cb_expand_fp8(torch::Tensor qw_padded, torch::Tensor cb_flat_fp8,
-                            torch::Tensor cb_row_offset, int64_t N, int64_t K,
-                            int64_t k_bits, int64_t n_sub, int64_t type_size) {
+// Shared body for both expander entries: identical validation, identical
+// launch-config selection, identical kernel. `w_ptr` is the N*K byte
+// destination (allocated by the caller). Keeping this in ONE place is
+// deliberate: the allocating entry is on the shipping stock path, and any
+// drift between it and the out-variant would silently corrupt served weights.
+static void cb_expand_fp8_launch(const torch::Tensor& qw_padded,
+                                 const torch::Tensor& cb_flat_fp8,
+                                 const torch::Tensor& cb_row_offset,
+                                 uint8_t* w_ptr, int64_t N, int64_t K,
+                                 int64_t k_bits, int64_t n_sub,
+                                 int64_t type_size) {
   TORCH_CHECK(qw_padded.is_cuda() && qw_padded.scalar_type() == torch::kUInt8);
   TORCH_CHECK(cb_flat_fp8.scalar_type() == torch::kUInt8,
               "cb_expand_fp8 wants the E4M3-byte (uint8) codebook");
@@ -1613,26 +1621,151 @@ torch::Tensor cb_expand_fp8(torch::Tensor qw_padded, torch::Tensor cb_flat_fp8,
   TORCH_CHECK(K % 256 == 0 && type_size == 4 * k_bits && type_size <= 192);
   TORCH_CHECK(qw_padded.dim() == 2 && qw_padded.size(0) == N &&
               qw_padded.stride(1) == 1);
-  const c10::cuda::OptionalCUDAGuard guard(qw_padded.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  auto w = torch::empty({N, K}, qw_padded.options());
   const int n_sb = (int)(K >> 8);
   const bool use4 = (n_sb % 8 != 0) && (n_sb % 4 == 0) && (n_sb < 48);
   if (use4) {
     cb_expand_fp8_kernel<4><<<(unsigned)N, 128, 0, stream>>>(
         qw_padded.data_ptr<uint8_t>(),
         reinterpret_cast<const uint16_t*>(cb_flat_fp8.data_ptr()),
-        cb_row_offset.data_ptr<int32_t>(), w.data_ptr<uint8_t>(),
+        cb_row_offset.data_ptr<int32_t>(), w_ptr,
         N, K, qw_padded.stride(0), (int)k_bits, (int)type_size);
   } else {
     cb_expand_fp8_kernel<8><<<(unsigned)N, 256, 0, stream>>>(
         qw_padded.data_ptr<uint8_t>(),
         reinterpret_cast<const uint16_t*>(cb_flat_fp8.data_ptr()),
-        cb_row_offset.data_ptr<int32_t>(), w.data_ptr<uint8_t>(),
+        cb_row_offset.data_ptr<int32_t>(), w_ptr,
         N, K, qw_padded.stride(0), (int)k_bits, (int)type_size);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor cb_expand_fp8(torch::Tensor qw_padded, torch::Tensor cb_flat_fp8,
+                            torch::Tensor cb_row_offset, int64_t N, int64_t K,
+                            int64_t k_bits, int64_t n_sub, int64_t type_size) {
+  TORCH_CHECK(qw_padded.is_cuda() && qw_padded.scalar_type() == torch::kUInt8);
+  const c10::cuda::OptionalCUDAGuard guard(qw_padded.device());
+  auto w = torch::empty({N, K}, qw_padded.options());
+  cb_expand_fp8_launch(qw_padded, cb_flat_fp8, cb_row_offset,
+                       w.data_ptr<uint8_t>(), N, K, k_bits, n_sub, type_size);
   return w.view(torch::kFloat8_e4m3fn);
+}
+
+// Out-variant: decode into a caller-owned buffer. Required by the l2_pipeline
+// prefill mode — a persisting-L2 access-policy window pins a FIXED address
+// range, so the destination must be a stable scratch buffer, not a fresh
+// allocation per decode. `out` may be LARGER than N*K (python slices a
+// rotating pair of scratch buffers out of one pinned arena); only the first
+// N*K bytes are written.
+void cb_expand_fp8_into(torch::Tensor out, torch::Tensor qw_padded,
+                        torch::Tensor cb_flat_fp8, torch::Tensor cb_row_offset,
+                        int64_t N, int64_t K, int64_t k_bits, int64_t n_sub,
+                        int64_t type_size) {
+  TORCH_CHECK(qw_padded.is_cuda() && qw_padded.scalar_type() == torch::kUInt8);
+  TORCH_CHECK(out.is_cuda(), "cb_expand_fp8_into: out must be CUDA");
+  TORCH_CHECK(out.scalar_type() == torch::kUInt8,
+              "cb_expand_fp8_into: out must be uint8 (raw E4M3 bytes)");
+  TORCH_CHECK(out.is_contiguous(), "cb_expand_fp8_into: out must be contiguous");
+  TORCH_CHECK(out.numel() >= N * K,
+              "cb_expand_fp8_into: out too small (need >= N*K bytes)");
+  TORCH_CHECK(out.device() == qw_padded.device(),
+              "cb_expand_fp8_into: out and qw_padded must share a device");
+  const c10::cuda::OptionalCUDAGuard guard(qw_padded.device());
+  cb_expand_fp8_launch(qw_padded, cb_flat_fp8, cb_row_offset,
+                       out.data_ptr<uint8_t>(), N, K, k_bits, n_sub, type_size);
+}
+
+// ---------------------------------------------------------------------------
+// L2 persisting-window helpers (host-only; torch exposes no access-policy API)
+//
+// Two independent CUDA calls are needed and BOTH are required:
+//   1. cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, bytes) RESERVES the
+//      set-aside carve-out of L2 that persisting lines are allowed to occupy.
+//      Without it the carve-out is 0 and the window below is advisory only.
+//   2. cudaStreamSetAttribute(cudaStreamAttributeAccessPolicyWindow) marks a
+//      specific address range as persisting FOR THAT STREAM. The window is a
+//      per-stream attribute, so every stream that touches the range (decode
+//      and GEMM alike) must carry it.
+// Everything degrades to false/no-op: an un-pinnable device must never be
+// fatal, python falls through to the stock path.
+// ---------------------------------------------------------------------------
+static int64_t l2_dev_attr(cudaDeviceAttr attr) {
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+  int v = 0;
+  if (cudaDeviceGetAttribute(&v, attr, dev) != cudaSuccess) return 0;
+  return (int64_t)v;
+}
+
+int64_t l2_persisting_max_bytes() {
+#if CUDART_VERSION >= 11000
+  return l2_dev_attr(cudaDevAttrMaxPersistingL2CacheSize);
+#else
+  return 0;
+#endif
+}
+
+int64_t l2_max_window_bytes() {
+#if CUDART_VERSION >= 11000
+  return l2_dev_attr(cudaDevAttrMaxAccessPolicyWindowSize);
+#else
+  return 0;
+#endif
+}
+
+bool l2_pin_region(torch::Tensor buf, int64_t num_bytes) {
+#if CUDART_VERSION >= 11000
+  if (!buf.is_cuda() || num_bytes <= 0) return false;
+  const c10::cuda::OptionalCUDAGuard guard(buf.device());
+
+  const int64_t win_max = l2_max_window_bytes();
+  const int64_t persist_max = l2_persisting_max_bytes();
+  if (win_max <= 0 || persist_max <= 0) return false;
+
+  // The window is hardware-capped; asking for more is an error, so clamp.
+  int64_t bytes = num_bytes < win_max ? num_bytes : win_max;
+  const int64_t reserve = bytes < persist_max ? bytes : persist_max;
+
+  // (1) reserve the L2 set-aside...
+  if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                         (size_t)reserve) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  // (2) ...then mark the range persisting on the CURRENT stream.
+  cudaStreamAttrValue attr = {};
+  attr.accessPolicyWindow.base_ptr = buf.data_ptr();
+  attr.accessPolicyWindow.num_bytes = (size_t)bytes;
+  attr.accessPolicyWindow.hitRatio = 1.0f;
+  attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+  attr.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+  cudaStream_t s = at::cuda::getCurrentCUDAStream();
+  if (cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow,
+                             &attr) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  return true;
+#else
+  (void)buf; (void)num_bytes;
+  return false;
+#endif
+}
+
+void l2_unpin() {
+#if CUDART_VERSION >= 11000
+  cudaStreamAttrValue attr = {};
+  attr.accessPolicyWindow.base_ptr = nullptr;
+  attr.accessPolicyWindow.num_bytes = 0;
+  attr.accessPolicyWindow.hitRatio = 0.0f;
+  attr.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+  attr.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+  cudaStream_t s = at::cuda::getCurrentCUDAStream();
+  cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &attr);
+  cudaCtxResetPersistingL2Cache();
+  cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
+  cudaGetLastError();  // swallow: unpin is best-effort, never fatal
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1706,6 +1839,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "in-register two-tier scale compose)");
   m.def("cb_expand_fp8", &cb_expand_fp8,
         "FP8-direct transient expand (prefill; bounded per-layer tile)");
+  m.def("cb_expand_fp8_into", &cb_expand_fp8_into,
+        "FP8-direct expand into a caller-owned (L2-pinnable) scratch buffer");
+  m.def("l2_pin_region", &l2_pin_region,
+        "pin a buffer range as L2-persisting on the current stream "
+        "(false if unavailable)");
+  m.def("l2_unpin", &l2_unpin,
+        "reset the access-policy window + persisting L2 carve-out");
+  m.def("l2_persisting_max_bytes", &l2_persisting_max_bytes,
+        "cudaDevAttrMaxPersistingL2CacheSize");
+  m.def("l2_max_window_bytes", &l2_max_window_bytes,
+        "cudaDevAttrMaxAccessPolicyWindowSize");
   m.def("cb_moe_gemv_fp8", &cb_moe_gemv_fp8,
         "grouped MoE decode GEMV over routed (token, expert) pairs");
   m.def("cb_moe_gemv_fp4_v2", &cb_moe_gemv_fp4_v2,

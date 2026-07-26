@@ -117,6 +117,43 @@ def _cb_expand_fp8_fake(qw_padded, cb_flat_fp8, cb_row_offset, N, K, k_bits,
                        device=qw_padded.device)
 
 
+@torch.library.custom_op("prismaquant::cb_expand_fp8_into",
+                         mutates_args=("out",), tags=_PQ_UNSAFE)
+def cb_expand_fp8_into(out: torch.Tensor, qw_padded: torch.Tensor,
+                       cb_flat_fp8: torch.Tensor, cb_row_offset: torch.Tensor,
+                       N: int, K: int, k_bits: int, n_sub: int,
+                       type_size: int) -> None:
+    """``cb_expand_fp8`` writing into a CALLER-OWNED buffer.
+
+    The allocating form is unusable for the L2 pipeline: the persisting-access
+    window pins a fixed ADDRESS RANGE, so a fresh allocation per expert would
+    land outside the pinned range and the lever would silently do nothing. ``out``
+    may be LARGER than ``N*K`` (it is one half of a rotating arena sized for the
+    largest expert group), and only the first ``N*K`` bytes are written.
+
+    ``mutates_args=("out",)`` is load-bearing: an empty annotation would let
+    compile/capture reorder or elide the write against the GEMM that reads it —
+    a silent wrong answer, not a crash. Caller must check ``cuda_ext.get_ext()``.
+    """
+    from .cuda_ext import get_ext
+    get_ext().cb_expand_fp8_into(out, qw_padded, cb_flat_fp8, cb_row_offset,
+                                 N, K, k_bits, n_sub, type_size)
+
+
+@cb_expand_fp8_into.register_fake
+def _cb_expand_fp8_into_fake(out, qw_padded, cb_flat_fp8, cb_row_offset, N, K,
+                             k_bits, n_sub, type_size):
+    return None
+
+
+def cb_expand_fp8_into_available() -> bool:
+    """Whether THIS extension build ships the into-buffer expander. An older
+    build must degrade to the stock path, never crash a serve."""
+    from .cuda_ext import get_ext
+    ext = get_ext()
+    return ext is not None and hasattr(ext, "cb_expand_fp8_into")
+
+
 @torch.library.custom_op("prismaquant::cb_prefill_persistent_tc",
                          mutates_args=(), tags=_PQ_UNSAFE)
 def cb_prefill_persistent_tc(a_fp8: torch.Tensor, packed_u8: torch.Tensor,

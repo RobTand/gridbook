@@ -444,16 +444,66 @@ struct CfgMoeScaled {
       cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
 };
 
-// The grouped path's TileM (python must pad Mp to a multiple of this).
+// The grouped path's DEFAULT TileM (python must pad Mp to a multiple of the
+// tile_m it selects; 128 stays the default so existing callers are unchanged).
 constexpr int64_t kMoeTileM = size<0>(TileF{});
 
-template <int KB>
+// ---------------------------------------------------------------------------
+// TileM ladder for the grouped path.
+//
+// MOTIVATION: every M-tile CTA re-decodes its expert's B weights, so an expert
+// covering ceil(m_e/TileM) tiles pays that many redundant decodes. A larger
+// TileM cuts both the redundancy and (per expert) the number of padded tiles.
+//
+// FEASIBILITY IS SMEM-BOUND, and the bound bites the HIGH rungs first, because
+// smem grows with BOTH TileM (smem_A = TileM*TileK*Stages) and k_bits
+// (smem_BP = TileN*4*k_bits*Stages). Measured exactly by
+// csrc/smem_probe_tilem.cu (host-only, no launch) against CUTLASS's
+// cutlass::arch::sm120_smem_capacity_bytes = 101376 (= 99 KiB, the CUDA
+// cc-12.0 max opt-in dynamic smem per block):
+//
+//   GemmKernel::SharedStorageSize, TileN=64 TileK=128 Stages=2
+//   TileM   k28     k32      k36      k40      k44      k48
+//   128    66560   68608    70656    72704    74752    76800     all FIT
+//   256    99328  101376   103424   105472   107520   109568     FIT only 28/32
+//   384   >=130624 (smem_A alone = 98304)                        none FIT
+//
+// So the compiled matrix is: TileM=128 x all six rungs, plus TileM=256 x
+// {28, 32} ONLY. TileM=384 is infeasible at every rung and is not compiled.
+// NOTE: TileM=256/k_bits=32 lands on EXACTLY the 101376-byte ceiling (zero
+// margin) — it is compiled, but must be launch-verified before being trusted.
+//
+// Nothing else changed: same SwapToFused mainloop, same MoeScaledFusion
+// expert-indexed epilogue, same Stages=2, same TileN=64/TileK=128, same
+// bf16_rn(b_scale * (a_scale * acc)) rounding order.
+// ---------------------------------------------------------------------------
+template <int TM>
+using MoeTile = Shape<Int<TM>, _64, _128>;
+
+// BIT-IDENTITY PROOF for the pre-existing TileM=128 grouped path: the templated
+// tile at TM=128 is the SAME TYPE as the TileF the old code hardcoded, so
+// run_moe_grouped<128, KB> instantiates a byte-for-byte identical kernel
+// (identical TiledMma, smem layouts, pipeline, epilogue and rounding order).
+static_assert(cute::is_same_v<MoeTile<128>, TileF>,
+              "TileM=128 grouped path must remain the original TileF config");
+
+// Compiled-matrix predicate. Derived from the measured smem table above.
+constexpr bool moe_tile_supported(int64_t tm, int64_t kb) {
+  return tm == 128 ? (kb == 28 || kb == 32 || kb == 36 || kb == 40 ||
+                      kb == 44 || kb == 48)
+       : tm == 256 ? (kb == 28 || kb == 32)
+                   : false;
+}
+
+template <int TM, int KB>
 torch::Tensor run_moe_grouped(torch::Tensor a, torch::Tensor packed,
                               torch::Tensor lut, torch::Tensor a_scales,
                               torch::Tensor b_scales, torch::Tensor expert_ids,
                               int64_t N, int64_t K) {
+  static_assert(moe_tile_supported(TM, KB),
+                "attempted to instantiate an smem-infeasible (TileM, k_bits)");
   constexpr int Stages = 2;
-  using TileShape = TileF;
+  using TileShape = MoeTile<TM>;
   using Mainloop = typename SwapToFused<
       KB, Stages, typename CfgMoeScaled<TileShape>::BuilderMainloop>::type;
   using Epilogue = typename CfgMoeScaled<TileShape>::Epilogue;
@@ -502,25 +552,44 @@ torch::Tensor run_moe_grouped(torch::Tensor a, torch::Tensor packed,
 
 int64_t cb_fused_moe_tile_m() { return kMoeTileM; }
 
+// Every TileM value for which AT LEAST ONE rung is compiled.
+std::vector<int64_t> cb_fused_moe_tile_sizes() { return {128, 256}; }
+
+// Per-rung candidate list — python should enumerate THIS, never the union,
+// so it can never select an uncompiled (TileM, k_bits) pair.
+std::vector<int64_t> cb_fused_moe_tile_sizes_for_kbits(int64_t k_bits) {
+  std::vector<int64_t> out;
+  for (int64_t tm : cb_fused_moe_tile_sizes()) {
+    if (moe_tile_supported(tm, k_bits)) out.push_back(tm);
+  }
+  return out;
+}
+
 torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
                                    torch::Tensor lut, torch::Tensor a_scales,
                                    torch::Tensor b_scales,
                                    torch::Tensor expert_ids, int64_t N,
-                                   int64_t K, int64_t k_bits) {
+                                   int64_t K, int64_t k_bits,
+                                   int64_t tile_m = kMoeTileM) {
   // --- mirrors check_fused_inputs, but packed is [E, N, row_bytes] ---
   TORCH_CHECK(a.is_cuda() && a.scalar_type() == torch::kFloat8_e4m3fn,
               "a must be fp8 e4m3 [Mp,K]");
   TORCH_CHECK(a.dim() == 2 && a.size(1) == K && a.stride(1) == 1 &&
                   a.stride(0) == K,
               "a must be contiguous [Mp,K]");
-  TORCH_CHECK(a.size(0) % kMoeTileM == 0,
-              "a.size(0) (Mp) must be a multiple of the grouped TileM (",
-              kMoeTileM, "); pad each expert's row segment");
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8);
   TORCH_CHECK(K % 256 == 0);
   TORCH_CHECK(k_bits == 28 || k_bits == 32 || k_bits == 36 ||
                   k_bits == 40 || k_bits == 44 || k_bits == 48,
               "unsupported k_bits ", k_bits);
+  TORCH_CHECK(moe_tile_supported(tile_m, k_bits),
+              "grouped tile_m=", tile_m, " is not compiled for k_bits=", k_bits,
+              " (smem-infeasible on sm_120: limit 101376 B). Query "
+              "cb_fused_moe_tile_sizes_for_kbits(k_bits) for the legal set.");
+  TORCH_CHECK(a.size(0) % tile_m == 0,
+              "a.size(0) (Mp=", a.size(0),
+              ") must be a multiple of the grouped tile_m (", tile_m,
+              "); pad each expert's row segment");
 
   TORCH_CHECK(packed.is_cuda() && packed.scalar_type() == torch::kUInt8 &&
                   packed.dim() == 3 && packed.size(1) == N,
@@ -543,18 +612,34 @@ torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
               "b_scales must be contiguous fp32 [E,N]");
   TORCH_CHECK(expert_ids.is_cuda() && expert_ids.scalar_type() == torch::kInt32 &&
                   expert_ids.is_contiguous() &&
-                  expert_ids.numel() == a.size(0) / kMoeTileM,
-              "expert_ids must be contiguous int32 cuda [Mp/TileM]");
+                  expert_ids.numel() == a.size(0) / tile_m,
+              "expert_ids must be contiguous int32 cuda [Mp/tile_m] (expected ",
+              a.size(0) / tile_m, ", got ", expert_ids.numel(), ")");
 
-  switch (k_bits) {
-    case 28: return run_moe_grouped<28>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
-    case 32: return run_moe_grouped<32>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
-    case 36: return run_moe_grouped<36>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
-    case 40: return run_moe_grouped<40>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
-    case 44: return run_moe_grouped<44>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
-    case 48: return run_moe_grouped<48>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
-    default: TORCH_CHECK(false, "unsupported k_bits ", k_bits);
+#define PQ_MOE_CALL(TM, KB) \
+  return run_moe_grouped<TM, KB>(a, packed, lut, a_scales, b_scales, expert_ids, N, K)
+  switch (tile_m) {
+    case 128:
+      switch (k_bits) {
+        case 28: PQ_MOE_CALL(128, 28);
+        case 32: PQ_MOE_CALL(128, 32);
+        case 36: PQ_MOE_CALL(128, 36);
+        case 40: PQ_MOE_CALL(128, 40);
+        case 44: PQ_MOE_CALL(128, 44);
+        case 48: PQ_MOE_CALL(128, 48);
+      }
+      break;
+    case 256:
+      // smem ceiling: only the two lowest rungs fit (see the table above).
+      switch (k_bits) {
+        case 28: PQ_MOE_CALL(256, 28);
+        case 32: PQ_MOE_CALL(256, 32);
+      }
+      break;
   }
+#undef PQ_MOE_CALL
+  TORCH_CHECK(false, "no compiled grouped kernel for (tile_m=", tile_m,
+              ", k_bits=", k_bits, ")");
 }
 
 std::vector<int64_t> smem_report() {
@@ -588,9 +673,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "[Mp,K] where each TileM block reads expert_ids[tile]'s weights from "
         "packed [E,N,row_bytes]; per-token a_scales[Mp] x per-expert-channel "
         "b_scales[E,N] applied in the fp32 EVT epilogue (same rounding order "
-        "as cb_fused_prefill_mm_scaled). Mp must be a multiple of "
-        "cb_fused_moe_tile_m().");
+        "as cb_fused_prefill_mm_scaled). Mp must be a multiple of tile_m "
+        "(default 128 = cb_fused_moe_tile_m()); legal tile_m values for a rung "
+        "come from cb_fused_moe_tile_sizes_for_kbits(k_bits).",
+        py::arg("a"), py::arg("packed"), py::arg("lut"), py::arg("a_scales"),
+        py::arg("b_scales"), py::arg("expert_ids"), py::arg("N"), py::arg("K"),
+        py::arg("k_bits"), py::arg("tile_m") = kMoeTileM);
   m.def("cb_fused_moe_tile_m", &cb_fused_moe_tile_m,
-        "TileM of the grouped (MoE) path — the row-padding granularity");
+        "DEFAULT TileM of the grouped (MoE) path — the row-padding granularity");
+  m.def("cb_fused_moe_tile_sizes", &cb_fused_moe_tile_sizes,
+        "every TileM with at least one compiled k_bits rung");
+  m.def("cb_fused_moe_tile_sizes_for_kbits", &cb_fused_moe_tile_sizes_for_kbits,
+        "the TileM values ACTUALLY compiled for this k_bits rung — enumerate "
+        "this to pick a grouped tile_m; anything else TORCH_CHECKs");
   m.def("smem_report", &smem_report, "SharedStorage sizes [F44, F48, K44, K48, Epi]");
 }

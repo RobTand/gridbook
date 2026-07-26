@@ -82,7 +82,16 @@ _CONFIGS = {
 
 
 def _require_stack():
+    # NOT a bare importorskip("vllm"): test_target_namespace_compat installs
+    # STUB vllm modules into sys.modules at collection time when real vLLM is
+    # absent, so in a full build-venv suite run "vllm" imports fine and the
+    # real submodule import then explodes INSIDE the test (a failure that looks
+    # like a code regression but is only a missing dependency). Probe the
+    # submodule the MoE path actually needs, so a stubbed env skips like an
+    # empty one. In the serving container the real package wins and nothing
+    # here changes.
     pytest.importorskip("vllm")
+    pytest.importorskip("vllm.model_executor.layers.fused_moe.config")
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for the batched-prefill forward tests")
 
