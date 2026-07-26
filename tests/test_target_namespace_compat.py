@@ -164,3 +164,62 @@ def test_new_form_layer_still_resolves():
     for pre in ("model.layers.1.", "language_model.model.layers.1.",
                 "model.language_model.layers.1."):
         assert cfg._scheme_for_prefix(pre + "mlp.down_proj") is not None
+
+
+# ---------------------------------------------------------------------------
+# 35B CB serve-boot regression: the MoE expert-stack lookup must canonicalise
+# the serving prefix exactly like the Linear lookup does. Before the fix,
+# `_moe_scheme_for_prefix` did a RAW `startswith`, so the wrapper-class serving
+# prefix `language_model.model.layers.N.mlp.experts` matched no canonicalised
+# target, no CB MoE method was created, no w13/w2_cb_qweight params existed, and
+# the arch's own expert mapping then blew up with
+# `'RoutedExperts' object has no attribute 'w2_weight.cb_qweight'`.
+# ---------------------------------------------------------------------------
+
+_MOE_EXPERT_PREFIXES = [
+    "language_model.model.layers.1.mlp.experts",   # wrapper-class serving form
+    "model.layers.1.mlp.experts",                  # canonical
+    "model.language_model.layers.1.mlp.experts",   # old checkpoint form
+]
+
+
+def _moe_config(targets):
+    return {
+        "quant_method": "prismaquant", "format": "nvfp4_cb",
+        "codebook_file": "cb_codebooks.pqcb",
+        "config_groups": {
+            "moe": {"format": "FP8_CB_K28", "targets": list(targets),
+                    "scheme": dict(_SCHEME)},
+        },
+        "ignore": ["lm_head"],
+    }
+
+
+@pytest.mark.parametrize("stored_ns", ["model.language_model.", "model."])
+@pytest.mark.parametrize("prefix", _MOE_EXPERT_PREFIXES)
+def test_moe_scheme_resolves_across_namespaces(stored_ns, prefix):
+    """Every (stored target namespace × serving prefix namespace) pair that
+    names layer 1's expert stack must resolve to the CB scheme."""
+    cfg = PrismaQuantConfig.from_config(_moe_config([
+        stored_ns + "layers.1.mlp.experts.gate_up_proj",
+        stored_ns + "layers.1.mlp.experts.down_proj",
+    ]))
+    cfg._ensure_resolved()
+    sch = cfg._moe_scheme_for_prefix(prefix)
+    assert sch is not None, (stored_ns, prefix)
+    assert sch["k"] == _SCHEME["k"]
+
+
+def test_moe_scheme_does_not_overmatch():
+    """A layer with no CB expert group must still resolve to None (so the stock
+    CT MoE path is used) — canonicalisation must not turn the prefix test into a
+    substring free-for-all."""
+    cfg = PrismaQuantConfig.from_config(_moe_config([
+        "model.language_model.layers.1.mlp.experts.gate_up_proj",
+    ]))
+    cfg._ensure_resolved()
+    assert cfg._moe_scheme_for_prefix(
+        "language_model.model.layers.2.mlp.experts") is None
+    # a dense MLP prefix must not pick up the expert group either
+    assert cfg._moe_scheme_for_prefix(
+        "language_model.model.layers.1.mlp.shared_expert") is None

@@ -681,6 +681,24 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # ---- stage 1: gate_up = x @ W13[e]^T -------------------------------
             if _timing: _t0 = _time.time()
             W13 = self._expand_stack_slice(layer, "w13", c0, c1, to_fp8=is_fp8)
+            # W2's expand has no dependency on stage 1 — run it on a side
+            # stream so it hides under the stage-1 GEMM + activation. The
+            # peak transient grows by |W2| (~0.8 GB on Laguna); the serve
+            # slack gate is the sizing authority. Prefill is eager
+            # (FULL_DECODE_ONLY graphs), so side-stream use is capture-safe.
+            # PRISMAQUANT_CB_PREFILL_OVERLAP=0 restores serial (bisection).
+            # Measured NULL on 35B-A3B (17 ms/layer, both arms identical,
+            # 2026-07-26); stays opt-in until a positive exists at any scale.
+            _ovl = (is_fp8 and os.environ.get(
+                "PRISMAQUANT_CB_PREFILL_OVERLAP") == "1")
+            W2 = None
+            if _ovl:
+                if not hasattr(self, "_ovl_stream"):
+                    self._ovl_stream = torch.cuda.Stream()
+                self._ovl_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._ovl_stream):
+                    W2 = self._expand_stack_slice(
+                        layer, "w2", c0, c1, to_fp8=is_fp8)
             if _timing:
                 torch.cuda.synchronize(); _t["expand"] += _time.time() - _t0
             ic1 = torch.empty((M, top_k, N1), dtype=x.dtype, device=dev)
@@ -720,7 +738,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
             # ---- stage 2: y = a @ W2[e]^T, router-weighted --------------------
             if _timing: _t0 = _time.time()
-            W2 = self._expand_stack_slice(layer, "w2", c0, c1, to_fp8=is_fp8)
+            if W2 is None:
+                W2 = self._expand_stack_slice(
+                    layer, "w2", c0, c1, to_fp8=is_fp8)
+            else:
+                # W2 was expanded on the side stream under stage 1; order
+                # stage 2 after it and pin its lifetime to this stream.
+                torch.cuda.current_stream().wait_stream(self._ovl_stream)
+                W2.record_stream(torch.cuda.current_stream())
             if _timing:
                 torch.cuda.synchronize(); _t["expand"] += _time.time() - _t0
             ic3 = torch.empty((M, top_k, Kh), dtype=x.dtype, device=dev)

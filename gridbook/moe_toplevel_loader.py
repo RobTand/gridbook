@@ -445,6 +445,55 @@ def _spec_layer_rename(model):
     return rename
 
 
+def _hf_mapper_rename(model):
+    """A ``checkpoint name -> vLLM module-tree name`` callable built from the
+    model's OWN ``hf_to_vllm_mapper`` (a vLLM ``WeightsMapper``), or ``None``
+    when the class has none.
+
+    Needed for multimodal wrappers such as Qwen3.5-MoE
+    (``Qwen3_5MoeForConditionalGeneration``), whose checkpoint carries
+    ``model.language_model.layers.N.…`` while ``named_parameters()`` reads
+    ``language_model.model.layers.N.…``. The original ``load_weights`` applies
+    the mapper *inside* itself (``AutoWeightsLoader(..., mapper=...)``), i.e.
+    AFTER our wrapper has seen the raw stream — so without this the
+    ``…mlp.experts.`` prefix anchor matches no registered param and every
+    stacked-CB expert tensor falls through to the arch loader (the bug).
+
+    We reuse the model's own mapper rather than hard-coding a prefix rewrite, so
+    any arch/prefix convention is handled by definition. A mapper that maps a
+    name to ``None`` means "drop"; we return the name unchanged so the original
+    loader performs the drop exactly as it would."""
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    map_name = getattr(mapper, "_map_name", None)
+    if not callable(map_name):
+        return None
+
+    def rename(name: str) -> str:
+        mapped = map_name(name)
+        return name if mapped is None else mapped
+
+    return rename
+
+
+def _compose_renames(*renames):
+    """Left-to-right composition of the non-``None`` renames, or ``None`` when
+    all are absent. A ``"__skip__"`` short-circuits (it is a terminal marker)."""
+    fns = [f for f in renames if f is not None]
+    if not fns:
+        return None
+    if len(fns) == 1:
+        return fns[0]
+
+    def rename(name: str) -> str:
+        for f in fns:
+            if name == "__skip__":
+                return name
+            name = f(name)
+        return name
+
+    return rename
+
+
 def install_toplevel_cb_expert_loader(model_cls: type) -> None:
     """Idempotently wrap ``model_cls.load_weights`` so stacked-CB expert tensors
     load directly into the registered FusedMoE params, and everything else
@@ -453,9 +502,17 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
     Safe to call repeatedly (guarded by a ``_pq_cb_wrapped`` class sentinel) and
     safe if the model has no CB experts at serve time (the wrapper only fires on
     matching names; all others pass straight through)."""
-    if getattr(model_cls, "_pq_cb_wrapped", False):
+    # Sentinel checked in the class's OWN __dict__: a subclass that defines its
+    # own ``load_weights`` must still be wrapped even though it inherits a
+    # wrapped base's sentinel (Qwen3_5 has a whole ForCausalLMBase /
+    # ForConditionalGeneration hierarchy). If the class merely INHERITS an
+    # already-wrapped function there is nothing to do.
+    if model_cls.__dict__.get("_pq_cb_wrapped", False):
         return
     orig_load_weights = model_cls.load_weights
+    if getattr(orig_load_weights, "_pq_cb_wrapper", False):
+        model_cls._pq_cb_wrapped = True
+        return
 
     def load_weights(self, weights):  # noqa: ANN001, ANN202
         # named_parameters() here carries the same module-nesting prefix as the
@@ -468,7 +525,12 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
         # Spec-layer (MTP) drafters nest a spec layer's block tensors under
         # ``.mtp_block.``; ``rename`` maps an incoming checkpoint name to the
         # served param naming before resolution (identity for a body model).
-        rename = _spec_layer_rename(self)
+        # Multimodal wrappers rename the checkpoint prefix
+        # (``model.language_model.`` -> ``language_model.model.``) via their own
+        # WeightsMapper, which the original loader applies only internally;
+        # apply it FIRST so our anchors match the registered param names.
+        rename = _compose_renames(_hf_mapper_rename(self),
+                                  _spec_layer_rename(self))
         loaded: set[str] = set()
         # Shared-expert CB tensors (…shared_mlp.*.cb_qweight / .weight_scale):
         # vLLM built bf16 Linears for these (no cb_qweight param). Buffer them
@@ -531,5 +593,6 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                                       rename=rename)
         return loaded
 
+    load_weights._pq_cb_wrapper = True
     model_cls.load_weights = load_weights
     model_cls._pq_cb_wrapped = True

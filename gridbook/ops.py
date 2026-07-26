@@ -117,6 +117,32 @@ def _cb_expand_fp8_fake(qw_padded, cb_flat_fp8, cb_row_offset, N, K, k_bits,
                        device=qw_padded.device)
 
 
+@torch.library.custom_op("prismaquant::cb_prefill_persistent_tc",
+                         mutates_args=(), tags=_PQ_UNSAFE)
+def cb_prefill_persistent_tc(a_fp8: torch.Tensor, packed_u8: torch.Tensor,
+                             cb_flat_fp8_u8: torch.Tensor, N: int, K: int,
+                             k_bits: int, type_size: int,
+                             variant: int = 1) -> torch.Tensor:
+    """Persistent-N tensor-core FP8_CB prefill (#4b): [M,K] e4m3 activations x
+    packed CB rows -> UNSCALED bf16 [M, N]. The caller MUST apply the
+    per-token activation scale and the per-output-channel weight scale.
+    Quarantined behind ``PRISMAQUANT_ENABLE_PTC=1`` (cuda_ext)."""
+    from .cuda_ext import get_persistent_ext
+    ext = get_persistent_ext()
+    if ext is None:
+        raise RuntimeError(
+            "persistent-TC ext not enabled (PRISMAQUANT_ENABLE_PTC=1)")
+    return ext.cb_prefill_persistent_tc(a_fp8, packed_u8, cb_flat_fp8_u8,
+                                        N, K, k_bits, type_size, variant)
+
+
+@cb_prefill_persistent_tc.register_fake
+def _cb_prefill_persistent_tc_fake(a_fp8, packed_u8, cb_flat_fp8_u8, N, K,
+                                   k_bits, type_size, variant=1):
+    return torch.empty((a_fp8.shape[0], N), dtype=torch.bfloat16,
+                       device=a_fp8.device)
+
+
 @torch.library.custom_op("prismaquant::fp8_act_qdq", mutates_args=(), tags=_PQ_UNSAFE)
 def fp8_act_qdq(x: torch.Tensor) -> torch.Tensor:
     """Fused per-token fp8 dynamic QDQ (bit-exact to codec.fp8_dynamic_act_qdq)

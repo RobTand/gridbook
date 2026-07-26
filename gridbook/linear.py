@@ -284,6 +284,36 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             self._cuda_gemv_cached = ok
         return ok
 
+    def _ptc_ok(self, layer, K: int) -> bool:
+        """Persistent-TC prefill eligibility for THIS layer (cached; the answer
+        never changes after load). Mirrors the kernel's own TORCH_CHECKs so a
+        miss is a silent fall-through, never a crash."""
+        ok = getattr(layer, "_cb_ptc_ok", None)
+        if ok is not None:
+            return ok
+        ok = (not self.is_fp4                      # fp8-CB only
+              and self.n_sub == 4                  # kernel LUT = 4 sub-tables
+              and K % 256 == 0 and K % 64 == 0
+              and self.k % 4 == 0
+              and self.type_size == 4 * self.k and self.type_size <= 192
+              and 16 * K + 16384 <= 99 * 1024      # smem plan
+              and getattr(layer, "_cb_flat_fp8", None) is not None
+              and layer.cb_qweight.data.dim() == 2
+              and layer.cb_qweight.data.stride(1) == 1)
+        if ok:
+            # Single uniform rung: one codebook block for every output row (the
+            # kernel has no per-row codebook offset). One host sync, once.
+            ro = layer._cb_row_offset
+            ok = bool((ro.max() == ro.min()).item()) and int(ro[0]) == 0
+        if ok:
+            from .cuda_ext import get_persistent_ext
+            ok = get_persistent_ext() is not None
+        if not ok and os.environ.get("PRISMAQUANT_DEBUG_PREFIXES") == "1":
+            print(f"[cb] persistent-TC ineligible: {self.prefix} "
+                  f"(K={K} k={self.k} ts={self.type_size} n_sub={self.n_sub})")
+        layer._cb_ptc_ok = ok
+        return ok
+
     def apply(self, layer, x, bias=None):
         # M-branch hoist (compile lane): dispatch through ONE opaque custom op
         # so torch.compile never traces the M-branch (which otherwise bakes
@@ -392,6 +422,31 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 y = (acc.float() * sa.reshape(-1, 1)
                      * layer._cb_scale.reshape(1, -1).float()).to(x.dtype)
                 return y.reshape(*x.shape[:-1], N)
+
+        # Persistent-N tensor-core prefill (#4b, OPT-IN and quarantined):
+        # PRISMAQUANT_CB_PREFILL_DENSE=persistent routes large-M fp8-CB prefill
+        # into the fused decode+TC-GEMM kernel, skipping the [N,K] e4m3
+        # transient entirely. Any constraint miss falls through SILENTLY to the
+        # shipping expand+cutlass path below (no behaviour change when off).
+        if (os.environ.get("PRISMAQUANT_CB_PREFILL_DENSE") == "persistent"
+                and x2.shape[0] > 128
+                and self._ptc_ok(layer, K)):
+            from .ops import cb_prefill_persistent_tc
+            d = cb_prefill_persistent_tc(
+                xq, layer.cb_qweight.data, layer._cb_flat_fp8, N, K,
+                self.k, self.type_size,
+                int(os.environ.get("PRISMAQUANT_PTC_VARIANT", "1")))
+            # Scale convention: the kernel returns the UNSCALED accumulation
+            # (like cb_fused_prefill_mm above), so the per-token activation
+            # scale `sa` [M,1] and the per-output-channel weight scale
+            # _cb_scale [N] are applied outside — same expression as the
+            # mid-M fused path (a rounding-ORDER difference vs
+            # cutlass_scaled_mm's f32 epilogue, hence the opt-in gate).
+            y = (d.float() * sa.reshape(-1, 1)
+                 * layer._cb_scale.reshape(1, -1).float()).to(x.dtype)
+            if bias is not None:
+                y = y + bias
+            return y.reshape(*x.shape[:-1], N)
 
         if self._cuda_gemv_ok():
             # CUDA expander (stream-bandwidth-bound; the Triton byte-gather

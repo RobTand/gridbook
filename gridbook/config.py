@@ -325,8 +325,22 @@ class PrismaQuantConfig(QuantizationConfig):
         """A CB expert stack (targets like ``…experts.gate_up_proj`` /
         ``…experts.down_proj``) under this FusedMoE prefix — return its scheme
         (uniform per layer, so any matching target's scheme is the layer's)."""
+        # Canonicalise BOTH sides, exactly as ``_scheme_for_prefix`` does for
+        # Linears. Without this the multimodal wrapper breaks experts ONLY:
+        # vLLM hands us the serving prefix ``language_model.model.layers.N.mlp.
+        # experts`` while the checkpoint-namespace targets read
+        # ``model.language_model.layers.N.mlp.experts.gate_up_proj``, so a raw
+        # ``startswith`` misses, no CB MoE method is created, no
+        # ``w13_cb_qweight``/``w2_cb_qweight`` params exist, and the arch's own
+        # expert mapping then derives ``experts.w2_weight.cb_qweight`` and
+        # AttributeErrors (35B CB serve boot). Dense Linears were unaffected
+        # because their lookup already canonicalised — that asymmetry WAS the bug.
+        cprefix = _canonical_prefix(prefix)
         for name, sch in self.target_scheme.items():
-            if name.startswith(prefix) and name.split(".")[-1] in _MOE_LEAVES:
+            if name.split(".")[-1] not in _MOE_LEAVES:
+                continue
+            if name.startswith(prefix) or _canonical_target(name).startswith(
+                    cprefix):
                 return sch
         return None
 

@@ -574,3 +574,165 @@ def test_load_shared_cb_with_spec_rename(monkeypatch):
     assert torch.all(gu[:INTER] == 1), "gate rows (shard 0) first"
     assert torch.all(gu[INTER:] == 2), "up rows (shard 1) second"
     assert torch.all(params_dict[par + ".down_proj.weight"] == 3)
+
+
+# ---------------------------------------------------------------------------
+# Multimodal prefix mapping (Qwen3.5-MoE): the checkpoint says
+# ``model.language_model.layers.N.…`` while named_parameters() says
+# ``language_model.model.layers.N.…``. The original loader applies the arch's
+# WeightsMapper only INSIDE itself, so the wrapper must apply the model's own
+# ``hf_to_vllm_mapper`` before resolving.
+# ---------------------------------------------------------------------------
+
+class _FakeWeightsMapper:
+    """Minimal stand-in for vLLM's WeightsMapper (prefix rewrites only)."""
+
+    def __init__(self, orig_to_new_prefix):
+        self._prefixes = dict(orig_to_new_prefix)
+
+    def _map_name(self, key):
+        for orig, new in self._prefixes.items():
+            if key.startswith(orig):
+                if new is None:
+                    return None
+                return new + key[len(orig):]
+        return key
+
+
+_QWEN35_MAPPER = _FakeWeightsMapper({
+    "model.visual.": "visual.",
+    "lm_head.": "language_model.lm_head.",
+    "model.language_model.": "language_model.model.",
+})
+
+
+def test_hf_mapper_rename_maps_multimodal_prefix():
+    from gridbook.moe_toplevel_loader import _hf_mapper_rename
+
+    class _M:
+        hf_to_vllm_mapper = _QWEN35_MAPPER
+
+    rename = _hf_mapper_rename(_M())
+    assert rename("model.language_model.layers.3.mlp.experts.down_proj.cb_qweight") \
+        == "language_model.model.layers.3.mlp.experts.down_proj.cb_qweight"
+    # unmapped names pass through unchanged
+    assert rename("model.layers.3.mlp.experts.down_proj.cb_qweight") == \
+        "model.layers.3.mlp.experts.down_proj.cb_qweight"
+
+
+def test_hf_mapper_rename_absent_is_none():
+    from gridbook.moe_toplevel_loader import _hf_mapper_rename
+
+    class _M:
+        pass
+
+    assert _hf_mapper_rename(_M()) is None
+
+
+def test_compose_renames():
+    from gridbook.moe_toplevel_loader import _compose_renames
+
+    assert _compose_renames(None, None) is None
+    f = _compose_renames(lambda n: n + "|a", None)
+    assert f("x") == "x|a"
+    g = _compose_renames(lambda n: n + "|a", lambda n: n + "|b")
+    assert g("x") == "x|a|b"
+    # a "__skip__" produced by an earlier stage short-circuits
+    h = _compose_renames(lambda n: "__skip__", lambda n: n + "|b")
+    assert h("x") == "__skip__"
+
+
+def test_wrapper_routes_experts_under_language_model_prefix():
+    """The 35B CB bug: stacked-CB expert tensors under the multimodal
+    ``model.language_model.`` checkpoint prefix must reach the FusedMoE params
+    registered under ``language_model.model.``."""
+    E, HID, INTER, BYTES = 2, 8, 4, 3
+    P = "language_model.model.layers.1.mlp.experts."
+
+    class _FakeCondGen:
+        hf_to_vllm_mapper = _QWEN35_MAPPER
+
+        def __init__(self):
+            self._params = {
+                P + "w13_cb_qweight": torch.zeros(E, 2 * INTER, BYTES,
+                                                  dtype=torch.uint8),
+                P + "w2_cb_qweight": torch.zeros(E, HID, BYTES,
+                                                 dtype=torch.uint8),
+                P + "w13_weight_scale": torch.zeros(E, 2 * INTER,
+                                                    dtype=torch.float32),
+                P + "w2_weight_scale": torch.zeros(E, HID, dtype=torch.float32),
+                # shared expert: vLLM built a FUSED CB Linear -> must DEFER
+                "language_model.model.layers.1.mlp.shared_expert."
+                "gate_up_proj.cb_qweight": torch.zeros(2 * INTER, BYTES,
+                                                       dtype=torch.uint8),
+                "language_model.model.layers.1.mlp.gate.weight":
+                    torch.zeros(E, HID),
+            }
+            self.delegated = []
+
+        def named_parameters(self):
+            return list(self._params.items())
+
+        def load_weights(self, weights):     # ORIGINAL (stub stock loader)
+            loaded = set()
+            for name, w in weights:
+                self.delegated.append(name)
+            return loaded
+
+    install_toplevel_cb_expert_loader(_FakeCondGen)
+    m = _FakeCondGen()
+    C = "model.language_model.layers.1.mlp."
+    loaded = m.load_weights(iter([
+        (C + "experts.gate_up_proj.cb_qweight",
+         torch.full((E, 2 * INTER, BYTES), 7, dtype=torch.uint8)),
+        (C + "experts.down_proj.cb_qweight",
+         torch.full((E, HID, BYTES), 9, dtype=torch.uint8)),
+        (C + "experts.gate_up_proj.weight_scale", torch.full((E, 2 * INTER), 2.0)),
+        (C + "experts.down_proj.weight_scale", torch.full((E, HID), 3.0)),
+        # shared-expert CB shard: vLLM built a fused CB param -> delegate
+        (C + "shared_expert.gate_proj.cb_qweight",
+         torch.full((INTER, BYTES), 5, dtype=torch.uint8)),
+        (C + "gate.weight", torch.zeros(E, HID)),
+    ]))
+
+    assert torch.all(m._params[P + "w13_cb_qweight"] == 7)
+    assert torch.all(m._params[P + "w2_cb_qweight"] == 9)
+    assert torch.allclose(m._params[P + "w13_weight_scale"], torch.tensor(2.0))
+    assert torch.allclose(m._params[P + "w2_weight_scale"], torch.tensor(3.0))
+    assert loaded == {P + "w13_cb_qweight", P + "w2_cb_qweight",
+                      P + "w13_weight_scale", P + "w2_weight_scale"}
+    # routed-expert tensors never leak; shared-expert + router DO delegate
+    assert not any(".experts." in n for n in m.delegated), m.delegated
+    assert m.delegated == [C + "shared_expert.gate_proj.cb_qweight",
+                           C + "gate.weight"]
+
+
+def test_install_wraps_subclass_with_own_load_weights():
+    """A subclass defining its OWN load_weights must be wrapped even though it
+    inherits the base's ``_pq_cb_wrapped`` sentinel; a subclass that merely
+    INHERITS the wrapped function must not be double-wrapped."""
+    class _Base:
+        def load_weights(self, weights):
+            return {n for n, _ in weights}
+
+    class _OwnLoader(_Base):
+        def load_weights(self, weights):     # distinct function object
+            return {n for n, _ in weights}
+
+    class _Inherits(_Base):
+        pass
+
+    install_toplevel_cb_expert_loader(_Base)
+    base_fn = _Base.__dict__["load_weights"]
+    install_toplevel_cb_expert_loader(_OwnLoader)
+    install_toplevel_cb_expert_loader(_Inherits)
+
+    assert getattr(base_fn, "_pq_cb_wrapper", False)
+    own_fn = _OwnLoader.__dict__["load_weights"]
+    assert getattr(own_fn, "_pq_cb_wrapper", False) and own_fn is not base_fn
+    # inherited: no own load_weights installed, sentinel recorded
+    assert "load_weights" not in _Inherits.__dict__
+    assert _Inherits.__dict__.get("_pq_cb_wrapped") is True
+    # idempotent
+    install_toplevel_cb_expert_loader(_Base)
+    assert _Base.__dict__["load_weights"] is base_fn
