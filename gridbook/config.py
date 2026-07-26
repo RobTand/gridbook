@@ -60,7 +60,27 @@ def _canonical_prefix(prefix: str) -> str:
         return prefix[len("language_model."):]
     if prefix.startswith("language_model."):
         return "model." + prefix[len("language_model."):]
+    # Pre-fix multimodal CHECKPOINT namespace (shipped 27B gridbook artifact):
+    # ``model.language_model.layers.*`` denotes the same Linear as canonical
+    # ``model.layers.*``. Normalising it here (as well as in
+    # ``_canonical_target``) keeps probe-side and target-side on one string.
+    if prefix.startswith("model.language_model."):
+        return "model." + prefix[len("model.language_model."):]
     return prefix
+
+
+def _canonical_target(name: str) -> str:
+    """Stored ``config_groups[*].targets`` / ``ignore`` entry -> canonical
+    target namespace, so historical checkpoint-namespace artifacts resolve
+    against the canonicalised serving prefixes ``_canonical_prefix`` produces.
+
+    Rewrites (prefix-anchored only):
+      ``model.language_model.`` -> ``model.``          (old multimodal ckpt)
+      ``language_model.model.`` -> ``model.``          (serving wrapper form)
+      ``language_model.<rest>`` -> ``model.<rest>``
+    Everything else (``visual.*``, ``mtp.*``, plain ``model.layers.*``,
+    bare leaf names) passes through untouched."""
+    return _canonical_prefix(name)
 
 
 def _resolve_model_file(model_dir: str, fname: str) -> str:
@@ -106,9 +126,18 @@ class PrismaQuantConfig(QuantizationConfig):
             with open(_resolve_model_file(model_dir, cfg_file)) as fh:
                 cfg = json.load(fh)
             self.codebook_file = cfg.get("codebook_file", self.codebook_file)
+        # Normalise stored namespaces ONCE, here, so all downstream resolution
+        # (ours and the delegated CT config's) sees canonical target names.
+        cfg = dict(cfg)
+        cfg["config_groups"] = {
+            name: {**g, "targets": [_canonical_target(t)
+                                    for t in g.get("targets", [])]}
+            for name, g in cfg["config_groups"].items()
+        }
+        cfg["ignore"] = [_canonical_target(i) for i in cfg.get("ignore", [])]
         self._full_config = cfg
         self.config_groups = cfg["config_groups"]
-        self.ignore = list(cfg.get("ignore", []))
+        self.ignore = list(cfg["ignore"])
         stock_groups: dict = {}
         for name, g in self.config_groups.items():
             if "scheme" in g:                        # CB group (our vocabulary)
