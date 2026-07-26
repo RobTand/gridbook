@@ -404,23 +404,24 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # Mid-M fused decode-in-prologue (task 7's measured WIN niche): at
         # M in (16, 128] ONE M-tile covers the batch, so decoding B inside
         # the CUTLASS prologue has no redundancy and beats expand+GEMM by
-        # 1.04-1.45x (M=32/64/128, GB10). OPT-IN (PRISMAQUANT_CB_FUSED_MIDM=1)
-        # until its served logprob A/B lands: the fused epilogue rounds the
-        # UNSCALED accumulation to bf16 and scales OUTSIDE, while
-        # cutlass_scaled_mm scales in the f32 epilogue then rounds — a
-        # rounding-ORDER numerics change vs the shipping path. Step-4 rungs
-        # only (the kernel's KBits template dispatch).
+        # 1.04-1.45x (M=32/64/128, GB10). OPT-IN (PRISMAQUANT_CB_FUSED_MIDM=1).
+        # Numerics: the _scaled entry applies BOTH the per-token activation
+        # scale and the per-channel weight scale inside its fp32 EVT epilogue
+        # and rounds once to bf16 — the same rounding ORDER as
+        # cutlass_scaled_mm (the older unscaled entry rounded first and scaled
+        # in python, which moved served prompt logprobs by up to 0.86 nats).
+        # Step-4 rungs only (the kernel's KBits template dispatch).
         if (bias is None and 16 < x2.shape[0] <= 128
                 and self.k in (36, 40, 44, 48)
-                and os.environ.get("PRISMAQUANT_CB_FUSED_MIDM") == "1"):
+                and os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0"):
             from .cuda_ext import get_fused_ext
             fext = get_fused_ext()
-            if fext is not None:
-                acc = fext.cb_fused_prefill_mm(
-                    xq, layer.cb_qweight.data, layer._cb_flat_fp8, N, K,
-                    self.k)
-                y = (acc.float() * sa.reshape(-1, 1)
-                     * layer._cb_scale.reshape(1, -1).float()).to(x.dtype)
+            if fext is not None and hasattr(fext, "cb_fused_prefill_mm_scaled"):
+                y = fext.cb_fused_prefill_mm_scaled(
+                    xq, layer.cb_qweight.data, layer._cb_flat_fp8,
+                    sa.reshape(-1).to(torch.float32).contiguous(),
+                    layer._cb_scale.reshape(-1).to(torch.float32).contiguous(),
+                    N, K, self.k)
                 return y.reshape(*x.shape[:-1], N)
 
         # Persistent-N tensor-core prefill (#4b, OPT-IN and quarantined):
@@ -436,12 +437,15 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 xq, layer.cb_qweight.data, layer._cb_flat_fp8, N, K,
                 self.k, self.type_size,
                 int(os.environ.get("PRISMAQUANT_PTC_VARIANT", "1")))
-            # Scale convention: the kernel returns the UNSCALED accumulation
-            # (like cb_fused_prefill_mm above), so the per-token activation
-            # scale `sa` [M,1] and the per-output-channel weight scale
-            # _cb_scale [N] are applied outside — same expression as the
-            # mid-M fused path (a rounding-ORDER difference vs
-            # cutlass_scaled_mm's f32 epilogue, hence the opt-in gate).
+            # Scale convention: the kernel returns the UNSCALED accumulation,
+            # so the per-token activation scale `sa` [M,1] and the
+            # per-output-channel weight scale _cb_scale [N] are applied
+            # outside. NOTE: this is the OLD convention — the mid-M fused path
+            # above has since moved to an in-epilogue fp32 scale
+            # (cb_fused_prefill_mm_scaled) to match cutlass_scaled_mm's
+            # rounding order; this route still rounds to bf16 first, which is
+            # a rounding-ORDER difference vs the shipping path (hence the
+            # opt-in gate). Behaviour deliberately unchanged here.
             y = (d.float() * sa.reshape(-1, 1)
                  * layer._cb_scale.reshape(1, -1).float()).to(x.dtype)
             if bias is not None:

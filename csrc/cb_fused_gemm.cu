@@ -31,8 +31,15 @@
 //    exists in HBM. KBits in {36,40,44,48} template-dispatched.
 //  - smem_report: per-config SharedStorage sizes (budget sanity).
 //
-// All entries return the UNSCALED bf16 accumulation (per-token x per-channel
-// scales applied outside, as the baseline gate established).
+// Scale convention:
+//  - the ORIGINAL entries return the UNSCALED bf16 accumulation (per-token x
+//    per-channel scales applied outside, as the baseline gate established);
+//  - cb_fused_prefill_mm_scaled applies BOTH scales inside an fp32 EVT
+//    epilogue -- out = bf16_rn(acc_f32 * a_scale[m] * b_scale[n]) -- which is
+//    the same rounding ORDER as ops.cutlass_scaled_mm. The unscaled entry
+//    rounds to bf16 first, and that order difference is measurable on served
+//    prompt logprobs (mean 0.10 / max 0.86 nats on the 27B artifact), so the
+//    serving call site uses the _scaled entry.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -44,6 +51,10 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/util/packed_stride.hpp"
+#include "cutlass/epilogue/fusion/operations.hpp"
+#include "cutlass/epilogue/fusion/sm90_visitor_load_tma_warpspecialized.hpp"
+#include "cutlass/epilogue/fusion/sm90_visitor_compute_tma_warpspecialized.hpp"
+#include "cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp"
 
 #include "cutlass_fork/sm120_cb_mma_tma.hpp"
 #include "cutlass_fork/sm120_cb_fused_mma.hpp"
@@ -76,6 +87,58 @@ struct Cfg {
       void, LayoutD, AlignD,
       ElementD, LayoutD, AlignD,
       cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+  using BuilderMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
+      ElementAB, LayoutA, AlignAB,
+      ElementAB, LayoutB, AlignAB,
+      ElementAcc,
+      TileShape, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+};
+
+// ---------------------------------------------------------------------------
+// Scaled config: identical mainloop, but the epilogue is an EVT that applies
+// the per-token (row / M) activation scale and the per-channel (col / N)
+// weight scale in fp32 BEFORE the bf16 round -- matching cutlass_scaled_mm.
+//
+//   D = convert<bf16>( b_scale[n] * ( a_scale[m] * acc_f32 ) )
+//
+// Node tree (the same shape vLLM's ScaledEpilogue uses):
+//   Sm90EVT<Compute<multiplies, bf16>, RowBroadcast(b_scales),
+//           Sm90EVT<Compute<multiplies, f32>, ColBroadcast(a_scales),
+//                   Sm90AccFetch>>
+// ---------------------------------------------------------------------------
+template <class TileShape>
+struct ScaledFusion {
+  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
+      0, TileShape, float, float, Stride<_1, _0, _0>>;
+  using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
+      0, TileShape, float, float, Stride<_0, _1, _0>>;
+  using AccFetch = cutlass::epilogue::fusion::Sm90AccFetch;
+  using MulA = cutlass::epilogue::fusion::Sm90Compute<
+      cutlass::multiplies, ElementAcc, ElementAcc,
+      cutlass::FloatRoundStyle::round_to_nearest>;
+  using MulB = cutlass::epilogue::fusion::Sm90Compute<
+      cutlass::multiplies, ElementD, ElementAcc,
+      cutlass::FloatRoundStyle::round_to_nearest>;
+  using EVTA = cutlass::epilogue::fusion::Sm90EVT<MulA, ScaleA, AccFetch>;
+  using type = cutlass::epilogue::fusion::Sm90EVT<MulB, ScaleB, EVTA>;
+};
+
+template <class TileShape>
+struct CfgScaled {
+  using Fusion = typename ScaledFusion<TileShape>::type;
+  using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
+      TileShape, ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAcc, ElementAcc,
+      void, LayoutD, AlignD,
+      ElementD, LayoutD, AlignD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto,
+      Fusion>::CollectiveOp;
   using BuilderMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
       ElementAB, LayoutA, AlignAB,
@@ -211,9 +274,9 @@ torch::Tensor run_fused(torch::Tensor a, torch::Tensor packed,
   return d;
 }
 
-torch::Tensor cb_fused_prefill_mm(torch::Tensor a, torch::Tensor packed,
-                                  torch::Tensor lut, int64_t N, int64_t K,
-                                  int64_t k_bits) {
+void check_fused_inputs(torch::Tensor a, torch::Tensor packed,
+                        torch::Tensor lut, int64_t N, int64_t K,
+                        int64_t k_bits) {
   TORCH_CHECK(a.is_cuda() && a.scalar_type() == torch::kFloat8_e4m3fn,
               "a must be fp8 e4m3 [M,K]");
   TORCH_CHECK(a.dim() == 2 && a.size(1) == K && a.stride(1) == 1 &&
@@ -226,11 +289,90 @@ torch::Tensor cb_fused_prefill_mm(torch::Tensor a, torch::Tensor packed,
   TORCH_CHECK(packed.stride(0) >= (K / 256) * 4 * k_bits);
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8);
   TORCH_CHECK(K % 256 == 0);
+  TORCH_CHECK(k_bits == 36 || k_bits == 40 || k_bits == 44 || k_bits == 48,
+              "unsupported k_bits ", k_bits);
+}
+
+torch::Tensor cb_fused_prefill_mm(torch::Tensor a, torch::Tensor packed,
+                                  torch::Tensor lut, int64_t N, int64_t K,
+                                  int64_t k_bits) {
+  check_fused_inputs(a, packed, lut, N, K, k_bits);
   switch (k_bits) {
     case 36: return run_fused<36>(a, packed, lut, N, K);
     case 40: return run_fused<40>(a, packed, lut, N, K);
     case 44: return run_fused<44>(a, packed, lut, N, K);
     case 48: return run_fused<48>(a, packed, lut, N, K);
+    default: TORCH_CHECK(false, "unsupported k_bits ", k_bits);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fused decode-in-prologue entry, SCALED epilogue (cutlass_scaled_mm-faithful).
+// ---------------------------------------------------------------------------
+template <int KB>
+torch::Tensor run_fused_scaled(torch::Tensor a, torch::Tensor packed,
+                               torch::Tensor lut, torch::Tensor a_scales,
+                               torch::Tensor b_scales, int64_t N, int64_t K) {
+  constexpr int Stages = 2;
+  using TileShape = TileF;
+  using Mainloop = typename SwapToFused<
+      KB, Stages, typename CfgScaled<TileShape>::BuilderMainloop>::type;
+  using Epilogue = typename CfgScaled<TileShape>::Epilogue;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>, Mainloop, Epilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  const int M = (int)a.size(0);
+  const c10::cuda::OptionalCUDAGuard guard(a.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto d = torch::empty({M, N}, a.options().dtype(torch::kBFloat16));
+
+  using StrideA = typename GemmKernel::StrideA;
+  using StrideC = typename GemmKernel::StrideC;
+  using StrideD = typename GemmKernel::StrideD;
+  StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {M, (int)K, 1});
+  StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {M, (int)N, 1});
+
+  typename Gemm::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {M, (int)N, (int)K, 1},
+      {reinterpret_cast<const ElementAB*>(a.data_ptr()), sa,
+       packed.data_ptr<uint8_t>(), packed.stride(0),
+       lut.data_ptr<uint8_t>()},
+      {// EVT args: children first, then node op args (empty for multiplies).
+       {{b_scales.data_ptr<float>(), 0.0f, Stride<_0, _1, _0>{}},
+        {{a_scales.data_ptr<float>(), 0.0f, Stride<_1, _0, _0>{}}, {}, {}},
+        {}},
+       nullptr, StrideC{},
+       reinterpret_cast<ElementD*>(d.data_ptr()), sd}};
+
+  Gemm gemm;
+  size_t ws = Gemm::get_workspace_size(args);
+  auto workspace = torch::empty({(int64_t)ws}, a.options().dtype(torch::kUInt8));
+  TORCH_CHECK(gemm.can_implement(args) == cutlass::Status::kSuccess,
+              "fused(scaled) can_implement failed (K%256? row stride %16?)");
+  TORCH_CHECK(gemm.initialize(args, workspace.data_ptr()) == cutlass::Status::kSuccess);
+  TORCH_CHECK(gemm.run(stream) == cutlass::Status::kSuccess);
+  return d;
+}
+
+torch::Tensor cb_fused_prefill_mm_scaled(torch::Tensor a, torch::Tensor packed,
+                                         torch::Tensor lut,
+                                         torch::Tensor a_scales,
+                                         torch::Tensor b_scales, int64_t N,
+                                         int64_t K, int64_t k_bits) {
+  check_fused_inputs(a, packed, lut, N, K, k_bits);
+  TORCH_CHECK(a_scales.is_cuda() && a_scales.scalar_type() == torch::kFloat32 &&
+                  a_scales.numel() == a.size(0) && a_scales.is_contiguous(),
+              "a_scales must be contiguous fp32 [M] (per-token)");
+  TORCH_CHECK(b_scales.is_cuda() && b_scales.scalar_type() == torch::kFloat32 &&
+                  b_scales.numel() == N && b_scales.is_contiguous(),
+              "b_scales must be contiguous fp32 [N] (per-output-channel)");
+  switch (k_bits) {
+    case 36: return run_fused_scaled<36>(a, packed, lut, a_scales, b_scales, N, K);
+    case 40: return run_fused_scaled<40>(a, packed, lut, a_scales, b_scales, N, K);
+    case 44: return run_fused_scaled<44>(a, packed, lut, a_scales, b_scales, N, K);
+    case 48: return run_fused_scaled<48>(a, packed, lut, a_scales, b_scales, N, K);
     default: TORCH_CHECK(false, "unsupported k_bits ", k_bits);
   }
 }
@@ -258,5 +400,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "passthrough at 64x128x128 (fused kernel's reference config)");
   m.def("cb_fused_prefill_mm", &cb_fused_prefill_mm,
         "FP8_CB decode-in-prologue fused GEMM (unscaled bf16 out)");
+  m.def("cb_fused_prefill_mm_scaled", &cb_fused_prefill_mm_scaled,
+        "FP8_CB decode-in-prologue fused GEMM, per-token x per-channel scales "
+        "applied in the fp32 EVT epilogue (cutlass_scaled_mm rounding order)");
   m.def("smem_report", &smem_report, "SharedStorage sizes [F44, F48, K44, K48, Epi]");
 }

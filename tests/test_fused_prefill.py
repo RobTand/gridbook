@@ -148,3 +148,54 @@ def test_chunked_overlap_bitexact_vs_monolithic():
     y_ch = torch.cat(outs, dim=-1)
     torch.cuda.synchronize()
     assert torch.equal(y_mono.view(torch.uint16), y_ch.view(torch.uint16))
+
+
+# ---------------------------------------------------------------------------
+# Scaled epilogue (cb_fused_prefill_mm_scaled): the per-token activation scale
+# and the per-channel weight scale are applied in the kernel's fp32 EVT
+# epilogue, rounding ONCE to bf16 — the rounding ORDER ops.cutlass_scaled_mm
+# uses. The old unscaled entry + a python multiply rounds twice, which moved
+# served 27B prompt logprobs by mean 0.10 / max 0.86 nats. The GATE reference
+# is therefore cutlass_scaled_mm, with the fp32 GEMM as ground truth.
+# ---------------------------------------------------------------------------
+def _scaled_case(k, N, K, M, seed):
+    packed, cb8 = _synth(k, N=N, K=K, seed=seed)
+    ts = 4 * k
+    qwp = codec.pad_qweight(packed)
+    off = torch.zeros(N, dtype=torch.int32, device=DEV)
+    W = gemv_ext.cb_expand_fp8(qwp, cb8, off, N, K, k, 4, ts)
+    torch.manual_seed(seed)
+    xq = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float8_e4m3fn)
+    sa = (torch.rand(M, 1, device=DEV) * 0.02 + 0.01).float()
+    ws = (torch.rand(N, 1, device=DEV) * 0.02 + 0.01).float()
+    y_scaled = fused.cb_fused_prefill_mm_scaled(
+        xq, packed, cb8, sa.reshape(-1).contiguous(),
+        ws.reshape(-1).contiguous(), N, K, k)
+    y_unscaled = (fused.cb_fused_prefill_mm(xq, packed, cb8, N, K, k).float()
+                  * sa * ws.reshape(1, -1)).to(torch.bfloat16)
+    ref32 = (xq.float() @ W.float().t()) * sa * ws.reshape(1, -1)
+    return xq, W, sa, ws, y_scaled, y_unscaled, ref32
+
+
+@pytest.mark.parametrize("k", [36, 40, 44, 48])
+def test_fused_scaled_matches_fp32_reference(k):
+    """In-epilogue scaling must be a correct-rounding of the fp32 product, and
+    never worse than the round-then-scale path it replaces."""
+    _, _, _, _, y_s, y_u, ref32 = _scaled_case(k, N=256, K=1024, M=96, seed=k)
+    err_s = (y_s.float() - ref32).abs().max().item()
+    err_u = (y_u.float() - ref32).abs().max().item()
+    scale = ref32.abs().max().item()
+    assert err_s <= 0.005 * scale, (err_s, scale)
+    assert err_s <= err_u + 1e-6, (err_s, err_u)
+
+
+def test_fused_scaled_matches_cutlass_scaled_mm():
+    """The promotion gate: same value as the shipping comparator path
+    (ops.cutlass_scaled_mm) to within one bf16 ulp — same scale semantics,
+    same rounding order, only the K-reduction schedule differs."""
+    ops = pytest.importorskip("vllm._custom_ops")
+    k, N, K, M = 44, 320, 1536, 96
+    xq, W, sa, ws, y_s, y_u, ref32 = _scaled_case(k, N, K, M, seed=11)
+    y_c = ops.cutlass_scaled_mm(xq, W.t(), sa, ws, torch.bfloat16, None)
+    tol = 4.0 * torch.finfo(torch.bfloat16).eps * ref32.abs().max().item()
+    assert (y_s.float() - y_c.float()).abs().max().item() <= tol

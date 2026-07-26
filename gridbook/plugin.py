@@ -22,6 +22,8 @@ only for archs we opt in below.
 """
 from __future__ import annotations
 
+import os
+
 from vllm.model_executor.layers.quantization import register_quantization_config
 
 from . import ops  # noqa: F401  (registers the prismaquant::cb_gemm custom op)
@@ -117,6 +119,16 @@ def _install_toplevel_cb_expert_loaders() -> None:
 
 
 def register() -> None:
+    # Residency-matched A/B support: force-build+load the fused ext even when
+    # its dispatch env is off, so both arms of a served logprob comparison
+    # carry identical CUDA-extension residency (the session-arithmetic-drift
+    # mechanism otherwise confounds the gate).
+    if os.environ.get("PRISMAQUANT_PRELOAD_FUSED") == "1":
+        try:
+            from .cuda_ext import get_fused_ext
+            get_fused_ext()
+        except Exception:  # noqa: BLE001
+            pass
     try:
         register_quantization_config("gridbook")(PrismaQuantConfig)
     except ValueError:
