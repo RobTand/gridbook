@@ -412,7 +412,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # in python, which moved served prompt logprobs by up to 0.86 nats).
         # Step-4 rungs only (the kernel's KBits template dispatch).
         if (bias is None and 16 < x2.shape[0] <= 128
-                and self.k in (36, 40, 44, 48)
+                and self.k in (28, 32, 36, 40, 44, 48)
                 and os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0"):
             from .cuda_ext import get_fused_ext
             fext = get_fused_ext()

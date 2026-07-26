@@ -44,6 +44,7 @@ from .expand import (
     expand_cb_to_value,
     expand_fp4_v2_to_weight,
 )
+from .moe_routing import cb_grouped_pad_routing
 from .ops import dispatch_via_op
 
 
@@ -332,8 +333,38 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # Laguna-256E, 2026-07-23, with the slack-gate discipline bounding
         # the ~1.6 GB chunk transient). fp4-CB keeps 'loop' until its stock
         # variant (bf16 expand) gets the same at-scale measurement.
+        #
+        #   'grouped_fused' — _apply_prefill_grouped_fused (round 1 of the MoE
+        #     fused campaign, OPT-IN). Drops the stock path's HBM e4m3 expand
+        #     round-trip (write N*K bytes, read them back) by decoding each
+        #     expert's packed CB rows INSIDE the CUTLASS prologue
+        #     (cb_fused_prefill_mm_scaled, the dense mid-M default). Round 1 is
+        #     a host-side loop over experts with ONE device->host sync per
+        #     layer (the E+1 segment boundaries); round 2 replaces the loop
+        #     with a true array-of-problems grouped CUTLASS over the same
+        #     collective. Any constraint miss falls through to 'stock'.
+        #
+        #     ROUND 2 (_apply_prefill_grouped_fused_v2) is what
+        #     'grouped_fused' selects when the grouped binding is present: ONE
+        #     launch per projection stage over a TileM-padded, expert-sorted row
+        #     collective, retiring R1's 2*E launches (~5-10 ms/layer of pure
+        #     launch overhead once R1 had removed the expand round-trip).
+        #     'grouped_fused_r1' forces R1 — the bisection reference R2 is
+        #     validated against.
         mode = os.environ.get("PRISMAQUANT_CB_PREFILL") or (
             "stock" if not self.is_fp4 else "loop")
+        if mode in ("grouped_fused", "grouped_fused_r1"):
+            out = None
+            if mode == "grouped_fused":
+                out = self._apply_prefill_grouped_fused_v2(
+                    layer, x, topk_weights, topk_ids, act)
+            if out is None:
+                out = self._apply_prefill_grouped_fused(
+                    layer, x, topk_weights, topk_ids, act)
+            if out is not None:
+                return out
+            return self._apply_prefill_stock(
+                layer, x, topk_weights, topk_ids, act)
         if mode == "loop":
             return self._apply_prefill_loop(
                 layer, x, topk_weights, topk_ids, act)
@@ -342,6 +373,339 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 layer, x, topk_weights, topk_ids, act)
         return self._apply_prefill_batched(
             layer, x, topk_weights, topk_ids, act)
+
+    # -- prefill: grouped FUSED (decode-in-prologue, round 1) ---------------
+    def _gf_ok(self, layer) -> bool:
+        """Eligibility for the grouped-fused prefill (cached per layer; the
+        answer never changes after load). Mirrors the kernel's own
+        TORCH_CHECKs so a miss is a silent fall-through, never a crash:
+
+          * fp8-CB only (the fused kernel's LUT is the 4-sub-table e4m3
+            codebook; fp4 two-tier composes a scale the prologue can't);
+          * k in {28,32,36,40,44,48} — the KBits template dispatch, uniform
+            per layer by the export union-find;
+          * both projection K's are multiples of 256 (SUPERBLOCK, and the
+            kernel's K%256 check);
+          * packed row stride == row_bytes == (K/256)*4*k, which satisfies
+            BOTH `stride(0) % 16 == 0` (4*k in {144,160,176,192}) and
+            `stride(0) >= (K/256)*4*k_bits` with equality (UNPADDED rows).
+        """
+        ok = getattr(layer, "_cb_gf_ok", None)
+        if ok is not None:
+            return ok
+        ok = (not self.is_fp4
+              and self.n_sub == 4
+              and self.k in (28, 32, 36, 40, 44, 48)
+              and self.type_size == 4 * self.k
+              and layer._cb_hidden % codec.SUPERBLOCK == 0
+              and layer._cb_inter % codec.SUPERBLOCK == 0
+              and hasattr(layer, "w13_weight_scale"))
+        if ok:
+            from .cuda_ext import get_fused_ext
+            fext = get_fused_ext()
+            ok = fext is not None and hasattr(fext, "cb_fused_prefill_mm_scaled")
+        if ok:
+            # 3-D stacked buffers: [e] must give a 2-D CONTIGUOUS [out, bytes]
+            # view (stride(1)==1, stride(0)==row_bytes) — true for a slice of a
+            # contiguous 3-D tensor, asserted rather than assumed.
+            for which, in_f in (("w13", layer._cb_hidden),
+                                ("w2", layer._cb_inter)):
+                qw = getattr(layer, f"{which}_cb_qweight")
+                rb = _row_bytes(in_f, self.type_size)
+                # stride(0) matters only to R2, which hands the WHOLE stack to
+                # the kernel and TORCH_CHECKs the expert stride; checking it
+                # here keeps an exotic layout a silent fall-through rather than
+                # a crash inside the extension.
+                ok = ok and (qw.dim() == 3 and qw.stride(2) == 1
+                             and qw.stride(1) == rb and qw.shape[2] == rb
+                             and qw.stride(0) == qw.shape[1] * rb
+                             and rb % 16 == 0)
+        layer._cb_gf_ok = bool(ok)
+        return layer._cb_gf_ok
+
+    def _apply_prefill_grouped_fused(self, layer, x, topk_weights, topk_ids,
+                                     act):
+        """ROUND 1 of the MoE grouped fused prefill
+        (``PRISMAQUANT_CB_PREFILL=grouped_fused``, OPT-IN). Returns ``None`` on
+        any constraint miss so the caller falls through to 'stock'.
+
+        WHAT IT REMOVES. The stock path CUDA-expands each expert chunk's packed
+        CB rows into an HBM e4m3 tile and then runs vLLM's Triton fused-MoE
+        grouped GEMM over that tile: N*K bytes written, then read straight back
+        — a pure round-trip tax (~17 ms/layer expand vs ~25 ms/layer GEMM on a
+        256-expert reference). ``cb_fused_prefill_mm_scaled`` decodes the packed
+        rows INSIDE the CUTLASS prologue, so the tile never exists.
+
+        ROUTING / SYNC DESIGN. Per (token, expert) PAIR p = t*top_k + j:
+        ``pair_expert = topk_ids.reshape(-1)``. A STABLE argsort by expert makes
+        each expert's rows a contiguous, token-major segment (the loop path's
+        ``torch.where(topk_ids == e)`` order, so per-segment GEMMs bit-match the
+        loop and only the combine reassociates). Segment boundaries are
+        ``cumsum(bincount(pair_expert, minlength=E))`` — an [E+1] tensor built
+        entirely on device. ONE ``.tolist()`` fetches those E+1 offsets; that is
+        the path's ONLY device->host sync per layer (the 'batched' path already
+        tolerates two, the loop one). Python then slices the sorted row-index
+        tensor per expert with no further reads, and zero-row experts are
+        skipped on the fetched offsets alone. NOT capture-safe (host-read
+        control flow) — same class as 'batched'; prefill is eager
+        (FULL_DECODE_ONLY), so that costs nothing today.
+
+        NUMERICS. Activations: the same per-token fp8-dynamic QDQ the stock path
+        uses (``moe_kernel_quantize_input``, bit-equivalent to
+        codec.fp8_dynamic_act_qdq — test_stock_fp8_quant_matches_codec) on the
+        module input AND the intermediate, gathered per expert (QDQ is a
+        per-row op, so gather-after-quant == quant-after-gather bit-exactly).
+        Weights: the fused prologue's decode is bit-exact vs the expander.
+        Scales: the kernel's fp32 EVT epilogue applies per-token a_scales and
+        per-channel b_scales and rounds ONCE to bf16 — the same rounding order
+        as cutlass_scaled_mm and as the stock W8A8 kernel. Only the GEMM
+        accumulation and the cross-expert combine reassociate
+        (REASSOCIATION-CLASS, the suite's 2e-2 contract).
+
+        MIN-M. ``check_fused_inputs`` imposes NO minimum M: M is a runtime GEMM
+        extent and CUTLASS covers a short expert with one partial 128-row tile.
+        No padding is needed (and none is done).
+        """
+        if not self._gf_ok(layer):
+            return None
+        from vllm.platforms import current_platform
+        from vllm.model_executor.layers.fused_moe.utils import (
+            moe_kernel_quantize_input,
+        )
+        from .cuda_ext import get_fused_ext
+        fext = get_fused_ext()
+
+        E = layer._cb_E
+        T = x.shape[0]
+        top_k = topk_ids.shape[-1]
+        dev = x.device
+        Kh = layer._cb_hidden                        # w13 in / w2 out
+        inter = layer._cb_inter
+        N1 = 2 * inter                               # w13 out (gate_up)
+        d = N1 // 2
+        lut = self._stock_cb_flat_fp8(layer)
+        kb = self.k
+        fp8_dtype = current_platform.fp8_dtype()
+
+        out = torch.zeros_like(x)
+
+        # ---- routing (all device-side up to the single sync) ---------------
+        pair_expert = topk_ids.reshape(-1).to(torch.long)          # [P]
+        pair_token = torch.arange(T, device=dev, dtype=torch.long) \
+            .repeat_interleave(top_k)                              # [P]
+        order = torch.argsort(pair_expert, stable=True)
+        ptok_sorted = pair_token[order]                            # [P]
+        pw_sorted = topk_weights.reshape(-1)[order]                # [P]
+        counts = torch.bincount(pair_expert, minlength=E)          # [E]
+        bounds_t = torch.cat([counts.new_zeros(1), torch.cumsum(counts, 0)])
+        bounds = bounds_t.tolist()                                 # THE one sync
+
+        # ---- input activation QDQ, ONCE over all token rows ----------------
+        a1, a1s = moe_kernel_quantize_input(
+            x, None, fp8_dtype, per_act_token_quant=True)
+        a1s = a1s.reshape(-1).to(torch.float32)
+
+        w13q = layer.w13_cb_qweight.data
+        w2q = layer.w2_cb_qweight.data
+        w13s = layer.w13_weight_scale
+        w2s = layer.w2_weight_scale
+
+        for e in range(E):
+            p0, p1 = bounds[e], bounds[e + 1]
+            if p1 == p0:                              # zero-row expert: skip
+                continue
+            rows = ptok_sorted[p0:p1]
+            ae = a1.index_select(0, rows).contiguous()             # [m_e, Kh]
+            ase = a1s.index_select(0, rows).contiguous()           # [m_e]
+
+            # stage 1: gate_up = ae @ W13[e]^T (decode in prologue)
+            gate_up = fext.cb_fused_prefill_mm_scaled(
+                ae, w13q[e], lut, ase,
+                w13s[e].reshape(-1).to(torch.float32).contiguous(),
+                N1, Kh, kb)                                        # [m_e, N1]
+            del ae, ase
+            a = torch.empty((gate_up.shape[0], d), dtype=gate_up.dtype,
+                            device=dev)
+            apply_moe_activation(act, a, gate_up)                  # silu(g)*u
+            del gate_up
+
+            # intermediate QDQ — the stock path's exact function
+            a2, a2s = moe_kernel_quantize_input(
+                a, None, fp8_dtype, per_act_token_quant=True)
+            del a
+
+            # stage 2: y = a2 @ W2[e]^T
+            y = fext.cb_fused_prefill_mm_scaled(
+                a2.contiguous(), w2q[e], lut,
+                a2s.reshape(-1).to(torch.float32).contiguous(),
+                w2s[e].reshape(-1).to(torch.float32).contiguous(),
+                Kh, inter, kb)                                     # [m_e, Kh]
+            del a2, a2s
+            y = y * pw_sorted[p0:p1, None].to(y.dtype)             # router w
+            out.index_add_(0, rows, y.to(out.dtype))
+            del y
+        return out
+
+    # -- prefill: grouped FUSED round 2 (one launch per stage) --------------
+    def _gf2_ok(self, layer) -> bool:
+        """Eligibility for ROUND 2. Everything R1 requires (``_gf_ok`` — fp8-CB,
+        the KBits rung, K%256, unpadded 16B-aligned rows) PLUS the grouped
+        binding itself, which ships independently of ``cb_fused_prefill_mm_scaled``:
+        an older extension build must fall back to R1, not crash."""
+        ok = getattr(layer, "_cb_gf2_ok", None)
+        if ok is not None:
+            return ok
+        ok = self._gf_ok(layer)
+        if ok:
+            from .cuda_ext import get_fused_ext
+            fext = get_fused_ext()
+            ok = (fext is not None
+                  and hasattr(fext, "cb_fused_moe_grouped")
+                  and hasattr(fext, "cb_fused_moe_tile_m"))
+        layer._cb_gf2_ok = bool(ok)
+        return layer._cb_gf2_ok
+
+    def _apply_prefill_grouped_fused_v2(self, layer, x, topk_weights, topk_ids,
+                                        act):
+        """ROUND 2 of the MoE grouped fused prefill (selected by
+        ``PRISMAQUANT_CB_PREFILL=grouped_fused`` when the grouped binding
+        exists). Returns ``None`` on any constraint miss so the caller falls
+        back to R1 and then to 'stock'.
+
+        WHAT IT REMOVES. R1 already decodes CB rows inside the CUTLASS prologue,
+        so the only structural cost it left is the HOST LOOP: 2*E dense kernel
+        launches per layer (~5-10 ms/layer at E=256, comparable to the GEMM work
+        itself). R2 issues ONE ``cb_fused_moe_grouped`` per projection stage over
+        the whole routed collective; the kernel picks each M-tile's B operand
+        from a per-tile expert id.
+
+        PADDED ROUTING. The kernel's tile is uniform, so each expert's rows must
+        start on a TileM boundary — hence a PADDED gather rather than R1's exact
+        segments. ``cb_grouped_pad_routing`` (see its docstring for the
+        capacity-bound proof and the no-host-read construction) returns per-tile
+        expert ids and, per padded row, the index into the STABLE-argsorted pair
+        array. Stable sort keeps each expert's rows token-major, so a padded
+        segment's GEMM sees the same row order as ``_apply_prefill_loop``'s
+        ``torch.where(topk_ids == e)`` and only the combine reassociates.
+        ``expert_ids`` is built once and REUSED across both stages: the row
+        layout is a property of the routing, not of the projection.
+
+        PADDING IS INERT BY CONSTRUCTION, not by cancellation. Padding rows
+        gather activation zeros (scale 1.0 — any finite value works since the
+        row is zero, but 1.0 avoids a degenerate 0*0 scale in the intermediate
+        per-token QDQ), and the combine scatters them into a THROWAWAY row T of
+        a ``[T+1, hidden]`` accumulator that is then sliced off. That is
+        stronger than zeroing their router weight: it holds even if a padding
+        row's output were non-finite, so the guarantee does not depend on the
+        kernel's behaviour on an all-zero tile.
+
+        TRIM. ``PRISMAQUANT_CB_GROUPED_TRIM`` (default "1") spends ONE
+        ``.item()`` on the real block total and slices the padded collective
+        down to it, so no wasted tile is ever launched. R1 already spends one
+        sync per layer, so the default is strictly no worse. Setting it to "0"
+        keeps the full static capacity — up to E wasted tiles per stage, but the
+        path then contains NO host read of device data at all, which is the
+        prerequisite for future CUDA-graph capture of prefill (today prefill is
+        eager/FULL_DECODE_ONLY, so the trim is the better default).
+
+        NUMERICS. Identical contract to R1: the stock path's own
+        ``moe_kernel_quantize_input`` per-token fp8 QDQ on the module input AND
+        the intermediate (a per-row op, so gather-after-quant ==
+        quant-after-gather bit-exactly), bit-exact prologue weight decode, and
+        the same fp32 EVT ``bf16_rn(b_scale * (a_scale * acc))`` rounding order.
+        """
+        if not self._gf2_ok(layer):
+            return None
+        from vllm.platforms import current_platform
+        from vllm.model_executor.layers.fused_moe.utils import (
+            moe_kernel_quantize_input,
+        )
+        from .cuda_ext import get_fused_ext
+        fext = get_fused_ext()
+
+        E = layer._cb_E
+        T = x.shape[0]
+        top_k = topk_ids.shape[-1]
+        dev = x.device
+        Kh = layer._cb_hidden                        # w13 in / w2 out
+        inter = layer._cb_inter
+        N1 = 2 * inter                               # w13 out (gate_up)
+        d = N1 // 2
+        lut = self._stock_cb_flat_fp8(layer)
+        kb = self.k
+        fp8_dtype = current_platform.fp8_dtype()
+        tile_m = int(fext.cb_fused_moe_tile_m())     # never hardcode: the
+        if tile_m <= 0:                              # kernel owns its TileM
+            return None
+
+        # ---- routing (device-side; static shapes) --------------------------
+        pair_expert = topk_ids.reshape(-1).to(torch.long)          # [P]
+        pair_token = torch.arange(T, device=dev, dtype=torch.long) \
+            .repeat_interleave(top_k)                              # [P]
+        order = torch.argsort(pair_expert, stable=True)            # STABLE
+        ptok_sorted = pair_token[order]
+        pw_sorted = topk_weights.reshape(-1)[order].to(torch.float32)
+
+        expert_ids, row_src, is_pad, n_blocks = cb_grouped_pad_routing(
+            topk_ids, E, tile_m)
+
+        if os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1":
+            nb = int(n_blocks.item())                # THE one sync (optional)
+            expert_ids = expert_ids[:nb].contiguous()
+            row_src = row_src[:nb * tile_m]
+            is_pad = is_pad[:nb * tile_m]
+
+        # ---- input activation QDQ, ONCE over all token rows ----------------
+        a1, a1s = moe_kernel_quantize_input(
+            x, None, fp8_dtype, per_act_token_quant=True)
+        a1s = a1s.reshape(-1).to(torch.float32)
+
+        # ONE index vector does both the gather and the scatter: real rows map
+        # to their token, padding rows to the appended zero row / throwaway
+        # output row T. Gathering the zeros (rather than masking an fp8 tensor
+        # after the fact) keeps every op on this path a plain index_select.
+        rows = ptok_sorted.index_select(0, row_src)                 # [Mp]
+        dest = torch.where(is_pad, torch.full_like(rows, T), rows)
+        a1x = torch.cat([a1, a1.new_zeros((1, Kh))])
+        # Padding scale 1.0 (see docstring): the row is zero either way, but a
+        # zero scale would make the intermediate QDQ's per-row amax degenerate.
+        a1sx = torch.cat([a1s, a1s.new_ones(1)])
+        a_pad = a1x.index_select(0, dest).contiguous()
+        as_pad = a1sx.index_select(0, dest).contiguous()
+
+        w13s = layer.w13_weight_scale.reshape(E, N1).to(
+            torch.float32).contiguous()
+        w2s = layer.w2_weight_scale.reshape(E, Kh).to(
+            torch.float32).contiguous()
+
+        # stage 1: gate_up = a_pad @ W13[expert_of_tile]^T
+        gate_up = fext.cb_fused_moe_grouped(
+            a_pad, layer.w13_cb_qweight.data, lut, as_pad, w13s,
+            expert_ids, N1, Kh, kb)                                # [Mp, N1]
+        del a_pad, as_pad
+        a = torch.empty((gate_up.shape[0], d), dtype=gate_up.dtype, device=dev)
+        apply_moe_activation(act, a, gate_up)                      # silu(g)*u
+        del gate_up
+
+        a2, a2s = moe_kernel_quantize_input(
+            a, None, fp8_dtype, per_act_token_quant=True)
+        del a
+
+        # stage 2: y = a2 @ W2[expert_of_tile]^T — SAME expert_ids, the row
+        # layout is a property of the routing, not of the projection.
+        y = fext.cb_fused_moe_grouped(
+            a2.contiguous(), layer.w2_cb_qweight.data, lut,
+            a2s.reshape(-1).to(torch.float32).contiguous(), w2s,
+            expert_ids, Kh, inter, kb)                             # [Mp, Kh]
+        del a2, a2s
+
+        # Padding rows carry pair 0's router weight; harmless, because they are
+        # scattered into throwaway row T, which is sliced off.
+        pw_pad = pw_sorted.index_select(0, row_src)
+        y = y * pw_pad[:, None].to(y.dtype)
+        out = torch.zeros((T + 1, Kh), dtype=x.dtype, device=dev)
+        out.index_add_(0, dest, y.to(out.dtype))
+        return out[:T]
 
     # -- prefill: per-expert loop (bisection reference) ---------------------
     def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):

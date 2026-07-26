@@ -140,8 +140,9 @@ struct CollectiveMma<
   static constexpr int TileN = size<1>(TileShape{});
   static constexpr int TileK = size<2>(TileShape{});
   static_assert(TileK == 128, "CB fused mainloop assumes TileK = 128 (half a 256-weight superblock)");
-  static_assert(KBits == 36 || KBits == 40 || KBits == 44 || KBits == 48,
-                "shipped FP8_CB rungs only");
+  static_assert(KBits == 28 || KBits == 32 || KBits == 36 ||
+                KBits == 40 || KBits == 44 || KBits == 48,
+                "even fp8-CB rungs only (4*KBits must be a 16-byte multiple)");
   static_assert(CbTypeSize % 16 == 0, "type_size must be a 16-byte multiple (TMA box)");
 
   static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
@@ -208,6 +209,12 @@ struct CollectiveMma<
     uint8_t const* ptr_packed{nullptr};   // [N_rows, row_stride_bytes] UNPADDED
     int64_t packed_row_bytes{0};          // = n_sb * type_size (16B multiple)
     uint8_t const* ptr_lut{nullptr};      // flat e4m3-byte codebook (global)
+    // --- OPTIONAL tile-indexed grouping (MoE). Strict no-op when unset. ---
+    // ptr_expert_ids[m_tile] selects which batch (expert) of a stacked
+    // [E, N, packed_row_bytes] packed buffer this M-tile's B comes from.
+    // nullptr  => dense path: the B batch coordinate is the problem's l.
+    int const* ptr_expert_ids{nullptr};
+    int packed_batch{1};                  // E (defaults to 1 == dense)
   };
 
   // Device side kernel params
@@ -233,6 +240,8 @@ struct CollectiveMma<
     uint32_t tma_transaction_bytes = TmaTransactionBytes;
     uint32_t tma_transaction_bytes_mk = TmaTransactionBytesMK;
     uint32_t tma_transaction_bytes_nk = TmaTransactionBytesNK;
+    int const* ptr_expert_ids = nullptr;
+    int packed_batch = 1;
   };
 
   template <class ProblemShape>
@@ -250,10 +259,13 @@ struct CollectiveMma<
 
     const int n_sb = K / 256;
     const int total_bytes = n_sb * CbTypeSize;
+    // The packed-B batch mode is the EXPERT mode for the grouped path. For the
+    // dense path packed_batch == 1 == L, so this is bit-identical to before.
+    const int32_t bp_batch = static_cast<int32_t>(args.packed_batch);
     Tensor tensor_bp = make_tensor(
         args.ptr_packed,
         make_layout(
-            make_shape(int32_t(N), int32_t(total_bytes), int32_t(L)),
+            make_shape(int32_t(N), int32_t(total_bytes), bp_batch),
             make_stride(args.packed_row_bytes, Int<1>{},
                         int64_t(N) * args.packed_row_bytes)));
     typename Params::TMA_BP tma_load_bp = make_tma_copy(
@@ -261,7 +273,8 @@ struct CollectiveMma<
         make_shape(Int<TileN>{}, Int<CbTypeSize>{}), _1{});
     return {
       tma_load_a, tma_load_bp, args.ptr_lut,
-      TmaTransactionBytes, TmaTransactionBytesMK, TmaTransactionBytesNK
+      TmaTransactionBytes, TmaTransactionBytesMK, TmaTransactionBytesNK,
+      args.ptr_expert_ids, args.packed_batch
     };
   }
 
@@ -276,6 +289,7 @@ struct CollectiveMma<
     implementable = implementable && (K % 256 == 0);
     implementable = implementable && (args.packed_row_bytes % 16 == 0);
     implementable = implementable && (args.packed_row_bytes >= (K / 256) * CbTypeSize);
+    implementable = implementable && (args.packed_batch >= 1);
     return implementable;
   }
 
@@ -292,8 +306,10 @@ struct CollectiveMma<
     auto [M, N, K, L] = problem_shape_MNKL;
     Tensor mA_mkl = mainloop_params.tma_load_a.get_tma_tensor(make_shape(M,K,L));
     const int n_sb = K / 256;
+    // B's batch mode is the PACKED batch (expert) mode, not the problem's L.
     Tensor mBP_nkl = mainloop_params.tma_load_bp.get_tma_tensor(
-        make_shape(int32_t(N), int32_t(n_sb * CbTypeSize), int32_t(L)));
+        make_shape(int32_t(N), int32_t(n_sb * CbTypeSize),
+                   int32_t(mainloop_params.packed_batch)));
 
     Tensor gA_mkl = local_tile(mA_mkl, TileShape{}, make_coord(_,_,_), Step<_1, X,_1>{});   // (BLK_M,BLK_K,m,k,l)
     Tensor gBP_nkl = local_tile(mBP_nkl, make_tile(Int<TileN>{}, Int<CbTypeSize>{}),
@@ -328,7 +344,16 @@ struct CollectiveMma<
 
       auto [m_coord, n_coord, k_coord, l_coord] = blk_coord;
       Tensor gA = gA_mkl(_,_,m_coord,_,l_coord);                        // (BLK_M,BLK_K,k)
-      Tensor gBP = gBP_nkl(_,_,n_coord,_,l_coord);                      // (BLK_N,TS,sb)
+      // Tile-indexed grouping: for the MoE path the B batch coordinate is the
+      // expert this M-tile belongs to (uniform across the CTA, one scalar gmem
+      // read). Padding tiles may carry -1; clamp so the TMA never goes OOB
+      // (their output rows are discarded by the caller's unpermute).
+      int bp_l = l_coord;
+      if (mainloop_params.ptr_expert_ids != nullptr) {
+        int eid = __ldg(mainloop_params.ptr_expert_ids + m_coord);
+        bp_l = (eid < 0) ? 0 : eid;
+      }
+      Tensor gBP = gBP_nkl(_,_,n_coord,_,bp_l);                         // (BLK_N,TS,sb)
 
       Tensor tAgA = block_tma_a.partition_S(gA);
       Tensor tAsA = block_tma_a.partition_D(sA);

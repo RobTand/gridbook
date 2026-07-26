@@ -28,7 +28,7 @@
 //    REFERENCE for the fused kernel (identical TiledMma/layout config).
 //  - cb_fused_prefill_mm: the decode-in-prologue FP8_CB GEMM — B is the
 //    PACKED byte stream + a global e4m3-byte LUT; the dense tile never
-//    exists in HBM. KBits in {36,40,44,48} template-dispatched.
+//    exists in HBM. KBits in {28,32,36,40,44,48} template-dispatched (full even fp8 ladder).
 //  - smem_report: per-config SharedStorage sizes (budget sanity).
 //
 // Scale convention:
@@ -58,6 +58,7 @@
 
 #include "cutlass_fork/sm120_cb_mma_tma.hpp"
 #include "cutlass_fork/sm120_cb_fused_mma.hpp"
+#include "cutlass_fork/sm120_expert_row_broadcast.hpp"
 
 namespace {
 
@@ -289,7 +290,8 @@ void check_fused_inputs(torch::Tensor a, torch::Tensor packed,
   TORCH_CHECK(packed.stride(0) >= (K / 256) * 4 * k_bits);
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8);
   TORCH_CHECK(K % 256 == 0);
-  TORCH_CHECK(k_bits == 36 || k_bits == 40 || k_bits == 44 || k_bits == 48,
+  TORCH_CHECK(k_bits == 28 || k_bits == 32 || k_bits == 36 ||
+              k_bits == 40 || k_bits == 44 || k_bits == 48,
               "unsupported k_bits ", k_bits);
 }
 
@@ -298,6 +300,8 @@ torch::Tensor cb_fused_prefill_mm(torch::Tensor a, torch::Tensor packed,
                                   int64_t k_bits) {
   check_fused_inputs(a, packed, lut, N, K, k_bits);
   switch (k_bits) {
+    case 28: return run_fused<28>(a, packed, lut, N, K);
+    case 32: return run_fused<32>(a, packed, lut, N, K);
     case 36: return run_fused<36>(a, packed, lut, N, K);
     case 40: return run_fused<40>(a, packed, lut, N, K);
     case 44: return run_fused<44>(a, packed, lut, N, K);
@@ -369,10 +373,186 @@ torch::Tensor cb_fused_prefill_mm_scaled(torch::Tensor a, torch::Tensor packed,
                   b_scales.numel() == N && b_scales.is_contiguous(),
               "b_scales must be contiguous fp32 [N] (per-output-channel)");
   switch (k_bits) {
+    case 28: return run_fused_scaled<28>(a, packed, lut, a_scales, b_scales, N, K);
+    case 32: return run_fused_scaled<32>(a, packed, lut, a_scales, b_scales, N, K);
     case 36: return run_fused_scaled<36>(a, packed, lut, a_scales, b_scales, N, K);
     case 40: return run_fused_scaled<40>(a, packed, lut, a_scales, b_scales, N, K);
     case 44: return run_fused_scaled<44>(a, packed, lut, a_scales, b_scales, N, K);
     case 48: return run_fused_scaled<48>(a, packed, lut, a_scales, b_scales, N, K);
+    default: TORCH_CHECK(false, "unsupported k_bits ", k_bits);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GROUPED (MoE) fused entry — TILE-INDEXED grouping.
+//
+// True CUTLASS ptr-array grouping is unavailable on this builder (the vendored
+// sm120_mma_builder.inl static_asserts !IsPtrArrayKernel and
+// MainloopSm120ArrayTmaWarpSpecialized has no implementation). Instead we do
+// what vLLM's Triton fused-MoE kernel does: the caller pre-gathers and PADS
+// A's rows so every expert's segment starts on a multiple of TileM and spans a
+// whole number of TileM blocks. The launch is then ONE ordinary single-problem
+// GEMM of shape (Mp, N, K) in which each M-tile reads a DIFFERENT expert's
+// weights: the fork's packed-B TMA tensor already carries a batch mode whose
+// stride is N * packed_row_bytes -- exactly the per-expert stride of a stacked
+// [E, N, row_bytes] buffer -- so the expert index is simply the B tile's
+// l-coordinate, chosen per M-tile from expert_ids[]. No tensormap updates, no
+// ptr-arrays; the descriptors stay host-built and immutable.
+//
+// The B-scale epilogue node is Sm120CbExpertRowBroadcast (same body as
+// Sm90RowBroadcast, base pointer offset by expert_ids[m] * N). Everything else
+// -- the A-scale ColBroadcast and the multiply/round order
+// bf16_rn(b_scale * (a_scale * acc)) -- is identical to ScaledFusion.
+// ---------------------------------------------------------------------------
+template <class TileShape>
+struct MoeScaledFusion {
+  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
+      0, TileShape, float, float, Stride<_1, _0, _0>>;
+  using ScaleB = cutlass::epilogue::fusion::Sm120CbExpertRowBroadcast<
+      0, TileShape, float, float, Stride<_0, _1, _0>>;
+  using AccFetch = cutlass::epilogue::fusion::Sm90AccFetch;
+  using MulA = cutlass::epilogue::fusion::Sm90Compute<
+      cutlass::multiplies, ElementAcc, ElementAcc,
+      cutlass::FloatRoundStyle::round_to_nearest>;
+  using MulB = cutlass::epilogue::fusion::Sm90Compute<
+      cutlass::multiplies, ElementD, ElementAcc,
+      cutlass::FloatRoundStyle::round_to_nearest>;
+  using EVTA = cutlass::epilogue::fusion::Sm90EVT<MulA, ScaleA, AccFetch>;
+  using type = cutlass::epilogue::fusion::Sm90EVT<MulB, ScaleB, EVTA>;
+};
+
+template <class TileShape>
+struct CfgMoeScaled {
+  using Fusion = typename MoeScaledFusion<TileShape>::type;
+  using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
+      TileShape, ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAcc, ElementAcc,
+      void, LayoutD, AlignD,
+      ElementD, LayoutD, AlignD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto,
+      Fusion>::CollectiveOp;
+  using BuilderMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
+      ElementAB, LayoutA, AlignAB,
+      ElementAB, LayoutB, AlignAB,
+      ElementAcc,
+      TileShape, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+};
+
+// The grouped path's TileM (python must pad Mp to a multiple of this).
+constexpr int64_t kMoeTileM = size<0>(TileF{});
+
+template <int KB>
+torch::Tensor run_moe_grouped(torch::Tensor a, torch::Tensor packed,
+                              torch::Tensor lut, torch::Tensor a_scales,
+                              torch::Tensor b_scales, torch::Tensor expert_ids,
+                              int64_t N, int64_t K) {
+  constexpr int Stages = 2;
+  using TileShape = TileF;
+  using Mainloop = typename SwapToFused<
+      KB, Stages, typename CfgMoeScaled<TileShape>::BuilderMainloop>::type;
+  using Epilogue = typename CfgMoeScaled<TileShape>::Epilogue;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>, Mainloop, Epilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  const int Mp = (int)a.size(0);
+  const int E = (int)packed.size(0);
+  const c10::cuda::OptionalCUDAGuard guard(a.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto d = torch::empty({Mp, N}, a.options().dtype(torch::kBFloat16));
+
+  using StrideA = typename GemmKernel::StrideA;
+  using StrideC = typename GemmKernel::StrideC;
+  using StrideD = typename GemmKernel::StrideD;
+  StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {Mp, (int)K, 1});
+  StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {Mp, (int)N, 1});
+
+  const int* ptr_eids = expert_ids.data_ptr<int>();
+
+  typename Gemm::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {Mp, (int)N, (int)K, 1},
+      {reinterpret_cast<const ElementAB*>(a.data_ptr()), sa,
+       packed.data_ptr<uint8_t>(), packed.stride(1),
+       lut.data_ptr<uint8_t>(),
+       ptr_eids, E},
+      {// EVT args: children first, then node op args (empty for multiplies).
+       {{b_scales.data_ptr<float>(), 0.0f, Stride<_0, _1, _0>{},
+         ptr_eids, (int)N},
+        {{a_scales.data_ptr<float>(), 0.0f, Stride<_1, _0, _0>{}}, {}, {}},
+        {}},
+       nullptr, StrideC{},
+       reinterpret_cast<ElementD*>(d.data_ptr()), sd}};
+
+  Gemm gemm;
+  size_t ws = Gemm::get_workspace_size(args);
+  auto workspace = torch::empty({(int64_t)ws}, a.options().dtype(torch::kUInt8));
+  TORCH_CHECK(gemm.can_implement(args) == cutlass::Status::kSuccess,
+              "moe grouped can_implement failed (K%256? row stride %16?)");
+  TORCH_CHECK(gemm.initialize(args, workspace.data_ptr()) == cutlass::Status::kSuccess);
+  TORCH_CHECK(gemm.run(stream) == cutlass::Status::kSuccess);
+  return d;
+}
+
+int64_t cb_fused_moe_tile_m() { return kMoeTileM; }
+
+torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
+                                   torch::Tensor lut, torch::Tensor a_scales,
+                                   torch::Tensor b_scales,
+                                   torch::Tensor expert_ids, int64_t N,
+                                   int64_t K, int64_t k_bits) {
+  // --- mirrors check_fused_inputs, but packed is [E, N, row_bytes] ---
+  TORCH_CHECK(a.is_cuda() && a.scalar_type() == torch::kFloat8_e4m3fn,
+              "a must be fp8 e4m3 [Mp,K]");
+  TORCH_CHECK(a.dim() == 2 && a.size(1) == K && a.stride(1) == 1 &&
+                  a.stride(0) == K,
+              "a must be contiguous [Mp,K]");
+  TORCH_CHECK(a.size(0) % kMoeTileM == 0,
+              "a.size(0) (Mp) must be a multiple of the grouped TileM (",
+              kMoeTileM, "); pad each expert's row segment");
+  TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8);
+  TORCH_CHECK(K % 256 == 0);
+  TORCH_CHECK(k_bits == 28 || k_bits == 32 || k_bits == 36 ||
+                  k_bits == 40 || k_bits == 44 || k_bits == 48,
+              "unsupported k_bits ", k_bits);
+
+  TORCH_CHECK(packed.is_cuda() && packed.scalar_type() == torch::kUInt8 &&
+                  packed.dim() == 3 && packed.size(1) == N,
+              "packed must be uint8 [E,N,row_bytes] on cuda");
+  const int64_t row_bytes = packed.size(2);
+  TORCH_CHECK(packed.stride(2) == 1 && packed.stride(1) == row_bytes &&
+                  packed.stride(0) == N * row_bytes,
+              "packed must be fully contiguous [E,N,row_bytes]");
+  TORCH_CHECK(row_bytes % 16 == 0,
+              "packed row stride must be a 16-byte multiple (UNPADDED rows)");
+  TORCH_CHECK(row_bytes >= (K / 256) * 4 * k_bits,
+              "packed row_bytes too small for K/k_bits");
+
+  TORCH_CHECK(a_scales.is_cuda() && a_scales.scalar_type() == torch::kFloat32 &&
+                  a_scales.numel() == a.size(0) && a_scales.is_contiguous(),
+              "a_scales must be contiguous fp32 [Mp] (per padded row)");
+  TORCH_CHECK(b_scales.is_cuda() && b_scales.scalar_type() == torch::kFloat32 &&
+                  b_scales.dim() == 2 && b_scales.size(0) == packed.size(0) &&
+                  b_scales.size(1) == N && b_scales.is_contiguous(),
+              "b_scales must be contiguous fp32 [E,N]");
+  TORCH_CHECK(expert_ids.is_cuda() && expert_ids.scalar_type() == torch::kInt32 &&
+                  expert_ids.is_contiguous() &&
+                  expert_ids.numel() == a.size(0) / kMoeTileM,
+              "expert_ids must be contiguous int32 cuda [Mp/TileM]");
+
+  switch (k_bits) {
+    case 28: return run_moe_grouped<28>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
+    case 32: return run_moe_grouped<32>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
+    case 36: return run_moe_grouped<36>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
+    case 40: return run_moe_grouped<40>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
+    case 44: return run_moe_grouped<44>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
+    case 48: return run_moe_grouped<48>(a, packed, lut, a_scales, b_scales, expert_ids, N, K);
     default: TORCH_CHECK(false, "unsupported k_bits ", k_bits);
   }
 }
@@ -403,5 +583,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cb_fused_prefill_mm_scaled", &cb_fused_prefill_mm_scaled,
         "FP8_CB decode-in-prologue fused GEMM, per-token x per-channel scales "
         "applied in the fp32 EVT epilogue (cutlass_scaled_mm rounding order)");
+  m.def("cb_fused_moe_grouped", &cb_fused_moe_grouped,
+        "FP8_CB grouped (MoE) fused GEMM: ONE launch over row-padded A "
+        "[Mp,K] where each TileM block reads expert_ids[tile]'s weights from "
+        "packed [E,N,row_bytes]; per-token a_scales[Mp] x per-expert-channel "
+        "b_scales[E,N] applied in the fp32 EVT epilogue (same rounding order "
+        "as cb_fused_prefill_mm_scaled). Mp must be a multiple of "
+        "cb_fused_moe_tile_m().");
+  m.def("cb_fused_moe_tile_m", &cb_fused_moe_tile_m,
+        "TileM of the grouped (MoE) path — the row-padding granularity");
   m.def("smem_report", &smem_report, "SharedStorage sizes [F44, F48, K44, K48, Epi]");
 }
