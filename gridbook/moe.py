@@ -351,8 +351,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         #     launch overhead once R1 had removed the expand round-trip).
         #     'grouped_fused_r1' forces R1 — the bisection reference R2 is
         #     validated against.
+        # fp8-CB default: grouped_fused (R2 tile-indexed grouped launch ->
+        # R1 -> stock fallback chain; any constraint miss lands on stock).
+        # Promoted 2026-07-26: teacher-relative conf-KL gate PASSED
+        # (0.06637/97.46% vs stock 0.06632/97.56% on the 35B), +9% prefill,
+        # variance collapsed (no HBM weight expansion).
         mode = os.environ.get("PRISMAQUANT_CB_PREFILL") or (
-            "stock" if not self.is_fp4 else "loop")
+            "grouped_fused" if not self.is_fp4 else "loop")
         if mode in ("grouped_fused", "grouped_fused_r1"):
             out = None
             if mode == "grouped_fused":
