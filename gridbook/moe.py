@@ -351,13 +351,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         #     launch overhead once R1 had removed the expand round-trip).
         #     'grouped_fused_r1' forces R1 — the bisection reference R2 is
         #     validated against.
-        # fp8-CB default: grouped_fused (R2 tile-indexed grouped launch ->
-        # R1 -> stock fallback chain; any constraint miss lands on stock).
-        # Promoted 2026-07-26: teacher-relative conf-KL gate PASSED
-        # (0.06637/97.46% vs stock 0.06632/97.56% on the 35B), +9% prefill,
-        # variance collapsed (no HBM weight expansion).
+        # fp8-CB default: stock. grouped_fused won on the 35B (+9%, KL gate
+        # passed) but REGRESSED on Laguna-class (1,503 vs 1,821 tok/s @8k,
+        # 2026-07-26): R2 re-decodes each expert's B per M-tile
+        # (ceil(m_e/TileM) x) and pads to tile multiples — decode redundancy
+        # scales with expert SIZE, and Laguna's experts are ~6x the 35B's.
+        # Promotion reverted per the two-model ladder rule; grouped_fused
+        # stays opt-in. The principled end state is measured per-layer
+        # auto-selection, not a shape heuristic.
         mode = os.environ.get("PRISMAQUANT_CB_PREFILL") or (
-            "grouped_fused" if not self.is_fp4 else "loop")
+            "stock" if not self.is_fp4 else "loop")
         if mode in ("grouped_fused", "grouped_fused_r1"):
             out = None
             if mode == "grouped_fused":
