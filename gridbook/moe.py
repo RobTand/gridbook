@@ -990,10 +990,18 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         ``(arena address, streams)`` key actually changes.
 
         The decision itself is ``moe_l2.cb_l2_pin_action`` (pure, CPU-tested);
-        this method is only its CUDA effect plus the per-layer memo. There is
-        deliberately NO per-forward unpin: the reset call is device-wide and
-        synchronizing, and paying it twice per layer per forward is what drove a
-        live serve's throughput to zero.
+        this method is only its CUDA effect plus the per-layer memo.
+
+        LIFETIME SPLIT (the correction to round 5's over-fix). The DEVICE-WIDE
+        carve-out reservation is grow-only and effectively once per process —
+        re-issuing it per layer per forward is synchronizing and drove a live
+        serve's throughput to zero. The PER-STREAM window is a different animal:
+        cheap to set, but it must be cleared before we hand the stream back
+        (``_l2_reset_window``, called from the caller's ``finally``). Round 5
+        removed BOTH, which left our window attached to vLLM's serving stream
+        for the life of the process — every later kernel on that stream then ran
+        pointed at a foreign address range, which is the leading suspect for the
+        third live wedge.
         """
         key = (int(arena.data_ptr()), int(nbytes),
                tuple(int(s.cuda_stream) for s in streams))
@@ -1012,6 +1020,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             layer._cb_l2_pinned_key = key
             layer._cb_l2_pinned_streams = tuple(streams)
         return ok
+
+    def _l2_reset_window(self, streams) -> None:
+        """Clear the per-stream access-policy window on every stream we set it
+        on. Cheap (a stream attribute, no device-wide call), so it belongs in a
+        per-forward ``finally``: the invariant is that vLLM's serving stream
+        never carries our window outside our own forward. The device-wide
+        carve-out reservation deliberately survives — see _l2_pin_window."""
+        for s in streams:
+            with torch.cuda.stream(s):
+                self._l2_ext_call("l2_reset_window")
 
     def _apply_prefill_l2_pipeline(self, layer, x, topk_weights, topk_ids,
                                    act):
@@ -1243,17 +1261,23 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if not torch.cuda.is_current_stream_capturing():
             self._l2_pin_window(layer, arena, plan.arena_bytes, streams)
 
-        if overlap:
-            self._l2_units_overlapped(units, _decode, _gemm_unit, main, side)
-        else:
-            # SERIAL (default). One stream orders decode-before-GEMM and the
-            # next decode after the GEMMs that read that half, so the rotation
-            # needs no events at all. The rotation is kept because the arena
-            # sizing and the single pinned window are defined over the pair.
-            for u, unit in enumerate(units):
-                i = u % 2
-                _decode(unit, i)
-                _gemm_unit(unit, i)
+        try:
+            if overlap:
+                self._l2_units_overlapped(units, _decode, _gemm_unit, main, side)
+            else:
+                # SERIAL (default). One stream orders decode-before-GEMM and the
+                # next decode after the GEMMs that read that half, so the
+                # rotation needs no events at all. The rotation is kept because
+                # the arena sizing and the single pinned window are defined over
+                # the pair.
+                for u, unit in enumerate(units):
+                    i = u % 2
+                    _decode(unit, i)
+                    _gemm_unit(unit, i)
+        finally:
+            # Hand the stream back clean. Cheap (stream attribute only); the
+            # device-wide reservation is NOT touched here.
+            self._l2_reset_window(streams)
         return out
 
     @staticmethod

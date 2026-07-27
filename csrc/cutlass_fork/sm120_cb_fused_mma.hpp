@@ -137,6 +137,60 @@ struct CollectiveMma<
   static constexpr int CbTypeSize = 4 * KBits;             // bytes / superblock
   static constexpr int CbSubW = KBits / 4;
   static constexpr uint32_t CbSubMask = (1u << CbSubW) - 1u;
+
+  // --- codebook LUT smem residency policy (R6) ---------------------------
+  // The flat codebook is 4 sub-tables x 2^CbSubW rows x 2 e4m3 bytes, i.e.
+  // 8 << CbSubW bytes: k28 1 KB ... k44 16 KB, k48 32 KB. Staging it in smem
+  // removes the decode gathers' dependence on whatever L1 the kernel's own
+  // ~75 KB smem carve-out leaves behind (measured: the k48 32 KB table falls
+  // off that cliff -- decode-ALU 0.091 ms at k44 vs 0.779 ms at k48).
+  //
+  // Feasibility (GemmKernel::SharedStorageSize vs sm_120's 101,376 B ceiling,
+  // TileN=64/TileK=128/Stages=2; measured by csrc/smem_probe_tilem.cu):
+  //   TileM=128 base:  k28 66,560 k32 68,608 k36 70,656 k40 72,704 k44 74,752 k48 76,800
+  //   TileM=256 base:  k28 99,328 k32 101,376  (the rest are not compiled)
+  // The pre-R6 base is exactly TileM*TileK*Stages + TileN*CbTypeSize*Stages +
+  // 19,456 B of fixed overhead (decoded-B buffer + epilogue + pipelines), so
+  // the headroom a rung can spend on the LUT is:
+  //   TileM=128: >= 24,576 B  -> full 4-sub table (8 << CbSubW) up to k44's
+  //                              16,384 B; k48's 32,768 B does NOT fit, so
+  //                              that rung stages a 2-sub HALF table
+  //                              (16,384 -> 93,184 total, 8,192 B margin).
+  //                              A 3-sub k48 lands on EXACTLY 101,376 with
+  //                              zero margin and is deliberately not taken.
+  //   TileM=256: k28 has 2,048 B (full 1,024 B table fits); k32 sits ON the
+  //              ceiling with 0 B headroom, so it stays entirely on the
+  //              global path (zero-sized stage, no smem cost).
+  // cb_fused_gemm.cu static_asserts the resulting SharedStorageSize for every
+  // instantiated config, so a future overrun is a compile error, not a
+  // silent launch failure.
+  static constexpr int CbSubEntries = 1 << CbSubW;
+  static constexpr int CbSubBytes = CbSubEntries * 2;
+  static constexpr int TileM = size<0>(TileShape{});
+  static constexpr int CbLutResidentSubs =
+      (TileM <= 128) ? ((4 * CbSubBytes <= 16384) ? 4 : 2)
+                     : ((4 * CbSubBytes <= 1024) ? 4 : 0);
+  static constexpr int CbLutSmemBytes = CbLutResidentSubs * CbSubBytes;
+  static_assert(CbLutSmemBytes % 1024 == 0,
+                "LUT stage must be a 1024-byte multiple so it cannot pad the "
+                "1024-aligned A/B buffers that follow it");
+
+  // Zero-sized stages must cost ZERO bytes (TileM=256/k32 has no headroom at
+  // all), and cute::array_aligned<uint8_t,0> is still CUTE_ALIGNAS(16) -> 16 B.
+  // So the stage is an empty BASE of TensorStorage instead of a member, which
+  // the empty-base optimization collapses to nothing.
+  struct LutStorageNone {
+    CUTLASS_HOST_DEVICE static uint8_t const* lut_smem() { return nullptr; }
+    CUTLASS_HOST_DEVICE static uint8_t* lut_smem_mut() { return nullptr; }
+  };
+  struct LutStorageArray {
+    alignas(16) cute::array_aligned<
+        uint8_t, (CbLutSmemBytes > 0 ? CbLutSmemBytes : 1024)> smem_lut;
+    CUTLASS_HOST_DEVICE uint8_t const* lut_smem() const { return smem_lut.data(); }
+    CUTLASS_HOST_DEVICE uint8_t* lut_smem_mut() { return smem_lut.data(); }
+  };
+  using LutStorage =
+      cute::conditional_t<(CbLutSmemBytes > 0), LutStorageArray, LutStorageNone>;
   static constexpr int TileN = size<1>(TileShape{});
   static constexpr int TileK = size<2>(TileShape{});
   static_assert(TileK == 128, "CB fused mainloop assumes TileK = 128 (half a 256-weight superblock)");
@@ -188,7 +242,10 @@ struct CollectiveMma<
   static constexpr uint32_t TmaTransactionBytes = TmaTransactionBytesMK + TmaTransactionBytesNK;
 
   struct SharedStorage {
-    struct TensorStorage : cute::aligned_struct<128, _0> {
+    // LutStorage is a BASE (not a member) so a zero-sized stage really is
+    // zero bytes; its size is always a 1024-byte multiple, so it never
+    // perturbs the 1024-byte alignment of the buffers below it.
+    struct TensorStorage : cute::aligned_struct<128, _0>, LutStorage {
       alignas(1024) cute::array_aligned<SmemAllocTypeA, cute::cosize_v<SmemLayoutA>> smem_A;
       alignas(128) cute::array_aligned<uint8_t, cute::cosize_v<SmemLayoutBPacked>> smem_BP;
       // 16-byte tail so the last row's aligned-u32 window overread (max
@@ -391,6 +448,25 @@ struct CollectiveMma<
   static constexpr int CwPerThread = CwPerTile / ThreadCount;
   static_assert(CwPerTile % ThreadCount == 0, "codeword count must divide thread count");
 
+  // Cooperative gmem->smem stage of the codebook prefix. Called by ALL
+  // thr_size(TiledMma) MMA threads; the caller issues the NamedBarrier.
+  CUTLASS_DEVICE void
+  load_lut(TensorStorage& shared_tensors, uint8_t const* __restrict__ lut,
+           int thread_idx) const {
+    // 4-byte granularity: valid for any 4-byte-aligned codebook pointer
+    // (torch allocations are far more aligned than that), and this runs once
+    // per CTA so a wider vector buys nothing measurable.
+    uint32_t* dst = reinterpret_cast<uint32_t*>(shared_tensors.lut_smem_mut());
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(lut);
+    constexpr int NWords = CbLutSmemBytes / 4;
+    static_assert(NWords % ThreadCount == 0, "LUT stage must divide the MMA thread count");
+    CUTLASS_PRAGMA_UNROLL
+    for (int w = 0; w < NWords / ThreadCount; ++w) {
+      const int idx = thread_idx + w * ThreadCount;
+      dst[idx] = __ldg(src + idx);
+    }
+  }
+
   template <class SBDecTensor>
   CUTLASS_DEVICE void
   decode_stage(TensorStorage& shared_tensors, SBDecTensor& sBx,
@@ -399,6 +475,8 @@ struct CollectiveMma<
     const uint8_t* stage_base =
         shared_tensors.smem_BP.data() + read_stage * (TileN * CbTypeSize);
     const uint16_t* lut16 = reinterpret_cast<const uint16_t*>(lut);
+    const uint16_t* lut16_s =
+        reinterpret_cast<const uint16_t*>(shared_tensors.lut_smem());
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < CwPerThread; ++i) {
       const int linear = thread_idx + i * ThreadCount;
@@ -421,13 +499,17 @@ struct CollectiveMma<
       }
       code &= (CbKBits >= 64) ? ~0ull : ((1ull << CbKBits) - 1ull);
 
+      // int_sequence (not a runtime loop) so `s < CbLutResidentSubs` is a
+      // compile-time branch: the smem/gmem routing costs nothing at runtime.
       uint64_t out8 = 0;
-      CUTLASS_PRAGMA_UNROLL
-      for (int s = 0; s < 4; ++s) {
+      for_each(make_int_sequence<4>{}, [&](auto s_) {
+        constexpr int s = decltype(s_)::value;
         const uint32_t idx = (uint32_t)(code >> (s * CbSubW)) & CbSubMask;
-        const uint16_t pair = __ldg(lut16 + (s << CbSubW) + idx);
+        const uint16_t pair = (s < CbLutResidentSubs)
+            ? lut16_s[(s << CbSubW) + idx]
+            : __ldg(lut16 + (s << CbSubW) + idx);
         out8 |= (uint64_t)pair << (16 * s);
-      }
+      });
       const int c0 = vl * 8;
       CUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < 8; ++j) {
@@ -501,6 +583,28 @@ struct CollectiveMma<
       cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), accum);
     };
 
+    // --- once-per-CTA codebook staging ------------------------------------
+    // The kernel is persistent: mma() is re-entered for every work tile this
+    // CTA visits, so the staging is guarded by a member flag that lives in the
+    // consumer threads' registers for the whole kernel (the kernel declares
+    // ONE CollectiveMainloop outside the scheduler loop). Race-freedom:
+    //   * only the two MMA warpgroups (thr_size(tiled_mma) threads) ever touch
+    //     smem_lut; the TMA producer warp never reads it;
+    //   * those threads enter mma() in lockstep for the same work tile -- the
+    //     mainloop's existing thr_size(tiled_mma)-wide NamedBarrier already
+    //     depends on that -- so the flag is uniform across the barrier's
+    //     participants and the barrier below can never be half-joined;
+    //   * the barrier orders every staging store before every decode_stage
+    //     load, and after it the region is read-only for the CTA's lifetime.
+    if constexpr (CbLutSmemBytes > 0) {
+      if (!lut_resident_) {
+        load_lut(shared_tensors, mainloop_params.ptr_lut, thread_idx);
+        cutlass::arch::NamedBarrier::sync(
+            thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+        lut_resident_ = true;
+      }
+    }
+
     int t_abs = 0;
     pipeline.consumer_wait(smem_pipe_read);
     decode_stage(shared_tensors, sBx, mainloop_params.ptr_lut, read_stage,
@@ -552,6 +656,10 @@ struct CollectiveMma<
   }
 
 private:
+  // Per-thread, whole-kernel-lifetime flag: has this CTA already staged the
+  // codebook prefix into smem? See the staging block in mma().
+  bool lut_resident_ = false;
+
   template <class TiledCopyB>
   CUTLASS_DEVICE static auto
   smem_thr_copy_B_init(TiledCopyB& tiled_copy_b, int thread_idx) {

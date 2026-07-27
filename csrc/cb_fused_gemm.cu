@@ -151,6 +151,18 @@ struct CfgScaled {
       cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
 };
 
+// Hard smem gate. The sm90 cooperative kernel layer does NOT static_assert
+// its own SharedStorageSize against the arch capacity (only the sm120
+// asymmetric-DMA kernel does), so an over-budget config would compile and then
+// fail at launch. Every instantiated fused config passes through this.
+template <class GemmKernel>
+struct AssertSmemFits {
+  static_assert((int)GemmKernel::SharedStorageSize <=
+                    cutlass::arch::sm120_smem_capacity_bytes,
+                "fused CB kernel exceeds the sm_120 shared-memory capacity");
+  static constexpr bool value = true;
+};
+
 template <class T>
 struct SwapToCb;
 template <int S, int SP, class CS, class KS, class... Rest>
@@ -245,6 +257,7 @@ torch::Tensor run_fused(torch::Tensor a, torch::Tensor packed,
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
       Shape<int, int, int, int>, Mainloop, Epilogue>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  static_assert(AssertSmemFits<GemmKernel>::value);
 
   const int M = (int)a.size(0);
   const c10::cuda::OptionalCUDAGuard guard(a.device());
@@ -325,6 +338,7 @@ torch::Tensor run_fused_scaled(torch::Tensor a, torch::Tensor packed,
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
       Shape<int, int, int, int>, Mainloop, Epilogue>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  static_assert(AssertSmemFits<GemmKernel>::value);
 
   const int M = (int)a.size(0);
   const c10::cuda::OptionalCUDAGuard guard(a.device());
@@ -510,6 +524,7 @@ torch::Tensor run_moe_grouped(torch::Tensor a, torch::Tensor packed,
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
       Shape<int, int, int, int>, Mainloop, Epilogue>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  static_assert(AssertSmemFits<GemmKernel>::value);
 
   const int Mp = (int)a.size(0);
   const int E = (int)packed.size(0);
@@ -656,6 +671,32 @@ std::vector<int64_t> smem_report() {
           (int64_t)sizeof(typename Cfg<TileF>::Epilogue::SharedStorage)};
 }
 
+// Per-rung SharedStorageSize of the fused kernel (host-only; no launch), plus
+// the smem the LUT stage costs at that rung and the sm_120 ceiling. Used to
+// verify the R6 codebook-residency arithmetic on a GPU-less box.
+template <int KB>
+static void push_rung(std::vector<int64_t>& out) {
+  using ML = typename SwapToFused<KB, 2, typename Cfg<TileF>::BuilderMainloop>::type;
+  using KN = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>, ML, typename Cfg<TileF>::Epilogue>;
+  out.push_back(KB);
+  out.push_back((int64_t)KN::SharedStorageSize);
+  out.push_back((int64_t)ML::CbLutSmemBytes);
+  out.push_back((int64_t)ML::CbLutResidentSubs);
+}
+
+// Flat [k_bits, SharedStorageSize, lut_smem_bytes, resident_sub_tables] x 6.
+std::vector<int64_t> smem_report_rungs() {
+  std::vector<int64_t> out;
+  push_rung<28>(out); push_rung<32>(out); push_rung<36>(out);
+  push_rung<40>(out); push_rung<44>(out); push_rung<48>(out);
+  out.push_back(-1);
+  out.push_back((int64_t)cutlass::arch::sm120_smem_capacity_bytes);
+  out.push_back(-1);
+  out.push_back(-1);
+  return out;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -687,4 +728,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "the TileM values ACTUALLY compiled for this k_bits rung — enumerate "
         "this to pick a grouped tile_m; anything else TORCH_CHECKs");
   m.def("smem_report", &smem_report, "SharedStorage sizes [F44, F48, K44, K48, Epi]");
+  m.def("smem_report_rungs", &smem_report_rungs,
+        "flat [k_bits, SharedStorageSize, lut_smem_bytes, resident_subs] x 6, "
+        "then [-1, sm120_capacity, -1, -1]");
 }

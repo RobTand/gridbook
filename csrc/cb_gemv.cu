@@ -1713,6 +1713,24 @@ int64_t l2_max_window_bytes() {
 #endif
 }
 
+// The device-wide carve-out reservation, remembered per process.
+//
+// WHY THIS IS SPLIT OUT. The two calls below are NOT the same kind of thing and
+// must not share a lifetime:
+//   * cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize) is DEVICE-WIDE and
+//     implicitly synchronizing. Re-issuing it per layer per forward drove a
+//     live serve's throughput to zero, so it fires only when the reservation
+//     must GROW — in practice once per process.
+//   * cudaStreamSetAttribute(accessPolicyWindow) is a cheap PER-STREAM
+//     attribute. It is safe on the hot path, and it MUST be reset before the
+//     stream is handed back: leaving our window attached to vLLM's serving
+//     stream points every later kernel on that stream at a foreign address
+//     range, which outlives the forward that set it.
+static int64_t g_l2_reserved_bytes = 0;
+
+int64_t l2_max_window_bytes();
+int64_t l2_persisting_max_bytes();
+
 bool l2_pin_region(torch::Tensor buf, int64_t num_bytes) {
 #if CUDART_VERSION >= 11000
   if (!buf.is_cuda() || num_bytes <= 0) return false;
@@ -1726,11 +1744,15 @@ bool l2_pin_region(torch::Tensor buf, int64_t num_bytes) {
   int64_t bytes = num_bytes < win_max ? num_bytes : win_max;
   const int64_t reserve = bytes < persist_max ? bytes : persist_max;
 
-  // (1) reserve the L2 set-aside...
-  if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
-                         (size_t)reserve) != cudaSuccess) {
-    cudaGetLastError();
-    return false;
+  // (1) reserve the L2 set-aside — GROW-ONLY, so the synchronizing call is
+  // paid once per process rather than once per layer per forward.
+  if (reserve > g_l2_reserved_bytes) {
+    if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                           (size_t)reserve) != cudaSuccess) {
+      cudaGetLastError();
+      return false;
+    }
+    g_l2_reserved_bytes = reserve;
   }
   // (2) ...then mark the range persisting on the CURRENT stream.
   cudaStreamAttrValue attr = {};
@@ -1752,8 +1774,27 @@ bool l2_pin_region(torch::Tensor buf, int64_t num_bytes) {
 #endif
 }
 
+// Clear ONLY the per-stream window. No device-wide call, so this is cheap
+// enough to run at the end of every forward — which is the point: the serving
+// stream must never carry our access-policy window outside the forward that
+// set it. The carve-out reservation deliberately survives (see above).
+void l2_reset_window() {
+#if CUDART_VERSION >= 11000
+  cudaStreamAttrValue attr = {};
+  attr.accessPolicyWindow.base_ptr = nullptr;
+  attr.accessPolicyWindow.num_bytes = 0;
+  attr.accessPolicyWindow.hitRatio = 0.0f;
+  attr.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+  attr.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+  cudaStream_t s = at::cuda::getCurrentCUDAStream();
+  cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &attr);
+  cudaGetLastError();  // best-effort, never fatal
+#endif
+}
+
 void l2_unpin() {
 #if CUDART_VERSION >= 11000
+  g_l2_reserved_bytes = 0;
   cudaStreamAttrValue attr = {};
   attr.accessPolicyWindow.base_ptr = nullptr;
   attr.accessPolicyWindow.num_bytes = 0;
@@ -1844,6 +1885,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("l2_pin_region", &l2_pin_region,
         "pin a buffer range as L2-persisting on the current stream "
         "(false if unavailable)");
+  m.def("l2_reset_window", &l2_reset_window,
+        "clear ONLY the per-stream access-policy window (cheap; no device-wide call)");
   m.def("l2_unpin", &l2_unpin,
         "reset the access-policy window + persisting L2 carve-out");
   m.def("l2_persisting_max_bytes", &l2_persisting_max_bytes,
