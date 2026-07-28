@@ -115,9 +115,11 @@ Until that lands, route 1 is the equivalent.
 ### 3. Container
 
 The repo-root [`Dockerfile`](../Dockerfile) layers gridbook onto a pinned vLLM
-image. Mount a host directory over the JIT build cache so it stays warm across
-container restarts — see
-[persisting the build cache](#persisting-the-jit-build-cache).
+image and compiles the kernels at image-build time. Full instructions —
+build, serve, volumes, and what is pinned — are in
+[**`CONTAINER.md`**](CONTAINER.md). If you build your own image instead, mount a
+host directory over the JIT build cache so it stays warm across container
+restarts: see [persisting the build cache](#persisting-the-jit-build-cache).
 
 ### 4. From a checkout (for development)
 
@@ -205,10 +207,18 @@ The directory must be writable by the serving process. It is never `/tmp`.
 
 ## Verify the install
 
-Run this in the environment where you will serve. It needs **no model, no vLLM
-server and no GPU-heavy work** — it resolves the packaged sources and then
-performs the same JIT build the plugin does, so it answers the only question
-that matters: *am I on the CUDA path or the Triton fallback?*
+Run this in the environment where you will serve. It needs **no model and no
+vLLM server** — it resolves the packaged sources, performs the same JIT build the
+plugin does, and reports the environment switches that can route around the
+result.
+
+**What it can and cannot tell you.** It proves the two things that fail
+*silently*: that the packaged `.cu` sources resolve from your install, and that
+they compile here. It does **not** prove a kernel ever runs on your GPU — the
+build needs `nvcc`, not a device, so it prints `LOADED` on a machine with no GPU
+at all. The last block below covers the third silent failure (dispatch gated off
+by environment), but the only end-to-end proof is serving a model and seeing no
+`[prismaquant-cb] WARNING` line.
 
 ```bash
 python - <<'PY'
@@ -230,26 +240,41 @@ print("cb_gemv.cu found:", os.path.isfile(os.path.join(src, "cb_gemv.cu")))
 
 ext = cuda_ext.get_ext()       # JIT-compiles on first run (~30 s), then cached
 if ext is None:
-    print("RESULT          : CUDA extension UNAVAILABLE -> Triton fallback (slow).")
+    print("BUILD           : CUDA extension UNAVAILABLE -> fallback path (slow).")
     print("                  See docs/TROUBLESHOOTING.md")
 else:
-    print("RESULT          : CUDA extension LOADED ->", getattr(ext, "__file__", "?"))
+    print("BUILD           : CUDA extension LOADED ->", getattr(ext, "__file__", "?"))
     have = [s for s in ("cb_gemv_fp8", "cb_gemv_fp4_v2", "cb_expand_fp8_into",
                         "cb_moe_gemv_fp8") if hasattr(ext, s)]
     print("                  symbols:", have)
+
+# A built extension is still not a used extension: these route around it.
+decode = os.environ.get("PRISMAQUANT_CB_DECODE", "cuda")
+print("CB_DECODE       :", decode,
+      "(default 'cuda')" if decode == "cuda"
+      else "*** NOT 'cuda' -> CUDA decode is DISABLED, you are on Triton ***")
+env = {k: v for k, v in os.environ.items() if k.startswith("PRISMAQUANT_")}
+print("other switches  :", {k: v for k, v in env.items()
+                            if k != "PRISMAQUANT_CB_DECODE"} or "none set")
+print("RESULT          :", "CUDA decode path"
+      if (ext is not None and decode == "cuda") else "FALLBACK path (slow)")
 PY
 ```
 
-A healthy install prints `RESULT : CUDA extension LOADED` and four symbols.
+A healthy install prints `BUILD : CUDA extension LOADED`, four symbols,
+`CB_DECODE : cuda`, and `RESULT : CUDA decode path`.
 
-Two distinct failures are reported differently, on purpose:
+Three distinct failures are reported differently, on purpose:
 
 - **`cb_gemv.cu found: False`** plus an *"installed without its CUDA sources"*
   error — a **packaging** problem with your install (reinstall gridbook).
-- **`RESULT : CUDA extension UNAVAILABLE`** preceded by a compiler error — a
+- **`BUILD : CUDA extension UNAVAILABLE`** preceded by a compiler error — a
   **toolchain** problem on your machine (usually no `nvcc`).
+- **`BUILD : ... LOADED` but `RESULT : FALLBACK path`** — nothing is broken; an
+  environment variable is forcing the slow path. `PRISMAQUANT_CB_DECODE=triton`
+  is a bisection switch that some scripts and model cards set. Unset it.
 
-Both are covered in [TROUBLESHOOTING](TROUBLESHOOTING.md).
+All three are covered in [TROUBLESHOOTING](TROUBLESHOOTING.md).
 
 ---
 
@@ -260,7 +285,7 @@ below are measured or user-reported, and named as such.
 
 | Artifact | Weights on disk | Measured serving configuration |
 |---|---|---|
-| [27B, 5.5 bpp](https://huggingface.co/rdtand/Qwen3.6-27B-prismaquant-gridbook-5.5bit-vllm) | 23.0 GB (21.4 GiB) | **MEASURED** on GB10. **USER-REPORTED** on a 32 GB RTX 5090: 20.54 GiB resident weights + 6.48 GiB KV at 32k context, with `--language-model-only` and the patches from [issue #1](https://github.com/RobTand/gridbook/issues/1). Check that issue's status before counting on a 32 GB fit. |
+| [27B, 5.5 bpp](https://huggingface.co/rdtand/Qwen3.6-27B-prismaquant-gridbook-5.5bit-vllm) | 23.0 GB (21.4 GiB) | **MEASURED** on GB10. On a 32 GB RTX 5090: **USER-REPORTED** 20.54 GiB resident weights + 6.48 GiB KV at 32k context with `--language-model-only`, using the local patches from [issue #1](https://github.com/RobTand/gridbook/issues/1). Those two fixes are now on `master` (`9b6cb2f`; 35.86 → 20.82 GiB of weights measured on the maintainer's box), but the issue is still open and no 32 GB card has been retested by a maintainer — [details](TROUBLESHOOTING.md#out-of-memory-on-a-32-gb-card). |
 | [Laguna-S-2.1, 6.0 bpp](https://huggingface.co/rdtand/Laguna-S-2.1-prismaquant-gridbook-6bit-vllm) | 89.4 GB (83.2 GiB) | **MEASURED** on one 128 GB DGX Spark: `--max-model-len 262144 --kv-cache-dtype fp8 --gpu-memory-utilization 0.85 --enforce-eager --max-num-batched-tokens 16384`. Only 12 of 48 layers are full-attention, so a full 256k request costs ~6 GiB of fp8 KV. |
 | [Hy3-295B-A21B, 2.9 bpp](https://huggingface.co/rdtand/Hy3-295B-A21B-prismaquant-gridbook-2.9bit-vllm) | 105.7 GB (98.5 GiB) | **MEASURED** on one 128 GB DGX Spark: `--max-model-len 8192`–`16384`, fp8 KV (12.7 GiB at 12288). Native 262k context does not fit — true of any ~105 GB weight class on this box. |
 

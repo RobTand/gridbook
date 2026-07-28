@@ -80,6 +80,28 @@ publisher on the project. Nothing further to do.
 
 ## 2. Cutting a release
 
+### 2.0 Publish order — the docs describe the *packaged* tree
+
+`README.md`, `docs/INSTALL.md`, `docs/TROUBLESHOOTING.md` and `ROADMAP.md` assert
+packaging facts as **true today**: that the CUDA sources ship at
+`gridbook/csrc/`, that a non-editable install resolves them, that the version is
+`0.1.0`, that `gridbook[serve]` exists. Those are properties of the plugin tree
+inside PrismaQuant. They become true here **only after the sync in §2.1**.
+
+Publishing docs ahead of that sync ships a README whose headline install command
+produces exactly the broken install `TROUBLESHOOTING.md` declares fixed. So:
+
+> **Sync the code first, or in the same commit. Never docs-first.**
+
+One command tells you which side of the line this tree is on:
+
+```bash
+test -f gridbook/csrc/cb_gemv.cu \
+  && grep -q '__version__ = "0.1.0"' gridbook/__init__.py \
+  && echo "SYNCED — docs are true here" \
+  || echo "NOT SYNCED — do not publish the docs yet"
+```
+
 ### 2.1 Bump the version — one place
 
 The version has a **single source of truth**: `__version__` in

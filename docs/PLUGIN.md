@@ -33,9 +33,13 @@ but several times slower and not a serving target.
   `bit_split` (K13 → (7,6); FP8 K30 → (8,8,7,7)) — CUDA + Triton paths,
   encoder-anchored tests. **Signed** mode (S-rungs, n_sub=1: 8 sign bits +
   magnitude index into one half-grid table): CUDA + Triton decode across all
-  paths, GPU-validated (18-test signed battery, 2026-07-22); production
-  menus gate it on a measured K-vs-S win. Full mode: spec-reserved,
-  unimplemented.
+  paths, serving correctness proven bit-exact end to end (18-test signed GPU
+  battery, 2026-07-22). **Closed as research-only** by the K-vs-S head-to-head
+  the same day: over 776 matched-rate per-(Linear, rung) comparisons the
+  unsigned rungs won 79% of the time and the allocator placed 6 signed units
+  against 147 unsigned, so S-rungs stay **off production menus**. The format
+  stays in the spec for exotic weight geometries; no published artifact uses
+  one. Full mode: spec-reserved, unimplemented.
 - **Mixed containers are supported and shipping.** A config group carrying a
   `"scheme"` key is a CB group and is served by this plugin; a group without one
   uses the stock `compressed-tensors` vocabulary and is delegated to a real
@@ -160,10 +164,60 @@ tooling and model cards — see the README's naming section.)
 | `PRISMAQUANT_PRELOAD_FUSED` | off | `1` force-builds the fused extension at registration so both arms of a served A/B carry identical extension residency (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |
 | `PRISMAQUANT_ENABLE_PTC` | off | Builds the quarantined persistent-N kernel. **Do not set this** — measured negative and under a stability quarantine. |
 
-Kernel-schedule switches (`PRISMAQUANT_CB_FP8_SCHED`, `..._FP4V2_SCHED`,
-`..._W2_SCHED`, `..._W2_WARPS`, `..._W2_ROWS`) are described inline in the kernel
-sections above. All schedule switches are read host-side in the launcher, so they
-are CUDA-graph-capture-safe.
+### The rest of them
+
+The table above is what an operator touches. For completeness — because a
+variable you find set in someone's script and cannot look up is worse than one
+you can — this is **every** `PRISMAQUANT_*` variable in the tree. Regenerate the
+list with:
+
+```bash
+grep -rho 'PRISMAQUANT_[A-Z0-9_]*' gridbook/*.py gridbook/csrc/*.cu | sort -u
+```
+
+**Kernel-schedule selectors** — read host-side in the launcher, so all of them
+are CUDA-graph-capture-safe. Described inline in the kernel sections above.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PRISMAQUANT_CB_FP8_SCHED` | auto | fp8-CB decode GEMV schedule variant. |
+| `PRISMAQUANT_CB_FP4V2_SCHED` | auto | fp4-CB two-tier decode GEMV schedule variant. |
+| `PRISMAQUANT_CB_W2_SCHED` | auto | `w2` grouped-MoE schedule. The rowpack variant measured negative and is kept as a recorded result. |
+| `PRISMAQUANT_CB_W2_WARPS` / `..._W2_ROWS` | auto | Warp count / rows per block for that schedule (bisection). |
+| `PRISMAQUANT_PTC_VARIANT` | `1` | Which persistent-TC kernel variant to build. Only reachable with the quarantined `PRISMAQUANT_ENABLE_PTC=1`. |
+
+**MoE prefill internals** — sizing and bisection knobs under
+`PRISMAQUANT_CB_PREFILL`. Non-defaults here change transient memory, so the
+serve-slack budget is the sizing authority, not throughput.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK` | `64` | Experts expanded per chunk in the batched path (~1.6 GB transient at Hy3's shapes). Lower it if the transient does not fit. |
+| `PRISMAQUANT_CB_PREFILL_GROUPED_MM` | `0` | `1` collapses the per-expert segment GEMMs into one grouped call. Off by default: its ragged-offset/B-layout requirements are not met by every artifact. |
+| `PRISMAQUANT_CB_PREFILL_OVERLAP` | `0` | `1` runs the `w2` expand on a side stream to hide it under stage 1. **Measured null** on 35B-A3B (17 ms/layer, both arms identical, 2026-07-26); stays opt-in until a positive exists at any scale. |
+| `PRISMAQUANT_CB_PREFILL_AUTO_FORCE` | unset | Pins one `auto` candidate as the winner with no timing pass — reproduces a documented experiment. |
+| `PRISMAQUANT_CB_AUTOTUNE_MIN_M` | `1024` | Token floor below which `auto` does not spend a timing pass; a short prefill is not worth tuning on. |
+| `PRISMAQUANT_CB_GROUPED_TRIM` | `1` | Spends one extra pass to trim empty expert segments out of the grouped call. |
+| `PRISMAQUANT_CB_PREFILL_DENSE` | unset | `persistent` routes **dense** large-M fp8-CB prefill through the quarantined persistent-N kernel. Do not set it; see the measured-negative row in [`ROADMAP.md`](../ROADMAP.md). |
+
+**L2-pipeline diagnostics** — the `l2_pipeline` prefill mode wedged live serving
+three times, including its serial variant. It is **DIAGNOSTIC-ONLY**, excluded
+from the `auto` candidate set, and these exist to bisect it. Do not set any of
+them on a serving box.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PRISMAQUANT_CB_L2_AUTOTUNE` | off | `1` admits the L2 path into `auto`'s candidate set. |
+| `PRISMAQUANT_CB_L2_OVERLAP` | off | `1` selects the overlapped driver (the variant that deadlocked stream/capture). |
+| `PRISMAQUANT_CB_L2_WINDOW_MB` | derived from the device's L2 size | Overrides the residency-window cap. Bisection only. |
+| `PRISMAQUANT_CB_L2_GROUP` | derived from the window plan | Forces the expert group size instead of deriving it. |
+| `PRISMAQUANT_CB_L2_MIN_M` | `128` | Token floor for the R4 path. `0` means "no floor" (the GPU parity tests use tiny shapes on purpose); an unparseable value falls back to the default rather than removing the floor. |
+
+**Custom-op boundary**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE` | off | `1` restores the pre-hardening op-boundary behaviour. The name is the documentation: it re-opens a capture-unsafe boundary. |
 
 ## Tests
 

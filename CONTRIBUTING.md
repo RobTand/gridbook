@@ -71,7 +71,7 @@ skip guards into spurious failures.
 
 | Tier | What it needs | Runs in CI? |
 |---|---|---|
-| **Anywhere** — no GPU, no vLLM | torch only | ✅ on every push and PR |
+| **Anywhere** — no GPU, no vLLM | torch only | ✅ on every pull request, and on pushes to `master` |
 | **GPU** — kernel parity, decode/prefill numerics | a CUDA GPU and `nvcc` | ❌ no GPU runners; run locally |
 | **GPU + artifacts** — end-to-end paths | an exported CB artifact on disk; a few still point at paths that only exist on the author's box | ❌ |
 
@@ -80,6 +80,11 @@ contain `gridbook/csrc/*.cu`, that a **non-editable** install resolves them from
 `site-packages`, that `import gridbook` needs no torch/triton/vLLM, and that the
 `vllm.general_plugins` entry point is discoverable. It cannot compile the CUDA
 extension — free runners have no `nvcc` — so that stays a manual pre-tag gate.
+
+A push to a topic branch does **not** trigger CI on its own
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml) listens on `master`
+pushes, pull requests, and manual dispatch): open the PR, or use the
+**Run workflow** button, to get a run.
 
 **Wanted, in rough order of value:**
 

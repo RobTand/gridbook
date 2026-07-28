@@ -212,11 +212,19 @@ attention modules on hybrid (linear-attention) models silently falling back to
 BF16 instead of the codebook format, and both the original and the derived
 padded copy of each quantized weight staying resident after load.
 
-**Status** — check the issue before assuming a 32 GB fit. With that issue's
-patches applied, the reporter measured **20.54 GiB** of weights and **6.48 GiB**
-of KV at 32k context, i.e. a comfortable fit.
+**Status** — **both defects are fixed on `master`** (commit `9b6cb2f`): the
+fused-module scheme lookup now probes the mapper-transformed namespace through
+one shared resolver, and only one padded copy of each dense CB weight stays
+resident. On the maintainer's box that took the 27B from **35.86 → 20.82 GiB**
+of model weights. The reporter, running their own patches, measured **20.54
+GiB** of weights and **6.48 GiB** of KV at 32k context on the 5090 itself.
 
-**Mitigations while you wait**, in decreasing order of effect:
+**The issue is still open** and no maintainer-side 32 GB card exists, so a
+32 GB fit is *strongly expected* but not independently confirmed on that
+hardware. Install from `master` (not from a release older than that commit), and
+check the issue.
+
+**Mitigations if it still does not fit**, in decreasing order of effect:
 
 ```bash
 --max-model-len 8192            # shrink the KV budget

@@ -15,6 +15,11 @@
 #     have none. It is a MANUAL pre-tag gate -- the exact docker command is in
 #     docs/RELEASING.md and takes ~30 s. Steps 1-3 above pass happily on a
 #     wheel whose resolver is still wrong, so the manual gate is not optional.
+#   * the Dockerfile. Nothing here builds it -- hosted runners have no nvcc and
+#     the base image alone is ~32 GB on disk. Its manual gate is
+#     `bash scripts/verify-image.sh` (build + 10 run-time checks, no GPU); see
+#     docs/CONTAINER.md, "Keeping this image from rotting". Run it before
+#     tagging and whenever VLLM_TAG moves, or the image rots silently.
 #
 # Action pinning: actions are pinned to exact patch tags (latest releases
 # checked 2026-07-28), never to a floating major like `@v7` and never to a

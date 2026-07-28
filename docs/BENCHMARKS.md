@@ -115,15 +115,18 @@ Two things move between the rows, and only one of them is the format:
    2026-07-18 session and **0.01302** in the 2026-07-22 session — a 1.85× move
    with no change to any served byte. Absolute KL from one session is therefore
    **not** comparable to absolute KL from another; only within-session
-   comparisons are. (See the ±17% extension-residency effect above, which is one
-   contributing mechanism, and the corpus/teacher-capture difference, which is
-   another.)
+   comparisons are. The ±17% extension-residency effect above is one identified
+   contributing mechanism and does not account for the whole move; each session
+   also took its own BF16 teacher dump, which every arm in that session is then
+   scored against. The full mechanism is **not** fully characterised, which is
+   exactly why cross-session absolute numbers are treated as incomparable rather
+   than rescaled.
 
-Both sessions are internally consistent — same corpus, same protocol, same
-teacher capture, all arms back-to-back — and both return the same verdict at
-matched bytes. This page quotes the more conservative one. The card's row is
-reproducible from the stored top-20 dumps of that session with the same
-comparison script that produced it.
+Both sessions are internally consistent — one corpus, one protocol, every arm
+scored against a single BF16 teacher capture taken in that session — and both
+return the same verdict at matched bytes. This page quotes the more conservative
+one. The card's row was re-derived for this note by re-running the comparison
+over that session's stored top-20 dumps; all four arms reproduce exactly.
 
 ---
 

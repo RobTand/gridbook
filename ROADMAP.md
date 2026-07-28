@@ -67,12 +67,20 @@ practice rather than in principle.
   today.
 - **Tagged releases and a changelog.** There are currently no tags, so a bug fix
   cannot be referred to by version and model cards pin the plugin by *date*.
-- **CI.** No automated build today. The packaging defect above survived to a
-  public repo precisely because nothing ever exercised a non-editable install;
-  the gate that catches it is a clean-environment install plus a compile-only
-  extension build, which needs no GPU.
+- **CI.** GitHub Actions now build the sdist and wheel, assert both really
+  contain `gridbook/csrc/*.cu`, install the wheel **non-editably** into a clean
+  environment and re-resolve the sources from `site-packages`, check the
+  `vllm.general_plugins` entry point, and run the GPU-free tests
+  ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). That closes the hole
+  the packaging defect came through — nothing had ever exercised a non-editable
+  install. **What CI still cannot do is compile the kernels**: free runners have
+  no `nvcc`, so the compile-only extension build is a manual pre-tag gate
+  documented in [`docs/RELEASING.md`](docs/RELEASING.md). A GPU-less
+  self-hosted runner with a CUDA toolkit would automate it.
 - **Container image.** A [`Dockerfile`](Dockerfile) that layers gridbook onto a
-  pinned vLLM image is in the repo; no image is published yet.
+  pinned vLLM image is in the repo and documented in
+  [`docs/CONTAINER.md`](docs/CONTAINER.md); no image is published to a registry
+  yet.
 
 ### Widening measured hardware coverage
 

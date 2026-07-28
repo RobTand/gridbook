@@ -92,12 +92,14 @@ LABEL org.opencontainers.image.title="gridbook" \
 # under `docker run --user 1000:1000` the UID has no /etc/passwd entry, so
 # `getpass.getuser()` raises KeyError('getpwuid(): uid not found: 1000') — and
 # torch calls it at IMPORT time (torch/_inductor/runtime/cache_dir_utils.py,
-# torch/_dynamo/config.py), so `import vllm` itself dies before anything of
-# gridbook's runs. Setting TORCHINDUCTOR_CACHE_DIR is NOT sufficient (measured:
-# the _dynamo import-time call still fires). getpass.getuser() reads LOGNAME
-# first, so one variable fixes every call site — in torch, in vLLM
-# (vllm/config/vllm.py builds a tmp dir from it) and in gridbook. Affects only
-# path naming for cache/tmp directories; it changes no identity or permission.
+# reached from torch/_dynamo/package.py), so `import vllm` itself dies before
+# anything of gridbook's runs. Setting TORCHINDUCTOR_CACHE_DIR is NOT sufficient
+# (measured: the import then dies in torch/_inductor/codecache.py, which calls
+# default_cache_dir() directly and ignores it). getpass.getuser() reads LOGNAME
+# first, so one variable fixes every call site at once — in torch and in vLLM
+# (vllm/config/vllm.py builds a tmp dir from it). gridbook itself never calls it;
+# its own cache path is PRISMAQUANT_CB_EXT_DIR above. Affects only the naming of
+# cache/tmp directories; it changes no identity and no permission.
 # This is a base-image bug: `docker run --user` cannot import vLLM at all in
 # stock vllm/vllm-openai:v0.24.0.
 ENV TORCH_CUDA_ARCH_LIST=${GRIDBOOK_CUDA_ARCH} \
@@ -327,23 +329,48 @@ set -eu
 # mkdir: with GRIDBOOK_PREWARM=0 nothing has created the cache dir yet, and the
 # runtime build must still be able to write into it under `--user`.
 mkdir -p /opt/gridbook/ext-cache
+# A Hugging Face cache location any UID can write. HF_HOME defaults to
+# ~/.cache/huggingface, and under `--user` $HOME is `/` (docker's value for a UID
+# with no passwd entry) — unwritable — while /root is mode 0700 and unreadable.
+# Docker seeds a fresh NAMED volume from the image directory including its mode,
+# so `-e HF_HOME=/opt/gridbook/hf -v gridbook-hf:/opt/gridbook/hf` is writable
+# for any UID. See docs/CONTAINER.md, "Running as a non-root UID".
+mkdir -p /opt/gridbook/hf
 chgrp -R 0 /opt/gridbook
 chmod -R g+rwX /opt/gridbook
-chmod -R a+rwX /opt/gridbook/ext-cache
+chmod -R a+rwX /opt/gridbook/ext-cache /opt/gridbook/hf
 EOF
 
 # Gate it. This invariant was asserted before it was tested, and it was wrong;
-# assert it now with a real non-root, non-group-0 UID, the same way `docker run
-# --user 1000:1000` would. Cheap: it is a cache hit, not a compile.
+# assert it now the same way `docker run --user 1000:1000` does: non-root UID,
+# non-zero GID, no supplementary groups, and HOME=/ (what docker sets for a UID
+# with no passwd entry — a build RUN leaves HOME unset, which is *easier* than
+# the real case and would hide bugs). Cheap: cache hit, not a compile.
 RUN <<'EOF'
 set -eu
-setpriv --reuid 1000 --regid 1000 --clear-groups python3 - <<'PY'
+env HOME=/ setpriv --reuid 1000 --regid 1000 --clear-groups python3 - <<'PY'
 import os, sys, time
 
+# 1. The import barrier: getpass.getuser() has no passwd entry for this UID.
+#    Stock vllm/vllm-openai dies here; the baked LOGNAME is what fixes it.
+import getpass
+try:
+    user = getpass.getuser()
+except Exception as exc:
+    print(f"\n[gridbook] --user GATE FAILED: getpass.getuser() raised "
+          f"{type(exc).__name__}: {exc} for uid 1000. torch calls this at "
+          f"import time, so `import vllm` would die under `docker run --user`.",
+          file=sys.stderr)
+    sys.exit(1)
+
+import vllm            # noqa: F401  — the actual import that used to die
+import gridbook
+gridbook.register()    # and the actual registration the plugin loader performs
+
 if os.environ.get("GRIDBOOK_PREWARM", "1") != "1":
-    print("[gridbook] --user gate skipped: prewarm disabled, so there is no "
-          "cached build to load. The cache directory is still world-writable, "
-          "so the first-use build works under --user.")
+    print(f"[gridbook] --user gate OK (getpass={user}, import vllm, register); "
+          f"kernel-cache load not checked because prewarm is disabled. The cache "
+          f"directory is world-writable, so the first-use build works too.")
     raise SystemExit(0)
 
 from gridbook import cuda_ext
@@ -359,7 +386,8 @@ if not ok_decode:
           f"prototype. Refusing to ship it.", file=sys.stderr)
     sys.exit(1)
 
-msg = f"[gridbook] --user gate OK: uid/gid 1000:1000 loaded decode in {t_decode:.2f}s"
+msg = (f"[gridbook] --user gate OK: uid/gid 1000:1000 HOME=/ getpass={user}, "
+       f"import vllm + register OK, decode loaded in {t_decode:.2f}s")
 
 # The fused prefill extension is only prewarmed on the sm_120 family; check it
 # only when it was actually built.

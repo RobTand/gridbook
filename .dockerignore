@@ -40,3 +40,4 @@ ext-cache/
 # Container assets that need not be inside the image
 Dockerfile
 .dockerignore
+scripts/

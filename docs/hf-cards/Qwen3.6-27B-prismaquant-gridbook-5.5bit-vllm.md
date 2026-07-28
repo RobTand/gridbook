@@ -152,10 +152,17 @@ the format breakdown, the honest-limitations section, and the
 `robert.tand@icloud.com` contact line. Two known issues in that region are
 **out of scope for this staging** and belong to the docs-consistency pass:
 
-- This card reports KL(all) 0.0049 / KL(conf) 0.00295 and "−77% KL", while
-  `docs/BENCHMARKS.md:51-59` reports 0.0134 / 0.01134 and "−58.3% ALL-KL" for
-  what reads as the same artifact and metric. Neither document references the
-  other. A reader who checks both will conclude one is inflated.
+- ~~This card reports KL(all) 0.0049 / KL(conf) 0.00295 and "−77% KL", while
+  `docs/BENCHMARKS.md` reports 0.0134 / 0.01134 and "−58.3% ALL-KL"…~~
+  **RECONCILED 2026-07-28.** They are different builds measured in different
+  sessions — this card's numbers are the shipped 8-rung ladder (2026-07-22),
+  BENCHMARKS' are the 4-rung A/B build (2026-07-18) — and absolute KL is not
+  comparable across those sessions (the *same* NVFP4/FP8 baseline artifact reads
+  0.02407 vs 0.01302 confident-KL). `BENCHMARKS.md` and `README.md` now carry
+  the cross-reference; **this card needs one too** — add a line pointing at
+  [`BENCHMARKS.md` § two sessions, two builds](https://github.com/RobTand/gridbook/blob/master/docs/BENCHMARKS.md#two-sessions-two-builds-why-the-model-card-says-77-and-this-page-says-583)
+  when the card is applied, so the two figures cannot be read as a
+  contradiction.
 - The card's ToolEvalBench line cites PrismaAURA-5.5 at 91; `docs/BENCHMARKS.md`
   and the repo README should be checked to agree.
 

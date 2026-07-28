@@ -1,7 +1,9 @@
 # Distribution — decision record and one-time action checklist
 
-**Status:** decision brief, written 2026-07-28. Nothing in this document has been
-executed. Every outward-facing action below is deliberately left for a human.
+**Status:** decision brief, written 2026-07-28 and corrected the same day after an
+adversarial verification pass (**§7** lists what changed and why). Nothing in this
+document has been executed. Every outward-facing action below is deliberately left
+for a human.
 
 **Scope.** `gridbook` is technically finished enough to be used by strangers and
 is not being used by strangers. This document records *why* each distribution
@@ -12,7 +14,8 @@ each thing buys). Section 2 is the part only Robert can do, with exact values to
 type. Section 3 is the gate that must pass before the first PyPI upload, because
 that upload is permanent. Section 4 is the honest list of things that look like
 progress and are actually a maintenance obligation. Section 5 is the factual kit
-for an announcement — not the announcement.
+for an announcement — not the announcement. Section 6 is what remains unverified,
+and Section 7 is the correction log.
 
 **House rule, applied here too:** every external claim carries a URL, every
 performance number carries a source-file citation, and anything not established
@@ -41,13 +44,22 @@ cited `BENCHMARKS.md` line numbers that were stale within four minutes. A quoted
 string can be `grep`-ed and either still exists or provably does not. Line
 numbers are given only alongside the string they point at, as a convenience.
 
-**Publication status of this file — a decision left open.** This is an internal
-decision record that happens to live in a public repo. It contains internal
-machine paths, internal task numbers, and a launch plan that has not been
-executed. It is **excluded from the published sdist** (`MANIFEST.in`:
-`exclude docs/DISTRIBUTION.md`), because a PyPI file is permanent — but
-committing it still publishes it on GitHub. Decide that deliberately before the
-commit; keeping it in a private tree and linking nothing is a legitimate answer.
+**Publication status of this file — already public, decide whether to keep it
+that way.** This is an internal decision record that lives in a public repo. It
+contains internal machine paths, internal task numbers, and a launch plan that has
+not been executed. Two separate surfaces, only one of which is still open:
+
+- **PyPI sdist — closed.** Excluded by name (`MANIFEST.in`:
+  `exclude docs/DISTRIBUTION.md`, `prune docs/hf-cards`), because a published PyPI
+  file is permanent and cannot be trimmed later.
+- **GitHub — already open.** This file was committed and pushed to
+  `origin/master` in `9b6cb2f` on 2026-07-28, so it is public now. That is
+  revisable: `git rm` it (optionally moving it to the private monorepo) if a
+  strategy document that says things like "do not donate the repo yet" and "do not
+  post to r/LocalLLaMA yet" is not something the project wants readable by anyone
+  evaluating it. **This is a judgment call for Robert, not a defect** — recorded
+  because the first draft of this document never considered that it publishes
+  itself.
 
 ---
 
@@ -585,13 +597,34 @@ once. This gate is the *only* protection against it that runs before the tag.
       Both must be silent. (`README.md`, `tests/` and every public-only file may
       legitimately differ — those are not rsynced. Only `gridbook/` and
       `pyproject.toml` are shared source.)
-- [ ] **The packaging invariant holds in (B), checked in (B):**
+- [ ] **The packaging invariant holds in (B), checked in (B).** Check the
+      *behaviour*, not the source text — a `grep` for `os.pardir` matches the
+      docstring that warns against reintroducing it, which makes it useless as a
+      gate:
 
       ```bash
-      test -d gridbook/csrc && ! test -e csrc          # sources inside the package
-      grep -c 'os.pardir' gridbook/cuda_ext.py         # must be 0 outside comments
-      python -c "import gridbook; print(gridbook.__version__)"
+      test -d gridbook/csrc && ! test -e csrc   # sources inside the package
+      python - <<'PY'
+      import os
+      from gridbook.cuda_ext import csrc_dir
+      import gridbook
+      d = csrc_dir()
+      assert os.path.basename(d) == "csrc", d
+      assert os.path.basename(os.path.dirname(d)) == "gridbook", d
+      cu = ("cb_gemv.cu", "cb_fused_gemm.cu", "cb_persistent_prefill.cu",
+            "cb_persistent_tc.cu", "sm120_fp8_gemm.cu", "smem_probe_tilem.cu",
+            "toolchain_probe.cu")
+      assert not [f for f in cu if not os.path.exists(os.path.join(d, f))]
+      assert len([f for f in os.listdir(os.path.join(d, "cutlass_fork"))
+                  if f.endswith(".hpp")]) == 5
+      print("ok", gridbook.__version__, d)
+      PY
       ```
+
+      Measured in (B) 2026-07-28 18:10 UTC: `csrc_dir()` →
+      `<repo>/gridbook/csrc`, 0 missing `.cu`, 5 `cutlass_fork/*.hpp`. Run the
+      same block again *after* a non-editable install from a directory that is not
+      the repo (§3.2) — that is the case the release actually ships.
 - [ ] **The build under test was produced from (B).** Not from (A), not from a
       copy of (A). If a build command in §3.2 was run somewhere else, the boxes it
       ticked are void.
@@ -1046,11 +1079,12 @@ before quoting rather than trusting this table:
 | 295B prefill throughput and its ratio to the GGUF IQ build | **CLEARED 2026-07-28 18:04 UTC.** The repo now agrees on **~109 tok/s vs 42 = ~2.6×**: `README.md` — *"~109 tok/s vs the matched-byte GGUF IQ build's 42 = ~2.6×"*; `docs/BENCHMARKS.md` — *"Prefill ~109 tok/s vs the GGUF IQ build's 42 — ~2.6× faster"*; `grep -n '2\.1' docs/MOTIVATION.md` → no output. This is the single best headline in the set — it is the format's whole thesis. **Two conditions on quoting it:** (a) carry the protocol caveat that already sits in BENCHMARKS — the comparison is *"against a different serving stack (llama.cpp CUDA-core IQ dequant)"*, not against another vLLM path; (b) the stale note in `docs/hf-cards/Hy3-295B-…-2.9bit-vllm.md` that still describes the old 2.1×/2.6× split must be deleted before those cards are applied. |
 | 295B ToolEvalBench | **CLEARED — it was never a self-contradiction.** `README.md` and both places in `docs/BENCHMARKS.md` say **88 (130/148)** for the gridbook artifact; the `87 (129/148)` is the **GGUF IQ comparator's** score in the same table, and `86 (128/148)` is k-quant's. Quote it exactly as BENCHMARKS already frames it: *"Read it as parity, not a win"* — across serving configs the same bytes measured 85–87 and the GGUF family's own band is 86–87, so +1 sits inside the churn band. |
 
-**Still blocked:**
+**Still blocked** (one further entry cleared 2026-07-28 and is struck through
+below, same rule: recorded, not deleted):
 
 | Claim | Why it is blocked |
 |---|---|
-| 27B "−77% KL" | The HF card reports ALL-KL **0.0049** / −77% under a top-20 `prompt_logprobs` protocol; `docs/BENCHMARKS.md` reports **0.0134** / −58.3%. A 2.7× gap that the documented ±17% drift cannot explain. Quote the BENCHMARKS number (−58.3%), and reconcile or explicitly cross-reference the card before anyone compares the two. |
+| ~~27B "−77% KL"~~ | **RECONCILED 2026-07-28 — quotable with the cross-reference now in the docs.** The two readouts are different *builds* measured in different *sessions*: the −58.3% is the 2026-07-18 A/B whose CB arm used a 4-rung menu (`K36/K40/K44/K48`), while the Hub artifact is the later 8-rung ladder (`K36`–`K47`, per its shipped `quant_config.json`) measured 2026-07-22. Absolute KL does not survive the session change either — the *same unchanged* NVFP4/FP8 baseline artifact reads confident-KL **0.02407** in the first session and **0.01302** in the second (1.85×), so cross-session absolute comparison is invalid by construction. Recomputing all four arms of the 2026-07-22 session from its stored top-20 dumps with `kl_tool.py compare` reproduces the card exactly: CB **0.0049 / 0.00295**, NVFP4/FP8 baseline **0.0211 / 0.01302**, PrismaSCOUT-5.31 **0.0344 / 0.02491**. Both sessions return the same verdict; **quote the conservative −58.3%**, and link the reconciliation in [`BENCHMARKS.md` § two sessions, two builds](BENCHMARKS.md#two-sessions-two-builds-why-the-model-card-says-77-and-this-page-says-583) whenever both numbers can be seen at once. `README.md` and the model card are now cross-referenced. |
 | Anything about the 35B MoE artifact being available | The 35B gridbook artifact is **not published**. The result is real and is in `docs/BENCHMARKS.md`; the model is not downloadable. Say so if the number is used. |
 
 ### 5.4 Links

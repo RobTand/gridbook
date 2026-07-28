@@ -18,6 +18,15 @@ cd gridbook
 docker build -t gridbook:local .
 ```
 
+The build takes a few minutes, most of it compiling the CUDA kernels, and it
+**fails loudly** rather than producing a quietly-degraded image (see
+[Build-time gates](#build-time-gates)). To build *and* re-run every check
+recorded in [Verified vs untested](#verified-vs-untested):
+
+```bash
+bash scripts/verify-image.sh --tag gridbook:local
+```
+
 Then serve a published artifact:
 
 ```bash
@@ -59,7 +68,15 @@ upstream vLLM flag works unchanged.
 | Kernel cache | prebuilt at `/opt/gridbook/ext-cache` |
 | Endpoint | OpenAI-compatible, `0.0.0.0:8000` |
 
-The image adds roughly **0.2 GB** on top of the base image.
+Size added over the base image, measured two ways because they disagree and both
+get quoted: **+31.8 MB** by `docker image inspect -f '{{.Size}}'`
+(10 617 665 238 → 10 649 446 254 B), which sums the layer contents; **+0.2 GB**
+by `docker images` disk-usage accounting (32.2 → 32.4 GB), which rounds. Of that
+31.8 MB only **3.2 MB** is the prewarmed kernel cache — the same build with
+`--build-arg GRIDBOOK_PREWARM=0` measures 10 646 242 057 B — and the rest is the
+gridbook package plus the build context kept at `/opt/gridbook/src`, so the exact
+figure tracks the repo's own size. The header repair below adds zero bytes: it is
+symlinks.
 
 ### Why `v0.24.0`
 
@@ -77,7 +94,9 @@ vLLM symbol the plugin imports, including the private fused-MoE internals
 and can be selected with `--build-arg VLLM_TAG=v0.26.0`, but they sit further
 from the measured stack. See [Verified vs untested](#verified-vs-untested).
 
-### A defect in the base image this Dockerfile repairs
+### Two defects in the base image this Dockerfile repairs
+
+#### 1. Missing CUDA headers
 
 The stock `vllm/vllm-openai` image installs the CUDA math **runtime** libraries
 but not their headers — `/usr/local/cuda/include` has no `cusparse.h`,
@@ -97,6 +116,31 @@ version-matched to the torch build by construction. The Dockerfile links in
 so nothing is ever shadowed and the step becomes a no-op if a future base image
 ships them properly. On `v0.24.0` this links 59 headers and costs no extra bytes.
 
+#### 2. `docker run --user` cannot import vLLM at all
+
+In the stock image, running under any UID that has no `/etc/passwd` entry —
+i.e. essentially every `docker run --user 1000:1000` — dies on `import vllm`:
+
+```
+File ".../torch/_inductor/runtime/cache_dir_utils.py", line 23, in default_cache_dir
+  sanitized_username = re.sub(r'[\\/:*?"<>|]', "_", getpass.getuser())
+File "/usr/lib/python3.12/getpass.py", line 169, in getuser
+  return pwd.getpwuid(os.getuid())[0]
+KeyError: 'getpwuid(): uid not found: 1000'
+```
+
+torch calls `getpass.getuser()` at **import** time to name its cache
+directories, and vLLM does the same for a temp directory. Setting
+`TORCHINDUCTOR_CACHE_DIR` is *not* enough — measured: the import then dies one
+frame later in `torch/_inductor/codecache.py`, which calls `default_cache_dir()`
+directly and so never consults that variable. `getpass.getuser()` consults
+`LOGNAME` before `pwd`, so this image bakes `LOGNAME=gridbook`, which repairs
+every call site at once. It affects nothing but the *names* of cache and temp
+directories; it confers no identity and no permission.
+
+This one is not gridbook-specific either: it applies to anything running
+`vllm/vllm-openai:v0.24.0` under `--user`.
+
 ---
 
 ## Build options
@@ -113,7 +157,7 @@ docker build \
 |---|---|---|
 | `VLLM_TAG` | `v0.24.0` | Base image tag. |
 | `GRIDBOOK_CUDA_ARCH` | `12.1a` | `TORCH_CUDA_ARCH_LIST` used to compile the kernels. |
-| `GRIDBOOK_PREWARM` | `1` | `0` skips kernel compilation; the user pays a one-time build inside their first request instead. |
+| `GRIDBOOK_PREWARM` | `1` | `0` skips kernel compilation; the user pays a one-time build inside their first request instead. Both values are build-tested. |
 
 ### `GRIDBOOK_CUDA_ARCH` is important — read this
 
@@ -144,6 +188,18 @@ You can also override the arch at *run* time (`-e TORCH_CUDA_ARCH_LIST=9.0`),
 which invalidates the baked cache and triggers a one-time rebuild inside the
 container. Rebuilding the image is the better path.
 
+**It is a process-wide torch setting, not a gridbook one.** gridbook JIT-compiles
+inside the vLLM process, so there is no way to scope this variable to the plugin.
+Baking it narrows the arch list for *every* torch JIT path in the container —
+vLLM's own `cpp_extension` / inductor compiles included — from the base image's
+`8.0 8.7 8.9 9.0 10.0 11.0 12.0` down to this one value (confirmed with
+`docker inspect`: the image exports `TORCH_CUDA_ARCH_LIST=12.1a`). That is the
+intended trade: the stock list omits `12.1` entirely, so it is *wrong* for
+gridbook on the reference target, and compiling all eight arches would add
+minutes to every build. If something else in your container needs the wider
+list, restore it at run time with `-e TORCH_CUDA_ARCH_LIST="8.0 8.7 8.9 9.0 10.0
+11.0 12.0 12.1a"` and accept a one-time gridbook kernel rebuild.
+
 ### Build-time gates
 
 The build **fails** rather than producing a quietly broken image if:
@@ -157,7 +213,12 @@ The build **fails** rather than producing a quietly broken image if:
 - `gridbook.register()` raises against the chosen vLLM (an API-drift canary —
   vLLM's plugin loader swallows load exceptions and continues, so without this
   check drift surfaces much later as a confusing "unknown quantization method");
-- the decode-GEMV kernel fails to compile.
+- the decode-GEMV kernel fails to compile;
+- a non-root, non-group-0 UID (1000:1000, `HOME=/` — what `docker run --user`
+  actually gives you) cannot `import vllm`, register the plugin, or load the
+  prewarmed kernels. All three of those failures are silent at run time: the
+  first two crash inside vLLM's swallow-and-continue plugin loader, the third
+  downgrades decode to the Triton prototype with a warning.
 
 ---
 
@@ -175,7 +236,7 @@ The build **fails** rather than producing a quietly broken image if:
 
 | Mount | Purpose |
 |---|---|
-| `-v hf-cache:/root/.cache/huggingface` | Model weights. Without it, every container restart re-downloads the artifact. |
+| `-v hf-cache:/root/.cache/huggingface` | Model weights. Without it, every container restart re-downloads the artifact. Under `--user`, use `/opt/gridbook/hf` + `HF_HOME` instead — see [Running as a non-root UID](#running-as-a-non-root-uid---user). |
 | `-v gridbook-ext:/opt/gridbook/ext-cache` | Compiled kernels. |
 
 **Use named volumes, not bind mounts, for the kernel cache.** Docker copies the
@@ -202,6 +263,75 @@ win. To bypass it entirely, use `--entrypoint`:
 ```bash
 docker run --rm --gpus all --entrypoint bash gridbook:local -lc 'python3 -c "import gridbook; print(gridbook.__file__)"'
 ```
+
+### Running as a non-root UID (`--user`)
+
+Supported, and gated at build time. Two of the three moving parts still need
+flags from you, because they are mount points rather than image state — so use
+this recipe:
+
+```bash
+docker run --rm --gpus all --ipc=host -p 8000:8000 \
+  --user "$(id -u):$(id -g)" \
+  -e HF_HOME=/opt/gridbook/hf \
+  -v gridbook-hf:/opt/gridbook/hf \
+  -v gridbook-ext:/opt/gridbook/ext-cache \
+  gridbook:local <model> ...
+```
+
+Why each piece:
+
+- **The kernel cache must be writable by your UID.**
+  `torch.utils.cpp_extension` takes a `lock` file *inside* the build directory
+  before it even checks whether anything needs building, so merely *loading* the
+  prewarmed cache needs create permission there. The image opens
+  `/opt/gridbook/ext-cache` to all UIDs for exactly this reason. If it were only
+  group-0-writable (the usual recipe), `--user 1000:1000` would fall back to the
+  slow Triton decode path with nothing but a warning.
+- **`HF_HOME` must point somewhere your UID can write.** `HF_HOME` defaults to
+  `~/.cache/huggingface`; under `--user` docker sets `HOME=/` for a UID with no
+  passwd entry, and `/root` is mode 0700 and unreadable anyway. The image ships a
+  world-writable `/opt/gridbook/hf` as a mount point, and docker seeds a fresh
+  *named* volume from it — including the mode — so the volume is writable by any
+  UID. A **bind mount** here is on you: it keeps the host directory's ownership.
+- **`LOGNAME` is already baked in**, which is what makes `import vllm` work at
+  all under `--user` (see [base-image defect 2](#2-docker-run---user-cannot-import-vllm-at-all)).
+
+Read-only root filesystems work too, with a writable `/tmp` and a writable
+kernel cache:
+
+```bash
+docker run --rm --gpus all --read-only --tmpfs /tmp \
+  -v gridbook-ext:/opt/gridbook/ext-cache ... gridbook:local <model>
+```
+
+Without `--tmpfs /tmp` a bare `--read-only` container fail-softs to the Triton
+path (`FileNotFoundError: No usable temporary directory found`) — torch and vLLM
+both need a writable temp directory.
+
+---
+
+## Keeping this image from rotting
+
+The image pins a vLLM release, links headers by a computed rule, and bakes a
+kernel cache — all three can break silently when `VLLM_TAG` moves. Nothing in CI
+covers them (no `nvcc` on hosted runners, ~32 GB for the base image), so the
+coverage is a script you run:
+
+```bash
+bash scripts/verify-image.sh                       # build + 10 run-time checks
+bash scripts/verify-image.sh --no-build --tag X    # re-check an existing image
+```
+
+It builds the Dockerfile from the repo root and then checks, on the built image:
+root, `--user 1000:1000`, `--user 1000:0`, `--user 65534:65534`, a named volume
+over the kernel cache under `--user`, `--read-only --tmpfs /tmp` under `--user`,
+three entrypoint argument shapes, and that `HF_HOME=/opt/gridbook/hf` is
+writable. Exit status is 0 only if all pass. It needs no GPU.
+
+Run it: before tagging a release, after changing `VLLM_TAG`, and after any
+Dockerfile change. The build-time gates (below) run inside `docker build` and so
+are covered by anyone's build, but the run-time behaviours are not.
 
 ---
 
@@ -261,29 +391,55 @@ expect to tune `--max-model-len` down substantially.
 ## Verified vs untested
 
 Everything below was run on this repo's Dockerfile against
-`vllm/vllm-openai:v0.24.0` (`linux/arm64`), **with no GPU attached** — `docker
-build` never has one.
+`vllm/vllm-openai:v0.24.0` (`linux/arm64`, GB10 host), **with no GPU attached** —
+`docker build` never has one. Last run **2026-07-28**, from a clean
+`git clone`-equivalent tree, i.e. the Quick Start command exactly as written.
+Re-run it yourself with `bash scripts/verify-image.sh`; the run-time half of this
+list *is* that script, so the two cannot drift.
 
 **Verified**
 
-- The image builds end to end.
+- The image builds end to end; `docker build --check` reports no warnings.
 - 59 missing CUDA headers are linked; `cusparse.h` resolves afterwards.
 - Install verification passes: gridbook 0.1.0, vLLM 0.24.0, torch 2.11.0+cu130,
   entry point registered, packaged `csrc` present.
 - `gridbook.register()` succeeds against **released vLLM 0.24.0** — the API
   canary passes.
-- Kernels compile without a GPU: decode GEMV **30.8 s**, CUTLASS mid-M fused
-  prefill **79.5 s** (`torch.cuda.is_available() == False` throughout). Only
-  `nvcc` and an explicit `TORCH_CUDA_ARCH_LIST` are required.
-- Both extensions load from the baked cache in **0.65 s** at container start,
-  versus ~110 s to compile them.
-- The entrypoint's host/port defaulting behaves correctly across five argument
-  shapes, including `--port=9000`.
+- Kernels compile without a GPU: decode GEMV **28.7–29.8 s**, CUTLASS mid-M
+  fused prefill **71.0–75.9 s**, **101.4–105.3 s** for the build step as a whole
+  (three uncached builds; `torch.cuda.is_available() == False` throughout). Only
+  `nvcc` and an explicit `TORCH_CUDA_ARCH_LIST` are required. These are the
+  current Dockerfile's own build-log numbers on the host above and move with the
+  host's CPU.
+- Loading the prewarmed extensions instead of compiling them, measured two ways
+  because the difference is a factor of ~20 and both get quoted:
+  - **inside a process that has already imported torch/vLLM** — the serving
+    condition — decode **0.04–0.05 s**, fused **0.02 s** (3 runs);
+  - **from a cold `python3 -c`**, where the timing also contains torch's own
+    import, decode **0.59–0.66 s**, fused **0.80 s**, both **1.40–1.46 s**
+    (3 runs).
+- `--user` is genuinely supported, not asserted: `--user 1000:1000`,
+  `--user 1000:0` and `--user 65534:65534` each import vLLM, register the plugin,
+  and load **both** prewarmed extensions. A build-time gate re-checks this at
+  uid/gid 1000:1000 with `HOME=/`, so the image cannot ship without it.
+  (Both halves of this were broken before: `getpass.getuser()` on import, and a
+  kernel cache only writable by group 0.)
+- Read-only rootfs: `--read-only --tmpfs /tmp` plus a named volume for the kernel
+  cache works, including combined with `--user 1000:1000`.
+- Named volumes preserve the prewarmed cache; bind mounts shadow it.
+- `-e HF_HOME=/opt/gridbook/hf` is writable under `--user 1000:1000`.
+- The entrypoint's host/port defaulting behaves correctly across the bare,
+  `--port=9000` and `--host 127.0.0.1` shapes.
 - The build **fails** when the packaged CUDA sources are removed (the gate is
   real, not decorative).
 - `--build-arg GRIDBOOK_CUDA_ARCH=9.0` builds successfully, compiles the decode
-  GEMV for `sm_90`, and correctly skips the Blackwell-only fused prefill prewarm.
-- Named volumes preserve the prewarmed cache; bind mounts shadow it.
+  GEMV for `sm_90` (28.4 s), and correctly skips the Blackwell-only fused
+  prefill prewarm.
+- `--build-arg GRIDBOOK_PREWARM=0` builds successfully: the prewarm step is
+  skipped, the kernel-cache directory is still created world-writable so the
+  first-use build works under `--user`, and the image is 3 MB smaller.
+- The run-time checks are known to *fail* on an image without these fixes: run
+  `scripts/verify-image.sh --no-build` against a pre-fix image and 5 of 10 fail.
 
 **Untested — do not read these as working**
 
@@ -301,6 +457,11 @@ build` never has one.
   the known `sm_89` floor on the dense FP8-CB prefill path — an A100 in
   particular is expected to fail on the first prompt longer than 16 tokens.
 - **No image has been published** to any registry.
+- **Nothing builds this image automatically.** CI cannot: GitHub-hosted runners
+  have no `nvcc`, and the base image alone is ~32 GB on disk. `scripts/verify-
+  image.sh` is therefore a **manual** gate — run it before tagging a release,
+  after bumping `VLLM_TAG`, and after any Dockerfile change. Until someone runs
+  it, this section is a claim about the last time it was run, not about HEAD.
 
 If you want the exact stack the published benchmarks were measured on, that is
 the third-party arm64 image `eugr/spark-vllm@sha256:d0840ff0e0ba1899a51bf4cb473f
@@ -322,9 +483,18 @@ You are building on a base image whose CUDA headers are incomplete and whose
 
 **`[prismaquant-cb] WARNING: ... falling back to the Triton decode path`**
 The kernel build failed at runtime. The Triton path is correct but is not a
-production serving target. Two usual causes: the arch flags changed between
-build and run (check `TORCH_CUDA_ARCH_LIST` is still `12.1a` inside the
-container), or the ext-cache directory was shadowed by a bind mount.
+production serving target. The message names the exception; the usual causes are:
+
+| In the message | Cause |
+|---|---|
+| `PermissionError: ... '/opt/gridbook/ext-cache/lock'` | The kernel cache is not writable by your UID — you mounted your own directory over it, or you are on an image predating this fix. |
+| `FileNotFoundError: No usable temporary directory` | `--read-only` without `--tmpfs /tmp`. |
+| a long `nvcc` error / a recompile every start | `TORCH_CUDA_ARCH_LIST` differs from build time, or a bind mount shadowed the prewarmed cache. |
+
+**`KeyError: 'getpwuid(): uid not found: 1000'` at startup**
+You are on a base image or an older gridbook image without the `LOGNAME` fix,
+running `--user` with a UID that has no `/etc/passwd` entry. Workaround without
+rebuilding: add `-e LOGNAME=anything` to the `docker run`.
 
 **Kernels rebuild on every container start**
 The cache directory is not persisting, or the arch list changed. Use a *named*
