@@ -299,42 +299,41 @@ trailing comment; Dependabot understands and maintains that form too.
 
 ---
 
-## Trusted publishing is NOT yet bound (state as of 0.1.0)
+## Trusted publishing: bound and proven (0.1.1)
 
-`v0.1.0`'s pipeline run reached `publish` and failed with:
+`v0.1.1` published to PyPI with **no token and no repository secret** — all four
+jobs green, PEP 740 attestations included. From here a release is:
+
+```bash
+# bump __version__ in gridbook/__init__.py, commit, then:
+git tag -a vX.Y.Z -m "gridbook X.Y.Z" && git push origin vX.Y.Z
+```
+
+Nothing else. The workflow refuses to publish if the tag disagrees with the
+built version, or if the built wheel fails a non-editable install with the
+CUDA sources re-resolved from site-packages.
+
+### The trap that cost us 0.1.0 — do not repeat it
+
+`v0.1.0`'s run failed at `publish` with:
 
 ```
 * `invalid-publisher`: valid token, but no corresponding publisher
   (Publisher with matching claims was not found)
 ```
 
-The OIDC claims it presented were correct — `repository: RobTand/gridbook`,
-`workflow_ref: .../release.yml@refs/tags/v0.1.0`, `environment: pypi`. The
-cause is sequencing, not configuration: **a *pending* publisher only converts
-into a real one when the project is created through it.** `gridbook` was
-created by a token upload of `0.1.0rc1`, so any pending publisher for that name
-was left orphaned, and the project had no publisher attached.
+The claims it presented were correct. The cause was sequencing: **a *pending*
+publisher only becomes a real one when the project is created through it.**
+`gridbook` was created by a token upload of `0.1.0rc1` — a rehearsal — which
+orphaned the pending publisher and left the project with none attached. So
+`0.1.0` had to be published with an API token from a workstation, and its
+GitHub Release created by hand.
 
-`0.1.0` was therefore published with an API token from a workstation, and the
-GitHub Release was created by hand. Both are visible in the run history as a
-failed `publish` job on the `v0.1.0` tag — that failure is expected and is not
-a defect in this workflow; `build` and `verify installed wheel` both passed.
+**If trusted publishing is the intent, the FIRST upload must come from the
+workflow.** Do not token-upload a release candidate first; there is nothing to
+rehearse that the `verify installed wheel` job does not already check.
 
-**To bind it (one time, then never again):** the project now exists, so use the
-project-scoped form, not the pending form —
-<https://pypi.org/manage/project/gridbook/settings/publishing/> → *Add a new
-publisher* → GitHub:
-
-| Field | Value |
-|---|---|
-| Owner | `RobTand` |
-| Repository name | `gridbook` |
-| Workflow name | `release.yml` |
-| Environment name | `pypi` |
-
-After that, `v0.1.1` needs nothing but a version bump, a commit and a tag push.
-Re-running the failed `v0.1.0` job afterwards will still fail, correctly:
-`0.1.0` already exists on PyPI and `skip-existing` is deliberately unset.
-
-**Then revoke the API token** used for `0.1.0` — it is account-scoped and is no
-longer needed for anything.
+Once a project exists, its publisher is added from the *project* settings, not
+the account-level pending form:
+<https://pypi.org/manage/project/gridbook/settings/publishing/> → owner
+`RobTand`, repository `gridbook`, workflow `release.yml`, environment `pypi`.
