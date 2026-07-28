@@ -296,3 +296,45 @@ PR is a real test of the new versions because the packaging gates run there.
 Git tags are mutable in principle, so full-SHA pinning is stricter. If you want
 it, replace each `@vX.Y.Z` with the tag's commit SHA and keep the version in a
 trailing comment; Dependabot understands and maintains that form too.
+
+---
+
+## Trusted publishing is NOT yet bound (state as of 0.1.0)
+
+`v0.1.0`'s pipeline run reached `publish` and failed with:
+
+```
+* `invalid-publisher`: valid token, but no corresponding publisher
+  (Publisher with matching claims was not found)
+```
+
+The OIDC claims it presented were correct — `repository: RobTand/gridbook`,
+`workflow_ref: .../release.yml@refs/tags/v0.1.0`, `environment: pypi`. The
+cause is sequencing, not configuration: **a *pending* publisher only converts
+into a real one when the project is created through it.** `gridbook` was
+created by a token upload of `0.1.0rc1`, so any pending publisher for that name
+was left orphaned, and the project had no publisher attached.
+
+`0.1.0` was therefore published with an API token from a workstation, and the
+GitHub Release was created by hand. Both are visible in the run history as a
+failed `publish` job on the `v0.1.0` tag — that failure is expected and is not
+a defect in this workflow; `build` and `verify installed wheel` both passed.
+
+**To bind it (one time, then never again):** the project now exists, so use the
+project-scoped form, not the pending form —
+<https://pypi.org/manage/project/gridbook/settings/publishing/> → *Add a new
+publisher* → GitHub:
+
+| Field | Value |
+|---|---|
+| Owner | `RobTand` |
+| Repository name | `gridbook` |
+| Workflow name | `release.yml` |
+| Environment name | `pypi` |
+
+After that, `v0.1.1` needs nothing but a version bump, a commit and a tag push.
+Re-running the failed `v0.1.0` job afterwards will still fail, correctly:
+`0.1.0` already exists on PyPI and `skip-existing` is deliberately unset.
+
+**Then revoke the API token** used for `0.1.0` — it is account-scoped and is no
+longer needed for anything.
