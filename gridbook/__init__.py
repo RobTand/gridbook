@@ -10,7 +10,7 @@ falls back to a correct-but-slow Triton path.
 (the format and correctness tests) work without vLLM installed.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 def register() -> None:
