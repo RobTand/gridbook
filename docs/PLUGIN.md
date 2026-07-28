@@ -1,24 +1,30 @@
-# vllm-prismaquant
+# Plugin reference
 
-Out-of-tree vLLM quantization plugin for PrismaQuant's **NVFP4-CB / FP8-CB**
-codebook formats (docs/nvfp4-cb-plan/). The **Triton** path (`kernels.py`) was
-**prototype (i)** — a correctness-first reference used to obtain the first served
-KL-vs-BF16 and speed reading. The **current served path is the CUDA kernel set**
-(`csrc/cb_gemv.cu`, JIT-built via `cuda_ext.get_ext()`), which honours INV-1
-(decode in registers/smem, never a materialized `[N,K]` in HBM) at
-bandwidth-bound decode speeds; the Triton path remains the bit-exact fallback
-when nvcc is unavailable. See the CUDA kernel-set section below.
+Operator-level reference for the out-of-tree vLLM plugin that serves the
+**NVFP4-CB / FP8-CB** codebook formats. For installation and first-run problems
+see [`INSTALL.md`](INSTALL.md) and [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md);
+for the format itself see [`SPEC.md`](SPEC.md).
+
+The **served path is the CUDA kernel set** (`gridbook/csrc/cb_gemv.cu`, JIT-built
+via `cuda_ext.get_ext()`, plus the CUTLASS fused prefill extension). The
+**Triton** path (`kernels.py`) was the original correctness-first reference and
+remains the bit-exact fallback when `nvcc` is unavailable — correct everywhere,
+but several times slower and not a serving target.
 
 ## Invariants
 
 - **INV-1 (honored):** the resident weight is the packed k-bit index stream +
   the tiny flat codebook + the (pre-decoded) scales. The dense `[N,K]` weight is
-  never materialized in HBM — each superblock's weight tile is expanded inside
-  the kernel, in registers, then consumed by the matmul.
-- **INV-2 (WAIVED):** we decode FP4/FP8 codes to bf16 and run `tl.dot` (bf16
-  MMA). Triton cannot emit the Blackwell sm_121 block-scaled FP4 MMA, so this
-  path will fail the prefill perf gate by construction. The production prefill is
-  prototype (iii) (CUTLASS/CuTe fused-expand).
+  never materialized in HBM as a *model-wide* tensor — each superblock's weight
+  tile is expanded inside the kernel, in registers, then consumed by the matmul.
+  The large-M transient-expand prefill path materializes one layer's `[N,K]` tile
+  at a time (expand → GEMM → free), a bounded, deliberate relaxation.
+- **INV-2 (decode feeds a native-format MMA):** honored by the CUTLASS
+  decode-in-prologue prefill kernel, which decodes each superblock into smem and
+  feeds the FP8/FP4 tensor-core MMA directly. **Waived on the Triton path**,
+  which decodes to bf16 and runs `tl.dot` — Triton cannot emit the Blackwell
+  `sm_120`-family block-scaled FP4 MMA, which is why that path is a correctness
+  fallback rather than a performance one.
 
 ## Scope
 
@@ -30,20 +36,38 @@ when nvcc is unavailable. See the CUDA kernel-set section below.
   paths, GPU-validated (18-test signed battery, 2026-07-22); production
   menus gate it on a measured K-vs-S win. Full mode: spec-reserved,
   unimplemented.
-- Uniform CB artifacts (all target Linears one format). Mixed containers would
-  delegate plain NVFP4/FP8 to stock compressed-tensors — stubbed with a clear
-  `NotImplementedError`.
-- Single-GPU (tp=1); `--enforce-eager`.
+- **Mixed containers are supported and shipping.** A config group carrying a
+  `"scheme"` key is a CB group and is served by this plugin; a group without one
+  uses the stock `compressed-tensors` vocabulary and is delegated to a real
+  `CompressedTensorsConfig` that the plugin constructs (NVFP4, FP8_DYNAMIC);
+  `ignore` entries become BF16 passthrough. The shipped 295B artifact serves 36
+  vanilla-FP8 Linears this way, and the 27B's vision tower is a stock NVFP4
+  W4A16 group. **Consequence:** an artifact's hardware requirements are the union
+  of gridbook's and those of its delegated groups.
+- **Single-GPU (`tp=1`) only** — there is no tensor-parallel handling for CB
+  weights. `--enforce-eager` is the tested serving configuration
+  ([why](TROUBLESHOOTING.md#do-i-really-need---enforce-eager)).
 
 ## Layout / registration
 
-- `register_quantization_config("prismaquant")` — vLLM auto-detects from
-  `config.json["quantization_config"]["quant_method"] == "prismaquant"`.
-- The exporter inlines the full quant config (config_groups + ignore) into
-  `config.json`, so `from_config` gets everything; the shared `cb_codebook.*`
-  tensors live in a sidecar `cb_codebooks.safetensors`, loaded **once** by the
-  config via `get_current_vllm_config()` at weight-load time. **Zero vLLM-core
-  monkeypatching.**
+- `register_quantization_config("gridbook")` — vLLM auto-detects from
+  `config.json["quantization_config"]["quant_method"] == "gridbook"`.
+  `"prismaquant"` is registered as a **legacy alias** for artifacts exported
+  before the rename; both dispatch to the same config.
+- Published artifacts write `config.json["quantization_config"]` as a **pointer
+  stub** — `{quant_method, format, config_file, codebook_file}` — with the full
+  `config_groups` / `ignore` / `layout_version` in the `config_file` sidecar
+  (`quant_config.json`), resolved lazily via `get_current_vllm_config()`. A fully
+  inlined config (with `config_groups` present) is also accepted.
+- The shared `cb_codebook.*` tensors live in the sidecar named by
+  `codebook_file`, default **`cb_codebooks.pqcb`**, loaded **once** at
+  weight-load time. Both sidecars are fetched from the Hub when the model is
+  given as a repo id rather than a local directory.
+- **No vLLM-core files are patched.** The plugin does wrap `load_weights` on
+  specific *model classes* (HunYuan-V3 + its MTP drafter, Laguna, Qwen3.5-MoE +
+  its MTP) whose loaders map MoE experts at the top level and would otherwise not
+  recognise stacked codebook expert tensors. The wrap is inert for non-CB
+  checkpoints.
 
 ## CUDA kernel set (decode-GEMV + prefill)
 
@@ -54,7 +78,7 @@ result differs from the reference only by summation **reassociation**, held to
 `≤1 bf16 output ULP + a norm backstop` (the `_assert_triton_close` contract in
 `tests/test_cuda_gemv.py`).
 
-**`csrc/cb_gemv.cu`** (`cuda_ext.get_ext()`) — the decode path (M ≤ 16) + a
+**`gridbook/csrc/cb_gemv.cu`** (`cuda_ext.get_ext()`) — the decode path (M ≤ 16) + a
 prefill expander:
 
 - **Dense decode-GEMV** `cb_gemv_fp8` / `cb_gemv_fp4_v2`: one block per output
@@ -93,7 +117,7 @@ prefill expander:
 - `fp8_act_qdq`, `cb_moe_combine` — fused per-token fp8 QDQ and the deterministic
   expert-ascending bf16 combine.
 
-**`csrc/cb_fused_gemm.cu`** (CUTLASS, separate JIT ext) — prefill:
+**`gridbook/csrc/cb_fused_gemm.cu`** (CUTLASS, separate JIT ext) — prefill:
 
 - **`cb_fused_prefill_mm`** — decode-in-prologue fused GEMM (CUTLASS sm120
   collective: decode each B superblock into smem, then the FP8/FP4 tensor-core
@@ -101,12 +125,45 @@ prefill expander:
   **mid-M niche (17–128)** (1.04–1.45× vs serial); at large M every M-tile CTA
   re-decodes B, so transient-expand is preferred there.
 
-**`csrc/cb_persistent_prefill.cu`** (experimental, off by default) — the
-large-M endgame reference: a **persistent-N** kernel that decodes each B N-tile
-**once** into smem and streams M through it (no `[N,K]` in HBM, INV-1). This is
-an f32-FMA **schedule/correctness reference**, not the tensor-core perf path; the
-go/no-go for the CUTLASS tensor-core version and the full design are in
-`docs/nvfp4-cb-plan/persistent-n-prefill.md`.
+**`gridbook/csrc/cb_persistent_prefill.cu`** and
+**`gridbook/csrc/cb_persistent_tc.cu`**
+(experimental, **off by default**) — the persistent-N schedule: decode each B
+N-tile **once** into smem and stream M through it (no `[N,K]` in HBM, INV-1). The
+first is an f32-FMA schedule/correctness reference; the second is the tensor-core
+build. **Verdict: measured negative for dense prefill** — parity-green but 2–5.7×
+slower than expand-then-GEMM at 27B shapes, because the CUDA expander had already
+cut the dense expand tax to ~10%. Retained as a schedule reference and quarantined
+behind `PRISMAQUANT_ENABLE_PTC=1`; **do not enable it**. The MoE analog of the
+idea is still open — see [`ROADMAP.md`](../ROADMAP.md).
+
+## Environment switches
+
+These are **escape hatches and A/B levers, not tuning knobs** — the defaults are
+what every published number used, and each non-default was chosen by measurement.
+Change one only to diagnose something or to reproduce a documented experiment.
+(The prefix is `PRISMAQUANT_`, not `GRIDBOOK_`, for compatibility with existing
+tooling and model cards — see the README's naming section.)
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PRISMAQUANT_CB_EXT_DIR` | `~/.cache/prismaquant-cb-ext` | Where the JIT extensions are built and cached. Point it at a persistent, writable directory in containers to avoid a ~30 s rebuild per start. |
+| `PRISMAQUANT_CB_DECODE` | `cuda` | `triton` forces the Triton decode path (much slower; bisection only). |
+| `PRISMAQUANT_CB_PREFILL` | `auto` (fp8-CB) / `loop` (fp4-CB) | MoE prefill path: `auto` \| `stock` \| `grouped_fused` \| `loop`. `auto` measures the candidates per layer on the first prefill and caches the choice. `l2_pipeline` exists but is **diagnostic-only** — it wedged live serving three times. |
+| `PRISMAQUANT_CB_FUSED_MIDM` | `1` | `0` skips the CUTLASS mid-M fused prefill kernel — including its JIT build, which is worth doing on non-`sm_120` GPUs where the build is doomed anyway. |
+| `PRISMAQUANT_PREFILL_M_THRESHOLD` | `16` | Token count above which a dense Linear takes the prefill path instead of the decode GEMV. |
+| `PRISMAQUANT_CB_CUDA_M_MAX` | `8` | Within the decode regime, the largest M handled by the CUDA GEMV before the Triton decode-GEMM takes over (measured crossover on GB10). |
+| `PRISMAQUANT_CB_DISPATCH` | `op` | `inline` restores in-graph host branching instead of the opaque custom-op dispatch (A/B only; less CUDA-graph-safe). |
+| `PRISMAQUANT_CB_DECODE_CONTRACT` | `v1` | `v2` selects the scale-epilogue-hoist decode contract. Measured **null** on the served 27B; kept for reproducibility. |
+| `PRISMAQUANT_CB_EXPAND` | CUDA | `triton` restores the previous Triton expander (bisection). |
+| `PRISMAQUANT_DEBUG_PREFIXES` | off | `1` prints, per Linear, whether it resolved to a CB scheme or fell through — the first tool to reach for when memory use is higher than expected (silent BF16 fallback). |
+| `PRISMAQUANT_CB_PREFILL_TIMING` | off | `1` emits per-stage prefill timers. |
+| `PRISMAQUANT_PRELOAD_FUSED` | off | `1` force-builds the fused extension at registration so both arms of a served A/B carry identical extension residency (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |
+| `PRISMAQUANT_ENABLE_PTC` | off | Builds the quarantined persistent-N kernel. **Do not set this** — measured negative and under a stability quarantine. |
+
+Kernel-schedule switches (`PRISMAQUANT_CB_FP8_SCHED`, `..._FP4V2_SCHED`,
+`..._W2_SCHED`, `..._W2_WARPS`, `..._W2_ROWS`) are described inline in the kernel
+sections above. All schedule switches are read host-side in the launcher, so they
+are CUDA-graph-capture-safe.
 
 ## Tests
 

@@ -2,7 +2,7 @@
 
 All results are from a **single NVIDIA GB10 / DGX Spark** (Blackwell `sm_121`,
 128 GB unified memory, ~273 GB/s), serving through vLLM with `--enforce-eager`.
-Read the [caveats](#caveats-read-these) — these are single-box, single-seed
+Read the [caveats](#caveats--read-these) — these are single-box, single-seed
 measurements, and the 295B result carries **no quality-vs-teacher claim**.
 
 ## What is being compared, and how
@@ -41,8 +41,17 @@ disk — noted per model below.
 
 A 27B hybrid model (attention + gated linear-attention, with a vision tower),
 quantized at **5.5 bpp**. The allocator placed the **entire quantizable body on
-FP8-CB codebook rungs** (a mix of `FP8_CB_K36/K40/K44/K48`) and **zero** stock
-NVFP4/FP8 — the codebook formats won every Linear on cost.
+FP8-CB codebook rungs** and **zero** stock NVFP4/FP8 — the codebook formats won
+every Linear on cost.
+
+> **Which build is this?** The A/B in this section is the **2026-07-18** run,
+> whose CB arm was allocated from a 4-rung menu (`FP8_CB_K36/K40/K44/K48`, 386 CB
+> Linears). The artifact **published on the Hub** is a later 8-rung-ladder build
+> (`K36`/`K40`/`K41`/`K43`/`K44`/`K45`/`K46`/`K47` — 427 CB targets, plus 110
+> NVFP4 vision-tower targets; read from the shipped `quant_config.json`) measured
+> in a **different session** with **different absolute KL**. See [two sessions,
+> two builds](#two-sessions-two-builds-why-the-model-card-says-77-and-this-page-says-583)
+> below before comparing this table with the model card.
 
 **Matched-bpp denominator (from the safetensors headers):** the CB body is
 **16.713 GB**, the NVFP4/FP8 baseline body is **16.707 GB** — a 0.04% difference.
@@ -84,6 +93,38 @@ from the CB kernels (both prefill paths are bit-identical offline). Under **eith
 reading the verdict is unchanged: −45% to −53% confident-KL, −56% to −58% ALL-KL,
 PPL gap 2-3× smaller. See [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing).
 
+### Two sessions, two builds: why the model card says 77% and this page says 58.3%
+
+The [published 27B model
+card](https://huggingface.co/rdtand/Qwen3.6-27B-prismaquant-gridbook-5.5bit-vllm)
+reports **ALL-KL 0.0049 / confident-KL 0.00295** and a **−77%** headline. This
+page reports 0.0134 / 0.01134 and −58.3%. Both are real; they are not the same
+measurement, and neither is a correction of the other.
+
+| | build | eval session | CB ALL-KL | CB conf-KL | NVFP4/FP8 baseline ALL-KL | baseline conf-KL | relative |
+|---|---|---|---|---|---|---|---|
+| This page | 4-rung menu, 386 CB Linears | 2026-07-18 | 0.0134 | 0.01134 | 0.0321 | 0.02407 | **−58.3% / −52.9%** |
+| Model card | 8-rung ladder (**the published file**) | 2026-07-22 | 0.0049 | 0.00295 | 0.0211 | 0.01302 | **−76.8% / −77.3%** |
+
+Two things move between the rows, and only one of them is the format:
+
+1. **Different artifacts.** The ladder build spends the same byte budget across
+   eight rungs instead of four, so it is expected to be the better artifact.
+2. **Different evaluation sessions, which shift the whole scale.** The *same
+   unchanged* NVFP4/FP8 baseline artifact reads confident-KL **0.02407** in the
+   2026-07-18 session and **0.01302** in the 2026-07-22 session — a 1.85× move
+   with no change to any served byte. Absolute KL from one session is therefore
+   **not** comparable to absolute KL from another; only within-session
+   comparisons are. (See the ±17% extension-residency effect above, which is one
+   contributing mechanism, and the corpus/teacher-capture difference, which is
+   another.)
+
+Both sessions are internally consistent — same corpus, same protocol, same
+teacher capture, all arms back-to-back — and both return the same verdict at
+matched bytes. This page quotes the more conservative one. The card's row is
+reproducible from the stored top-20 dumps of that session with the same
+comparison script that produced it.
+
 ---
 
 ## 35B MoE (Qwen3-MoE-class) — the win reproduces on Mixture-of-Experts
@@ -116,10 +157,14 @@ formats on the experts.
   projection, replacing ~10k host operations per token) took decode from 3.5 to
   ~33 tok/s — **faster than BF16**, within 8% of the native baseline, at 3× smaller
   and −43% ALL-KL.
-- **Prefill is not yet solved for MoE:** TTFT is dominated by a per-expert launch
-  storm in the correctness-path prefill loop (~71k launches per 1400-token
-  prefill). A batched-expert expand + grouped GEMM is the remaining work; see
-  [`KERNELS.md`](KERNELS.md#moe-path-grouped-token-expert-gemv).
+- **Prefill (updated 2026-07-23): solved.** The TTFT above was measured against
+  the old correctness-path per-expert prefill loop (~71k launches per 1400-token
+  prefill) and **no longer describes the shipping default**. A CUDA chunk-expander
+  feeding vLLM's own fused-MoE grouped kernel replaced it; measured on
+  Laguna-S-2.1 (117B MoE): **293 → 1,821 tok/s at 8k** and **207 → 1,822 tok/s at
+  63k** (commit `8829c16`). The current default is `auto` — a measured per-layer
+  selection over the candidate prefill paths. The 35B TTFT row has not been
+  re-measured on the new path.
 
 ---
 
@@ -134,12 +179,15 @@ body.
 > scale. What is validated is: it loads, fits, serves, generates coherent and
 > correct output, and its serving speed against the equivalent GGUF build.
 
-**Footprint (read from the artifact header):** `model.safetensors` = **110.3 GB**
-(102.7 GiB) = 99.68 GB packed `cb_qweight` + 10.52 GB BF16 sidecars (57 non-CB
-layers) + 0.10 GB FP32 scales. The 2.902 bpp figure is over quantizable params; the
-BF16 floor is bpp-excluded but disk-resident, which is why the total is 110 GB.
+**Footprint.** The **published** joint-menu artifact is **105.7 GB** (98.5 GiB)
+across 5 shards — the figure to plan against, read from the Hugging Face file
+listing. The composition breakdown below is from the earlier single-file body
+(110.3 GB / 102.7 GiB): 99.68 GB packed `cb_qweight` + 10.52 GB BF16 sidecars (57
+non-CB layers) + 0.10 GB FP32 scales. In both, the 2.902 bpp figure is over
+quantizable params; the BF16 floor is bpp-excluded but disk-resident, which is why
+the total exceeds `bpp × params`.
 
-**Single-Spark fit:** 110.3 GB weights + ~2 GB framework on the ~121 GB usable
+**Single-Spark fit:** ~105–110 GB weights + ~2 GB framework on the ~121 GB usable
 pool. Because CB decode is transient (no load-time expansion, INV-1), resident
 weight footprint == disk. Serve with `--max-model-len 8192-16384`; the demo used
 4096. Load 77 s; 44,272 tokens of KV at 4k context (10.8× concurrency). Native
@@ -183,17 +231,55 @@ FP8-CB K44 MTP draft).
   NVFP4 and FP8 alongside the codebook rungs, the measured allocator gave 36
   Linears to vanilla FP8 and **zero to vanilla NVFP4** — at matched bits the
   codebook dominates the fixed grid on every unit of a 295B.
-- **ToolEvalBench 87/100 (129/148) — an exact tie with the GGUF IQ build** (87,
-  129/148) and above k-quant (86), under the identical protocol below. Zero errors,
-  all 74 scenarios ran. Honest reading: at matched body bytes, tool-use quality is
-  **base-model-dominated — this is parity, not a quality win over IQ.** The
-  case for the CB build over the GGUF one is: **same quality, ~2.1× prefill, native
-  kernels, and it can additionally carry a BF16 multi-token-prediction head the GGUF
-  build cannot.**
+- **ToolEvalBench: the shipped joint-menu artifact scored 88/100 (130/148)** on
+  the ship config, against the GGUF IQ build's 87 (129/148) and k-quant's 86
+  (128/148), under the identical protocol below. Zero errors, all 74 scenarios
+  ran. **Read it as parity, not a win:** earlier bodies of the same bytes measured
+  85–87 across serving configs and the GGUF family's own band is 86–87, so +1 sits
+  inside the churn band. At matched body bytes tool-use quality is
+  **base-model-dominated.** The case for the CB build over the GGUF one is:
+  **same quality band, ~2.6× prefill, native kernels, and it can additionally
+  carry a multi-token-prediction draft head the GGUF build cannot.**
 
 TEB protocol: 12288 context, FP8 KV cache, model-specific tool parsers, seed 1234,
 `--no-think --hardmode --parallel 1`. Failures are the known cross-artifact
 family failures shared by all three builds — scenario churn at the quality plateau.
+
+---
+
+## What the fallback costs
+
+If `nvcc` is missing, the JIT build fails, or `PRISMAQUANT_CB_DECODE=triton` is
+set, the plugin keeps serving **correct** output on the pre-CUDA code paths.
+**There is no fresh benchmark of that configuration.** What there is:
+
+**Dense decode — measured, and the fallback code is unchanged.** On the 27B at
+5.5 bpp, the Triton decode-GEMM measured **4.20 tok/s** and the CUDA GEMV that
+replaced it measures **10.27–10.30 tok/s**. That Triton path is still what a
+dense CB Linear executes when `_cuda_gemv_ok()` is false — the gate is
+`PRISMAQUANT_CB_DECODE == "cuda"` **and** `get_ext() is not None`
+(`gridbook/linear.py`), and the miss falls through to the same `cb_gemm` call.
+The 4.20 figure was taken on the whole Triton-prototype configuration, which
+also predates the fp8-direct expander, so treat it as the pessimistic end.
+
+**MoE decode — the grouped CUDA GEMV is skipped entirely; the magnitude depends
+on the artifact.** `_cuda_moe_ok()` in `gridbook/moe.py` returns `False` when
+`get_ext() is None`, and the call falls through to the prefill-family paths:
+
+- **fp4-CB artifacts** (the 295B) default to `PRISMAQUANT_CB_PREFILL=loop` —
+  literally the per-expert transient loop that measured **3.52 tok/s** decoding
+  the 35B before the grouped kernel replaced it (**32.6–33.3 tok/s** after). That
+  loop costs ~10k host syncs/launches per token; it is a launch-storm, not a
+  bandwidth problem.
+- **fp8-CB artifacts** default to `auto`, a different (batched-expand) path.
+  Expect a large regression — the one-launch-per-projection grouped GEMV is gone
+  — but **its size has not been measured**, and the 3.52 figure above does *not*
+  describe it.
+
+Prefill degrades too and is not separately quantified for the fallback.
+
+Sources: 27B dense before/after and 35B MoE before/after are the same served A/B
+runs as the tables above.
 
 ---
 
@@ -214,14 +300,24 @@ family failures shared by all three builds — scenario churn at the quality pla
   quantizations of the same base model is the expected result; treat TEB as a "does
   not regress" gate, not a quantization-quality discriminator.
 - **Speed status is honest and uneven.** Decode is at/above native parity (dense
-  and MoE). Large-M **prefill is not yet at native parity**: ~1.44× on the 27B
-  (traffic-bound transient expand) and materially worse on MoE (per-expert prefill
-  loop). The GGUF prefill comparison (the 295B 2.1×) is against a *different*
-  serving stack (llama.cpp CUDA-core IQ dequant), and is the clean "why native
-  tiles win" number; it is not a claim of parity with vLLM's own native NVFP4/FP8
-  GEMM at large M.
+  and MoE). Large-M dense **prefill is not yet at native parity**: ~1.44× on the
+  27B (traffic-bound transient expand). MoE prefill was the worst gap and is now
+  the default CUDA chunk-expander path (Laguna 117B: 293 → 1,821 tok/s at 8k) —
+  the 35B TTFT row above predates it. The GGUF prefill comparison (the 295B
+  ~2.6×) is against a *different* serving stack (llama.cpp CUDA-core IQ dequant),
+  and is the clean "why native tiles win" number; it is not a claim of parity
+  with vLLM's own native NVFP4/FP8 GEMM at large M.
 - **bpp vs disk size differ by the BF16 floor.** Reported bpp is over quantizable
   params; embeddings/`lm_head`/norms/non-CB Linears are excluded from bpp but
   resident on disk, so `bpp × params` understates the artifact size.
-- **Blackwell-only.** The native-speed path targets `sm_120/121`. On other GPUs the
-  Triton fallback runs (correct, not fast, not INV-2-eligible).
+- **Blackwell is the only measured target.** Every number on this page is from
+  `sm_121`. The decode kernel itself carries no architecture guards and is
+  *expected* to run from `sm_80` up, and only the mid-M fused prefill kernel is
+  genuinely `sm_120`-family bound — but that is inferred from the code, not
+  measured. Per-GPU expectations, with measured/inferred labelled, are in
+  [`INSTALL.md`](INSTALL.md#hardware-matrix). Without `nvcc` the Triton fallback
+  runs everywhere (correct, not fast).
+- **One published artifact per headline is not the same as three.** The 27B and
+  295B artifacts are downloadable; **the 35B MoE artifact is not published** — its
+  numbers are an internal measurement showing the format win reproduces on MoE,
+  not something you can reproduce without an encoder.

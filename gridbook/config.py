@@ -69,6 +69,26 @@ def _canonical_prefix(prefix: str) -> str:
     return prefix
 
 
+def _candidate_bases(name: str) -> list[str]:
+    """Every namespace vintage *name* can legitimately be matched against,
+    **most specific first** (the string as given, then its canonical form).
+
+    THE one place that answers "which namespace am I in?". A stored target /
+    serving prefix reaches us in one of three vintages — the old multimodal
+    CHECKPOINT form (``model.language_model.*``), the canonical form
+    (``model.*``), and the vLLM wrapper-class SERVING form
+    (``language_model.model.*``) — and ``apply_vllm_mapper`` can move the
+    stored keys into a *fourth*, the mapper's own namespace, AFTER
+    ``_ensure_resolved`` canonicalised them. Anything that matches a prefix
+    against ``target_scheme`` / ``ignore`` must therefore try both sides, and
+    must do so HERE: the dense fused path grew its own single-namespace copy of
+    this logic and silently mis-resolved for it (issue #1). A future fifth
+    vintage should mean editing this function and nothing else.
+    """
+    canonical = _canonical_prefix(name)
+    return [name] if canonical == name else [name, canonical]
+
+
 def _canonical_target(name: str) -> str:
     """Stored ``config_groups[*].targets`` / ``ignore`` entry -> canonical
     target namespace, so historical checkpoint-namespace artifacts resolve
@@ -241,34 +261,67 @@ class PrismaQuantConfig(QuantizationConfig):
 
     # -- per-prefix scheme resolution (handles vLLM fused qkv/gate_up) -------
     def _is_ignored(self, prefix: str) -> bool:
-        cp = _canonical_prefix(prefix)
-        return any(ig in prefix or ig in cp for ig in self.ignore)
+        return any(ig in base for base in _candidate_bases(prefix)
+                   for ig in self.ignore)
+
+    def shard_target_keys(self, prefix: str, *,
+                          unfused_fallback: bool = False) -> list[str]:
+        """``target_scheme`` keys naming the CB shards of (possibly fused)
+        *prefix*, in shard order — ``[]`` if none resolve.
+
+        THE single owner of fused-shard resolution: ``_scheme_for_prefix``
+        (which format does this module decode as?) and
+        ``PrismaQuantCBLinearMethod._shard_roles`` (which per-role codebooks
+        does it concatenate?) must agree module-for-module, and before issue #1
+        they were two hand-rolled copies that had already drifted — the copies
+        built their shard keys from the CANONICAL prefix only, so once
+        ``apply_vllm_mapper`` moved the stored keys into the mapper's namespace
+        a fused GDN ``in_proj_qkvz`` resolved to nothing (silent BF16
+        fall-through) and every dense ``_shard_roles`` returned ``[]`` (a
+        load-time width assert). Namespace choice is delegated wholesale to
+        ``_candidate_bases``.
+
+        Bases are tried in order and the FIRST base with any hit wins **whole**:
+        hits are never mixed across bases, because two vintages of one key can
+        name two different on-disk tensors and pairing shards across them would
+        silently fuse the wrong weights.
+
+        ``unfused_fallback`` reproduces ``_shard_roles``' extra ``or [leaf]``
+        rung — a plain Linear is its own single role. ``_scheme_for_prefix``
+        deliberately omits it (it has already tried the exact keys itself, and
+        a bare-leaf retry there would only re-ask the same question).
+        """
+        pmm = getattr(self, "packed_modules_mapping", {}) or {}
+        for base in _candidate_bases(prefix):
+            leaf = base.split(".")[-1]
+            shard_leaves = pmm.get(leaf) or _FUSED_FALLBACK.get(leaf)
+            if shard_leaves is None:
+                if not unfused_fallback:
+                    continue
+                shard_leaves = [leaf]
+            stem = base[: -len(leaf)]
+            hits = [stem + sl for sl in shard_leaves
+                    if stem + sl in self.target_scheme]
+            if hits:
+                return hits
+        return []
 
     def _scheme_for_prefix(self, prefix: str) -> dict | None:
-        if prefix in self.target_scheme:
-            return self.target_scheme[prefix]
-        prefix = _canonical_prefix(prefix)
-        if prefix in self.target_scheme:
-            return self.target_scheme[prefix]
-        leaf = prefix.split(".")[-1]
-        pmm = getattr(self, "packed_modules_mapping", {}) or {}
-        shard_leaves = pmm.get(leaf) or _FUSED_FALLBACK.get(leaf)
-        if shard_leaves:
-            schemes = []
-            for shard_leaf in shard_leaves:
-                sp = prefix[: -len(leaf)] + shard_leaf
-                if sp in self.target_scheme:
-                    schemes.append(self.target_scheme[sp])
-            if schemes:
-                fmt_keys = ("grid", "mode", "k", "n_sub", "type_size")
-                sig = {kk: schemes[0][kk] for kk in fmt_keys}
-                for s in schemes[1:]:
-                    if {kk: s[kk] for kk in fmt_keys} != sig:
-                        raise ValueError(
-                            f"fused module {prefix} maps to mixed CB decode "
-                            "formats — export union-find should prevent this")
-                return schemes[0]
-        return None
+        for base in _candidate_bases(prefix):
+            if base in self.target_scheme:
+                return self.target_scheme[base]
+        schemes = [self.target_scheme[k]
+                   for k in self.shard_target_keys(prefix)]
+        if not schemes:
+            return None
+        fmt_keys = ("grid", "mode", "k", "n_sub", "type_size")
+        sig = {kk: schemes[0][kk] for kk in fmt_keys}
+        for s in schemes[1:]:
+            if {kk: s[kk] for kk in fmt_keys} != sig:
+                raise ValueError(
+                    f"fused module {prefix} maps to mixed CB decode "
+                    "formats — export union-find should prevent this")
+        return schemes[0]
 
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> "QuantizeMethodBase | None":
@@ -335,12 +388,20 @@ class PrismaQuantConfig(QuantizationConfig):
         # expert mapping then derives ``experts.w2_weight.cb_qweight`` and
         # AttributeErrors (35B CB serve boot). Dense Linears were unaffected
         # because their lookup already canonicalised — that asymmetry WAS the bug.
-        cprefix = _canonical_prefix(prefix)
+        #
+        # Structurally different from the dense lookup (the TARGET is longer
+        # than the prefix here, so this is a ``startswith``, not a key lookup),
+        # but the namespace question is the same one — so it comes from the same
+        # ``_candidate_bases``, on BOTH sides. Cross-vintage matches are safe
+        # here: ``_canonical_prefix`` only rewrites the ``language_model``
+        # wrapper, i.e. it renames the SAME module; it can never move a match to
+        # a different layer index or leaf.
+        bases = _candidate_bases(prefix)
         for name, sch in self.target_scheme.items():
             if name.split(".")[-1] not in _MOE_LEAVES:
                 continue
-            if name.startswith(prefix) or _canonical_target(name).startswith(
-                    cprefix):
+            variants = _candidate_bases(name)
+            if any(v.startswith(b) for v in variants for b in bases):
                 return sch
         return None
 

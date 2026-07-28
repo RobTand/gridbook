@@ -64,6 +64,30 @@ def test_persistent_tc_parity(kbits, shape, variant):
     assert rel < 2e-2, f"rel={rel:.3e}"
 
 
+@pytest.mark.skipif(not cuda_ok, reason="needs CUDA")
+@pytest.mark.parametrize("kbits", [44])
+def test_persistent_tc_accepts_a_padded_row_stride(kbits):
+    """This path reads ``layer.cb_qweight.data``, which since issue #1 is a
+    NARROW VIEW of the 16-byte-padded buffer (stride(0) == row_bytes + 16, not
+    row_bytes). The kernel takes the row stride explicitly (packed.stride(0),
+    cb_persistent_tc.cu) and only requires ``stride(1) == 1``, so the strided
+    view must give the identical result."""
+    from gridbook import codec
+    N, K, M = 256, 1024, 512
+    ptc = get_persistent_ext()
+    if ptc is None:
+        pytest.skip("extensions unavailable")
+    a, packed, cb, tsize = _mk(N, K, kbits, M, seed=5)
+    view = codec.pad_qweight(packed).narrow(1, 0, packed.shape[1])
+    assert view.stride(0) == packed.shape[1] + codec.PAD_BYTES
+    assert torch.equal(view, packed)
+    d_c = ptc.cb_prefill_persistent_tc(a, packed, cb, N, K, kbits, tsize,
+                                       variant=1)
+    d_v = ptc.cb_prefill_persistent_tc(a, view, cb, N, K, kbits, tsize,
+                                       variant=1)
+    assert torch.equal(d_c, d_v)
+
+
 def bench():  # pragma: no cover
     ext, ptc = get_ext(), get_persistent_ext()
     assert ext is not None and ptc is not None

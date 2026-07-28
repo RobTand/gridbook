@@ -1066,7 +1066,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             variant did on its first qualifying prefill (throughput -> 0, request
             stuck Running, no OOM, no watchdog line). Every synthetic test ran on
             the DEFAULT stream, which is why the suite was green.
-          * MEASURED. There is no overlap win to give up. ``csrc/cb_fused_gemm.cu``
+          * MEASURED. There is no overlap win to give up. ``gridbook/csrc/cb_fused_gemm.cu``
             records chunked-expand + GEMM overlap at 0.74-0.79x of SERIAL speed
             on this part: unified memory at ~273 GB/s leaves the expander no
             spare bandwidth for the GEMM to hide behind, so the two streams

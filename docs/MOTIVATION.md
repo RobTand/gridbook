@@ -130,9 +130,9 @@ comparison is the fair one to make. It is not a strawman:
 `gridbook` aims squarely at the gap: **IQ-class quality (codebook, sub-3-bit-capable)
 with native-kernel speed (decoded tiles hit the tensor cores).** The clearest
 single data point is on a 295B model at matched bytes: the CB build's prefill runs
-at **~2.1× the throughput** of the equivalent GGUF IQ build, while landing on the
-**same** tool-use benchmark score. The prefill tax that IQ pays is exactly what
-the native-tile design removes. Details, numbers, and caveats in
+at **~109 tok/s against the equivalent GGUF IQ build's 42 — ~2.6×** — while
+landing in the **same** tool-use benchmark band. The prefill tax that IQ pays is
+exactly what the native-tile design removes. Details, numbers, and caveats in
 [`BENCHMARKS.md`](BENCHMARKS.md).
 
 What `gridbook` does **not** claim over GGUF: it is Blackwell-specific (the tensor-core

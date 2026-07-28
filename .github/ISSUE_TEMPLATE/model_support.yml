@@ -1,0 +1,72 @@
+name: Model / architecture support
+description: A model architecture gridbook does not handle, or handles wrongly.
+labels: ["model-support"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        gridbook wires itself into vLLM per architecture. An architecture it has
+        never been run against usually fails in one of two ways, and they need
+        different information:
+
+        * **Loud** — vLLM raises on load (unrecognised quant method, a weight
+          name that never gets claimed, a shape mismatch). File the traceback.
+        * **Quiet** — the model loads and generates fluent nonsense. That is the
+          signature of weights that were *loaded* but not routed through the CB
+          path (MoE expert loaders are the usual culprit). Say so explicitly:
+          it is a different bug from the loud kind, and the sample output is the
+          evidence.
+
+        Serving an architecture nobody has served before is expected to need a
+        code change. This form is the input to that change, not a support queue.
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: HuggingFace repo id of the artifact you are serving, and of the base model it was quantized from.
+    validations:
+      required: true
+  - type: input
+    id: arch
+    attributes:
+      label: Architecture
+      description: The `architectures` entry from the model's `config.json` (e.g. `Qwen3MoeForCausalLM`).
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Failure mode
+      options:
+        - Loud — raises on load or on the first request
+        - Quiet — loads and serves, output is nonsense
+        - Quiet — loads and serves, output is plausible but measurably worse than the BF16 source
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: detail
+    attributes:
+      label: Traceback, or sample prompt and output
+      description: >-
+        For a loud failure: the full traceback. For a quiet one: a short prompt
+        and the generated text, plus the same prompt against the unquantized
+        model if you have it.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: gridbook version, vLLM version, GPU, and the `vllm serve` command line.
+      render: shell
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        Related reading: [`docs/PLUGIN.md`](https://github.com/RobTand/gridbook/blob/master/docs/PLUGIN.md)
+        (how registration and weight loading hook into vLLM) and
+        [`docs/SPEC.md`](https://github.com/RobTand/gridbook/blob/master/docs/SPEC.md)
+        (the on-disk format the loader expects).

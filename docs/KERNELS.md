@@ -124,12 +124,22 @@ artifact this took decode from 3.5 tok/s (per-expert loop) to **~33 tok/s** (9.4
 smaller and −43% ALL-KL. For the FP4 two-tier grid there is a dedicated grouped
 GEMV that composes the two-tier scale in-register per the decode rules above.
 
-The **correctness-first per-expert loop is retained** as the prefill and fallback
-path, and its numerics are pinned bit-identical to the grouped kernel by a
-regression test. MoE **prefill** is still that per-expert loop today (a per-expert
-launch storm dominates TTFT); a batched-expert transient expand + grouped GEMM is
-the remaining piece. Even so, the per-expert prefill already beats the GGUF IQ
-comparison at 295B (see [`BENCHMARKS.md`](BENCHMARKS.md)).
+The **correctness-first per-expert loop is retained** as a fallback path, and its
+numerics are pinned bit-identical to the grouped kernel by a regression test.
+
+MoE **prefill** used to be that per-expert loop, whose launch storm dominated
+TTFT. It no longer is. A **CUDA chunk-expander** now expands expert chunks
+directly into vLLM's own fused-MoE grouped kernel (raw unpadded views,
+byte-identical to the Triton expand on every rung), and the fp8-CB default is
+`auto`: a first-prefill measured selection, per layer, over the candidate paths,
+cached for the process. Measured on Laguna-S-2.1 (117B MoE): **293 → 1,821 tok/s
+at 8k** and **207 → 1,822 tok/s at 63k**. Chunked prefill re-expands per
+microbatch, so `--max-num-batched-tokens 16384` matters for this path. The
+per-expert loop remains the default for **fp4**-CB MoE prefill.
+
+The remaining MoE prefill target is a persistent/grouped decode-in-mainloop
+schedule (the expand is ~35% of MoE layer time at Laguna scale) — see
+[`ROADMAP.md`](../ROADMAP.md).
 
 ---
 
@@ -195,6 +205,6 @@ serving; it is documented in [`BENCHMARKS.md`](BENCHMARKS.md) too.
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
 | Fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — persistent-N is the answer |
-| Persistent-N large-M prefill | **Measured GO, deferred**: expand is 23–38% of serial time at real prefill M (ceiling 1.3–1.6×); a plain-CUDA reference kernel validates the decode-once schedule (6/6 parity); the tensor-core CUTLASS build is the roadmap's next kernel |
-| MoE prefill | Per-expert loop (shipping); a batched-expert grouped path passes 27/27 small-scale parity but crashed at 1.4k-token scale (chunk transients) — opt-in pending a memory-bounded gate |
+| Persistent-N large-M dense prefill | **Built and MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. Quarantined behind `PRISMAQUANT_ENABLE_PTC=1` as a schedule reference; do not enable it. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
+| MoE prefill | **Shipped**: CUDA chunk-expander into vLLM's fused-MoE grouped kernel; fp8-CB default is `auto` (measured per-layer path selection). Laguna-S-2.1 117B: 293 → 1,821 tok/s @8k, 207 → 1,822 @63k. fp4-CB MoE prefill stays on the per-expert loop |
 | Triton fallbacks | **Shipped** for every path (correctness/CI; not INV-2-eligible) |

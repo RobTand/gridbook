@@ -1,13 +1,16 @@
-"""vLLM out-of-tree plugin for PrismaQuant NVFP4-CB / FP8-CB codebook formats.
+"""vLLM out-of-tree plugin for the NVFP4-CB / FP8-CB product-codebook formats.
 
-Prototype (i) of docs/nvfp4-cb-plan/serving-kernel.md: a correctness-first,
-Triton-based serving path (INV-1 honored, INV-2 waived). Not production-eligible.
+Registers a ``QuantizationConfig`` (``"gridbook"``, with ``"prismaquant"`` kept
+as a legacy alias) plus the linear and fused-MoE methods that serve
+codebook-quantized weights. The CUDA kernels ship as sources under
+``gridbook/csrc`` and are JIT-compiled on first use; without nvcc the plugin
+falls back to a correct-but-slow Triton path.
 
-``register`` is lazy so ``import gridbook.kernels`` (the correctness
-tests) works without vLLM installed.
+``register`` is lazy so ``import gridbook.codec`` / ``import gridbook.kernels``
+(the format and correctness tests) work without vLLM installed.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 
 def register() -> None:

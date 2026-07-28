@@ -1,0 +1,42 @@
+# Build context for the gridbook image. Keep this tight: everything here is
+# uploaded to the daemon on every `docker build`.
+#
+# NOTE: gridbook/csrc/**/*.cu and *.hpp MUST reach the image — they are the
+# packaged CUDA sources the kernels are JIT-compiled from, and the Dockerfile
+# fails the build if they are missing. Do not add a broad `*.cu` or `csrc`
+# ignore here.
+
+.git
+.gitignore
+.github
+
+# Python build/test detritus
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+wheelhouse/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.venv/
+venv/
+.coverage
+htmlcov/
+
+# Local kernel JIT caches — the image builds its own
+.cache/
+ext-cache/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Container assets that need not be inside the image
+Dockerfile
+.dockerignore

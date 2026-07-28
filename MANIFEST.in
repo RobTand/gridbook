@@ -1,0 +1,33 @@
+# Sdist contents beyond the package itself. Release artifacts are built from
+# THIS tree (the public repo), so the sdist gets the full public README, the
+# docs/ set and the roadmap; the in-tree plugin has none of those.
+#
+# The runtime CUDA sources need no rule here: they live inside the package
+# (gridbook/csrc) and are declared as [tool.setuptools.package-data] in
+# pyproject.toml, which setuptools also honours when building the sdist.
+#
+# LICENSE / NOTICE need no rule either: setuptools' default `license-files`
+# globs (LICEN[CS]E*, COPYING*, NOTICE*, AUTHORS*) put them in both the sdist
+# and the wheel's .dist-info/licenses/.
+include ROADMAP.md
+graft docs
+recursive-include tests *.py
+
+# ...but `graft docs` is indiscriminate, and two things under docs/ are internal
+# working material, not documentation for someone who ran `pip install gridbook`.
+# A published sdist is permanent (a PyPI file cannot be re-uploaded), so these
+# are excluded at the source rather than trimmed later:
+#
+#   docs/DISTRIBUTION.md  the distribution decision record -- internal machine
+#                         paths, internal task numbers, and a not-yet-executed
+#                         launch plan. Reaches the public via the GitHub repo,
+#                         which is a revisable surface; it has no business in an
+#                         immutable release artifact.
+#   docs/hf-cards/        staged HuggingFace card edits that have not been
+#                         applied yet, each carrying its own APPLY GATE. Shipping
+#                         un-applied drafts inside the wheel's own sdist invites
+#                         someone to read them as the current cards.
+exclude docs/DISTRIBUTION.md
+prune docs/hf-cards
+
+global-exclude *.py[cod]

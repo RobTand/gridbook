@@ -38,8 +38,24 @@ if "vllm" not in sys.modules:
         class UnquantizedLinearMethod:
             pass
 
+        class LinearMethodBase:  # PrismaQuantCBLinearMethod's base
+            pass
+
         lin.LinearBase = LinearBase
         lin.UnquantizedLinearMethod = UnquantizedLinearMethod
+        lin.LinearMethodBase = LinearMethodBase
+        lin.register_weight_loader_v2_supported_method = lambda cls: cls
+        par = _mod("vllm.model_executor.parameter")
+
+        class _StubParam(torch.nn.Parameter):
+            def __new__(cls, data, **kw):
+                return super().__new__(cls, data, requires_grad=False)
+
+            def __init__(self, data, **kw):
+                pass
+
+        par.ModelWeightParameter = _StubParam
+        par.ChannelQuantScaleParameter = _StubParam
         bc = _mod("vllm.model_executor.layers.quantization.base_config")
 
         class QuantizationConfig:
@@ -223,3 +239,139 @@ def test_moe_scheme_does_not_overmatch():
     # a dense MLP prefix must not pick up the expert group either
     assert cfg._moe_scheme_for_prefix(
         "language_model.model.layers.1.mlp.shared_expert") is None
+
+
+# ---------------------------------------------------------------------------
+# The FOURTH namespace vintage: post-``apply_vllm_mapper`` (issue #1,
+# RobTand/gridbook, 2026-07-25).
+#
+# ``_ensure_resolved`` canonicalises the STORED targets, but
+# ``apply_vllm_mapper`` then rewrites ``target_scheme`` keys INTO the vLLM
+# mapper's namespace (``model.`` -> ``language_model.model.`` for a VL wrapper
+# class). Dense fused re-fusion built its shard keys from the CANONICAL prefix
+# only, so on a Qwen3.5/3.6-VL-class hybrid the GDN fused ``in_proj_qkvz``
+# matched nothing, fell through to ``UnquantizedLinearMethod``, and the layer
+# allocated BF16 instead of FP8-CB. ``_shard_roles`` had the identical bug.
+# Both now go through ``PrismaQuantConfig.shard_target_keys``, which owns the
+# "which namespace vintage?" question for every dense call site.
+# ---------------------------------------------------------------------------
+
+
+class _WrapperMapper:
+    """The one rewrite that matters here, mimicking vLLM's ``WeightsMapper``:
+    nest ``model.*`` under ``language_model.`` for a VL wrapper class."""
+
+    @staticmethod
+    def _apply(name):
+        return "language_model." + name if name.startswith("model.") else name
+
+    def apply_list(self, names):
+        return [self._apply(n) for n in names]
+
+    def apply_dict(self, mapping):
+        return {self._apply(k): v for k, v in mapping.items()}
+
+
+_GDN_BASE = "model.layers.45.linear_attn."
+_GDN_ROLES = ("in_proj_qkv", "in_proj_z")
+_GDN_SERVE = "language_model.model.layers.45.linear_attn.in_proj_qkvz"
+_GDN_MAPPED_ROLES = {"language_model." + _GDN_BASE + r for r in _GDN_ROLES}
+
+
+def _mapped_config(targets, ignore=("lm_head",)):
+    """Resolve, then push the targets into the vLLM mapper namespace — exactly
+    the state ``get_quant_method`` sees at serve time on a wrapper-class model."""
+    cfg = PrismaQuantConfig.from_config({
+        "quant_method": "prismaquant", "format": "fp8_cb",
+        "codebook_file": "cb_codebooks.pqcb",
+        "config_groups": {"gdn": {"format": "FP8_CB_K44",
+                                  "targets": list(targets),
+                                  "scheme": dict(_SCHEME)}},
+        "ignore": list(ignore),
+    })
+    cfg._ensure_resolved()
+    cfg.apply_vllm_mapper(_WrapperMapper())
+    return cfg
+
+
+def _gdn_cfg():
+    return _mapped_config([_GDN_BASE + r for r in _GDN_ROLES])
+
+
+def test_mapper_moves_targets_out_of_the_canonical_namespace():
+    """Precondition for the two tests below: after the mapper the keys are
+    NEITHER the stored form NOR the canonical form."""
+    assert set(_gdn_cfg().target_scheme) == _GDN_MAPPED_ROLES
+
+
+def test_fused_gdn_resolves_in_the_mapper_namespace():
+    """Bug 1: the fused GDN module must resolve to its members' CB scheme."""
+    sch = _gdn_cfg()._scheme_for_prefix(_GDN_SERVE)
+    assert sch is not None
+    assert sch["k"] == _SCHEME["k"]
+
+
+def test_gdn_shard_roles_resolve_in_the_mapper_namespace():
+    """Bug 2: ``_shard_roles`` must return BOTH CB roles, in shard order, so
+    ``process_weights_after_loading`` builds a full-length ``cb_row_offset``."""
+    from gridbook.linear import PrismaQuantCBLinearMethod
+    cfg = _gdn_cfg()
+    method = PrismaQuantCBLinearMethod(cfg, dict(_SCHEME), _GDN_SERVE)
+    assert method._shard_roles() == [
+        "language_model." + _GDN_BASE + r for r in _GDN_ROLES]
+
+
+@pytest.mark.parametrize("leaf,members", [
+    ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
+    ("gate_up_proj", ("gate_proj", "up_proj")),
+    ("in_proj_ba", ("in_proj_b", "in_proj_a")),
+])
+def test_every_fused_family_resolves_in_the_mapper_namespace(leaf, members):
+    base = "model.layers.7.mod."
+    cfg = _mapped_config([base + m for m in members])
+    assert cfg._scheme_for_prefix("language_model." + base + leaf) is not None
+
+
+def test_plain_linear_and_shard_roles_survive_the_mapper():
+    """Already-working case: an unfused Linear resolves and reports itself as
+    its own single role (the ``or [leaf]`` fallback ``_shard_roles`` relies on
+    and ``_scheme_for_prefix`` deliberately does NOT have)."""
+    from gridbook.linear import PrismaQuantCBLinearMethod
+    base = "model.layers.3.mlp."
+    cfg = _mapped_config([base + "down_proj"])
+    serve = "language_model." + base + "down_proj"
+    assert cfg._scheme_for_prefix(serve) is not None
+    method = PrismaQuantCBLinearMethod(cfg, dict(_SCHEME), serve)
+    assert method._shard_roles() == ["language_model." + base + "down_proj"]
+
+
+def test_shard_keys_never_mix_namespaces():
+    """If BOTH vintages are present, the resolver must take one base's hits
+    whole — a mixed list would pair shards from two namespaces (and, on a real
+    load, two different tensors)."""
+    cfg = _gdn_cfg()
+    # Add the canonical vintage of ONE role only.
+    cfg.target_scheme[_GDN_BASE + "in_proj_qkv"] = dict(_SCHEME)
+    keys = cfg.shard_target_keys(_GDN_SERVE)
+    assert keys == ["language_model." + _GDN_BASE + r for r in _GDN_ROLES]
+
+
+def test_no_scheme_when_nothing_matches():
+    cfg = _gdn_cfg()
+    assert cfg._scheme_for_prefix(
+        "language_model.model.layers.46.linear_attn.in_proj_qkvz") is None
+    assert cfg.shard_target_keys(
+        "language_model.model.layers.46.mlp.down_proj",
+        unfused_fallback=True) == []
+
+
+def test_mixed_fused_formats_still_raise():
+    """The export union-find guarantee is load-bearing; the guard that catches
+    a violation must survive the namespace refactor."""
+    cfg = _gdn_cfg()
+    other = dict(_SCHEME)
+    other["k"] = 28
+    other["type_size"] = 112
+    cfg.target_scheme["language_model." + _GDN_BASE + "in_proj_z"] = other
+    with pytest.raises(ValueError, match="mixed CB decode"):
+        cfg._scheme_for_prefix(_GDN_SERVE)

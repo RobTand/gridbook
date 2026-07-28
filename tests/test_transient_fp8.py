@@ -161,10 +161,16 @@ def test_fp8_direct_expand_bitexact(qname):
 
 def test_value_expand_rejects_fp4():
     """NVFP4_CB must stay on the Triton decode path -- the expander refuses it
-    rather than silently producing a scale-less fp4 tile."""
-    dummy = torch.zeros(4, 8, dtype=torch.uint8, device=DEV)
-    cb = torch.zeros(16, dtype=torch.bfloat16, device=DEV)
-    off = torch.zeros(4, dtype=torch.int32, device=DEV)
+    rather than silently producing a scale-less fp4 tile.
+
+    CPU tensors on purpose: ``expand_cb_to_value`` rejects ``is_fp4`` on its
+    first line, before it touches the device, so the argument-validation
+    contract is testable without a GPU. Allocating these dummies on ``DEV`` made
+    this the one test in the file that *failed* (rather than skipped) on a
+    CUDA-less machine, which is what CI runs on."""
+    dummy = torch.zeros(4, 8, dtype=torch.uint8)
+    cb = torch.zeros(16, dtype=torch.bfloat16)
+    off = torch.zeros(4, dtype=torch.int32)
     with pytest.raises(NotImplementedError):
         expand_cb_to_value(dummy, cb, off, 4, 256, 16, 2, 80, is_fp4=True)
 

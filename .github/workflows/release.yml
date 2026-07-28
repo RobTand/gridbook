@@ -1,0 +1,198 @@
+# gridbook release: build, verify, publish to PyPI, attach to a GitHub Release.
+#
+# TRIGGER: tag pushes matching `v*` ONLY. There is deliberately no `push:
+# branches:` and no `release:` trigger, so this file is safe to merge before the
+# PyPI project exists -- merging it, or any later commit to master, can never
+# attempt an upload. The first publish happens only when a human pushes a tag.
+#
+# ROUTING: a PEP 440 pre-release version (v0.1.0rc1, v0.1.0a1, ...) goes to
+# TestPyPI; a final version goes to PyPI. Rehearse on TestPyPI first -- a PyPI
+# version number can never be reused, even after deleting the release.
+#
+# AUTH: Trusted Publishing (OIDC). No API token, no repository secret. The
+# one-time PyPI-side setup is written out in docs/RELEASING.md; until it is
+# done, the publish job fails with an OIDC error and nothing is uploaded.
+#
+# Action pins: exact patch tags, latest releases checked 2026-07-28. See the
+# header of ci.yml for the pinning rationale.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build + verify tag
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      environment: ${{ steps.meta.outputs.environment }}
+      repository_url: ${{ steps.meta.outputs.repository_url }}
+      project_url: ${{ steps.meta.outputs.project_url }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine packaging
+
+      - name: Build
+        run: python -m build
+
+      - name: twine check
+        run: python -m twine check --strict dist/*
+
+      - name: Assert native sources are packaged
+        run: python .github/scripts/check_dist.py dist .
+
+      # The tag is the release's identity; if it disagrees with the version
+      # actually baked into the artifact, the wrong thing is about to be
+      # published under the wrong name. Fail before any upload.
+      - name: Tag must match the built version
+        id: meta
+        run: |
+          python - "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT" <<'PY'
+          import glob, os, sys
+          from packaging.utils import parse_wheel_filename
+          from packaging.version import Version
+
+          tag = sys.argv[1]
+          if not tag.startswith("v"):
+              sys.exit(f"tag {tag!r} must be of the form vX.Y.Z")
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              sys.exit(f"expected exactly one wheel, got {wheels}")
+          _, built, _, _ = parse_wheel_filename(os.path.basename(wheels[0]))
+          want = Version(tag[1:])
+          if want != built:
+              sys.exit(f"tag {tag} means version {want}, but the build produced "
+                       f"{built}. Bump the version in the source, commit, then "
+                       f"re-tag.")
+          pre = built.is_prerelease
+          print(f"version={built}")
+          print(f"prerelease={str(pre).lower()}")
+          print(f"environment={'testpypi' if pre else 'pypi'}")
+          print("repository_url=" + ("https://test.pypi.org/legacy/" if pre
+                                     else "https://upload.pypi.org/legacy/"))
+          print("project_url=" + ("https://test.pypi.org/p/gridbook" if pre
+                                  else "https://pypi.org/p/gridbook"))
+          print(f"{built} -> {'TestPyPI' if pre else 'PyPI'}", file=sys.stderr)
+          PY
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # Same gate as CI, re-run against the exact artifact about to be published:
+  # the wheel is installed non-editable into a clean interpreter and the
+  # packaged CUDA sources must resolve from site-packages. This is the check
+  # that a broken package cannot pass.
+  verify:
+    name: verify installed wheel
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      - name: Install CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install the wheel with its dependencies
+        run: python -m pip install pytest dist/*.whl
+
+      - name: Stage tests outside the checkout
+        run: cp -r tests "${RUNNER_TEMP}/gbtests"
+
+      - name: Post-install checks
+        working-directory: ${{ runner.temp }}
+        run: python "${GITHUB_WORKSPACE}/.github/scripts/check_installed.py"
+
+      - name: Run GPU-free tests
+        working-directory: ${{ runner.temp }}
+        run: |
+          bash "${GITHUB_WORKSPACE}/.github/scripts/run_cpu_tests.sh" \
+            "${RUNNER_TEMP}/gbtests"
+
+  publish:
+    name: publish to ${{ needs.build.outputs.environment }}
+    needs: [build, verify]
+    runs-on: ubuntu-24.04
+    # A fork that pushes a v* tag must never attempt to publish gridbook.
+    if: github.repository == 'RobTand/gridbook'
+    environment:
+      # `pypi` / `testpypi` GitHub environments. Add a required reviewer to the
+      # `pypi` environment to get a human approval gate in front of the one
+      # irreversible step in this workflow (docs/RELEASING.md).
+      name: ${{ needs.build.outputs.environment }}
+      url: ${{ needs.build.outputs.project_url }}
+    permissions:
+      id-token: write   # OIDC token for Trusted Publishing. Nothing else.
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      # Pinned to an exact release rather than the `release/v1` branch that
+      # PyPA's own docs suggest: a branch ref is re-pointable, and this action
+      # holds an OIDC token that can upload under our project name.
+      # Publishes every file in dist/ and, by default, PEP 740 attestations.
+      # `skip-existing` is deliberately NOT set: re-publishing an existing
+      # version is a mistake, and PyPI must refuse it loudly.
+      - uses: pypa/gh-action-pypi-publish@v1.14.1
+        with:
+          repository-url: ${{ needs.build.outputs.repository_url }}
+          print-hash: true
+
+  github-release:
+    name: github release
+    needs: [build, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # only this job may write to the repo
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      # gh is preinstalled on GitHub-hosted runners, so the release step needs
+      # no third-party action and no extra pin. GH_REPO is required because this
+      # job deliberately does not check out the repo, so gh has no git remote to
+      # infer the target from.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          args=(--generate-notes --title "gridbook ${VERSION}")
+          if [ "${PRERELEASE}" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${GITHUB_REF_NAME}" "${args[@]}" dist/*

@@ -1,0 +1,419 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# gridbook — out-of-tree vLLM quantization plugin for NVFP4-CB / FP8-CB
+#
+# Build:  docker build -t gridbook:local .
+# Serve:  docker run --gpus all --ipc=host -p 8000:8000 gridbook:local <model>
+#
+# See docs/CONTAINER.md for the full run recipe, volume mounts and VRAM guidance.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Base image
+# -----------------------------------------------------------------------------
+# WHY v0.24.0: gridbook's only *measured* serving stack is a vLLM source build
+# (0.23.1rc1.dev764+g54b16d8a9, built 2026-07-03). No published vLLM release
+# corresponds to that build exactly, so there is no tag that reproduces it.
+# v0.24.0 (tagged 2026-06-30) is the official release nearest in time, and it
+# was verified to match the measured stack on every dimension the kernels touch:
+#
+#     torch 2.11.0+cu130 · triton 3.6.0 · nvcc 13.0 · CUTLASS 4.3.4 bundled at
+#     vllm/third_party/fmha_sm100/cutlass · linux/arm64 + linux/amd64
+#
+# and to export every vLLM symbol the plugin imports (including the private
+# fused-MoE internals: RoutedExperts, FusedMoEMethodBase, MoEActivation,
+# dispatch_fused_moe_kernel, _get_config_dtype_str, moe_align_block_size).
+#
+# HONEST LIMIT: v0.24.0 itself has NOT been served end-to-end with gridbook.
+# What is verified is toolchain parity, symbol presence, install, and that both
+# CUDA extensions compile inside this image. v0.25.1 and v0.26.0 were checked
+# to carry the same gridbook-facing symbols and can be selected with
+# --build-arg VLLM_TAG=..., but they are further from the measured stack.
+ARG VLLM_TAG=v0.24.0
+FROM vllm/vllm-openai:${VLLM_TAG}
+
+ARG VLLM_TAG
+
+# -----------------------------------------------------------------------------
+# CUDA architecture
+# -----------------------------------------------------------------------------
+# The upstream vLLM image ships TORCH_CUDA_ARCH_LIST="8.0 8.7 8.9 9.0 10.0 11.0
+# 12.0" — note that 12.1 is ABSENT. gridbook's kernels are JIT-compiled by
+# torch.utils.cpp_extension, which inherits that list, so on the GB10 / DGX Spark
+# reference target (sm_121) the stock list would never emit matching SASS.
+# We therefore set the list explicitly.
+#
+# TWO CONSEQUENCES — READ THIS:
+#
+# 1. The image's prebuilt kernel cache becomes architecture-locked. torch only
+#    reuses a cached build when the arch flags match, so this value MUST be
+#    identical at build time and run time or every kernel is silently
+#    recompiled on first use. To target other hardware, rebuild with e.g.
+#    --build-arg GRIDBOOK_CUDA_ARCH=9.0 (H100) or 8.9 (RTX 4090).
+#
+# 2. TORCH_CUDA_ARCH_LIST is a PROCESS-WIDE torch setting, not a gridbook one.
+#    gridbook JIT-compiles inside the vLLM process, so there is no way to scope
+#    it to this plugin from the environment. Baking it narrows the arch list for
+#    *every* torch JIT path in the container — vLLM's own cpp_extension /
+#    inductor compiles included — from the base image's
+#    "8.0 8.7 8.9 9.0 10.0 11.0 12.0" to this single value. That is the intended
+#    trade (the stock list omits 12.1 entirely, so on the GB10 reference target
+#    it is wrong for gridbook and compiling all eight arches is minutes of build
+#    time), but if something else in your container needs the broader list,
+#    restore it at run time with -e TORCH_CUDA_ARCH_LIST=... — which invalidates
+#    the prewarmed gridbook cache and triggers a one-time rebuild.
+#
+# See docs/CONTAINER.md.
+ARG GRIDBOOK_CUDA_ARCH=12.1a
+
+# Set to 0 to skip compiling the kernels into the image (smaller/faster build,
+# but the user pays a one-time ~30 s build inside their first request).
+ARG GRIDBOOK_PREWARM=1
+
+LABEL org.opencontainers.image.title="gridbook" \
+      org.opencontainers.image.description="Out-of-tree vLLM quantization plugin serving NVFP4-CB / FP8-CB product-codebook weight formats on Blackwell tensor cores" \
+      org.opencontainers.image.source="https://github.com/RobTand/gridbook" \
+      org.opencontainers.image.documentation="https://github.com/RobTand/gridbook/blob/master/docs/CONTAINER.md" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.authors="Robert Tand <robert.tand@icloud.com>" \
+      org.opencontainers.image.base.name="vllm/vllm-openai:${VLLM_TAG}"
+
+# TORCH_CUDA_ARCH_LIST must persist into the runtime environment so the
+# prewarmed cache below is reused (a sub-second dlopen) instead of rebuilt (a
+# ~30 s nvcc compile for the decode GEMV, minutes for the CUTLASS prefill).
+# Exact measured timings live in ONE place — docs/CONTAINER.md, "Verified vs
+# untested" — so the two files cannot drift apart. Do not restate digits here.
+#
+# PRISMAQUANT_CB_EXT_DIR is a fixed absolute path rather than ~/.cache, because
+# the ninja build files record absolute paths and $HOME changes under
+# `docker run --user`. A stable path keeps the cache valid for any UID.
+#
+# LOGNAME repairs a second defect in the base image, and it is not cosmetic:
+# under `docker run --user 1000:1000` the UID has no /etc/passwd entry, so
+# `getpass.getuser()` raises KeyError('getpwuid(): uid not found: 1000') — and
+# torch calls it at IMPORT time (torch/_inductor/runtime/cache_dir_utils.py,
+# torch/_dynamo/config.py), so `import vllm` itself dies before anything of
+# gridbook's runs. Setting TORCHINDUCTOR_CACHE_DIR is NOT sufficient (measured:
+# the _dynamo import-time call still fires). getpass.getuser() reads LOGNAME
+# first, so one variable fixes every call site — in torch, in vLLM
+# (vllm/config/vllm.py builds a tmp dir from it) and in gridbook. Affects only
+# path naming for cache/tmp directories; it changes no identity or permission.
+# This is a base-image bug: `docker run --user` cannot import vLLM at all in
+# stock vllm/vllm-openai:v0.24.0.
+ENV TORCH_CUDA_ARCH_LIST=${GRIDBOOK_CUDA_ARCH} \
+    PRISMAQUANT_CB_EXT_DIR=/opt/gridbook/ext-cache \
+    LOGNAME=gridbook
+
+# -----------------------------------------------------------------------------
+# Complete the CUDA header set
+# -----------------------------------------------------------------------------
+# The upstream vLLM image installs the CUDA math *runtime* libraries but not
+# their headers: /usr/local/cuda/include has no cusparse.h, cublas.h,
+# cusolverDn.h or cufft.h. torch's <ATen/cuda/CUDAContext.h> includes
+# <cusparse.h>, so *every* torch cpp_extension CUDA JIT build fails in the
+# stock image with "fatal error: cusparse.h: No such file or directory" — for
+# gridbook that means a silent fail-soft to the slow Triton path.
+#
+# The matching headers are already inside the image: torch's own nvidia-*-cu13
+# wheels ship a complete include tree under site-packages/nvidia/cu13/include,
+# version-matched to the torch build by construction. So rather than apt-install
+# hundreds of MB of -dev packages (libcublas-dev alone carries huge static
+# archives), link in exactly the headers that are MISSING.
+#
+# The rule is computed, not a hardcoded list: link a wheel header only when no
+# entry of that name already exists in the toolkit include dir. Nothing is ever
+# shadowed, and the step self-heals if a future base image ships them properly.
+RUN <<'EOF'
+set -eu
+inc="$(python3 -c "
+import glob
+p = sorted(glob.glob('/usr/local/lib/python3*/dist-packages/nvidia/cu*/include'))
+print(p[0] if p else '')
+")"
+dst=/usr/local/cuda/include
+if [ -z "$inc" ] || [ ! -d "$inc" ]; then
+  echo "[gridbook] NOTE: no bundled nvidia/cu*/include found; leaving the CUDA"
+  echo "           header set as-is. If headers are missing the kernel prewarm"
+  echo "           below will fail the build with the exact missing header."
+  exit 0
+fi
+linked=0
+for src in "$inc"/*; do
+  name="$(basename "$src")"
+  if [ ! -e "$dst/$name" ]; then
+    ln -s "$src" "$dst/$name"
+    linked=$((linked + 1))
+  fi
+done
+echo "[gridbook] linked $linked missing CUDA headers from $inc into $dst"
+test -e "$dst/cusparse.h" || { echo "[gridbook] FATAL: cusparse.h still unresolved" >&2; exit 1; }
+EOF
+
+# -----------------------------------------------------------------------------
+# Install gridbook
+# -----------------------------------------------------------------------------
+# --no-deps is deliberate: torch, triton and safetensors are already installed
+# in the base image, and letting pip resolve `torch` here could pull a different
+# torch wheel over the one vLLM was compiled against. The verification step
+# below asserts each runtime dependency actually imports, so nothing is assumed.
+COPY . /opt/gridbook/src
+
+RUN pip install --no-deps --no-cache-dir /opt/gridbook/src \
+    && rm -rf /root/.cache/pip
+
+# -----------------------------------------------------------------------------
+# Verify the install (build fails loudly rather than shipping a broken image)
+# -----------------------------------------------------------------------------
+WORKDIR /
+RUN python3 <<'PY'
+import os, sys
+from importlib.resources import files
+from importlib.metadata import entry_points, version
+
+problems = []
+
+# 1. Runtime dependencies. Installed with --no-deps, so prove they are present
+#    instead of trusting the base image.
+for mod in ("torch", "triton", "safetensors", "vllm"):
+    try:
+        __import__(mod)
+    except Exception as exc:
+        problems.append(f"runtime dependency {mod!r} does not import: {exc}")
+
+# 2. gridbook must resolve to a real installed package, not a stray source dir.
+import gridbook
+loc = os.path.dirname(os.path.abspath(gridbook.__file__))
+if "packages" not in loc:
+    problems.append(f"gridbook resolved to {loc}, which is not a site/dist-packages install")
+
+# 3. The packaged CUDA sources must be present. This is the invariant that a
+#    non-editable `pip install` used to break: csrc lived at the repo root, so
+#    only `gridbook/` landed in site-packages, every extension build failed, and
+#    the plugin fail-softed to the slow Triton path with only a warning. Gating
+#    it here converts that silent downgrade into a build failure.
+REQUIRED = ("cb_gemv.cu", "cb_fused_gemm.cu", "cb_persistent_tc.cu")
+try:
+    csrc = files("gridbook") / "csrc"
+    missing = [n for n in REQUIRED if not (csrc / n).is_file()]
+    if missing:
+        problems.append(
+            f"packaged CUDA sources missing from the installed package: {missing} "
+            f"(looked in {csrc}). The wheel must ship gridbook/csrc/*.cu.")
+except Exception as exc:
+    problems.append(f"could not locate the packaged csrc directory: {exc}")
+
+# 4. The vLLM plugin entry point must be registered, or vLLM will never load us.
+eps = [e for e in entry_points(group="vllm.general_plugins") if e.name == "gridbook"]
+if not eps:
+    problems.append("no 'gridbook' entry point in group 'vllm.general_plugins'")
+
+if problems:
+    print("\n[gridbook] IMAGE VERIFICATION FAILED:", file=sys.stderr)
+    for p in problems:
+        print(f"  - {p}", file=sys.stderr)
+    sys.exit(1)
+
+import vllm, torch
+print(f"[gridbook] verified: gridbook {version('gridbook')} | "
+      f"vllm {vllm.__version__} | torch {torch.__version__} | "
+      f"entry point OK | packaged csrc OK")
+PY
+
+# -----------------------------------------------------------------------------
+# vLLM API canary
+# -----------------------------------------------------------------------------
+# vLLM's plugin loader wraps plugin.load() in `except Exception: logger.
+# exception(...)` — it logs and CONTINUES. So if any vLLM internal gridbook
+# imports has drifted, registration silently does not happen and the user's
+# only symptom is an unrelated "unknown quantization method" much later, at
+# model load. Running register() here surfaces that at build time instead.
+RUN python3 <<'PY'
+import sys, traceback
+try:
+    import gridbook
+    gridbook.register()
+except Exception:
+    traceback.print_exc()
+    print("\n[gridbook] vLLM API CANARY FAILED: gridbook.register() raised "
+          "against this vLLM build. The plugin's imports have drifted from "
+          "this vLLM version — pick a different --build-arg VLLM_TAG, or "
+          "update the plugin. Refusing to ship an image whose plugin would "
+          "silently not register at serve time.", file=sys.stderr)
+    sys.exit(1)
+print("[gridbook] vLLM API canary OK: register() succeeded")
+PY
+
+# -----------------------------------------------------------------------------
+# Pre-warm the JIT kernel cache
+# -----------------------------------------------------------------------------
+# Measured: torch.utils.cpp_extension.load() needs nvcc and an explicit
+# TORCH_CUDA_ARCH_LIST, but NOT a GPU — so the kernels compile during
+# `docker build`, which never has a GPU attached (torch.cuda.is_available() is
+# False throughout; it only warns). Both extensions compile here.
+#
+# The per-kernel wall-clock numbers this step prints are recorded in
+# docs/CONTAINER.md, "Verified vs untested". They are deliberately NOT restated
+# in this file: two copies of a measurement drift, and one of them is then a
+# false claim in a public file.
+RUN python3 <<'PY'
+import os, sys, time
+
+if os.environ.get("GRIDBOOK_PREWARM", "1") != "1":
+    print("[gridbook] prewarm disabled (GRIDBOOK_PREWARM != 1); kernels will "
+          "build on first use inside the first request.")
+    raise SystemExit(0)
+
+from gridbook import cuda_ext
+
+# Decode GEMV — the production decode path. Hard gate: an image that cannot
+# build this would serve through the Triton prototype, which the kernel header
+# itself labels not production-eligible. Better to fail the build.
+t = time.time()
+if cuda_ext.get_ext() is None:
+    print("\n[gridbook] FATAL: the CUDA decode-GEMV extension failed to build "
+          "at image build time (reason printed above). This is the production "
+          "decode path — refusing to ship an image that would silently fall "
+          "back to the slow Triton prototype.", file=sys.stderr)
+    sys.exit(1)
+print(f"[gridbook] prewarmed decode-GEMV extension in {time.time() - t:.1f}s")
+
+# Mid-M fused prefill (CUTLASS). Genuinely sm_120-family only, and default-ON at
+# runtime — without this prewarm a non-prewarmed image burns a multi-minute
+# CUTLASS compile inside the user's first request. Soft: the runtime already
+# falls back to the transient-expand path by design.
+arch = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
+if "12.0" in arch or "12.1" in arch:
+    t = time.time()
+    if cuda_ext.get_fused_ext() is None:
+        print("[gridbook] NOTE: mid-M fused prefill extension did not prewarm; "
+              "mid-M prefill will use the transient-expand path (a supported "
+              "fallback, not an error).")
+    else:
+        print(f"[gridbook] prewarmed mid-M fused prefill extension in "
+              f"{time.time() - t:.1f}s")
+else:
+    print(f"[gridbook] NOTE: TORCH_CUDA_ARCH_LIST={arch!r} is not Blackwell "
+          f"sm_120/sm_121 — skipping the CUTLASS mid-M fused prefill prewarm, "
+          f"which is sm_120-family only. Decode and the other prefill paths "
+          f"are unaffected.")
+
+# The persistent-TC prefill extension is deliberately NOT prewarmed: it is
+# quarantined upstream behind PRISMAQUANT_ENABLE_PTC=1 pending a hardware
+# canary. Do not enable it here.
+PY
+
+# -----------------------------------------------------------------------------
+# Make the prewarmed cache usable under `docker run --user`
+# -----------------------------------------------------------------------------
+# torch.utils.cpp_extension._jit_compile() takes a FileBaton on
+# <build_directory>/lock BEFORE it decides whether anything needs building:
+#
+#     baton = FileBaton(os.path.join(build_directory, 'lock'))
+#     if baton.try_acquire():   # os.open(..., O_CREAT | O_EXCL)
+#
+# so *loading* a fully prewarmed cache still requires CREATE permission in the
+# cache directory. Read access is not enough. That makes the cache directory's
+# write permission a correctness property of this image, not a convenience:
+# without it `docker run --user 1000:1000` fail-softs to the slow Triton decode
+# path with only a warning — exactly the failure this image exists to prevent.
+#
+# chgrp 0 + g+rwX (the usual OpenShift-style recipe) only covers `--user <uid>:0`.
+# `--user 1000:1000` is neither root nor in group 0, so the cache directory is
+# opened world-writable. This is a single-application container whose cache
+# contains only compiled kernel objects; if you run untrusted code beside the
+# server, mount your own cache directory over /opt/gridbook/ext-cache instead.
+RUN <<'EOF'
+set -eu
+# mkdir: with GRIDBOOK_PREWARM=0 nothing has created the cache dir yet, and the
+# runtime build must still be able to write into it under `--user`.
+mkdir -p /opt/gridbook/ext-cache
+chgrp -R 0 /opt/gridbook
+chmod -R g+rwX /opt/gridbook
+chmod -R a+rwX /opt/gridbook/ext-cache
+EOF
+
+# Gate it. This invariant was asserted before it was tested, and it was wrong;
+# assert it now with a real non-root, non-group-0 UID, the same way `docker run
+# --user 1000:1000` would. Cheap: it is a cache hit, not a compile.
+RUN <<'EOF'
+set -eu
+setpriv --reuid 1000 --regid 1000 --clear-groups python3 - <<'PY'
+import os, sys, time
+
+if os.environ.get("GRIDBOOK_PREWARM", "1") != "1":
+    print("[gridbook] --user gate skipped: prewarm disabled, so there is no "
+          "cached build to load. The cache directory is still world-writable, "
+          "so the first-use build works under --user.")
+    raise SystemExit(0)
+
+from gridbook import cuda_ext
+
+t = time.time()
+ok_decode = cuda_ext.get_ext() is not None
+t_decode = time.time() - t
+
+if not ok_decode:
+    print(f"\n[gridbook] --user GATE FAILED: uid/gid 1000:1000 could not load the "
+          f"prewarmed decode-GEMV extension (reason above). Under `docker run "
+          f"--user` this image would silently serve through the slow Triton "
+          f"prototype. Refusing to ship it.", file=sys.stderr)
+    sys.exit(1)
+
+msg = f"[gridbook] --user gate OK: uid/gid 1000:1000 loaded decode in {t_decode:.2f}s"
+
+# The fused prefill extension is only prewarmed on the sm_120 family; check it
+# only when it was actually built.
+if os.path.isdir(os.path.join(os.environ["PRISMAQUANT_CB_EXT_DIR"], "fused")):
+    t = time.time()
+    if cuda_ext.get_fused_ext() is None:
+        print("\n[gridbook] --user GATE FAILED: uid/gid 1000:1000 could not load "
+              "the prewarmed mid-M fused prefill extension.", file=sys.stderr)
+        sys.exit(1)
+    msg += f", fused in {time.time() - t:.2f}s"
+print(msg)
+PY
+EOF
+
+# The gate ran as uid 1000 and only ever created/removed the baton lock file,
+# but re-assert the permissions so nothing it touched can narrow them.
+RUN chmod -R a+rwX /opt/gridbook/ext-cache
+
+# -----------------------------------------------------------------------------
+# Entrypoint — OpenAI-compatible server on 0.0.0.0:8000
+# -----------------------------------------------------------------------------
+# Same shape as upstream's ENTRYPOINT ["vllm", "serve"], so every upstream flag
+# and manifest still works, but defaults the bind to 0.0.0.0:8000 when the user
+# has not specified it. Binding to loopback inside a container makes the server
+# unreachable from the host even with -p published, which is a routine and
+# confusing first-run failure.
+RUN <<'EOF'
+set -eu
+cat > /usr/local/bin/gridbook-serve <<'SH'
+#!/usr/bin/env bash
+# gridbook entrypoint: `vllm serve` with a container-reachable default bind.
+set -euo pipefail
+
+have_host=0
+have_port=0
+for arg in "$@"; do
+  case "$arg" in
+    --host|--host=*) have_host=1 ;;
+    --port|--port=*) have_port=1 ;;
+  esac
+done
+
+if [ "$have_host" -eq 0 ]; then
+  set -- "$@" --host 0.0.0.0
+fi
+if [ "$have_port" -eq 0 ]; then
+  set -- "$@" --port 8000
+fi
+
+exec vllm serve "$@"
+SH
+chmod 0755 /usr/local/bin/gridbook-serve
+EOF
+
+WORKDIR /vllm-workspace
+EXPOSE 8000
+ENTRYPOINT ["/usr/local/bin/gridbook-serve"]

@@ -67,10 +67,39 @@ def decode_fp4_scale_plane(qw: torch.Tensor, k: int) -> torch.Tensor:
     return plane.view(_E4M3).to(torch.float32).reshape(n, n_sb * FP4_GROUP)
 
 
+PAD_BYTES = 16
+
+
 def pad_qweight(qw: torch.Tensor) -> torch.Tensor:
-    """Right-pad each row by 8 bytes so the kernel's 8-byte codeword window can
-    never read out of bounds at the last superblock/last row."""
-    return F.pad(qw.contiguous(), (0, 8), value=0).contiguous()
+    """Right-pad each row by ``PAD_BYTES`` so the padded buffer satisfies BOTH
+    invariants every consumer of a padded row depends on:
+
+    1. **>= 8 bytes of read slack per row.** The decode/expand kernels extract a
+       codeword with an 8-byte window anchored at the codeword's first byte, so
+       the last codeword of the last superblock of the last row reads up to 7
+       bytes past the packed data. Without the slack that is an out-of-bounds
+       global read (illegal-memory-access, or silent garbage in the final
+       output rows).
+    2. **The padded row stride stays a 16-byte multiple** whenever the UNPADDED
+       one was. The fp8 CUTLASS entries (``cb_fused_prefill_mm_scaled``, the
+       persistent-TC prefill) take the row stride explicitly and TORCH_CHECK
+       ``stride(0) % 16 == 0`` — TMA needs 16-byte-aligned row starts. Every fp8
+       rung has ``type_size = 4k`` in {112,128,144,160,176,192}, so
+       ``row_bytes`` is 16-aligned and ``row_bytes + 16`` still is; the old
+       ``+ 8`` pad was NOT, which is why the padded buffer could not be shared
+       with the registered ``cb_qweight`` parameter and both had to stay
+       resident (see ``linear.process_weights_after_loading``). Pad width is
+       therefore load-bearing, not a spare-bytes choice: dropping it back to 8
+       re-breaks the fp8 prefill kernels' alignment check.
+
+    (fp4 rungs carry an odd ``type_size`` — ``4k+16`` v1, ``4k+9`` v2 — so their
+    row stride is not 16-aligned either way; they only ever hit kernels that
+    take the stride explicitly and require ``stride(1) == 1``.)
+
+    Consumers must read the row stride from the tensor (``.stride(0)``), never
+    derive it as ``size(1) - PAD_BYTES``.
+    """
+    return F.pad(qw.contiguous(), (0, PAD_BYTES), value=0).contiguous()
 
 
 # Signed E2M1 grid, cached per device: building it per call allocated a CPU

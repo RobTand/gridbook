@@ -310,7 +310,7 @@ def expand_fp4_v2_to_weight(cb_qweight_padded, cb_flat, cb_row_offset, compose,
 
 
 def expand_cb_to_fp8(
-    cb_qweight_padded: torch.Tensor,   # (N, row_bytes + 8) uint8, 8-byte pad
+    cb_qweight_padded: torch.Tensor,   # (N, row_bytes + PAD) uint8 (codec.PAD_BYTES)
     cb_flat_fp8: torch.Tensor,         # (cb_total,) uint8 E4M3-byte codebook(s)
     cb_row_offset: torch.Tensor,       # (N,) int32 per-row base into cb_flat
     N: int, K: int,
@@ -353,7 +353,7 @@ def expand_cb_to_fp8(
 
 
 def expand_cb_to_value(
-    cb_qweight_padded: torch.Tensor,   # (N, row_bytes + 8) uint8, 8-byte pad
+    cb_qweight_padded: torch.Tensor,   # (N, row_bytes + PAD) uint8 (codec.PAD_BYTES)
     cb_flat: torch.Tensor,             # (cb_total,) bf16 flat codebook(s)
     cb_row_offset: torch.Tensor,       # (N,) int32 per-row base into cb_flat
     N: int, K: int,

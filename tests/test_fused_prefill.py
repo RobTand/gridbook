@@ -25,7 +25,7 @@ import pytest
 import torch
 
 codec = pytest.importorskip("gridbook.codec")
-from gridbook.cuda_ext import get_ext  # noqa: E402
+from gridbook.cuda_ext import _find_cutlass_include, csrc_dir, get_ext  # noqa: E402
 
 gemv_ext = get_ext()
 if gemv_ext is None:
@@ -36,14 +36,14 @@ def _build_fused():
     from torch.utils.cpp_extension import load
     build = os.path.join(os.path.expanduser("~"), ".cache", "pq-fused-build")
     os.makedirs(build, exist_ok=True)
-    cut = ("/usr/local/lib/python3.12/dist-packages/vllm/third_party/"
-           "fmha_sm100/cutlass")
-    src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           os.pardir, "csrc")
+    inc = _find_cutlass_include()          # same discovery the plugin uses
+    cut = os.path.dirname(inc)
+    src_dir = csrc_dir()
     return load(name="pq_cb_fused",
                 sources=[os.path.join(src_dir, "cb_fused_gemm.cu")],
-                extra_include_paths=[f"{cut}/include",
-                                     f"{cut}/tools/util/include", src_dir],
+                extra_include_paths=[inc,
+                                     os.path.join(cut, "tools", "util",
+                                                  "include"), src_dir],
                 extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                 build_directory=build, verbose=False)
 
@@ -199,3 +199,52 @@ def test_fused_scaled_matches_cutlass_scaled_mm():
     y_c = ops.cutlass_scaled_mm(xq, W.t(), sa, ws, torch.bfloat16, None)
     tol = 4.0 * torch.finfo(torch.bfloat16).eps * ref32.abs().max().item()
     assert (y_s.float() - y_c.float()).abs().max().item() <= tol
+
+
+# ---------------------------------------------------------------------------
+# Padded-row-stride acceptance (issue #1, 2026-07-25).
+#
+# `process_weights_after_loading` no longer keeps a second contiguous copy of
+# the packed weight: `layer.cb_qweight.data` is now a NARROW VIEW of the
+# 16-byte-padded buffer, so what reaches these entries has
+# `stride(0) == row_bytes + codec.PAD_BYTES`, not `row_bytes`. The kernel
+# already takes the row stride explicitly (`packed.stride(0)` -> the packed-B
+# TMA descriptor's row stride, cb_fused_gemm.cu run_fused*/to_underlying_
+# arguments), and check_fused_inputs never required contiguity — only
+# `stride(1) == 1`, `stride(0) % 16 == 0` and `stride(0) >= (K/256)*4*k`, all of
+# which the 16-byte pad preserves. These gates make that a tested contract
+# rather than a read of the source: same bytes in, bit-identical bytes out.
+# ---------------------------------------------------------------------------
+
+def _padded_view(packed):
+    view = codec.pad_qweight(packed).narrow(1, 0, packed.shape[1])
+    assert view.stride(0) == packed.shape[1] + codec.PAD_BYTES
+    assert view.stride(0) % 16 == 0 and view.stride(1) == 1
+    assert torch.equal(view, packed)          # same bytes, different stride
+    return view
+
+
+@pytest.mark.parametrize("k", [28, 44])
+def test_fused_padded_view_bitexact_vs_contiguous(k):
+    N, K, M = 320, 1536, 96
+    packed, cb8 = _synth(k, N=N, K=K, seed=100 + k)
+    torch.manual_seed(k)
+    xq = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float8_e4m3fn)
+    y_c = fused.cb_fused_prefill_mm(xq, packed, cb8, N, K, k)
+    y_v = fused.cb_fused_prefill_mm(xq, _padded_view(packed), cb8, N, K, k)
+    assert torch.equal(y_c.view(torch.uint16), y_v.view(torch.uint16))
+
+
+@pytest.mark.parametrize("k", [28, 44])
+def test_fused_scaled_padded_view_bitexact_vs_contiguous(k):
+    """The default-on mid-M serving entry (linear.py:_apply_inline)."""
+    N, K, M = 320, 1536, 96
+    packed, cb8 = _synth(k, N=N, K=K, seed=200 + k)
+    torch.manual_seed(k)
+    xq = (torch.randn(M, K, device=DEV) * 0.1).to(torch.float8_e4m3fn)
+    sa = (torch.rand(M, device=DEV) * 0.02 + 0.01).float().contiguous()
+    ws = (torch.rand(N, device=DEV) * 0.02 + 0.01).float().contiguous()
+    y_c = fused.cb_fused_prefill_mm_scaled(xq, packed, cb8, sa, ws, N, K, k)
+    y_v = fused.cb_fused_prefill_mm_scaled(
+        xq, _padded_view(packed), cb8, sa, ws, N, K, k)
+    assert torch.equal(y_c.view(torch.uint16), y_v.view(torch.uint16))

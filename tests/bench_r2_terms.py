@@ -2,7 +2,7 @@
 python serving path. Run standalone in a container. Delete when done.
 
 The decode-ALU instrument this bench needs (an #ifdef PQ_BENCH_DECODE_NOALU
-block in csrc/cutlass_fork/sm120_cb_fused_mma.hpp) is deliberately NOT in the
+block in gridbook/csrc/cutlass_fork/sm120_cb_fused_mma.hpp) is deliberately NOT in the
 tree: a wrong-numerics ifdef inside the shipping decode mainloop is a landmine
 for the next reader. Re-apply it with
     git apply /home/rob/dq-runs/r2-bench/noalu_instrument.patch
@@ -27,13 +27,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gridbook import codec  # noqa: E402
 
 DEV = "cuda"
-CUT = ("/usr/local/lib/python3.12/dist-packages/vllm/third_party/"
-       "fmha_sm100/cutlass")
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "csrc")
+from gridbook.cuda_ext import _find_cutlass_include, csrc_dir  # noqa: E402
+
+SRC = csrc_dir()
 
 
 def build(noalu: bool):
     from torch.utils.cpp_extension import load
+
+    # Resolved here, not at module scope: _find_cutlass_include() does
+    # `import vllm`, and this module must stay importable (and --help-able)
+    # without vLLM installed, as it was when this was a literal path constant.
+    CUT_INC = _find_cutlass_include()       # same discovery the plugin uses
+    CUT = os.path.dirname(CUT_INC)
     name = "pq_cb_fused_noalu" if noalu else "pq_cb_fused_bench"
     bd = os.path.join(os.path.expanduser("~"), ".cache", "pq-r2-bench", name)
     os.makedirs(bd, exist_ok=True)
@@ -41,8 +47,9 @@ def build(noalu: bool):
     if noalu:
         flags.append("-DPQ_BENCH_DECODE_NOALU")
     return load(name=name, sources=[os.path.join(SRC, "cb_fused_gemm.cu")],
-                extra_include_paths=[f"{CUT}/include",
-                                     f"{CUT}/tools/util/include", SRC],
+                extra_include_paths=[CUT_INC,
+                                     os.path.join(CUT, "tools", "util",
+                                                  "include"), SRC],
                 extra_cuda_cflags=flags, build_directory=bd, verbose=False)
 
 

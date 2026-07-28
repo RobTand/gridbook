@@ -1,0 +1,23 @@
+# Keeps the exact action pins in .github/workflows/* from rotting.
+#
+# Every action there is pinned to a patch tag (e.g. actions/checkout@v7.0.1)
+# rather than a floating major, which is the safe choice but only if something
+# actually bumps them. Weekly, grouped into ONE pull request, is about the right
+# noise level for a single maintainer: one PR to glance at, and CI on that PR is
+# a real test of the new action versions because the packaging gates run there.
+#
+# Deliberately NOT enabled: a `pip` ecosystem entry. gridbook's runtime deps are
+# intentionally unpinned (torch/triton must match whatever CUDA build the user's
+# vLLM environment already has), so there is nothing for Dependabot to bump and
+# it would only generate noise.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"

@@ -180,7 +180,8 @@ def _cb_decode_gemm_kernel(
 
 def cb_decode_linear(
     x: torch.Tensor,             # (..., K) activations (bf16/fp16)
-    qw_padded: torch.Tensor,     # (N, row_bytes+8) uint8, +8 pad for the window
+    qw_padded: torch.Tensor,     # (N, row_bytes+codec.PAD_BYTES) uint8; row stride
+                                 # is read from .stride(0), never size(1)-PAD
     cb_flat: torch.Tensor,       # (cb_total,) bf16 flat codebook(s), concatenated
     cb_row_offset: torch.Tensor,  # (N,) int32 per-row base into cb_flat
     scale: torch.Tensor,         # fp4 v1: (N, n_sb*16) fp32 ; fp8: (N,) fp32 ;

@@ -27,15 +27,12 @@ from . import codec
 from .expand import expand_cb_to_fp8, expand_fp4_v2_to_weight
 from .ops import cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op
 
-# Fallback fused mapping if the config's packed_modules_mapping is unset.
-_FUSED_FALLBACK = {
-    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-    "gate_up_proj": ["gate_proj", "up_proj"],
-    # Qwen3.5-class hybrid linear attention fuses the recipe's separate
-    # projections into single serving modules (shard order per the class):
-    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-    "in_proj_ba": ["in_proj_b", "in_proj_a"],
-}
+# NOTE: the fused-sibling fallback map (qkv_proj, gate_up_proj, in_proj_qkvz,
+# in_proj_ba) used to be duplicated here. It — and the namespace handling around
+# it — now live once, in ``config`` (``_FUSED_FALLBACK`` +
+# ``PrismaQuantConfig.shard_target_keys``), because this module's copy and the
+# config's copy answered "which shards does this fused module have?" separately
+# and drifted (issue #1).
 
 # M-gate for the CB dispatch (GGUF's mmvq_safe pattern, quantization/linear.py
 # :34-57): M<=threshold is the decode regime -> keep the bf16-MMA Triton
@@ -114,18 +111,21 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
 
     # -- shard-role resolution for a (possibly fused) layer -----------------
     def _shard_roles(self):
-        # Serving prefixes may carry a class wrapper (language_model.model.*)
-        # while target_scheme keys are canonical — normalize first (same
-        # bridge as config._scheme_for_prefix; the 0.8B hybrid resolved ZERO
-        # roles here without it and died on the width assert).
-        from .config import _canonical_prefix
-        cprefix = _canonical_prefix(self.prefix)
-        leaf = cprefix.split(".")[-1]
-        pmm = getattr(self.quant_config, "packed_modules_mapping", {}) or {}
-        shard_leaves = pmm.get(leaf) or _FUSED_FALLBACK.get(leaf) or [leaf]
-        prefixes = [cprefix[: -len(leaf)] + sl for sl in shard_leaves]
-        # Keep only shards that are actual CB targets (all, for uniform arts).
-        return [p for p in prefixes if p in self.quant_config.target_scheme]
+        """The ``target_scheme`` keys of this (possibly fused) module's CB
+        roles, in shard order — the per-role codebooks
+        ``process_weights_after_loading`` concatenates.
+
+        Delegated to the config so this and ``_scheme_for_prefix`` can never
+        disagree about which shards a fused module has, or about which
+        namespace vintage the keys are in. ``unfused_fallback=True`` keeps this
+        call site's semantics: a plain Linear is its own single role (the
+        scheme lookup deliberately has no such rung). Serving prefixes may
+        carry a class wrapper (``language_model.model.*``) OR the mapper's own
+        namespace while the stored keys sit in another — both the 0.8B hybrid
+        (resolved ZERO roles, died on the width assert) and issue #1 were that
+        one question answered locally and wrongly."""
+        return self.quant_config.shard_target_keys(self.prefix,
+                                                   unfused_fallback=True)
 
     def _ckpt_cb_rows(self) -> dict[str, int]:
         """Row count of every ``*.cb_qweight`` tensor in the on-disk checkpoint
@@ -228,11 +228,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         cb_row_offset = torch.cat(row_offsets).contiguous()
 
         qw = layer.cb_qweight.data
-        assert cb_row_offset.numel() == qw.shape[0], (
+        rows, row_bytes = int(qw.shape[0]), int(qw.shape[1])
+        assert cb_row_offset.numel() == rows, (
             f"{self.prefix}: cb_row_offset has {cb_row_offset.numel()} rows but "
-            f"the packed weight has {qw.shape[0]} — per-row offset must cover "
+            f"the packed weight has {rows} — per-row offset must cover "
             "every output row (kernels index it by row).")
-        layer._cb_qw_padded = codec.pad_qweight(qw)
         layer._cb_flat = cb_flat
         layer._cb_row_offset = cb_row_offset
         dummy = torch.zeros(1, dtype=torch.float32, device=dev)
@@ -262,7 +262,30 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # in-container build fires on the first decode step and poisons
             # the first request's latency (seen live: 1.89 tok/s rep 1).
             self._cuda_gemv_ok()
-        layer._cb_N = qw.shape[0]
+
+        # ONE resident copy of the packed weight (issue #1, 2026-07-25).
+        #
+        # ``pad_qweight`` allocates a padded COPY, and the registered
+        # ``cb_qweight`` parameter used to stay live alongside it for the whole
+        # serve — every dense CB weight was resident TWICE. Measured on the
+        # shipped Qwen3.6-27B gridbook artifact (safetensors header): 15.07 GiB
+        # of dense ``cb_qweight`` out of 21.38 GiB total, i.e. ~36.5 GiB of
+        # weights served instead of ~21.4 GiB. It went unnoticed because the
+        # reference box is a 128 GB unified-memory DGX Spark, where the slack
+        # simply absorbed it; it only bites on 24/32 GB cards (reported from a
+        # 32 GB RTX 5090). MoE stacks were never affected — ``moe.py`` pads only
+        # bounded per-forward transients, never the resident expert stack.
+        #
+        # The fix is a narrow VIEW, not a ``del``: ``cb_qweight.data`` is still
+        # read by the fp8 mid-M fused prefill entry and the persistent-TC path,
+        # both of which take the row stride explicitly and only require
+        # ``stride(1) == 1`` and a 16-byte-multiple ``stride(0)`` — which the
+        # 16-byte pad preserves (see ``codec.pad_qweight``). Dropping the local
+        # ``qw`` then releases the original storage.
+        layer._cb_qw_padded = codec.pad_qweight(qw)
+        layer.cb_qweight.data = layer._cb_qw_padded.narrow(1, 0, row_bytes)
+        del qw
+        layer._cb_N = rows
         layer._cb_K = layer._cb_input_size
         from .ops import register_cb_layer
         layer._cb_layer_id = register_cb_layer(self, layer)

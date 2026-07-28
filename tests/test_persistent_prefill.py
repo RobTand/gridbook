@@ -1,5 +1,5 @@
 """Parity gate for the persistent-N FP8_CB prefill reference kernel
-(csrc/cb_persistent_prefill.cu). See docs/nvfp4-cb-plan/persistent-n-prefill.md.
+(gridbook/csrc/cb_persistent_prefill.cu). See docs/nvfp4-cb-plan/persistent-n-prefill.md.
 
 Container-only (JIT-builds an isolated extension; needs nvcc):
 
@@ -21,7 +21,7 @@ import pytest
 import torch
 
 codec = pytest.importorskip("gridbook.codec")
-from gridbook.cuda_ext import get_ext  # noqa: E402
+from gridbook.cuda_ext import csrc_dir, get_ext  # noqa: E402
 
 gemv_ext = get_ext()
 if gemv_ext is None:
@@ -32,8 +32,7 @@ def _build():
     from torch.utils.cpp_extension import load
     build = os.path.join(os.path.expanduser("~"), ".cache", "pq-persistent-build")
     os.makedirs(build, exist_ok=True)
-    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
-                       "csrc", "cb_persistent_prefill.cu")
+    src = os.path.join(csrc_dir(), "cb_persistent_prefill.cu")
     return load(name="pq_cb_persistent", sources=[src],
                 extra_cuda_cflags=["-O3"], build_directory=build, verbose=False)
 

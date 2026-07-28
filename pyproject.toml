@@ -1,19 +1,85 @@
 [build-system]
-requires = ["setuptools>=61"]
+# >=77 is the real floor: `license = "Apache-2.0"` is a PEP 639 SPDX
+# expression, which setuptools only emits (Metadata-Version 2.4) from 77.0.0.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gridbook"
-version = "0.0.1"
-description = "Out-of-tree vLLM plugin for PrismaQuant NVFP4-CB / FP8-CB codebook formats (prototype (i): correctness-first Triton serving, INV-2 waived)."
+dynamic = ["version"]          # single source of truth: gridbook.__version__
+# Bit-rate range is the union of the two format families' rung ladders, from
+# docs/nvfp4-cb-plan/STANDARDS.md: NVFP4_CB K12-K24 = 2.0-3.28 bpw (2.28-3.53
+# effective) and FP8_CB K28-K48 = 3.5-6.0 bpw. The published artifacts sit at
+# 2.9 / 5.5 / 6 bit, so "sub-4-bit" would be wrong for most of the family.
+description = "vLLM plugin for the NVFP4-CB / FP8-CB product-codebook weight formats: 2-6 bit-per-weight LLM quantization served by dedicated CUDA decode and prefill kernels."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-dependencies = ["torch", "triton", "safetensors"]
+authors = [{ name = "Robert Tand", email = "robert.tand@icloud.com" }]
+keywords = [
+    "vllm",
+    "quantization",
+    "llm",
+    "inference",
+    "cuda",
+    "nvfp4",
+    "fp8",
+    "codebook",
+    "vector-quantization",
+    "blackwell",
+]
+classifiers = [
+    # NOTE: no `License ::` classifier — PEP 639 deprecates it alongside the
+    # SPDX `license` expression above, and setuptools>=77 rejects both together.
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    # 3.13 measured end-to-end 2026-07-28 (clean python:3.13-slim container,
+    # installed wheel, torch 2.13.0+cpu: 156 passed / 136 skipped / 0 failed).
+    # 3.14 stays out until torch and triton both ship wheels for it.
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Unpinned on purpose. gridbook is installed *into an environment that already
+# has vLLM*, whose torch/triton are typically local-version wheels
+# (e.g. 2.11.0+cu130) that no pin from PyPI can satisfy. huggingface-hub is a
+# direct import (config.py, linear.py) and was previously relied on
+# transitively via vLLM.
+dependencies = ["torch", "triton", "safetensors", "huggingface-hub"]
+
+[project.optional-dependencies]
+# vLLM is NOT a hard dependency: it is multi-GB, the reference serving builds
+# are source/nightly builds that are not on PyPI, and `import gridbook` (codec
+# + kernel tests) deliberately works without it — only `register()` needs it.
+serve = ["vllm"]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/RobTand/gridbook"
+Repository = "https://github.com/RobTand/gridbook"
+Issues = "https://github.com/RobTand/gridbook/issues"
+Documentation = "https://github.com/RobTand/gridbook/blob/master/docs/SPEC.md"
 
 [project.entry-points."vllm.general_plugins"]
 gridbook = "gridbook:register"
 
+[tool.setuptools.dynamic]
+version = { attr = "gridbook.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["gridbook*"]
+
+# The CUDA/CUTLASS sources are JIT-compiled at first use by
+# torch.utils.cpp_extension.load, so they must be present in *any* install,
+# including a non-editable wheel. They live under gridbook/csrc (inside the
+# package) precisely so this glob can reach them; package-data also lands in
+# the sdist automatically. Do not move csrc back to the repo root.
+[tool.setuptools.package-data]
+gridbook = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/cutlass_fork/*.hpp"]

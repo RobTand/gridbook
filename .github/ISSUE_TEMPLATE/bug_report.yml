@@ -1,0 +1,98 @@
+name: Bug report
+description: Something breaks, or serves wrong / slow output.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, check [`docs/TROUBLESHOOTING.md`](https://github.com/RobTand/gridbook/blob/master/docs/TROUBLESHOOTING.md)
+        — it is indexed by symptom and the frequent causes each have a section.
+
+        Two things worth knowing up front:
+
+        * **The plugin fail-softs.** If the CUDA extension does not build, gridbook
+          still serves *correct* output on the Triton reference path, several times
+          slower, with one stderr warning as the only clue. "Much slower than the
+          published numbers" is almost always this. The env block below is what
+          distinguishes it.
+        * **Blackwell only for the fast path.** The CUDA kernels target sm_120 /
+          sm_121 (GB10 DGX Spark, RTX 5090 class). Elsewhere the Triton path is
+          the only path.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, what you got, and the full traceback or the relevant stderr lines.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: >-
+        The exact `vllm serve` command line (or Python), the model repo id, and
+        the request that triggers it. Redact tokens and hostnames.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: >-
+        Paste the output of this block, run in the same environment that serves.
+        It answers "is the CUDA extension actually loaded", which is the first
+        question for any speed or numerics report.
+      value: |
+        python - <<'PY'
+        import platform, sys
+        print("python  ", sys.version.split()[0], platform.machine())
+        try:
+            import gridbook; print("gridbook", gridbook.__version__, gridbook.__file__)
+        except Exception as e:
+            print("gridbook IMPORT FAILED:", e)
+        try:
+            import torch
+            print("torch   ", torch.__version__, "| cuda", torch.version.cuda)
+            if torch.cuda.is_available():
+                p = torch.cuda.get_device_properties(0)
+                print("gpu     ", p.name, f"sm_{p.major}{p.minor}")
+            else:
+                print("gpu      NONE VISIBLE")
+        except Exception as e:
+            print("torch    IMPORT FAILED:", e)
+        try:
+            import vllm; print("vllm    ", vllm.__version__, vllm.__file__)
+        except Exception as e:
+            print("vllm     IMPORT FAILED:", e)
+        try:
+            from gridbook.cuda_ext import csrc_dir, get_ext
+            print("csrc    ", csrc_dir())
+            print("cuda_ext", "LOADED" if get_ext() is not None else "None (TRITON FALLBACK)")
+        except Exception as e:
+            print("cuda_ext PROBE FAILED:", e)
+        import os
+        env = {k: v for k, v in os.environ.items() if k.startswith(("PRISMAQUANT_", "VLLM_", "TORCH_CUDA_ARCH"))}
+        print("env     ", env or "(none set)")
+        PY
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: install
+    attributes:
+      label: How gridbook was installed
+      description: e.g. `pip install gridbook`, `pip install -e .` from a checkout (which commit?), or the container image tag.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I read the section of `docs/TROUBLESHOOTING.md` matching my symptom, or none matched.
+          required: true
+        - label: >-
+            If this is a speed report: the `cuda_ext` line above says LOADED. (If it
+            says TRITON FALLBACK, that is the cause — the fix is in TROUBLESHOOTING.)

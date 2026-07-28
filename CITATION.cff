@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use gridbook or the NVFP4-CB / FP8-CB formats, please cite this repository."
+title: "gridbook: product-codebook weight formats that serve on native tensor-core kernels"
+abstract: >-
+  gridbook specifies the NVFP4-CB and FP8-CB product vector-quantization weight
+  formats and provides an out-of-tree vLLM plugin that serves them. Codebook
+  entries lie exactly on a hardware grid (NVFP4 or FP8), so a decoded tile is
+  bit-compatible with a native format and is consumed by the same tensor-core
+  GEMM path a conventional checkpoint uses, without a forked runtime.
+type: software
+authors:
+  - family-names: Tand
+    given-names: Robert
+    email: robert.tand@icloud.com
+repository-code: "https://github.com/RobTand/gridbook"
+url: "https://github.com/RobTand/gridbook"
+license: Apache-2.0
+version: "0.1.0"
+keywords:
+  - quantization
+  - vector-quantization
+  - codebook
+  - llm-inference
+  - vllm
+  - cuda
+  - nvfp4
+  - fp8
+  - blackwell

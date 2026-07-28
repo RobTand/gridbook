@@ -1,0 +1,20 @@
+# Blank issues stay ON: the forms below are for the two report shapes that need
+# a fixed set of facts, not a funnel that turns away anything else.
+blank_issues_enabled: true
+contact_links:
+  - name: Serving problem — read this first
+    url: https://github.com/RobTand/gridbook/blob/master/docs/TROUBLESHOOTING.md
+    about: >-
+      Symptom-indexed. The common ones (Triton fallback / "Invalid quantization
+      method: gridbook" / OOM / garbage generation / slower than the published
+      numbers) each have a section with the exact diagnostic command.
+  - name: Installation and tested software stack
+    url: https://github.com/RobTand/gridbook/blob/master/docs/INSTALL.md
+    about: >-
+      Which vLLM, torch and CUDA versions are actually tested, and what the
+      install needs on the serving box (nvcc, for the JIT extension build).
+  - name: Format specification
+    url: https://github.com/RobTand/gridbook/blob/master/docs/SPEC.md
+    about: >-
+      The on-disk NVFP4-CB / FP8-CB layout, sidecars and quant config, for
+      anyone writing an encoder or a second implementation.
