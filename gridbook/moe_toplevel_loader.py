@@ -36,6 +36,15 @@ the original loader. One line per arch registers it
 (``install_toplevel_cb_expert_loader(SomeForCausalLM)``); DSv4 and any other
 top-level-expert-mapping MoE arch reuse it as-is.
 
+The same KeyError hits FUSED **native-NVFP4** expert stacks
+(``…experts.gate_up_proj.weight_packed`` and friends), which a heterogeneous
+artifact carries for the layers left on stock compressed-tensors instead of CB:
+they too are one 3D tensor per role, and vLLM's ``expert_params_mapping`` too
+matches only per-expert names. Those land on the params that
+``CompressedTensorsW4A4Nvfp4MoEMethod.create_weights`` registers
+(``w13_weight_packed``/``w2_weight_packed`` + the global-scale stacks) — see
+``_CB_EXPERT_SUFFIX_TO_LEAF`` below for the shape/order proof.
+
 **Shared-expert (``shared_mlp``) CB tensors — the second interception.** HunYuan
 V3 passes ``shared_experts=self.shared_mlp`` into ``FusedMoE``; the shared MLP is
 an ordinary ``HYV3FeedForward`` (fused ``gate_up_proj`` + ``down_proj`` Linears).
@@ -111,11 +120,59 @@ def installed_module_paths() -> set[str]:
 # and dense MLP projections that share the ``gate_up_proj`` / ``down_proj`` leaf
 # names (e.g. ``…mlp.shared_mlp.gate_proj.cb_qweight``,
 # ``…layers.0.mlp.down_proj.cb_qweight``), which must go to the ORIGINAL loader.
+#
+# NATIVE-NVFP4 FUSED STACKS (the ``weight_packed`` block below).
+# A heterogeneous artifact leaves some layers on stock compressed-tensors NVFP4
+# rather than CB. Those layers are written in the SAME fused 3D stacked layout
+# as our CB experts, and vLLM's ``CompressedTensorsW4A4Nvfp4MoEMethod.
+# create_weights`` registers params that match them EXACTLY (vLLM
+# ``model_executor/layers/quantization/compressed_tensors/
+# compressed_tensors_moe/compressed_tensors_moe_w4a4_nvfp4.py``:82/95/109/125/
+# 136/145/156/165). Shapes below are that method's own, for E experts, hidden
+# ``H``, per-partition intermediate ``I``, group size ``g``:
+#
+#   checkpoint suffix                          shape          dtype   -> param
+#   .experts.gate_up_proj.weight_packed        (E, 2I, H//2)  u8       w13_weight_packed
+#   .experts.down_proj.weight_packed           (E, H,  I//2)  u8       w2_weight_packed
+#   .experts.gate_up_proj.weight_scale         (E, 2I, H//g)  f8e4m3   w13_weight_scale
+#   .experts.down_proj.weight_scale            (E, H,  I//g)  f8e4m3   w2_weight_scale
+#   .experts.gate_up_proj.weight_global_scale  (E, 2)         f32      w13_weight_global_scale
+#   .experts.down_proj.weight_global_scale     (E,)           f32      w2_weight_global_scale
+#   .experts.gate_up_proj.input_global_scale   (E, 2)         f32      w13_input_global_scale
+#   .experts.down_proj.input_global_scale      (E,)           f32      w2_input_global_scale
+#
+# Row/shard ORDER is gate-first, and that is what stock vLLM expects, so a
+# whole-stack ``copy_`` reproduces byte-for-byte what the per-expert
+# weight_loader would have built — no de-fusing and no re-fusing. Read out of
+# vLLM ``model_executor/layers/fused_moe/routed_experts.py``: ``_load_w13``
+# (:436) narrows ``w1``/gate_proj to rows ``[0:I]`` and ``w3``/up_proj to
+# ``[I:2I]``, and ``_load_per_tensor_weight_scale`` (:278) uses
+# ``idx = 0 if shard_id == "w1" else 1`` — i.e. ``[:, 0] = gate, [:, 1] = up``
+# for the two ``(E, 2)`` global-scale stacks.
+#
+# Why these need an entry at all: ``FusedMoE.make_expert_params_mapping``
+# (routed_experts.py:906) emits weight names of the form
+# ``experts.{expert_id}.{proj}.`` only, so a FUSED stack matches nothing there
+# and falls through to the arch loader's final ``params_dict[name]`` ->
+# ``KeyError``. ``resolve_cb_expert_param`` below is purely table-driven, so
+# extending this table IS the whole fix, and it is generic: any fused
+# native-NVFP4 MoE export benefits; nothing here is arch-specific.
+#
+# The ``weight_scale`` pair is shared by both lanes: CB fp8 rungs and native
+# NVFP4 both land on ``w13_weight_scale`` / ``w2_weight_scale``, and the
+# resolver keys on the param that actually exists, so one entry serves both.
 _CB_EXPERT_SUFFIX_TO_LEAF: dict[str, str] = {
     ".experts.gate_up_proj.cb_qweight": "w13_cb_qweight",
     ".experts.down_proj.cb_qweight": "w2_cb_qweight",
     ".experts.gate_up_proj.weight_scale": "w13_weight_scale",
     ".experts.down_proj.weight_scale": "w2_weight_scale",
+    # -- native NVFP4 fused stacks (stock compressed-tensors MoE method) --
+    ".experts.gate_up_proj.weight_packed": "w13_weight_packed",
+    ".experts.down_proj.weight_packed": "w2_weight_packed",
+    ".experts.gate_up_proj.weight_global_scale": "w13_weight_global_scale",
+    ".experts.down_proj.weight_global_scale": "w2_weight_global_scale",
+    ".experts.gate_up_proj.input_global_scale": "w13_input_global_scale",
+    ".experts.down_proj.input_global_scale": "w2_input_global_scale",
 }
 
 
@@ -573,10 +630,15 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                     param = params_dict[mapped]
                     if tuple(param.shape) != tuple(w.shape):
                         raise ValueError(
-                            f"prismaquant CB expert '{name}' -> '{mapped}': "
-                            f"checkpoint shape {tuple(w.shape)} != param "
-                            f"shape {tuple(param.shape)} — stacked "
-                            "(E, out, bytes) contract violated")
+                            f"prismaquant fused expert '{name}' -> "
+                            f"'{mapped}': checkpoint shape {tuple(w.shape)} "
+                            f"!= param shape {tuple(param.shape)} — fused "
+                            "whole-stack contract violated. This is the "
+                            "INTENDED failure when the param is TP/EP-sharded "
+                            "(the param holds this rank's slice, so a "
+                            "whole-stack copy_ would silently place the wrong "
+                            "rows), or when gate/up are ordered differently "
+                            "from vLLM's gate-first w13 convention.")
                     param.data.copy_(w.to(param.dtype))
                     # fill path 2 of 2 (top-level): stamp the sentinel that
                     # process_weights_after_loading checks (cb_fill_guard).

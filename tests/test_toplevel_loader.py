@@ -736,3 +736,150 @@ def test_install_wraps_subclass_with_own_load_weights():
     # idempotent
     install_toplevel_cb_expert_loader(_Base)
     assert _Base.__dict__["load_weights"] is base_fn
+
+
+# ---------------------------------------------------------------------------
+# Fused NATIVE-NVFP4 expert stacks. A heterogeneous artifact leaves some layers
+# on stock compressed-tensors NVFP4; those experts are written as ONE 3D tensor
+# per role (…experts.gate_up_proj.weight_packed, …), which vLLM's per-expert
+# ``expert_params_mapping`` never matches -> the arch loader KeyErrors. The
+# params are the ones CompressedTensorsW4A4Nvfp4MoEMethod.create_weights
+# registers, and their shapes/order are identical to the whole-stack tensor, so
+# the same plain copy_ path serves them.
+# ---------------------------------------------------------------------------
+
+def test_map_cb_expert_name_native_nvfp4_fused_stack():
+    P = "model.layers.42.mlp.experts."
+    assert map_cb_expert_name(P + "gate_up_proj.weight_packed") == \
+        P + "w13_weight_packed"
+    assert map_cb_expert_name(P + "down_proj.weight_packed") == \
+        P + "w2_weight_packed"
+    assert map_cb_expert_name(P + "gate_up_proj.weight_global_scale") == \
+        P + "w13_weight_global_scale"
+    assert map_cb_expert_name(P + "down_proj.weight_global_scale") == \
+        P + "w2_weight_global_scale"
+    assert map_cb_expert_name(P + "gate_up_proj.input_global_scale") == \
+        P + "w13_input_global_scale"
+    assert map_cb_expert_name(P + "down_proj.input_global_scale") == \
+        P + "w2_input_global_scale"
+    # the block-scale pair is shared with the CB fp8-rung lane (one entry,
+    # both lanes) — the resolver keys on whichever param actually exists
+    assert map_cb_expert_name(P + "gate_up_proj.weight_scale") == \
+        P + "w13_weight_scale"
+
+
+def test_map_cb_expert_name_nvfp4_excludes_non_experts():
+    # The .experts. anchor governs the NVFP4 suffixes exactly as it does the CB
+    # ones: dense / shared-expert NVFP4 tensors reach the ORIGINAL loader, which
+    # already handles them via the arch's stacked_params_mapping.
+    for n in [
+        "model.layers.0.mlp.gate_up_proj.weight_packed",          # dense L0
+        "model.layers.0.mlp.down_proj.weight_packed",
+        "model.layers.5.mlp.shared_mlp.gate_proj.weight_packed",  # shared expert
+        "model.layers.5.mlp.shared_mlp.down_proj.input_global_scale",
+        "model.layers.1.self_attn.qkv_proj.weight_packed",        # dense attn
+        # per-expert (unfused) NVFP4 — vLLM's expert_params_mapping owns these
+        "model.layers.7.mlp.experts.3.gate_proj.weight_packed",
+    ]:
+        assert map_cb_expert_name(n) is None, n
+
+
+def test_wrapper_routes_native_nvfp4_fused_stack():
+    """End-to-end: the eight fused native-NVFP4 tensors land in the eight params
+    CompressedTensorsW4A4Nvfp4MoEMethod registers, none leaks to the original."""
+    E, HID, INTER, GROUP = 4, 32, 16, 16
+    P = "model.layers.42.mlp.experts.routed_experts."   # SharedFusedMoE nesting
+
+    class _FakeCausalLM:
+        def __init__(self):
+            self._params = {
+                P + "w13_weight_packed":
+                    torch.zeros(E, 2 * INTER, HID // 2, dtype=torch.uint8),
+                P + "w2_weight_packed":
+                    torch.zeros(E, HID, INTER // 2, dtype=torch.uint8),
+                P + "w13_weight_scale":
+                    torch.zeros(E, 2 * INTER, HID // GROUP,
+                                dtype=torch.float8_e4m3fn),
+                P + "w2_weight_scale":
+                    torch.zeros(E, HID, INTER // GROUP,
+                                dtype=torch.float8_e4m3fn),
+                P + "w13_weight_global_scale": torch.zeros(E, 2),
+                P + "w2_weight_global_scale": torch.zeros(E),
+                P + "w13_input_global_scale": torch.zeros(E, 2),
+                P + "w2_input_global_scale": torch.zeros(E),
+                "model.layers.42.mlp.gate.weight": torch.zeros(E, HID),
+            }
+            self.delegated = []
+
+        def named_parameters(self):
+            return list(self._params.items())
+
+        def load_weights(self, weights):     # ORIGINAL (stub stock loader)
+            loaded = set()
+            for name, w in weights:
+                self.delegated.append(name)
+                if name in self._params:
+                    self._params[name].copy_(w)
+                    loaded.add(name)
+            return loaded
+
+    install_toplevel_cb_expert_loader(_FakeCausalLM)
+    m = _FakeCausalLM()
+    C = "model.layers.42.mlp.experts."        # checkpoint: flat, no nesting
+    loaded = m.load_weights(iter([
+        (C + "gate_up_proj.weight_packed",
+         torch.full((E, 2 * INTER, HID // 2), 7, dtype=torch.uint8)),
+        (C + "down_proj.weight_packed",
+         torch.full((E, HID, INTER // 2), 9, dtype=torch.uint8)),
+        (C + "gate_up_proj.weight_scale",
+         torch.full((E, 2 * INTER, HID // GROUP), 2.0).to(torch.float8_e4m3fn)),
+        (C + "down_proj.weight_scale",
+         torch.full((E, HID, INTER // GROUP), 3.0).to(torch.float8_e4m3fn)),
+        (C + "gate_up_proj.weight_global_scale", torch.full((E, 2), 4.0)),
+        (C + "down_proj.weight_global_scale", torch.full((E,), 5.0)),
+        (C + "gate_up_proj.input_global_scale", torch.full((E, 2), 6.0)),
+        (C + "down_proj.input_global_scale", torch.full((E,), 8.0)),
+        ("model.layers.42.mlp.gate.weight", torch.full((E, HID), 1.0)),
+    ]))
+
+    assert torch.all(m._params[P + "w13_weight_packed"] == 7)
+    assert torch.all(m._params[P + "w2_weight_packed"] == 9)
+    assert torch.all(m._params[P + "w13_weight_scale"].float() == 2.0)
+    assert torch.all(m._params[P + "w2_weight_scale"].float() == 3.0)
+    assert torch.all(m._params[P + "w13_weight_global_scale"] == 4.0)
+    assert torch.all(m._params[P + "w2_weight_global_scale"] == 5.0)
+    assert torch.all(m._params[P + "w13_input_global_scale"] == 6.0)
+    assert torch.all(m._params[P + "w2_input_global_scale"] == 8.0)
+    # router still delegates; no expert tensor leaks (no double-load)
+    assert m.delegated == ["model.layers.42.mlp.gate.weight"]
+    assert loaded == set(m._params)
+
+
+def test_wrapper_nvfp4_sharded_param_raises_diagnosable_error():
+    """A TP/EP-sharded param holds only this rank's slice, so a whole-stack
+    copy_ would silently place the wrong rows. The shape guard must fire, and
+    say so."""
+    E, HID, INTER = 4, 32, 16
+
+    class _FakeCausalLM:
+        def __init__(self):
+            self._params = {           # EP=2: half the experts on this rank
+                "model.layers.42.mlp.experts.w13_weight_packed":
+                    torch.zeros(E // 2, 2 * INTER, HID // 2, dtype=torch.uint8),
+            }
+
+        def named_parameters(self):
+            return list(self._params.items())
+
+        def load_weights(self, weights):
+            for _ in weights:
+                pass
+            return set()
+
+    install_toplevel_cb_expert_loader(_FakeCausalLM)
+    m = _FakeCausalLM()
+    with pytest.raises(ValueError, match="TP/EP-sharded"):
+        m.load_weights(iter([
+            ("model.layers.42.mlp.experts.gate_up_proj.weight_packed",
+             torch.zeros(E, 2 * INTER, HID // 2, dtype=torch.uint8)),
+        ]))
