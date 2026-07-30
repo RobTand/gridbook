@@ -40,6 +40,35 @@ except Exception:  # pragma: no cover - older vLLM
 
 _MOE_LEAVES = ("gate_up_proj", "down_proj", "gate_proj", "up_proj")
 
+# MoE target leaf -> the PACKED STACK it lands in (w13 = the fused gate_up
+# buffer, w2 = down). Unfused ``gate_proj``/``up_proj`` targets fold into the
+# gate_up_proj stack and must therefore agree with each other
+# (``_moe_stack_schemes_for_prefix`` asserts it). The stack, not the layer, is
+# the unit a CB byte width is allocated for — see that method's docstring.
+_MOE_STACK_OF = {
+    "gate_up_proj": "gate_up_proj",
+    "gate_proj": "gate_up_proj",
+    "up_proj": "gate_up_proj",
+    "down_proj": "down_proj",
+}
+assert set(_MOE_STACK_OF) == set(_MOE_LEAVES)   # one list of MoE leaves
+
+def _scheme_signature(scheme: dict) -> tuple:
+    """Hashable, lossless signature of a resolved scheme.
+
+    Do not maintain a hand-picked field list here: exporter revisions may add a
+    format-bearing field, and treating two such schemes as interchangeable
+    would recreate the silent per-stack aliasing bug this resolver prevents.
+    """
+    def freeze(value):
+        if isinstance(value, dict):
+            return tuple(sorted((k, freeze(v)) for k, v in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(freeze(v) for v in value)
+        return value
+
+    return freeze(scheme)
+
 # vLLM fuses these siblings into one module; packed_modules_mapping is populated
 # by dispatch time, but we keep the standard mapping as a fallback.
 _FUSED_FALLBACK = {
@@ -364,46 +393,113 @@ class PrismaQuantConfig(QuantizationConfig):
         # FusedMoE expert stacks (RoutedExperts): a CB expert group -> our MoE
         # method; else delegate to the stock CT MoE path.
         if RoutedExperts is not None and isinstance(layer, RoutedExperts):
-            scheme = self._moe_scheme_for_prefix(prefix)
-            if scheme is not None:
+            # Per-STACK, not per-layer: the two packed expert buffers may sit
+            # on different rungs (see _moe_stack_schemes_for_prefix).
+            stacks = self._moe_stack_schemes_for_prefix(prefix)
+            if stacks is not None:
                 from .moe import PrismaQuantCBMoEMethod
                 return PrismaQuantCBMoEMethod(
-                    self, layer.moe_config, scheme, prefix)
+                    self, layer.moe_config, stacks, prefix)
             if self.ct_config is not None:
                 return self.ct_config.get_quant_method(layer, prefix)
             return None
         return None
 
-    def _moe_scheme_for_prefix(self, prefix: str) -> dict | None:
-        """A CB expert stack (targets like ``…experts.gate_up_proj`` /
-        ``…experts.down_proj``) under this FusedMoE prefix — return its scheme
-        (uniform per layer, so any matching target's scheme is the layer's)."""
-        # Canonicalise BOTH sides, exactly as ``_scheme_for_prefix`` does for
-        # Linears. Without this the multimodal wrapper breaks experts ONLY:
-        # vLLM hands us the serving prefix ``language_model.model.layers.N.mlp.
-        # experts`` while the checkpoint-namespace targets read
-        # ``model.language_model.layers.N.mlp.experts.gate_up_proj``, so a raw
-        # ``startswith`` misses, no CB MoE method is created, no
-        # ``w13_cb_qweight``/``w2_cb_qweight`` params exist, and the arch's own
-        # expert mapping then derives ``experts.w2_weight.cb_qweight`` and
-        # AttributeErrors (35B CB serve boot). Dense Linears were unaffected
-        # because their lookup already canonicalised — that asymmetry WAS the bug.
-        #
-        # Structurally different from the dense lookup (the TARGET is longer
-        # than the prefix here, so this is a ``startswith``, not a key lookup),
-        # but the namespace question is the same one — so it comes from the same
-        # ``_candidate_bases``, on BOTH sides. Cross-vintage matches are safe
-        # here: ``_canonical_prefix`` only rewrites the ``language_model``
-        # wrapper, i.e. it renames the SAME module; it can never move a match to
-        # a different layer index or leaf.
+    def _moe_stack_schemes_for_prefix(self, prefix: str) -> dict | None:
+        """The CB scheme of EACH packed expert stack under this FusedMoE
+        prefix: ``{"gate_up_proj": scheme, "down_proj": scheme}`` — or ``None``
+        when no CB expert target lives under the prefix at all.
+
+        RESOLUTION IS PER (LAYER, STACK), NOT PER LAYER.  A graded checkpoint
+        may place ``…experts.gate_up_proj`` on one rung and
+        ``…experts.down_proj`` on another (different ``k`` / ``n_sub`` /
+        ``type_size`` / ``codebook_ref``).  The two stacks are separately
+        allocated ``(E, out, row_bytes)`` byte buffers whose last dim is a
+        function of the stack's OWN ``type_size``, so collapsing the layer onto
+        one scheme mis-sizes the other buffer and the load dies in
+        ``_cb_load_weights`` with a shape mismatch — and, for two rungs that
+        happen to share a ``type_size``, would instead decode the whole stack
+        against the wrong codebook SILENTLY.
+
+        Unfused ``gate_proj``/``up_proj`` targets fold into the ``gate_up_proj``
+        stack (``_MOE_STACK_OF``) and must agree with each other, because they
+        land in the ONE ``w13`` buffer; disagreement is an exporter bug and is
+        raised, not resolved.
+
+        Namespace handling is ``_scheme_for_prefix``'s, unchanged: canonicalise
+        BOTH sides via ``_candidate_bases``.  Without it the multimodal wrapper
+        breaks experts ONLY: vLLM hands us the serving prefix
+        ``language_model.model.layers.N.mlp.experts`` while the
+        checkpoint-namespace targets read
+        ``model.language_model.layers.N.mlp.experts.gate_up_proj``, so a raw
+        ``startswith`` misses, no CB MoE method is created, no
+        ``w13_cb_qweight``/``w2_cb_qweight`` params exist, and the arch's own
+        expert mapping then derives ``experts.w2_weight.cb_qweight`` and
+        AttributeErrors (35B CB serve boot).  Dense Linears were unaffected
+        because their lookup already canonicalised — that asymmetry WAS the bug.
+
+        Structurally different from the dense lookup (the TARGET is longer than
+        the prefix here, so this is a ``startswith``, not a key lookup), but the
+        namespace question is the same one — so it comes from the same
+        ``_candidate_bases``, on BOTH sides.  Cross-vintage matches are safe
+        here: ``_canonical_prefix`` only rewrites the ``language_model``
+        wrapper, i.e. it renames the SAME module; it can never move a match to a
+        different layer index or leaf.
+        """
         bases = _candidate_bases(prefix)
+        out: dict[str, dict] = {}
+        claimed: dict[str, str] = {}
         for name, sch in self.target_scheme.items():
-            if name.split(".")[-1] not in _MOE_LEAVES:
+            stack = _MOE_STACK_OF.get(name.split(".")[-1])
+            if stack is None:
                 continue
             variants = _candidate_bases(name)
-            if any(v.startswith(b) for v in variants for b in bases):
-                return sch
-        return None
+            # A target must be a DIRECT dotted child of this expert prefix.
+            # Raw startswith also matches neighbouring modules such as
+            # ``experts2`` and ``experts_backup`` and can assign their rungs to
+            # the wrong live layer.
+            if not any(v.startswith(b.rstrip(".") + ".")
+                       for v in variants for b in bases):
+                continue
+            prev = out.get(stack)
+            if prev is None:
+                out[stack] = sch
+                claimed[stack] = name
+            elif prev is not sch and prev != sch:
+                raise ValueError(
+                    f"[prismaquant] FusedMoE {prefix}: targets "
+                    f"{claimed[stack]!r} and {name!r} both land in the "
+                    f"{stack} expert buffer but carry DIFFERENT CB schemes — "
+                    f"fix the exporter's config_groups (one scheme per "
+                    f"(layer, stack))")
+        return out or None
+
+    def _moe_scheme_for_prefix(self, prefix: str) -> dict | None:
+        """The single CB scheme of a UNIFORM FusedMoE layer under *prefix*, or
+        ``None`` when no CB expert target lives there.
+
+        Thin accessor over ``_moe_stack_schemes_for_prefix`` for callers that
+        want one subscriptable scheme.  A layer whose two stacks are on
+        DIFFERENT rungs has no such answer, so this raises rather than pick one
+        — picking one is exactly the bug the per-stack resolution fixes.  The
+        serving path does not use this: ``get_quant_method`` passes the
+        per-stack mapping straight to ``PrismaQuantCBMoEMethod``.
+        """
+        stacks = self._moe_stack_schemes_for_prefix(prefix)
+        if stacks is None:
+            return None
+        first = next(iter(stacks.values()))
+        sig = _scheme_signature(first)
+        for sch in stacks.values():
+            if _scheme_signature(sch) != sig:
+                rungs = ", ".join(
+                    "{}=k{}/ts{}".format(s, v.get("k"), v.get("type_size"))
+                    for s, v in sorted(stacks.items()))
+                raise ValueError(
+                    f"[prismaquant] FusedMoE {prefix}: expert stacks are on "
+                    f"different CB rungs ({rungs}) — there is no single layer "
+                    f"scheme; use _moe_stack_schemes_for_prefix")
+        return first
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper):
         self._ensure_resolved()

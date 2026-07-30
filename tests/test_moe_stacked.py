@@ -103,3 +103,36 @@ def test_moe_method_buffer_shapes():
     assert layer.w2_cb_qweight.shape == (E, hidden, _row_bytes(inter, ts))
     assert layer.w13_weight_scale.shape == (E, 2 * inter)
     assert layer.w2_weight_scale.shape == (E, hidden)
+
+
+def test_moe_method_buffer_shapes_graded_rungs():
+    """vLLM-dependent: a GRADED layer — gate_up on k44 (type_size 176), down on
+    k36 (type_size 144) — must allocate each stacked buffer at ITS OWN byte
+    width. Resolving one scheme per layer sizes the second buffer with the
+    other stack's type_size, and the checkpoint tensor then fails the shape
+    check in the CB load hook."""
+    pytest.importorskip("vllm")
+    import types
+    from gridbook.moe import PrismaQuantCBMoEMethod, _row_bytes
+
+    E, hidden, inter = 8, 512, 1024
+    hi = {"grid": "fp8", "mode": "product", "k": 44, "n_sub": 4,
+          "type_size": 176, "codebook_ref": ["cb.k44"]}
+    lo = {"grid": "fp8", "mode": "product", "k": 36, "n_sub": 4,
+          "type_size": 144, "codebook_ref": ["cb.k36"]}
+    m = PrismaQuantCBMoEMethod.__new__(PrismaQuantCBMoEMethod)
+    # bypass FusedMoEMethodBase.__init__ (needs a real FusedMoEConfig); test the
+    # per-stack buffer-shape logic directly.
+    m.quant_config = None; m.prefix = "x"; m.is_fp4 = False; m.is_v2 = False
+    m.stack_scheme = {"w13": hi, "w2": lo}
+    m.scheme = hi
+    m.k = {"w13": 44, "w2": 36}
+    m.n_sub = {"w13": 4, "w2": 4}
+    m.type_size = {"w13": 176, "w2": 144}
+    layer = types.SimpleNamespace()
+    layer.register_parameter = lambda n, p: setattr(layer, n, p)
+    m.create_weights(layer, E, hidden, inter, torch.bfloat16, weight_loader=None)
+    assert layer.w13_cb_qweight.shape == (E, 2 * inter, _row_bytes(hidden, 176))
+    assert layer.w2_cb_qweight.shape == (E, hidden, _row_bytes(inter, 144))
+    # The two widths must actually differ, or the test proves nothing.
+    assert layer.w13_cb_qweight.shape[2] != _row_bytes(hidden, 144)

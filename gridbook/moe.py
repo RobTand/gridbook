@@ -4,8 +4,10 @@
 Each expert stack ships as ONE tensor per role: ``<q>.cb_qweight`` uint8
 ``(E, out, (in/256)·type_size)`` (+ fp8 ``<q>.weight_scale`` ``(E, out)``), where
 ``cb_qweight[e]`` is exactly the dense §1 superblock layout. All experts of a
-stack share one format + one codebook (per-layer uniformity, union-find at
-export; asserted here). Serving mirrors ``GGUFMoEMethod``: register w13/w2 expert
+stack share one format + one codebook (per-STACK uniformity, union-find at
+export; asserted here) — but the two stacks of a layer may sit on DIFFERENT
+rungs, so every byte width, codebook and k_bits below is resolved per stack.
+Serving mirrors ``GGUFMoEMethod``: register w13/w2 expert
 buffers, then a per-expert **transient** decode (one expert's ``[out, in]`` bf16
 tile live at a time — INV-1, the dense transient pattern extended to experts).
 
@@ -72,6 +74,34 @@ def _row_bytes(in_features: int, type_size: int) -> int:
     return (in_features // codec.SUPERBLOCK) * type_size
 
 
+def _scale_coding_kind(scheme: dict):
+    """Normalise the two accepted ``scale_coding`` representations."""
+    sc = scheme.get("scale_coding")
+    return sc.get("kind") if isinstance(sc, dict) else sc
+
+
+def _scale_coding_table(scheme: dict):
+    """Return the two-tier compose sub-table for *scheme*, if applicable."""
+    if _scale_coding_kind(scheme) != codec.SCALE_CODING_TWO_TIER:
+        return None
+    sc = scheme.get("scale_coding")
+    if isinstance(sc, dict):
+        return sc.get("table") or codec.TWO_TIER_SUB_TABLE
+    return codec.TWO_TIER_SUB_TABLE
+
+
+def _scheme_signature(scheme: dict) -> tuple:
+    """Lossless signature used only to decide whether legacy aliases are safe."""
+    def freeze(value):
+        if isinstance(value, dict):
+            return tuple(sorted((k, freeze(v)) for k, v in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(freeze(v) for v in value)
+        return value
+
+    return freeze(scheme)
+
+
 # torch._grouped_mm — the single-launch ragged grouped GEMM (2d×3d: mat_a
 # [P,K] × mat_b [G,K,N] with cumulative-end offsets [G] -> [P,N]) that collapses
 # the batched-prefill per-expert-segment GEMMs into ONE kernel. Opt-in
@@ -100,31 +130,90 @@ def _disable_grouped_mm(exc) -> None:
 
 
 class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
-    """CB decode for RoutedExperts (FusedMoE) — one uniform CB format per layer."""
+    """CB decode for RoutedExperts — one CB format per (layer, stack).
+
+    A plain scheme remains accepted for uniform callers and fixtures.  The
+    serving resolver passes ``gate_up_proj`` and ``down_proj`` separately so
+    their rung, byte width and codebook may differ.  Grid and scale-coding kind
+    remain layer-wide because activation QDQ and kernel-family selection are
+    layer-wide decisions.
+    """
 
     def __init__(self, quant_config, moe: FusedMoEConfig, scheme: dict,
                  prefix: str) -> None:
         super().__init__(moe)
         self.quant_config = quant_config
-        self.scheme = scheme
         self.prefix = prefix
-        self.is_fp4 = scheme["grid"] == "fp4"
-        self.k = int(scheme["k"])
-        self.n_sub = int(scheme["n_sub"])
-        self.type_size = int(scheme["type_size"])
-        sc = scheme.get("scale_coding")
-        if isinstance(sc, dict):
-            self.is_v2 = sc.get("kind") == codec.SCALE_CODING_TWO_TIER
-            self._sub_table = sc.get("table") or codec.TWO_TIER_SUB_TABLE
-        else:
-            self.is_v2 = (sc == codec.SCALE_CODING_TWO_TIER)
-            self._sub_table = codec.TWO_TIER_SUB_TABLE if self.is_v2 else None
+        if "grid" in scheme:                  # single scheme -> both stacks
+            per = {"w13": scheme, "w2": scheme}
+        else:                                 # per-stack mapping
+            missing = {"gate_up_proj", "down_proj"} - set(scheme)
+            if missing:
+                raise ValueError(
+                    f"{prefix}: the CB config groups cover only "
+                    f"{sorted(scheme)} — a CB FusedMoE layer needs BOTH "
+                    f"gate_up_proj and down_proj (missing {sorted(missing)}); "
+                    f"a half-CB layer cannot serve, the other stack has no "
+                    f"owner")
+            per = {"w13": scheme["gate_up_proj"], "w2": scheme["down_proj"]}
+        self.stack_scheme = per
+        self.scheme = per["w13"]              # layer-level attrs read from w13
+        self._stack_formats_match = (
+            _scheme_signature(per["w13"]) == _scheme_signature(per["w2"]))
+        if (per["w13"]["grid"] != per["w2"]["grid"]
+                or _scale_coding_kind(per["w13"])
+                != _scale_coding_kind(per["w2"])):
+            raise NotImplementedError(
+                f"{prefix}: mixed GRID / scale-coding across the two expert "
+                f"stacks (gate_up={per['w13'].get('grid')}/"
+                f"{_scale_coding_kind(per['w13'])}, "
+                f"down={per['w2'].get('grid')}/"
+                f"{_scale_coding_kind(per['w2'])}) is not supported; only the "
+                f"RUNG (k / n_sub / type_size / codebook_ref) may differ")
+        self.is_fp4 = per["w13"]["grid"] == "fp4"
+        # PER-STACK rung constants. Dicts keyed 'w13'/'w2' — read them through
+        # ``_fmt``, never directly: that accessor also serves the plain-int
+        # attrs the GPU test fixtures set on a ``__new__``-built method.
+        self.k = {w: int(per[w]["k"]) for w in ("w13", "w2")}
+        self.n_sub = {w: int(per[w]["n_sub"]) for w in ("w13", "w2")}
+        self.type_size = {w: int(per[w]["type_size"]) for w in ("w13", "w2")}
+        self.is_v2 = (_scale_coding_kind(per["w13"])
+                      == codec.SCALE_CODING_TWO_TIER)
+        # Retained for back-compat readers; the compose tables are now built
+        # per stack from ``stack_scheme`` in process_weights_after_loading.
+        self._sub_table = _scale_coding_table(per["w13"])
         if self.is_fp4 and not self.is_v2:
             # fp4-v1 expert transient is a follow-up (no compose-during-expand);
             # export MoE experts as fp8-CB or fp4 two-tier v2.
             raise NotImplementedError(
                 f"{prefix}: fp4 MoE experts require two-tier v2 scale coding "
                 "(fp4-v1 expert transient not yet implemented)")
+
+    # -- per-stack accessors -------------------------------------------------
+    def _fmt(self, which: str) -> tuple[int, int, int]:
+        """``(k, n_sub, type_size)`` for stack *which* (``'w13'`` | ``'w2'``).
+
+        Falls back to the layer-uniform scalars when the attributes are plain
+        ints — GPU test fixtures build the method via ``__new__`` and set
+        ``m.k = 16`` etc., and those fixtures stay valid.
+        """
+        k, ns, ts = self.k, self.n_sub, self.type_size
+        if isinstance(k, dict):
+            return k[which], ns[which], ts[which]
+        return int(k), int(ns), int(ts)
+
+    @staticmethod
+    def _cb(layer, attr: str, which: str) -> torch.Tensor:
+        """Per-stack layer tensor ``_cb_<attr>_<which>`` (``flat`` /
+        ``compose``), falling back to the uniform ``_cb_<attr>`` that test
+        fixtures set directly on the layer."""
+        t = getattr(layer, f"_cb_{attr}_{which}", None)
+        if t is not None:
+            return t
+        if getattr(layer, "_cb_stack_uniform", True) is False:
+            raise AttributeError(
+                f"graded CB MoE layer is missing per-stack {attr!r} for {which}")
+        return getattr(layer, f"_cb_{attr}")
 
     # -- weight buffers (stacked experts) ------------------------------------
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
@@ -140,8 +229,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # "Overwriting existing tensor attribute" assert — 35B first serve).
         attrs = dict(extra_weight_attrs)
         # w13 = gate_up: out=2*inter, in=hidden.  w2 = down: out=hidden, in=inter.
+        w13_ts = self._fmt("w13")[2]
+        w2_ts = self._fmt("w2")[2]
         w13 = torch.nn.Parameter(torch.empty(
-            E, 2 * inter, _row_bytes(hidden_size, self.type_size),
+            E, 2 * inter, _row_bytes(hidden_size, w13_ts),
             dtype=torch.uint8), requires_grad=False)
         set_weight_attrs(w13, {**attrs, "is_transposed": False})
         # Fill sentinel (cb_fill_guard): False until a fill path copies
@@ -153,7 +244,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_cb_qweight", w13)
 
         w2 = torch.nn.Parameter(torch.empty(
-            E, hidden_size, _row_bytes(inter, self.type_size),
+            E, hidden_size, _row_bytes(inter, w2_ts),
             dtype=torch.uint8), requires_grad=False)
         set_weight_attrs(w2, {**attrs, "is_transposed": False})
         mark_unfilled(w2)
@@ -223,25 +314,67 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         dev = layer.w13_cb_qweight.device
         E = layer.w13_cb_qweight.shape[0]
         codebooks = self.quant_config.get_codebooks()
-        ref = self.scheme["codebook_ref"]
-        names = ref if isinstance(ref, list) else [ref]
-        subs = [codebooks[n].to(dev) for n in names]
-        layer._cb_flat = codec.build_flat_codebook(subs)
+        stack_scheme = (getattr(self, "stack_scheme", None)
+                        or {"w13": self.scheme, "w2": self.scheme})
+        flats: dict[tuple, torch.Tensor] = {}
+        composes: dict[tuple, torch.Tensor] = {}
+        zero_compose = None
+        for which in ("w13", "w2"):
+            sch = stack_scheme[which]
+            ref = sch["codebook_ref"]
+            names = tuple(ref) if isinstance(ref, list) else (ref,)
+            if names not in flats:
+                flats[names] = codec.build_flat_codebook(
+                    [codebooks[n].to(dev) for n in names])
+            setattr(layer, f"_cb_flat_{which}", flats[names])
+
+            table = _scale_coding_table(sch)
+            if table is None:
+                if zero_compose is None:
+                    zero_compose = torch.zeros(
+                        1, dtype=torch.float32, device=dev)
+                compose = zero_compose
+            else:
+                table_key = tuple(table)
+                if table_key not in composes:
+                    composes[table_key] = codec.build_compose_table(
+                        list(table_key)).to(dev)
+                compose = composes[table_key]
+            setattr(layer, f"_cb_compose_{which}", compose)
+
+        # Legacy per-layer aliases are safe only when the COMPLETE resolved
+        # schemes match.  Equal codebook refs alone are insufficient: k/n_sub,
+        # row format or scale coding can still differ.  Delete aliases left by
+        # a reused/test layer so a stale consumer fails loudly on graded data.
+        uniform = (_scheme_signature(stack_scheme["w13"])
+                   == _scheme_signature(stack_scheme["w2"]))
+        layer._cb_stack_uniform = uniform
+        for attr in ("_cb_flat", "_cb_compose", "_cb_flat_fp8"):
+            if hasattr(layer, attr):
+                delattr(layer, attr)
+        if uniform:
+            layer._cb_flat = layer._cb_flat_w13
+            layer._cb_compose = layer._cb_compose_w13
+
         layer._cb_row0 = torch.zeros(1, dtype=torch.int32, device=dev)
-        if self.is_v2:
-            layer._cb_compose = codec.build_compose_table(
-                self._sub_table).to(dev)
-        else:
-            layer._cb_compose = torch.zeros(1, dtype=torch.float32, device=dev)
-        # Per-layer uniformity: one format for all experts (union-find at
-        # export). The stacked buffer is single-format by construction; assert
-        # the byte width matches the scheme so a mis-exported stack fails loudly.
-        exp_w13 = _row_bytes(layer._cb_hidden, self.type_size)
-        exp_w2 = _row_bytes(layer._cb_inter, self.type_size)
+        # Per-stack uniformity: each stacked buffer is single-format by
+        # construction.  Check it against that stack's own byte contract.
+        exp_w13 = _row_bytes(layer._cb_hidden, self._fmt("w13")[2])
+        exp_w2 = _row_bytes(layer._cb_inter, self._fmt("w2")[2])
         assert layer.w13_cb_qweight.shape[2] == exp_w13, (
             f"{self.prefix}: w13 byte width {layer.w13_cb_qweight.shape[2]} != "
-            f"{exp_w13} (type_size/uniformity mismatch)")
-        assert layer.w2_cb_qweight.shape[2] == exp_w2
+            f"{exp_w13} (type_size/per-stack-uniformity mismatch)")
+        assert layer.w2_cb_qweight.shape[2] == exp_w2, (
+            f"{self.prefix}: w2 byte width {layer.w2_cb_qweight.shape[2]} != "
+            f"{exp_w2} (type_size/per-stack-uniformity mismatch)")
+
+        # Warm all resident representations before a captured/compiled forward.
+        if self.is_fp4:
+            self._fp4_fused_tables(layer, "w13")
+            self._fp4_fused_tables(layer, "w2")
+        else:
+            self._flat_fp8(layer, "w13")
+            self._flat_fp8(layer, "w2")
         layer._cb_E = E
         from .ops import register_cb_layer
         layer._cb_layer_id = register_cb_layer(self, layer)
@@ -255,16 +388,18 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         out = qw.shape[0]
         # w13 in=hidden (gate_up), w2 in=inter (down).
         in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
+        k, n_sub, type_size = self._fmt(which)                 # per-stack rung
         qwp = codec.pad_qweight(qw.contiguous())
         row0 = torch.zeros(out, dtype=torch.int32, device=qw.device)
         if self.is_fp4:                                        # fp4 v2
             W = expand_fp4_v2_to_weight(
-                qwp, layer._cb_flat, row0, layer._cb_compose,
-                out, in_f, self.k, self.n_sub, self.type_size)
+                qwp, self._cb(layer, "flat", which), row0,
+                self._cb(layer, "compose", which),
+                out, in_f, k, n_sub, type_size)
         else:                                                  # fp8
-            val = expand_cb_to_value(qwp, layer._cb_flat, row0,
-                                     out, in_f, self.k, self.n_sub,
-                                     self.type_size, is_fp4=False)
+            val = expand_cb_to_value(qwp, self._cb(layer, "flat", which), row0,
+                                     out, in_f, k, n_sub,
+                                     type_size, is_fp4=False)
             ws = getattr(layer, f"{which}_weight_scale")[e].to(torch.float32)
             W = (val.float() * ws[:, None]).to(torch.bfloat16)
         return W                                               # (out, in) bf16
@@ -487,15 +622,29 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         ok = getattr(layer, "_cb_gf4_ok", None)
         if ok is not None:
             return ok
+        def _rung_ok(which: str) -> bool:
+            k, n_sub, type_size = self._fmt(which)
+            if not (12 <= k <= 24 and n_sub in (1, 2)
+                    and type_size == 4 * k + 9):
+                return False
+            if n_sub == 2:
+                w0 = k - k // 2
+                return ((1 << w0) + (1 << (k // 2))) * 2 <= 16384
+            return True
+
         ok = (self.is_fp4 and self.is_v2
-              and 12 <= self.k <= 24
-              and self.n_sub in (1, 2)
-              and self.type_size == 4 * self.k + 9
+              and all(_rung_ok(which) for which in ("w13", "w2"))
               and layer._cb_hidden % codec.SUPERBLOCK == 0
               and layer._cb_inter % codec.SUPERBLOCK == 0)
-        if ok and self.n_sub == 2:
-            w0 = self.k - self.k // 2
-            ok = ((1 << w0) + (1 << (self.k // 2))) * 2 <= 16384
+        if ok:
+            for which, in_f in (("w13", layer._cb_hidden),
+                                ("w2", layer._cb_inter)):
+                qw = getattr(layer, f"{which}_cb_qweight")
+                row_bytes = _row_bytes(in_f, self._fmt(which)[2])
+                ok = ok and (qw.dim() == 3 and qw.stride(2) == 1
+                             and qw.stride(1) == row_bytes
+                             and qw.shape[2] == row_bytes
+                             and qw.stride(0) == qw.shape[1] * row_bytes)
         if ok:
             try:
                 import vllm._custom_ops as vops
@@ -508,6 +657,29 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             ok = fext is not None and hasattr(fext, "cb_fused_fp4_moe_grouped")
         layer._cb_gf4_ok = bool(ok)
         return layer._cb_gf4_ok
+
+    def _fp4_fused_tables(self, layer, which: str):
+        """Return the fp4 value LUT and compose bytes for one expert stack."""
+        attr = f"_cb_fp4_gf_{which}"
+        cached = getattr(layer, attr, None)
+        if cached is not None:
+            return cached
+        k, n_sub, _type_size = self._fmt(which)
+        scheme = (getattr(self, "stack_scheme", None)
+                  or {"w13": self.scheme, "w2": self.scheme})[which]
+        table = _scale_coding_table(scheme)
+        if table is None:
+            raise ValueError(
+                f"{self.prefix}.{which}: fp4 fused tables require two-tier "
+                "scale coding")
+        cached = (
+            codec.build_fp4_value_lut(
+                self._cb(layer, "flat", which), k, n_sub).to(
+                    layer.w13_cb_qweight.device),
+            codec.build_compose_u8(table).to(layer.w13_cb_qweight.device),
+        )
+        setattr(layer, attr, cached)
+        return cached
 
     def _fp4_quant(self, x2: torch.Tensor):
         """Native NVFP4 activation quant (packed e2m1 + swizzled ue4m3 SFA +
@@ -543,18 +715,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         inter = layer._cb_inter
         N1 = 2 * inter
         d = N1 // 2
-        kb = self.k
-
-        luts = getattr(layer, "_cb_fp4_gf", None)
-        if luts is None:
-            lut = codec.build_fp4_value_lut(
-                layer._cb_flat, kb, self.n_sub).to(dev)
-            compose = codec.build_compose_u8(self._sub_table).to(dev)
-            luts = (lut, compose,
-                    torch.ones(N1, dtype=torch.float32, device=dev),
+        k13, ns13, ts13 = self._fmt("w13")
+        k2, ns2, ts2 = self._fmt("w2")
+        lut13, compose13 = self._fp4_fused_tables(layer, "w13")
+        lut2, compose2 = self._fp4_fused_tables(layer, "w2")
+        ones = getattr(layer, "_cb_fp4_gf_ones", None)
+        if ones is None:
+            ones = (torch.ones(N1, dtype=torch.float32, device=dev),
                     torch.ones(Kh, dtype=torch.float32, device=dev))
-            layer._cb_fp4_gf = luts
-        lut, compose, ones_n1, ones_kh = luts
+            layer._cb_fp4_gf_ones = ones
+        ones_n1, ones_kh = ones
         w13 = layer.w13_cb_qweight.data
         w2 = layer.w2_cb_qweight.data
 
@@ -584,9 +754,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         aq1, sfa1, recip1 = self._fp4_quant(a_pad)
         del a_pad
         gate_up = fext.cb_fused_fp4_moe_grouped(
-            aq1, sfa1, w13, lut, compose,
+            aq1, sfa1, w13, lut13, compose13,
             recip1.expand(Mp).contiguous(), ones_n1, expert_ids,
-            N1, Kh, kb, self.n_sub, self.type_size, True, tile_m)   # [Mp, N1]
+            N1, Kh, k13, ns13, ts13, True, tile_m)       # [Mp, N1]
         del aq1, sfa1
         a = torch.empty((Mp, d), dtype=gate_up.dtype, device=dev)
         apply_moe_activation(act, a, gate_up)                       # silu(g)*u
@@ -596,9 +766,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         aq2, sfa2, recip2 = self._fp4_quant(a)
         del a
         y = fext.cb_fused_fp4_moe_grouped(
-            aq2, sfa2, w2, lut, compose,
+            aq2, sfa2, w2, lut2, compose2,
             recip2.expand(Mp).contiguous(), ones_kh, expert_ids,
-            Kh, inter, kb, self.n_sub, self.type_size, True, tile_m)
+            Kh, inter, k2, ns2, ts2, True, tile_m)
         del aq2, sfa2
 
         pw_pad = pw_sorted.index_select(0, row_src)
@@ -616,7 +786,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
           * fp8-CB only (the fused kernel's LUT is the 4-sub-table e4m3
             codebook; fp4 two-tier composes a scale the prologue can't);
           * k in {28,32,36,40,44,48} — the KBits template dispatch, uniform
-            per layer by the export union-find;
+            per STACK by the export union-find and checked per stack, since
+            the two projections are separate launches with their own k_bits;
           * both projection K's are multiples of 256 (SUPERBLOCK, and the
             kernel's K%256 check);
           * packed row stride == row_bytes == (K/256)*4*k, which satisfies
@@ -626,10 +797,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         ok = getattr(layer, "_cb_gf_ok", None)
         if ok is not None:
             return ok
+
+        def _rung_ok(which: str) -> bool:
+            k, n_sub, ts = self._fmt(which)
+            return (n_sub == 4 and k in (28, 32, 36, 40, 44, 48)
+                    and ts == 4 * k)
+
         ok = (not self.is_fp4
-              and self.n_sub == 4
-              and self.k in (28, 32, 36, 40, 44, 48)
-              and self.type_size == 4 * self.k
+              and all(_rung_ok(w) for w in ("w13", "w2"))
               and layer._cb_hidden % codec.SUPERBLOCK == 0
               and layer._cb_inter % codec.SUPERBLOCK == 0
               and hasattr(layer, "w13_weight_scale"))
@@ -644,7 +819,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             for which, in_f in (("w13", layer._cb_hidden),
                                 ("w2", layer._cb_inter)):
                 qw = getattr(layer, f"{which}_cb_qweight")
-                rb = _row_bytes(in_f, self.type_size)
+                rb = _row_bytes(in_f, self._fmt(which)[2])
                 # stride(0) matters only to R2, which hands the WHOLE stack to
                 # the kernel and TORCH_CHECKs the expert stride; checking it
                 # here keeps an exotic layout a silent fall-through rather than
@@ -716,8 +891,12 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         inter = layer._cb_inter
         N1 = 2 * inter                               # w13 out (gate_up)
         d = N1 // 2
-        lut = self._stock_cb_flat_fp8(layer)
-        kb = self.k
+        # Per-stack LUT + k_bits: each stage is its own launch, so the two may
+        # sit on different rungs (they are the same objects on a uniform layer).
+        lut13 = self._flat_fp8(layer, "w13")
+        lut2 = self._flat_fp8(layer, "w2")
+        kb13 = self._fmt("w13")[0]
+        kb2 = self._fmt("w2")[0]
         fp8_dtype = current_platform.fp8_dtype()
 
         out = torch.zeros_like(x)
@@ -753,9 +932,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
             # stage 1: gate_up = ae @ W13[e]^T (decode in prologue)
             gate_up = fext.cb_fused_prefill_mm_scaled(
-                ae, w13q[e], lut, ase,
+                ae, w13q[e], lut13, ase,
                 w13s[e].reshape(-1).to(torch.float32).contiguous(),
-                N1, Kh, kb)                                        # [m_e, N1]
+                N1, Kh, kb13)                                      # [m_e, N1]
             del ae, ase
             a = torch.empty((gate_up.shape[0], d), dtype=gate_up.dtype,
                             device=dev)
@@ -769,10 +948,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
             # stage 2: y = a2 @ W2[e]^T
             y = fext.cb_fused_prefill_mm_scaled(
-                a2.contiguous(), w2q[e], lut,
+                a2.contiguous(), w2q[e], lut2,
                 a2s.reshape(-1).to(torch.float32).contiguous(),
                 w2s[e].reshape(-1).to(torch.float32).contiguous(),
-                Kh, inter, kb)                                     # [m_e, Kh]
+                Kh, inter, kb2)                                    # [m_e, Kh]
             del a2, a2s
             y = y * pw_sorted[p0:p1, None].to(y.dtype)             # router w
             out.index_add_(0, rows, y.to(out.dtype))
@@ -804,33 +983,44 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         k_bits) pair can be uncompilable (shared-memory limit), so a hardcoded
         list would hand the kernel a tile it cannot serve.
 
-        Precedence: the per-rung query (the only one that knows this layer's
+        Precedence: the per-rung query (the only one that knows a stack's
         k_bits), then the general one, then the back-compat single default. An
         extension build predating the newer symbols therefore degrades to
         exactly the one tile it has always supported. Cached per layer (the
-        answer is a property of the build + the layer's rung)."""
+        answer is a property of the build + the layer's rungs).
+
+        BOTH STACKS, INTERSECTED. The padded row layout that TileM defines is a
+        property of the ROUTING (``cb_grouped_pad_routing``) and is shared by
+        the two stages, so a graded layer may only use a tile its w13 rung AND
+        its w2 rung are both compiled for. On a uniform layer the two queries
+        return the same set and the intersection is a no-op."""
         sizes = getattr(layer, "_cb_gf2_tiles", None)
         if sizes is not None:
             return sizes
         from .cuda_ext import get_fused_ext
         fext = get_fused_ext()
-        sizes = []
+        per_stack = []
         if fext is not None:
-            for getter, args in (
-                    ("cb_fused_moe_tile_sizes_for_kbits", (self.k,)),
-                    ("cb_fused_moe_tile_sizes", ()),
-                    ("cb_fused_moe_tile_m", ())):
-                fn = getattr(fext, getter, None)
-                if fn is None:
-                    continue
-                try:
-                    got = fn(*args)
-                except Exception:  # noqa: BLE001 — treat as "not offered"
-                    continue
-                got = [got] if isinstance(got, int) else list(got)
-                sizes = sorted({int(s) for s in got if int(s) > 0})
-                if sizes:
-                    break
+            for which in ("w13", "w2"):
+                got_sizes = []
+                for getter, args in (
+                        ("cb_fused_moe_tile_sizes_for_kbits",
+                         (self._fmt(which)[0],)),
+                        ("cb_fused_moe_tile_sizes", ()),
+                        ("cb_fused_moe_tile_m", ())):
+                    fn = getattr(fext, getter, None)
+                    if fn is None:
+                        continue
+                    try:
+                        got = fn(*args)
+                    except Exception:  # noqa: BLE001 — treat as "not offered"
+                        continue
+                    got = [got] if isinstance(got, int) else list(got)
+                    got_sizes = sorted({int(s) for s in got if int(s) > 0})
+                    if got_sizes:
+                        break
+                per_stack.append(set(got_sizes))
+        sizes = sorted(set.intersection(*per_stack)) if per_stack else []
         layer._cb_gf2_tiles = sizes
         return sizes
 
@@ -924,8 +1114,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         inter = layer._cb_inter
         N1 = 2 * inter                               # w13 out (gate_up)
         d = N1 // 2
-        lut = self._stock_cb_flat_fp8(layer)
-        kb = self.k
+        # Per-stack LUT + k_bits (one launch per stage — see R1).
+        lut13 = self._flat_fp8(layer, "w13")
+        lut2 = self._flat_fp8(layer, "w2")
+        kb13 = self._fmt("w13")[0]
+        kb2 = self._fmt("w2")[0]
         fp8_dtype = current_platform.fp8_dtype()
         # Never hardcode a tile: the kernel owns which TileM it compiled.
         tile_m = int(fext.cb_fused_moe_tile_m() if tile_m is None else tile_m)
@@ -974,8 +1167,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
         # stage 1: gate_up = a_pad @ W13[expert_of_tile]^T
         gate_up = self._grouped_call(
-            fext, (a_pad, layer.w13_cb_qweight.data, lut, as_pad, w13s,
-                   expert_ids, N1, Kh, kb), tile_m)                # [Mp, N1]
+            fext, (a_pad, layer.w13_cb_qweight.data, lut13, as_pad, w13s,
+                   expert_ids, N1, Kh, kb13), tile_m)              # [Mp, N1]
         del a_pad, as_pad
         if gate_up is None:                          # binding has no TileM knob
             return None
@@ -990,9 +1183,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # stage 2: y = a2 @ W2[expert_of_tile]^T — SAME expert_ids, the row
         # layout is a property of the routing, not of the projection.
         y = self._grouped_call(
-            fext, (a2.contiguous(), layer.w2_cb_qweight.data, lut,
+            fext, (a2.contiguous(), layer.w2_cb_qweight.data, lut2,
                    a2s.reshape(-1).to(torch.float32).contiguous(), w2s,
-                   expert_ids, Kh, inter, kb), tile_m)             # [Mp, Kh]
+                   expert_ids, Kh, inter, kb2), tile_m)            # [Mp, Kh]
         del a2, a2s
         if y is None:
             return None
@@ -1027,7 +1220,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if ok is not None:
             return ok
         ok = (not self.is_fp4
-              and self.n_sub == 4
+              and all(self._fmt(w)[1] == 4 for w in ("w13", "w2"))
               and hasattr(layer, "w13_weight_scale")
               and layer._cb_hidden % codec.SUPERBLOCK == 0
               and layer._cb_inter % codec.SUPERBLOCK == 0)
@@ -1035,7 +1228,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             for which, in_f in (("w13", layer._cb_hidden),
                                 ("w2", layer._cb_inter)):
                 qw = getattr(layer, f"{which}_cb_qweight")
-                rb = _row_bytes(in_f, self.type_size)
+                rb = _row_bytes(in_f, self._fmt(which)[2])
                 ok = ok and (qw.dim() == 3 and qw.stride(2) == 1
                              and qw.stride(1) == rb and qw.shape[2] == rb
                              and qw.stride(0) == qw.shape[1] * rb)
@@ -1313,7 +1506,6 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         inter = layer._cb_inter
         N1 = 2 * inter
         d = N1 // 2
-        lut = self._stock_cb_flat_fp8(layer)
         fp8_dtype = current_platform.fp8_dtype()
 
         # ---- routing: R1's construction verbatim (ONE host sync) -----------
@@ -1370,9 +1562,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             in_f = Kh if which == "w13" else inter
             rows = n_e * out_f
             packed = getattr(layer, f"{which}_cb_qweight")[e0:e1]
+            # Per-stack LUT + rung: a unit decodes exactly one stack, and the
+            # two stacks may sit on different rungs.
+            k, n_sub, type_size = self._fmt(which)
             pq_ops.cb_expand_fp8_into(
-                halves[buf_idx], packed.reshape(rows, -1), lut,
-                row0[:rows], rows, in_f, self.k, self.n_sub, self.type_size)
+                halves[buf_idx], packed.reshape(rows, -1),
+                self._flat_fp8(layer, which),
+                row0[:rows], rows, in_f, k, n_sub, type_size)
 
         def _weights(unit, buf_idx):
             which, e0, e1, _p0, _p1 = unit
@@ -1590,7 +1786,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             record_autotune_timings(
                 best, timings,
                 layer_prefix=self.prefix,
-                fmt=("NVFP4_CB_K%d" if self.is_fp4 else "FP8_CB_K%d") % self.k,
+                fmt=self._autotune_format(),
                 regime=autotune_shape_regime(
                     num_tokens if num_tokens is not None else 0,
                     n_experts=getattr(layer, "_cb_E", None),
@@ -1601,6 +1797,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             )
         except Exception:                      # noqa: BLE001 — never fail a serve
             pass
+
+    def _autotune_format(self) -> str:
+        """Stable cost-table key that preserves both rungs on graded layers."""
+        family = "NVFP4_CB" if self.is_fp4 else "FP8_CB"
+        f13 = self._fmt("w13")
+        f2 = self._fmt("w2")
+        if f13 == f2:
+            return f"{family}_K{f13[0]}"
+        return (f"{family}[w13=K{f13[0]}/N{f13[1]}/T{f13[2]},"
+                f"w2=K{f2[0]}/N{f2[1]}/T{f2[2]}]")
 
     # -- prefill: per-expert loop (bisection reference) ---------------------
     def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
@@ -1746,15 +1952,17 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         packed = getattr(layer, f"{which}_cb_qweight")[experts]   # [C,out,bytes]
         C, out_f = packed.shape[0], packed.shape[1]
         in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
+        k, n_sub, type_size = self._fmt(which)                 # per-stack rung
         qwp = codec.pad_qweight(packed.reshape(C * out_f, -1).contiguous())
         row0 = torch.zeros(C * out_f, dtype=torch.int32, device=packed.device)
         if self.is_fp4:                                        # fp4 two-tier v2
             W = expand_fp4_v2_to_weight(
-                qwp, layer._cb_flat, row0, layer._cb_compose,
-                C * out_f, in_f, self.k, self.n_sub, self.type_size)
+                qwp, self._cb(layer, "flat", which), row0,
+                self._cb(layer, "compose", which),
+                C * out_f, in_f, k, n_sub, type_size)
         else:                                                  # fp8
-            val = expand_cb_to_value(qwp, layer._cb_flat, row0, C * out_f, in_f,
-                                     self.k, self.n_sub, self.type_size,
+            val = expand_cb_to_value(qwp, self._cb(layer, "flat", which), row0,
+                                     C * out_f, in_f, k, n_sub, type_size,
                                      is_fp4=False)
             ws = getattr(layer, f"{which}_weight_scale")[experts].reshape(
                 C * out_f).to(torch.float32)
@@ -2058,6 +2266,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         nE = c1 - c0
         out_f = packed.shape[1]
         in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
+        k, n_sub, type_size = self._fmt(which)
         row0 = torch.zeros(nE * out_f, dtype=torch.int32, device=packed.device)
         if to_fp8:                                                # fp8 bytes
             # CUDA expander (2.1x the Triton one, byte-identical) on the RAW
@@ -2070,41 +2279,47 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 qwp = codec.pad_qweight(
                     packed.reshape(nE * out_f, -1).contiguous())
                 W = expand_cb_to_fp8(
-                    qwp, self._stock_cb_flat_fp8(layer), row0, nE * out_f,
-                    in_f, self.k, self.n_sub, self.type_size)
+                    qwp, self._flat_fp8(layer, which), row0, nE * out_f,
+                    in_f, k, n_sub, type_size)
             else:
                 from . import ops as pq_ops
                 W = pq_ops.cb_expand_fp8(
                     packed.reshape(nE * out_f, -1),
-                    self._stock_cb_flat_fp8(layer), row0, nE * out_f, in_f,
-                    self.k, self.n_sub, self.type_size)
+                    self._flat_fp8(layer, which), row0, nE * out_f, in_f,
+                    k, n_sub, type_size)
         elif self.is_fp4:                                         # fp4 two-tier v2
             qwp = codec.pad_qweight(
                 packed.reshape(nE * out_f, -1).contiguous())
             W = expand_fp4_v2_to_weight(
-                qwp, layer._cb_flat, row0, layer._cb_compose, nE * out_f, in_f,
-                self.k, self.n_sub, self.type_size)
+                qwp, self._cb(layer, "flat", which), row0,
+                self._cb(layer, "compose", which), nE * out_f, in_f,
+                k, n_sub, type_size)
         else:                                                     # fp8 -> bf16
             qwp = codec.pad_qweight(
                 packed.reshape(nE * out_f, -1).contiguous())
-            val = expand_cb_to_value(qwp, layer._cb_flat, row0, nE * out_f, in_f,
-                                     self.k, self.n_sub, self.type_size,
+            val = expand_cb_to_value(qwp, self._cb(layer, "flat", which), row0,
+                                     nE * out_f, in_f, k, n_sub, type_size,
                                      is_fp4=False)
             ws = getattr(layer, f"{which}_weight_scale")[c0:c1].reshape(
                 nE * out_f).to(torch.float32)
             W = (val.float() * ws[:, None]).to(torch.bfloat16)
         return W.view(nE, out_f, in_f)
 
-    @staticmethod
-    def _stock_cb_flat_fp8(layer) -> torch.Tensor:
-        """The per-layer codebook re-encoded to E4M3 bytes for the fp8-direct
-        expand (every CB value is on the e4m3 grid — lossless). Cached on the
-        layer (also built by the CUDA-decode gate); built once, before capture."""
-        cb = getattr(layer, "_cb_flat_fp8", None)
+    def _flat_fp8(self, layer, which: str) -> torch.Tensor:
+        """One stack's resident E4M3 LUT, with uniform-fixture compatibility."""
+        attr = f"_cb_flat_fp8_{which}"
+        cb = getattr(layer, attr, None)
         if cb is None:
-            cb = layer._cb_flat.to(torch.float8_e4m3fn).view(
-                torch.uint8).contiguous()
-            layer._cb_flat_fp8 = cb
+            legacy = getattr(layer, "_cb_flat_fp8", None)
+            specific = getattr(layer, f"_cb_flat_{which}", None)
+            if specific is None and legacy is not None:
+                cb = legacy
+            else:
+                cb = self._cb(layer, "flat", which).to(
+                    torch.float8_e4m3fn).view(torch.uint8).contiguous()
+            setattr(layer, attr, cb)
+            if getattr(layer, "_cb_stack_uniform", False):
+                layer._cb_flat_fp8 = cb
         return cb
 
     # -- grouped CUDA decode path -------------------------------------------
@@ -2114,18 +2329,20 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # Grouped CUDA GEMV support: fp8-CB v1 (n_sub=4, per-(expert,out)
             # fp32 scale) and fp4-CB two-tier v2 (n_sub=2, scale composed
             # in-kernel from the packed 9-byte section). fp4-v1 (bare e4m3
-            # plane) has no grouped path yet.
-            fmt_ok = ((self.n_sub == 4 and not self.is_fp4)
-                      or (self.n_sub in (1, 2) and self.is_fp4
-                          and self.is_v2))
+            # plane) has no grouped path yet. BOTH stacks must qualify: they
+            # are separate launches on possibly different rungs.
+            def _ns_ok(ns: int) -> bool:
+                return ((ns == 4 and not self.is_fp4)
+                        or (ns in (1, 2) and self.is_fp4 and self.is_v2))
+            fmt_ok = all(_ns_ok(self._fmt(w)[1]) for w in ("w13", "w2"))
             ok = (fmt_ok and os.environ.get(
                 "PRISMAQUANT_CB_DECODE", "cuda") == "cuda")
             if ok:
                 from .cuda_ext import get_ext
                 ok = get_ext() is not None
-            if ok and not self.is_fp4 and not hasattr(layer, "_cb_flat_fp8"):
-                layer._cb_flat_fp8 = layer._cb_flat.to(
-                    torch.float8_e4m3fn).view(torch.uint8).contiguous()
+            if ok and not self.is_fp4:
+                for which in ("w13", "w2"):
+                    self._flat_fp8(layer, which)
             layer._cb_moe_cuda_ok = ok
         return ok
 
@@ -2154,6 +2371,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         pair_self = torch.arange(pair_expert.numel(), device=x.device,
                                  dtype=torch.int32)
 
+        k13, ns13, ts13 = self._fmt("w13")                # per-stack rung
         if self.is_fp4:                                  # fp4-CB two-tier v2
             # Activation QDQ (fp4 group-16 RTN) stays OUTSIDE the kernel,
             # bit-identical to the loop's codec.fp4_group16_act_qdq; the kernel
@@ -2161,31 +2379,35 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # 9-byte section + the resident (256,16) compose table.
             xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
             gate_up = pq_ops.cb_moe_gemv_fp4_v2(
-                xq, layer.w13_cb_qweight.data, layer._cb_flat,
-                layer._cb_compose, pair_expert, pair_xrow,
-                self.k, self.n_sub, self.type_size)      # (P, 2*inter)
+                xq, layer.w13_cb_qweight.data,
+                self._cb(layer, "flat", "w13"),
+                self._cb(layer, "compose", "w13"), pair_expert, pair_xrow,
+                k13, ns13, ts13)                         # (P, 2*inter)
         else:                                            # fp8-CB v1
             xq = pq_ops.fp8_act_qdq(x.to(torch.bfloat16))
             gate_up = pq_ops.cb_moe_gemv_fp8(
-                xq, layer.w13_cb_qweight.data, layer._cb_flat_fp8,
+                xq, layer.w13_cb_qweight.data,
+                self._flat_fp8(layer, "w13"),
                 layer.w13_weight_scale.data, pair_expert, pair_xrow,
-                self.k, self.n_sub, self.type_size)      # (P, 2*inter)
+                k13, ns13, ts13)                         # (P, 2*inter)
 
         d = gate_up.shape[-1] // 2
         a = torch.empty(gate_up.shape[:-1] + (d,), dtype=gate_up.dtype,
                         device=gate_up.device)
         apply_moe_activation(act, a, gate_up)
 
+        k2, ns2, ts2 = self._fmt("w2")
         if self.is_fp4:
             aq = codec.fp4_group16_act_qdq(a).to(torch.bfloat16)
             y_down = pq_ops.cb_moe_gemv_fp4_v2(
-                aq, layer.w2_cb_qweight.data, layer._cb_flat,
-                layer._cb_compose, pair_expert, pair_self,
-                self.k, self.n_sub, self.type_size)      # (P, hidden)
+                aq, layer.w2_cb_qweight.data,
+                self._cb(layer, "flat", "w2"),
+                self._cb(layer, "compose", "w2"), pair_expert, pair_self,
+                k2, ns2, ts2)                            # (P, hidden)
         else:
             aq = pq_ops.fp8_act_qdq(a)
             y_down = pq_ops.cb_moe_gemv_fp8(
-                aq, layer.w2_cb_qweight.data, layer._cb_flat_fp8,
+                aq, layer.w2_cb_qweight.data, self._flat_fp8(layer, "w2"),
                 layer.w2_weight_scale.data, pair_expert, pair_self,
-                self.k, self.n_sub, self.type_size)      # (P, hidden)
+                k2, ns2, ts2)                            # (P, hidden)
         return pq_ops.cb_moe_combine(y_down, pair_w, tok_start, T)
