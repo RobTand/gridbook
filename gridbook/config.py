@@ -252,10 +252,15 @@ class PrismaQuantConfig(QuantizationConfig):
     # -- codebook sidecar (loaded once, shared across all layers) ------------
     def get_codebooks(self) -> dict[str, torch.Tensor]:
         if self._codebooks is None:
-            from safetensors.torch import load_file
             from vllm.config import get_current_vllm_config
+
+            from .cb_digest import load_codebooks
             model_dir = get_current_vllm_config().model_config.model
-            self._codebooks = load_file(
+            # NOT a bare load_file: wrong codebook VALUES are invisible at
+            # decode time, so the sidecar is bound to its own declared digest
+            # here — the single choke point every consumer of the codebooks
+            # goes through (linear.py, moe.py, moe_toplevel_loader.py).
+            self._codebooks = load_codebooks(
                 _resolve_model_file(model_dir, self.codebook_file))
         return self._codebooks
 

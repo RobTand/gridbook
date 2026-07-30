@@ -18,6 +18,7 @@ for "gridbook" will find nothing. Search for **`[prismaquant-cb]`**.
 - [Fused prefill extension unavailable](#fused-prefill-extension-unavailable)
 - [Invalid quantization method: gridbook](#invalid-quantization-method-gridbook)
 - [Missing codebook sidecar or quant config](#missing-codebook-sidecar-or-quant-config)
+- [Corrupted codebook sidecar (`cb_tables_sha256` mismatch)](#corrupted-codebook-sidecar-cb_tables_sha256-mismatch)
 - [Out of memory on a 32 GB card](#out-of-memory-on-a-32-gb-card)
 - [Out of memory / box hang on a DGX Spark](#out-of-memory--box-hang-on-a-dgx-spark)
 - [Serving is far slower than the published numbers](#serving-is-far-slower-than-the-published-numbers)
@@ -197,6 +198,59 @@ huggingface-cli download rdtand/Qwen3.6-27B-prismaquant-gridbook-5.5bit-vllm \
 
 Serving by Hub id (`vllm serve rdtand/...`) also works — the sidecars are fetched
 from the Hub automatically in that case.
+
+---
+
+## Corrupted codebook sidecar (`cb_tables_sha256` mismatch)
+
+**Symptom** — model load aborts with:
+
+```
+ValueError: [prismaquant-cb] ERROR: <path>/cb_codebooks.pqcb: the codebook
+tables hash to <computed> but the file's own cb_tables_sha256 metadata declares
+<declared> — this sidecar is corrupted, or belongs to a different checkpoint or
+a different encode of this one. ...
+```
+
+**What it means** — the `.pqcb` carries a digest of its own tables
+([SPEC.md §4.1](SPEC.md)) and the tables no longer match it. The usual causes
+are a hand-assembled model directory that picked up a `.pqcb` from a *different*
+artifact, a stale sidecar left behind when the model was re-encoded, and
+length-preserving data corruption (a bad disk, an interrupted in-place sync).
+
+**Why this is an error and not a warning** — wrong codebook *values* cannot be
+caught any later. A `k`-bit codeword indexes a `2^k`-row table, so every index
+is in range by construction and a wrong table decodes to a correctly-shaped
+tensor of structured garbage: the server starts, the weights "load", and
+generation is quietly wrong. See
+[the model loads but generates garbage](#the-model-loads-but-generates-garbage)
+for the other member of that family. (Structural damage was never the problem —
+a byte-truncated `.pqcb` already fails to deserialize with
+`SafetensorError: MetadataIncompleteBuffer`.)
+
+**Fix** — re-download the artifact (see
+[missing sidecar](#missing-codebook-sidecar-or-quant-config)). To check a
+sidecar without starting a server (no GPU, no vLLM needed):
+
+```bash
+python scripts/cb_digest.py verify /path/to/cb_codebooks.pqcb   # exit 1 on mismatch
+python scripts/cb_digest.py show   /path/to/cb_codebooks.pqcb   # declared vs computed
+```
+
+**Escape hatch** — `PRISMAQUANT_SKIP_CB_DIGEST=1` downgrades the error to a
+warning and serves anyway. It exists for debugging a suspected false positive;
+output produced under it is not trustworthy and must not be benchmarked or
+published.
+
+**If your sidecar has no digest** you will instead see, once, at load:
+
+```
+[prismaquant-cb] <path>/cb_codebooks.pqcb: no cb_tables_sha256 metadata
+(sidecar predates digest binding) — integrity check skipped.
+```
+
+That is informational. Artifacts published before the digest existed — including
+the 27B on the Hub — carry no metadata and load exactly as they always have.
 
 ---
 
