@@ -56,6 +56,7 @@ from .moe_autotune import (
     record_autotune_timings,
     shape_regime as autotune_shape_regime,
 )
+from .moe_gemv_select import cb_gemv_choice, decode_contract_v2_arg
 from .moe_l2 import (
     L2_PIPELINE,
     cb_l2_cap_bytes,
@@ -242,6 +243,32 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             f"{self.prefix}: w13 byte width {layer.w13_cb_qweight.shape[2]} != "
             f"{exp_w13} (type_size/uniformity mismatch)")
         assert layer.w2_cb_qweight.shape[2] == exp_w2
+        # Which grouped GEMV each stack runs. Decided HERE, at load, on python
+        # ints only — so `_apply_grouped_decode` gains no host work, the
+        # call-site branch is a trace-time constant (cudagraph-safe by
+        # construction, no host sync reachable from a captured region), and the
+        # operator gets a startup diagnostic instead of a first-forward
+        # surprise. Same reasoning as the byte-width asserts above.
+        # The two stacks are decided separately: they sit on different K
+        # (hidden vs inter) and the occupancy predicate is a function of K, so
+        # w13 and w2 of ONE layer can legitimately land on different kernels.
+        # `_cb_v2_arg` hoists the decode contract off the hot path; it is the
+        # same env read the inherited kernel does per launch (see
+        # decode_contract_v2_arg).
+        layer._cb_v2_arg = decode_contract_v2_arg()
+        for which, in_f in (("w13", layer._cb_hidden), ("w2", layer._cb_inter)):
+            if self.is_fp4 and self.is_v2:
+                use_v2, why = cb_gemv_choice(
+                    self.k, self.n_sub, self.type_size, in_f)
+            else:
+                # fp8-CB v1 has no v2 kernel. Short-circuit BEFORE the probe so
+                # an fp8-only serve never pays the v2 JIT build.
+                use_v2, why = False, "not fp4-CB two-tier v2"
+            setattr(layer, f"_cb_use_v2_{which}", use_v2)
+            print(f"[prismaquant-cb] cb_gemv_kernel {self.prefix}.{which} "
+                  f"k={self.k} n_sub={self.n_sub} type_size={self.type_size} "
+                  f"K={in_f} -> {'v2' if use_v2 else 'inherited'} ({why})",
+                  flush=True)
         layer._cb_E = E
         from .ops import register_cb_layer
         layer._cb_layer_id = register_cb_layer(self, layer)
@@ -2160,10 +2187,27 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # composes the two-tier weight scale in-register from the packed
             # 9-byte section + the resident (256,16) compose table.
             xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
-            gate_up = pq_ops.cb_moe_gemv_fp4_v2(
-                xq, layer.w13_cb_qweight.data, layer._cb_flat,
-                layer._cb_compose, pair_expert, pair_xrow,
-                self.k, self.n_sub, self.type_size)      # (P, 2*inter)
+            # CB-GEMV-v2 dispatch. `_cb_use_v2_w13` is a python bool fixed at
+            # load (process_weights_after_loading), so this `if` resolves at
+            # trace time and both arms are pure device work — nothing here
+            # reads the env, syncs, or branches on a tensor. Layers built by a
+            # fixture that never ran process_weights_after_loading default to
+            # the inherited kernel, i.e. to today's behaviour.
+            # v2 takes (…, k, type_size, rpb, v2, dict_mode) — no n_sub (it is
+            # product-mode only) — with rpb=0 / dict_mode=0 selecting the
+            # kernel's measured auto policies, and the contract arg coming from
+            # the one load-time resolution so a mixed dispatch cannot run v1
+            # semantics on one kernel and v2 on the other.
+            if getattr(layer, "_cb_use_v2_w13", False):
+                gate_up = pq_ops.cb_moe_gemv_v2(
+                    xq, layer.w13_cb_qweight.data, layer._cb_flat,
+                    layer._cb_compose, pair_expert, pair_xrow,
+                    self.k, self.type_size, 0, layer._cb_v2_arg, 0)
+            else:
+                gate_up = pq_ops.cb_moe_gemv_fp4_v2(
+                    xq, layer.w13_cb_qweight.data, layer._cb_flat,
+                    layer._cb_compose, pair_expert, pair_xrow,
+                    self.k, self.n_sub, self.type_size)  # (P, 2*inter)
         else:                                            # fp8-CB v1
             xq = pq_ops.fp8_act_qdq(x.to(torch.bfloat16))
             gate_up = pq_ops.cb_moe_gemv_fp8(
@@ -2178,10 +2222,18 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
         if self.is_fp4:
             aq = codec.fp4_group16_act_qdq(a).to(torch.bfloat16)
-            y_down = pq_ops.cb_moe_gemv_fp4_v2(
-                aq, layer.w2_cb_qweight.data, layer._cb_flat,
-                layer._cb_compose, pair_expert, pair_self,
-                self.k, self.n_sub, self.type_size)      # (P, hidden)
+            # v2 dispatch, w2 stack — decided independently of w13 (different
+            # K, and the occupancy predicate is a function of K).
+            if getattr(layer, "_cb_use_v2_w2", False):
+                y_down = pq_ops.cb_moe_gemv_v2(
+                    aq, layer.w2_cb_qweight.data, layer._cb_flat,
+                    layer._cb_compose, pair_expert, pair_self,
+                    self.k, self.type_size, 0, layer._cb_v2_arg, 0)
+            else:
+                y_down = pq_ops.cb_moe_gemv_fp4_v2(
+                    aq, layer.w2_cb_qweight.data, layer._cb_flat,
+                    layer._cb_compose, pair_expert, pair_self,
+                    self.k, self.n_sub, self.type_size)  # (P, hidden)
         else:
             aq = pq_ops.fp8_act_qdq(a)
             y_down = pq_ops.cb_moe_gemv_fp8(

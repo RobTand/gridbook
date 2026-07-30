@@ -59,11 +59,19 @@ PKG = "gridbook"
 
 # Runtime-required native sources, reached from gridbook/*.py:
 #   cb_gemv.cu          -> cuda_ext.get_ext()            (decode GEMV; the hot one)
+#   cb_gemv_v2.cu       -> cuda_ext.get_ext_v2()         (smem-resident-dict
+#                                                         decode GEMV, opt-in)
 #   cb_fused_gemm.cu    -> cuda_ext.get_fused_ext()      (fused prefill)
 #   cb_persistent_tc.cu -> cuda_ext.get_persistent_ext() (opt-in, still shipped)
 # cb_fused_gemm.cu #includes the three cutlass_fork headers listed below.
+# An opt-in kernel still belongs on this floor: check 3 (drift) would also
+# notice it missing, but only while the file exists in the checkout the CI job
+# happens to be run against. This list is the literal floor that cannot be
+# satisfied vacuously, and a wheel that silently lacks the v2 source degrades
+# to the inherited kernel with one stderr line as the only clue.
 REQUIRED = [
     f"{PKG}/csrc/cb_gemv.cu",
+    f"{PKG}/csrc/cb_gemv_v2.cu",
     f"{PKG}/csrc/cb_fused_gemm.cu",
     f"{PKG}/csrc/cb_persistent_tc.cu",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_mma_tma.hpp",

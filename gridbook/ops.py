@@ -211,6 +211,45 @@ def _cb_moe_gemv_fp4_v2_fake(xq, qw, cb_flat, compose, pair_expert, pair_xrow,
                        device=xq.device)
 
 
+# CB-GEMV-v2. Same job, same inputs and same output contract as
+# ``cb_moe_gemv_fp4_v2`` above — it is the smem-resident-dictionary
+# reimplementation, and ``moe_gemv_select.cb_gemv_choice`` picks between the
+# two per (layer, stack). Differences in the SIGNATURE only: no ``n_sub`` (v2 is
+# product-mode only), plus ``rpb`` / ``v2`` / ``dict_mode`` (rpb<=0 and
+# dict_mode==0 select the kernel's measured auto policies; ``v2`` is the decode
+# contract, which the inherited kernel reads from the environment per launch).
+#
+# It MUST carry the same ``_PQ_UNSAFE`` tagging as every op above — see the
+# module header: tagging these ops ``cudagraph_unsafe`` under
+# ``use_inductor_graph_partition=True`` + PIECEWISE cudagraphs makes each a
+# graph-PARTITION BOUNDARY and this build mishandles the hand-off, giving
+# DETERMINISTIC output corruption. An op that disagreed with its neighbours on
+# this tag would partition the decode path in exactly the wrong place.
+#
+# Separate JIT module (``get_ext_v2`` -> ``prismaquant_cb_v2_ext``), not a
+# second source of the inherited one: both .cu files define
+# ``PYBIND11_MODULE(TORCH_EXTENSION_NAME, ...)`` and would collide at link.
+@torch.library.custom_op("prismaquant::cb_moe_gemv_v2", mutates_args=(), tags=_PQ_UNSAFE)
+def cb_moe_gemv_v2(xq: torch.Tensor, qw: torch.Tensor,
+                   cb_flat: torch.Tensor, compose: torch.Tensor,
+                   pair_expert: torch.Tensor, pair_xrow: torch.Tensor,
+                   k_bits: int, type_size: int, rpb: int, v2: int,
+                   dict_mode: int) -> torch.Tensor:
+    """Grouped MoE decode GEMV, fp4-CB two-tier v2, smem-resident-dictionary
+    kernel (act-QDQ outside)."""
+    from .cuda_ext import get_ext_v2
+    return get_ext_v2().cb_gemv_v2(xq, qw, cb_flat, compose, pair_expert,
+                                   pair_xrow, k_bits, type_size, rpb, v2,
+                                   dict_mode)
+
+
+@cb_moe_gemv_v2.register_fake
+def _cb_moe_gemv_v2_fake(xq, qw, cb_flat, compose, pair_expert, pair_xrow,
+                         k_bits, type_size, rpb, v2, dict_mode):
+    return torch.empty((pair_expert.shape[0], qw.shape[1]), dtype=xq.dtype,
+                       device=xq.device)
+
+
 @torch.library.custom_op("prismaquant::cb_moe_gemv_fp8", mutates_args=(), tags=_PQ_UNSAFE)
 def cb_moe_gemv_fp8(xq: torch.Tensor, qw: torch.Tensor,
                     cb_flat_fp8: torch.Tensor, scale: torch.Tensor,
