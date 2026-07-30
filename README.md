@@ -262,6 +262,7 @@ arithmetic band and the single-seed noise band.
 | [`docs/MOTIVATION.md`](docs/MOTIVATION.md) | Why the 2–4 bpp regime needs codebooks, why serving has been the blocker, and an honest comparison to GGUF k-quant/IQ. |
 | [`docs/KERNELS.md`](docs/KERNELS.md) | Serving kernel design: transient-expand prefill, fused act-QDQ decode GEMV, two-tier in-register scale compose, grouped MoE GEMV, Triton fallbacks, CUDA-graph rules. |
 | [`docs/PLUGIN.md`](docs/PLUGIN.md) | Operator reference for the plugin itself: dispatch, kernel set, environment switches. |
+| [`docs/DELEGATED-NVFP4-MOE.md`](docs/DELEGATED-NVFP4-MOE.md) | What a **non-CB** NVFP4 MoE group in a mixed container gets on GB10 (`sm_121`): the capability-family formula, which vLLM MoE backends survive it, and why `marlin` serves a W4A4 group as W4A16 with no log line. |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | The measured results with full hardware/protocol context and caveats. |
 | [`ROADMAP.md`](ROADMAP.md) | What is done, what is open, and what was measured and rejected. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to run the tests, what a good bug report contains, and what is in scope. |

@@ -85,7 +85,12 @@ it already fails soft.
 
 Per-artifact caveat: an artifact may contain non-CB groups served by stock
 `compressed-tensors` (the 27B's vision tower is NVFP4 W4A16). Those groups carry
-**their own** hardware requirements, independent of gridbook's kernels.
+**their own** hardware requirements, independent of gridbook's kernels. For a
+delegated NVFP4 **MoE** group those requirements are sharper than the table
+above and one of the failure modes is silent — see
+[**`DELEGATED-NVFP4-MOE.md`**](DELEGATED-NVFP4-MOE.md), which spells out which
+vLLM NVFP4 MoE backends pass GB10's `sm_121` capability-family check and why
+`marlin` will serve a W4A4 group as W4A16 without logging anything.
 
 ---
 
