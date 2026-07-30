@@ -18,6 +18,14 @@ container start; mount a host dir over it to persist). Never ``/tmp``.
 (~30 s is measured: cold ``get_ext()`` in ``vllm-node:latest``, no ``--gpus``,
 ``TORCH_CUDA_ARCH_LIST=12.1`` -> 29.4 s / 29.7 s on two runs.)
 
+Because that cache is persistent and reused, every loader here asserts the
+symbol set its callers need before returning the module — see
+:func:`_require_symbols`.
+A ``.so`` left in the cache by an older ``.cu`` would otherwise be handed back
+unexamined, and the miss would surface as an ``AttributeError`` mid-forward —
+or, worse, as a silent degrade where an optional-binding probe reads the stale
+module as "an older build".
+
 No fast-math: the QDQ kernel's division/conversion rounding must match torch
 bit-for-bit.
 """
@@ -43,6 +51,17 @@ class IncompleteInstallError(FileNotFoundError):
     Distinct from "no nvcc": this is a packaging/installation defect, not a
     property of the user's machine, and it is reported differently so the two
     are never confused.
+    """
+
+
+class StaleExtensionError(RuntimeError):
+    """An extension loaded, but does not export a symbol its callers need.
+
+    A third, distinct failure class: the toolchain worked and the package is
+    complete, but the binary that came out of the build cache is not the one
+    the current sources describe. That is a *deployment* defect, like
+    :class:`IncompleteInstallError` and unlike "this machine has no nvcc", so
+    it is reported at ERROR and it names the directory to delete.
     """
 
 
@@ -86,6 +105,64 @@ def _require_csrc(*names: str) -> str:
     return d
 
 
+def _require_symbols(mod, names, *, build_dir: str, source: str):
+    """Return ``mod``, refusing it unless it exports every name in ``names``.
+
+    ``torch.utils.cpp_extension.load`` hands back whatever the build cache
+    produced, and until this check nothing in the package ever looked at the
+    result. A cache that yields an OLD ``.so`` therefore surfaces only when a
+    call site dereferences a symbol that the old source never had: an
+    ``AttributeError`` raised from inside a ``torch.library.custom_op`` body
+    (``ops.py``), i.e. mid-forward and possibly mid-capture, whose message
+    names the attribute but not the directory that has to be deleted. Some
+    misses do not even raise — the optional-binding probes
+    (``ops.cb_expand_fp8_into_available``) read a missing symbol as "older
+    build", so a stale cache silently costs a fast path instead.
+
+    The cache is *designed* to be persistent and reused across restarts
+    (``PRISMAQUANT_CB_EXT_DIR``; docs/INSTALL.md "Persisting the JIT build
+    cache"; the reference image pins it to ``/opt/gridbook/ext-cache``), so
+    "the cache outlived the sources" is a supported configuration reached by
+    following the docs, not an exotic one.
+
+    ``names`` is deliberately only the symbols the package calls WITHOUT a
+    guard. Bindings that ship independently keep their existing call-site
+    ``hasattr`` probes and must stay optional, or this check would turn a
+    working degrade into a hard fallback: ``cb_expand_fp8_into``
+    (``ops.cb_expand_fp8_into_available``), the ``l2_*`` window API
+    (``moe.PrismaQuantCBMoEMethod._l2_ext_call``), and the grouped-MoE fused
+    bindings (``moe.PrismaQuantCBMoEMethod._gf2_ok`` / ``_gf2_tile_sizes``).
+    """
+    missing = [n for n in names if not hasattr(mod, n)]
+    if missing:
+        raise StaleExtensionError(
+            f"the extension built from {source} loaded from {build_dir}, but "
+            f"does not export {missing} (needs {list(names)}). The JIT build "
+            f"cache is persistent and shared by design, so the usual cause is "
+            f"a STALE .so left there by an older {source} — the current "
+            f"source was never compiled. Delete {build_dir} and start again, "
+            f"or point PRISMAQUANT_CB_EXT_DIR at a fresh dir. Check that the "
+            f"serving user can WRITE that directory: a cache dir owned by "
+            f"another user (e.g. created by an earlier `docker run` without "
+            f"`--user`) is the common way a rebuild does not happen.")
+    return mod
+
+
+# Symbols ``get_ext()``'s module must export, asserted on EVERY load rather
+# than only at build time. Each is dereferenced unconditionally by a custom op
+# in ``ops.py`` -- there is no probe upstream of these, so a module missing one
+# is strictly worse than no module at all:
+_EXT_SYMBOLS = (
+    "fp8_act_qdq",          # ops.fp8_act_qdq
+    "cb_gemv_fp8",          # ops.cb_gemv_fp8
+    "cb_gemv_fp4_v2",       # ops.cb_gemv_fp4_v2
+    "cb_expand_fp8",        # ops.cb_expand_fp8
+    "cb_moe_gemv_fp8",      # ops.cb_moe_gemv_fp8
+    "cb_moe_gemv_fp4_v2",   # ops.cb_moe_gemv_fp4_v2
+    "cb_moe_combine",       # ops.cb_moe_combine
+)
+
+
 def get_ext():
     """The compiled extension module, or None if unavailable."""
     global _ext, _tried
@@ -100,9 +177,23 @@ def get_ext():
         build_dir = os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext")
         os.makedirs(build_dir, exist_ok=True)
-        _ext = load(name="prismaquant_cb_ext", sources=[src],
-                    build_directory=build_dir,
-                    extra_cuda_cflags=["-O3"], verbose=False)
+        mod = load(name="prismaquant_cb_ext", sources=[src],
+                   build_directory=build_dir,
+                   extra_cuda_cflags=["-O3"], verbose=False)
+        # Assign only after the symbol set checks out: a module missing one of
+        # these must never become the value `get_ext()` returns.
+        _ext = _require_symbols(mod, _EXT_SYMBOLS, build_dir=build_dir,
+                                source="cb_gemv.cu")
+    except StaleExtensionError as exc:
+        # Same severity as IncompleteInstallError and for the same reason: a
+        # deployment defect the operator can fix, not a property of the box.
+        # The cost of the fallback is the figure sourced in the arm below.
+        print(f"[prismaquant-cb] ERROR: stale CUDA decode-GEMV extension — "
+              f"{exc} Falling back to the Triton decode path until the cache "
+              f"is cleared: correct, but not production-eligible "
+              f"(docs/BENCHMARKS.md).",
+              file=sys.stderr, flush=True)
+        _ext = None
     except IncompleteInstallError as exc:
         # The speed figure is sourced, not asserted: docs/BENCHMARKS.md records
         # the CUDA grouped-GEMV decode path taking the reference 35B MoE
@@ -151,6 +242,10 @@ def _find_cutlass_include() -> str:
 _ptc = None
 _ptc_tried = False
 
+# ops.cb_prefill_persistent_tc dereferences this straight after the None check
+# (it has no probe), and it is the only binding cb_persistent_tc.cu exports.
+_PTC_SYMBOLS = ("cb_prefill_persistent_tc",)
+
 
 def get_persistent_ext():
     """JIT build/load of the persistent-N tensor-core prefill kernel
@@ -175,11 +270,21 @@ def get_persistent_ext():
         build_dir = os.path.join(build_dir, "ptc")
         os.makedirs(build_dir, exist_ok=True)
         cut = _find_cutlass_include()
-        _ptc = load(name="pq_cb_ptc",
-                    sources=[os.path.join(src_dir, "cb_persistent_tc.cu")],
-                    extra_include_paths=[cut, src_dir],
-                    extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
-                    build_directory=build_dir, verbose=False)
+        mod = load(name="pq_cb_ptc",
+                   sources=[os.path.join(src_dir, "cb_persistent_tc.cu")],
+                   extra_include_paths=[cut, src_dir],
+                   extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+                   build_directory=build_dir, verbose=False)
+        _ptc = _require_symbols(mod, _PTC_SYMBOLS, build_dir=build_dir,
+                                source="cb_persistent_tc.cu")
+    except StaleExtensionError as exc:
+        # Worth a warning even though this ext is opt-in: without it the None
+        # return makes ops.cb_prefill_persistent_tc report "ext not enabled
+        # (PRISMAQUANT_ENABLE_PTC=1)", which is the wrong diagnosis for someone
+        # who has just set that variable.
+        import warnings
+        warnings.warn(f"stale persistent-TC ext — {exc}")
+        _ptc = None
     except IncompleteInstallError as exc:
         import warnings
         warnings.warn(f"broken gridbook install — {exc}")
@@ -252,6 +357,16 @@ def get_fused_fp4_ext():
     return _fused_fp4
 
 
+# The one binding this module exists for: BOTH fused entry points gate the
+# whole path on it (moe.PrismaQuantCBMoEMethod._gf_ok and the mid-M branch of
+# linear.PrismaQuantCBLinearMethod._apply_inline), so a module without it is
+# functionally identical to None -- except that it costs a multi-minute CUTLASS
+# build and hides the reason for the degrade. Everything else cb_fused_gemm.cu
+# exports stays OPTIONAL and keeps its call-site probe: the grouped-MoE
+# bindings ship independently of this one by design (moe.py, _gf2_ok).
+_FUSED_SYMBOLS = ("cb_fused_prefill_mm_scaled",)
+
+
 def get_fused_ext():
     """The CUTLASS decode-in-prologue prefill extension (cb_fused_gemm.cu),
     or None. Separate module from the GEMV ext: it needs the CUTLASS headers
@@ -288,14 +403,21 @@ def get_fused_ext():
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
         build_dir = os.path.join(build_dir, "fused")
         os.makedirs(build_dir, exist_ok=True)
-        _fused = load(name="pq_cb_fused",
-                      sources=[os.path.join(src_dir, "cb_fused_gemm.cu")],
-                      extra_include_paths=[os.path.join(cut, "include"),
-                                           os.path.join(cut, "tools", "util",
-                                                        "include"),
-                                           src_dir],
-                      extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
-                      build_directory=build_dir, verbose=False)
+        mod = load(name="pq_cb_fused",
+                   sources=[os.path.join(src_dir, "cb_fused_gemm.cu")],
+                   extra_include_paths=[os.path.join(cut, "include"),
+                                        os.path.join(cut, "tools", "util",
+                                                     "include"),
+                                        src_dir],
+                   extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+                   build_directory=build_dir, verbose=False)
+        _fused = _require_symbols(mod, _FUSED_SYMBOLS, build_dir=build_dir,
+                                  source="cb_fused_gemm.cu")
+    except StaleExtensionError as exc:
+        print(f"[prismaquant-cb] ERROR: stale fused prefill extension — {exc} "
+              f"Mid-M prefill stays on the transient expand path.",
+              file=sys.stderr, flush=True)
+        _fused = None
     except IncompleteInstallError as exc:
         print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
               f"Mid-M prefill stays on the transient expand path.",

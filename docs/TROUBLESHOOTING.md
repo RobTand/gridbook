@@ -102,6 +102,55 @@ found` must print `True`. Do **not** work around this by copying `csrc/` into
 
 ---
 
+## Stale JIT build cache: the extension loaded but is the wrong build
+
+**Symptom** — on stderr:
+
+```
+[prismaquant-cb] ERROR: stale CUDA decode-GEMV extension — the extension built
+from cb_gemv.cu loaded from /opt/gridbook/ext-cache, but does not export
+['cb_gemv_fp4_v2'] (needs [...]). The JIT build cache is persistent and shared
+by design, so the usual cause is a STALE .so left there by an older cb_gemv.cu
+— the current source was never compiled. Delete /opt/gridbook/ext-cache and
+start again ...
+```
+
+Same message shape for `stale fused prefill extension` and, as a
+`UserWarning`, `stale persistent-TC ext`.
+
+**Cause** — the build cache is *meant* to persist across restarts
+([persisting the cache](INSTALL.md#persisting-the-jit-build-cache); the
+reference image pins `PRISMAQUANT_CB_EXT_DIR=/opt/gridbook/ext-cache`). When
+the cached `.so` is not rebuilt, the process runs a binary from older sources.
+The two ways to get there:
+
+* **one cache directory, two gridbook versions** — a host directory mounted
+  into images of different versions, or a package upgrade/rollback against a
+  kept cache;
+* **the cache is not writable by the serving user** — most often a directory
+  created root-owned by an earlier `docker run` without `--user`, so the
+  rebuild cannot land.
+
+**Fix** — delete the directory (or point `PRISMAQUANT_CB_EXT_DIR` at a fresh
+one) and restart; you pay one ~30 s rebuild. If it recurs, check the ownership
+and mode of the directory from *inside* the serving container:
+
+```bash
+docker exec <container> ls -ld "$PRISMAQUANT_CB_EXT_DIR"
+docker exec <container> id
+```
+
+Use one cache directory per gridbook version if you mount one from the host.
+
+**Why it is reported rather than tolerated** — until the loaders checked, the
+module was returned unexamined. A missing symbol then surfaced either as
+`AttributeError: module 'prismaquant_cb_ext' has no attribute '<name>'` raised
+mid-forward from inside a custom op, or — for the optional bindings, which read
+an absent symbol as "an older build" — as no error at all and a quietly slower
+server.
+
+---
+
 ## Fused prefill extension unavailable
 
 **Symptom**
