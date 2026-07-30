@@ -10,6 +10,7 @@ from __future__ import annotations
 import torch
 
 import os
+import sys
 
 from .kernels import cb_decode_linear
 
@@ -191,6 +192,71 @@ def fp8_act_qdq(x: torch.Tensor) -> torch.Tensor:
 @fp8_act_qdq.register_fake
 def _fp8_act_qdq_fake(x):
     return torch.empty_like(x)
+
+
+@torch.library.custom_op("prismaquant::fp4_act_qdq", mutates_args=(), tags=_PQ_UNSAFE)
+def fp4_act_qdq(x: torch.Tensor) -> torch.Tensor:
+    """Fused group-16 fp4 (E2M1) activation QDQ (bit-exact to
+    codec.fp4_group16_act_qdq) as a custom op for the compile path."""
+    from .cuda_ext import get_ext
+    return get_ext().fp4_act_qdq(x)
+
+
+@fp4_act_qdq.register_fake
+def _fp4_act_qdq_fake(x):
+    return torch.empty_like(x)
+
+
+# One-shot resolution of the fp4 act-QDQ implementation.
+#
+# The fp8 CB lane has always fused its activation QDQ into ONE CUDA launch
+# (fp8_act_qdq above); the fp4 lane ran codec.fp4_group16_act_qdq, roughly two
+# dozen eager torch dispatches plus the matching allocator round-trips per
+# module call. The grouped MoE decode path pays that twice per layer per token
+# (moe.py, the module input and the intermediate), which is milliseconds of pure
+# host dispatch on a many-layer MoE.
+#
+# The fallback is bit-identical, only slow, so correctness never depends on the
+# ext being present. But a SILENT fallback would make a decode benchmark measure
+# the wrong throughput class while looking valid. So the resolution prints its
+# verdict once, loudly, on BOTH branches -- the same discipline as
+# cb_expand_fp8_into_available()'s degrade-never-crash contract, with the
+# addition that the degraded branch says so out loud.
+_FP4_ACT_QDQ_OK = None
+
+
+def fp4_act_qdq_ok() -> bool:
+    """True when the CUDA fp4 act-QDQ is available (resolved once, cached)."""
+    global _FP4_ACT_QDQ_OK
+    if _FP4_ACT_QDQ_OK is None:
+        from .cuda_ext import get_ext
+        ext = get_ext()
+        _FP4_ACT_QDQ_OK = ext is not None and hasattr(ext, "fp4_act_qdq")
+        if _FP4_ACT_QDQ_OK:
+            print("[prismaquant-cb] act-qdq fp4=cuda "
+                  "(prismaquant::fp4_act_qdq, 1 launch/call)", flush=True)
+        else:
+            print("[prismaquant-cb] WARNING: act-qdq fp4=EAGER-CODEC -- the "
+                  "CUDA fp4_act_qdq symbol is missing from the ext, so every "
+                  "fp4-CB projection pays ~two dozen torch dispatches instead "
+                  "of one kernel launch. Numerics are unchanged; DECODE "
+                  "THROUGHPUT IS NOT REPRESENTATIVE -- do not bench.",
+                  file=sys.stderr, flush=True)
+    return _FP4_ACT_QDQ_OK
+
+
+def fp4_act_qdq_or_codec(x: torch.Tensor) -> torch.Tensor:
+    """fp4 group-16 activation QDQ: CUDA op when available, eager codec else.
+
+    Bit-identical either way (tests/test_fp4_act_qdq.py asserts torch.equal,
+    never a tolerance) -- linear.py and moe.py both document that this QDQ runs
+    OUTSIDE the kernel precisely so CUDA-vs-Triton numerics stay aligned, so a
+    tolerance here would silently break that contract.
+    """
+    if x.dtype is torch.bfloat16 and fp4_act_qdq_ok():
+        return fp4_act_qdq(x)
+    from . import codec
+    return codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
 
 
 @torch.library.custom_op("prismaquant::cb_moe_gemv_fp4_v2", mutates_args=(), tags=_PQ_UNSAFE)

@@ -25,7 +25,8 @@ from vllm.model_executor.parameter import (
 
 from . import codec
 from .expand import expand_cb_to_fp8, expand_fp4_v2_to_weight
-from .ops import cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op
+from .ops import (cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op,
+                  fp4_act_qdq_or_codec)
 
 # NOTE: the fused-sibling fallback map (qkv_proj, gate_up_proj, in_proj_qkvz,
 # in_proj_ba) used to be duplicated here. It — and the namespace handling around
@@ -504,11 +505,14 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             if M <= CUDA_GEMV_M_MAX and self._cuda_gemv_ok():
                 if self.is_fp4:
                     # fp4-v2 CUDA GEMV: act-QDQ (fp4 group-16 RTN) runs OUTSIDE
-                    # the kernel via codec — exactly as the Triton fp4 path — so
-                    # CUDA-vs-Triton numerics stay aligned. The kernel gathers
-                    # the bf16 codebook and composes the two-tier scale
+                    # the kernel — exactly as the Triton fp4 path — so
+                    # CUDA-vs-Triton numerics stay aligned. The resolver picks
+                    # the fused CUDA op when the ext has it and the eager codec
+                    # otherwise; the two are bit-identical (tests/
+                    # test_fp4_act_qdq.py asserts torch.equal). The kernel
+                    # gathers the bf16 codebook and composes the two-tier scale
                     # in-register from the packed 9-byte plane.
-                    xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+                    xq = fp4_act_qdq_or_codec(x)
                     y = cb_gemv_fp4_v2(xq, layer._cb_qw_padded, layer._cb_flat,
                                        layer._cb_row_offset, layer._cb_compose,
                                        N, K, self.k, self.n_sub, self.type_size)
@@ -539,7 +543,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # the [N,K] tile is bounded to one layer, freed per forward. (bf16
             # MMA — INV-2 waived; the FP4-MMA CUTLASS prefill is prototype iii.)
             import torch.nn.functional as F
-            xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+            xq = fp4_act_qdq_or_codec(x)
             W = expand_fp4_v2_to_weight(
                 layer._cb_qw_padded, layer._cb_flat, layer._cb_row_offset,
                 layer._cb_compose, N, K, self.k, self.n_sub, self.type_size)
