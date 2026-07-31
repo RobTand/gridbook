@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 SCHEMA = "gridbook.vllm-bench-serve.v1"
@@ -58,10 +59,37 @@ REQUIRED_STREAMING_RESULTS = (
     "mean_itl_ms",
     "mean_e2el_ms",
 )
+REQUIRED_THROUGHPUT_RESULTS = (
+    "request_throughput",
+    "output_throughput",
+    "total_token_throughput",
+)
 _PERCENTILE_RESULT = re.compile(
     r"^p(?:\d+(?:\.\d+)?)_(?:ttft|tpot|itl|e2el)_ms$"
 )
-_SENSITIVE_ENV = re.compile(r"(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)", re.I)
+_SENSITIVE_SEGMENTS = {
+    "AUTH",
+    "AUTHORIZATION",
+    "BEARER",
+    "COOKIE",
+    "CREDENTIAL",
+    "CREDENTIALS",
+    "KEY",
+    "PASSWORD",
+    "PASSWD",
+    "PRIVATE",
+    "SECRET",
+    "SESSION",
+    "SIGNATURE",
+    "TOKEN",
+}
+_SENSITIVE_COMPOUNDS = ("APIKEY", "AUTHTOKEN", "ACCESSTOKEN", "REFRESHTOKEN")
+_ASSIGNMENT = re.compile(r"(\b[-\w.]+\b\s*(?:=|:)\s*)([^\s,;]+)")
+_OPTION_VALUE = re.compile(r"((?:^|\s)(--?[-\w.]+)\s+)([^\s]+)")
+_AUTH_HEADER = re.compile(
+    r"(?i)(authorization\s*:\s*(?:basic|bearer)\s+)([^\s,;]+)"
+)
+_URL = re.compile(r"https?://[^\s]+", re.I)
 
 
 class BenchmarkError(RuntimeError):
@@ -114,6 +142,13 @@ def _percentiles(value: str) -> str:
     return ",".join(f"{item:g}" for item in parsed)
 
 
+def _server_environment(value: str) -> tuple[str, str]:
+    name, separator, setting = value.partition("=")
+    if not separator or not name or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise argparse.ArgumentTypeError("must have the form NAME=VALUE")
+    return name, setting
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gridbook-bench-serve",
@@ -127,6 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     server.add_argument(
         "--backend",
         default="openai",
+        choices=("openai",),
         help="vLLM bench serve backend (default: openai)",
     )
     server.add_argument(
@@ -206,9 +242,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--blocks",
         type=_positive_int,
         default=3,
-        help="independent client blocks; distinct deterministic seed per block (default: 3)",
+        help=(
+            "independent client blocks; distinct deterministic dataset seed per "
+            "block (default: 3)"
+        ),
     )
-    workload.add_argument("--seed", type=int, default=1234)
+    workload.add_argument(
+        "--dataset-seed",
+        "--seed",
+        dest="dataset_seed",
+        type=int,
+        default=1234,
+        help="random prompt seed; server generation is separately pinned greedy",
+    )
     workload.add_argument(
         "--request-rate",
         type=_request_rate,
@@ -224,20 +270,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     dispatch = parser.add_argument_group("dispatch provenance")
     dispatch.add_argument(
-        "--dispatch-env",
+        "--runner-env",
         action="append",
         default=[],
         metavar="NAME",
-        help="environment variable to record; repeat as needed",
+        help="benchmark-runner environment variable to record; repeat as needed",
     )
     dispatch.add_argument(
-        "--dispatch-env-prefix",
+        "--runner-env-prefix",
         action="append",
         default=["PRISMAQUANT_"],
         metavar="PREFIX",
         help=(
-            "record variables matching this prefix; repeat to add prefixes "
+            "record runner variables matching this prefix; repeat to add prefixes "
             "(PRISMAQUANT_ is always included)"
+        ),
+    )
+    dispatch.add_argument(
+        "--server-env",
+        action="append",
+        default=[],
+        type=_server_environment,
+        metavar="NAME=VALUE",
+        help=(
+            "explicit environment from the separately managed server; repeat as "
+            "needed (never inferred from the runner)"
         ),
     )
 
@@ -259,6 +316,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.max_concurrency > args.num_prompts:
         parser.error("--max-concurrency cannot exceed --num-prompts")
+    server_env_names = [name for name, _ in args.server_env]
+    if len(server_env_names) != len(set(server_env_names)):
+        parser.error("--server-env names must not be repeated")
     return args
 
 
@@ -271,7 +331,7 @@ def build_vllm_command(
 ) -> list[str]:
     """Build one official streaming ``vllm bench serve`` invocation."""
 
-    seed = args.seed + block_index
+    dataset_seed = args.dataset_seed + block_index
     return [
         args.vllm_executable,
         "bench",
@@ -305,7 +365,9 @@ def build_vllm_command(
         "--request-rate",
         args.request_rate,
         "--seed",
-        str(seed),
+        str(dataset_seed),
+        "--temperature",
+        "0",
         "--ignore-eos",
         "--disable-shuffle",
         "--percentile-metrics",
@@ -324,6 +386,78 @@ def build_vllm_command(
         args.run_label,
         "--disable-tqdm",
     ]
+
+
+def _is_sensitive_key(key: str) -> bool:
+    normalized = key.upper().strip("-")
+    segments = set(filter(None, re.split(r"[^A-Z0-9]+|_+", normalized)))
+    if segments & _SENSITIVE_SEGMENTS:
+        return True
+    compact = re.sub(r"[^A-Z0-9]", "", normalized)
+    return any(marker in compact for marker in _SENSITIVE_COMPOUNDS)
+
+
+def _redact_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return value
+        hostname = parsed.hostname
+        if hostname is None:
+            return "<redacted-invalid-url>"
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        try:
+            port = parsed.port
+        except ValueError:
+            return "<redacted-invalid-url>"
+        if port is not None:
+            host = f"{host}:{port}"
+        netloc = f"<redacted>@{host}" if parsed.username is not None else host
+        query = urlencode(
+            [
+                (key, "<redacted>" if _is_sensitive_key(key) else setting)
+                for key, setting in parse_qsl(parsed.query, keep_blank_values=True)
+            ],
+            doseq=True,
+        )
+        return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+    except (TypeError, ValueError):
+        return "<redacted-invalid-url>"
+
+
+def _redact_text(value: str) -> str:
+    def redact_url(match: re.Match[str]) -> str:
+        return _redact_url(match.group(0))
+
+    def redact_assignment(match: re.Match[str]) -> str:
+        prefix = match.group(1)
+        key = re.split(r"\s*(?:=|:)\s*", prefix, maxsplit=1)[0]
+        return prefix + ("<redacted>" if _is_sensitive_key(key) else match.group(2))
+
+    def redact_option(match: re.Match[str]) -> str:
+        return match.group(1) + (
+            "<redacted>" if _is_sensitive_key(match.group(2)) else match.group(3)
+        )
+
+    redacted = _URL.sub(redact_url, str(value))
+    redacted = _AUTH_HEADER.sub(r"\1<redacted>", redacted)
+    redacted = _ASSIGNMENT.sub(redact_assignment, redacted)
+    return _OPTION_VALUE.sub(redact_option, redacted)
+
+
+def redact_command(command: Sequence[str]) -> list[str]:
+    redacted: list[str] = []
+    hide_next = False
+    for item in command:
+        if hide_next:
+            redacted.append("<redacted>")
+            hide_next = False
+            continue
+        text = _redact_text(str(item))
+        redacted.append(text)
+        if str(item).startswith("-") and "=" not in str(item):
+            hide_next = _is_sensitive_key(str(item))
+    return redacted
 
 
 def _git_state(commit_override: str | None) -> dict[str, Any]:
@@ -389,8 +523,8 @@ def capture_dispatch_environment(
     captured: dict[str, str | None] = {}
     for key in sorted(selected):
         value = env.get(key)
-        if value is not None and _SENSITIVE_ENV.search(key):
-            value = "<redacted>"
+        if value is not None:
+            value = "<redacted>" if _is_sensitive_key(key) else _redact_text(value)
         captured[key] = value
     return captured
 
@@ -398,40 +532,65 @@ def capture_dispatch_environment(
 def collect_metadata(
     args: argparse.Namespace, env: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
-    git = _git_state(args.git_commit)
-    if not git["commit"]:
-        raise BenchmarkError(
-            "Gridbook commit is unavailable; run from a checkout or pass --git-commit"
-        )
-    return {
+    probe_errors: dict[str, str] = {}
+
+    def probe(name: str, function, fallback=None):
+        try:
+            return function()
+        except Exception as exc:  # noqa: BLE001 - metadata cannot hide run failure
+            probe_errors[name] = _redact_text(f"{type(exc).__name__}: {exc}")
+            return fallback
+
+    git = probe(
+        "git",
+        lambda: _git_state(args.git_commit),
+        {"commit": None, "dirty": None, "source": "probe-error"},
+    )
+    runner_env = os.environ if env is None else env
+    explicit_server_env = {
+        key: "<redacted>" if _is_sensitive_key(key) else _redact_text(value)
+        for key, value in sorted(args.server_env)
+    }
+    metadata = {
         "git": git,
         "software": {
-            "gridbook_version": _package_version(),
-            "vllm_cli_version": _vllm_version(args.vllm_executable),
-            "python": platform.python_version(),
-            "platform": platform.platform(),
-            "machine": platform.machine(),
-            "hostname": platform.node(),
+            "gridbook_version": probe("gridbook_version", _package_version),
+            "vllm_cli_version": probe(
+                "vllm_cli_version", lambda: _vllm_version(args.vllm_executable)
+            ),
+            "python": probe("python", platform.python_version),
+            "platform": probe("platform", platform.platform),
+            "machine": probe("machine", platform.machine),
+            "hostname": probe("hostname", platform.node),
         },
         "artifacts": {
-            "image_id": args.image_id,
-            "model_id": args.model_id,
-            "benchmark_model": args.model,
-            "tokenizer": args.tokenizer or args.model,
+            "image_id": _redact_text(args.image_id),
+            "model_id": _redact_text(args.model_id),
+            "benchmark_model": _redact_text(args.model),
+            "tokenizer": _redact_text(args.tokenizer or args.model),
         },
         "server": {
-            "base_url": args.base_url.rstrip("/"),
+            "base_url": _redact_url(args.base_url.rstrip("/")),
             "backend": args.backend,
-            "endpoint": args.endpoint,
-            "served_model_name": args.served_model_name or args.model,
-            "recorded_args": list(args.server_arg),
+            "endpoint": _redact_text(args.endpoint),
+            "served_model_name": _redact_text(
+                args.served_model_name or args.model
+            ),
+            "recorded_args": [_redact_text(value) for value in args.server_arg],
         },
         "dispatch": {
-            "environment": capture_dispatch_environment(
-                os.environ if env is None else env,
-                args.dispatch_env,
-                args.dispatch_env_prefix,
-            )
+            "runner_environment": {
+                "source": "benchmark process",
+                "values": capture_dispatch_environment(
+                    runner_env,
+                    args.runner_env,
+                    args.runner_env_prefix,
+                ),
+            },
+            "server_environment": {
+                "source": "explicit --server-env arguments",
+                "values": explicit_server_env,
+            },
         },
         "workload": {
             "dataset": "random",
@@ -441,8 +600,15 @@ def collect_metadata(
             "warmups_per_block": args.warmups,
             "max_concurrency": args.max_concurrency,
             "blocks": args.blocks,
-            "base_seed": args.seed,
-            "block_seeds": [args.seed + index for index in range(args.blocks)],
+            "dataset_base_seed": args.dataset_seed,
+            "dataset_block_seeds": [
+                args.dataset_seed + index for index in range(args.blocks)
+            ],
+            "sampling": {
+                "strategy": "greedy",
+                "temperature": 0.0,
+                "sampling_seed": None,
+            },
             "request_rate": args.request_rate,
             "random_range_ratio": 0,
             "ignore_eos": True,
@@ -451,6 +617,8 @@ def collect_metadata(
             "percentiles": [float(item) for item in args.percentiles.split(",")],
         },
     }
+    metadata["collection_errors"] = probe_errors
+    return metadata
 
 
 def _load_result(path: Path) -> dict[str, Any]:
@@ -473,14 +641,90 @@ def _number(result: Mapping[str, Any], key: str) -> float | None:
     value = result.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _nonfinite_paths(value: Any, path: str = "$") -> list[str]:
+    if isinstance(value, bool) or value is None:
+        return []
+    if isinstance(value, float) and not math.isfinite(value):
+        return [path]
+    if isinstance(value, Mapping):
+        paths: list[str] = []
+        for key, child in value.items():
+            paths.extend(_nonfinite_paths(child, f"{path}.{key}"))
+        return paths
+    if isinstance(value, (list, tuple)):
+        paths = []
+        for index, child in enumerate(value):
+            paths.extend(_nonfinite_paths(child, f"{path}[{index}]"))
+        return paths
+    return []
+
+
+def _percentile_result_key(percentile: str, metric: str) -> str:
+    number = float(percentile)
+    label = str(int(number)) if number.is_integer() else f"{number:g}"
+    return f"p{label}_{metric}_ms"
 
 
 def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None:
-    missing = [key for key in REQUIRED_STREAMING_RESULTS if _number(result, key) is None]
+    nonfinite = _nonfinite_paths(result)
+    if nonfinite:
+        raise BenchmarkError(
+            "vLLM result contains NaN/Infinity at: " + ", ".join(nonfinite[:10])
+        )
+
+    requested_percentiles = args.percentiles.split(",")
+    required_metrics = list(REQUIRED_STREAMING_RESULTS)
+    required_metrics.extend(REQUIRED_THROUGHPUT_RESULTS)
+    for metric in ("ttft", "tpot", "itl", "e2el"):
+        required_metrics.extend((f"median_{metric}_ms", f"std_{metric}_ms"))
+        required_metrics.extend(
+            _percentile_result_key(percentile, metric)
+            for percentile in requested_percentiles
+        )
+    missing = [key for key in required_metrics if _number(result, key) is None]
     if missing:
         raise BenchmarkError(
-            "vLLM result lacks streaming metrics: " + ", ".join(missing)
+            "vLLM result lacks finite required metrics: " + ", ".join(missing)
+        )
+
+    positive_metrics = list(REQUIRED_THROUGHPUT_RESULTS)
+    for metric in ("ttft", "e2el"):
+        positive_metrics.extend((f"mean_{metric}_ms", f"median_{metric}_ms"))
+        positive_metrics.extend(
+            _percentile_result_key(percentile, metric)
+            for percentile in requested_percentiles
+        )
+    if args.output_len > 1:
+        for metric in ("tpot", "itl"):
+            positive_metrics.extend((f"mean_{metric}_ms", f"median_{metric}_ms"))
+            positive_metrics.extend(
+                _percentile_result_key(percentile, metric)
+                for percentile in requested_percentiles
+            )
+    nonpositive = [key for key in positive_metrics if _number(result, key) <= 0]
+    if nonpositive:
+        raise BenchmarkError(
+            "vLLM result has non-positive latency/throughput metrics: "
+            + ", ".join(nonpositive)
+        )
+    nonnegative_metrics = [
+        f"std_{metric}_ms" for metric in ("ttft", "tpot", "itl", "e2el")
+    ]
+    if args.output_len == 1:
+        for metric in ("tpot", "itl"):
+            nonnegative_metrics.extend((f"mean_{metric}_ms", f"median_{metric}_ms"))
+            nonnegative_metrics.extend(
+                _percentile_result_key(percentile, metric)
+                for percentile in requested_percentiles
+            )
+    negative = [key for key in nonnegative_metrics if _number(result, key) < 0]
+    if negative:
+        raise BenchmarkError(
+            "vLLM result has negative latency metrics: " + ", ".join(negative)
         )
 
     expected = {
@@ -526,9 +770,68 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
                 f"fixed-shape block has unexpected {key} at request index: {preview}"
             )
 
+    errors = result.get("errors")
+    if not isinstance(errors, list) or len(errors) != args.num_prompts:
+        raise BenchmarkError("vLLM detailed result errors must cover every prompt")
+    if any(error is not None and error != "" for error in errors):
+        raise BenchmarkError("vLLM detailed result contains request errors")
+
+    ttfts = result.get("ttfts")
+    if not isinstance(ttfts, list) or len(ttfts) != args.num_prompts:
+        raise BenchmarkError("vLLM detailed result ttfts must cover every prompt")
+    bad_ttft = [
+        index
+        for index, value in enumerate(ttfts)
+        if isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value <= 0
+    ]
+    if bad_ttft:
+        raise BenchmarkError(
+            "vLLM detailed result has non-positive/non-finite TTFT at request "
+            f"index: {', '.join(str(index) for index in bad_ttft[:5])}"
+        )
+
+    itls = result.get("itls")
+    if not isinstance(itls, list) or len(itls) != args.num_prompts:
+        raise BenchmarkError("vLLM detailed result itls must cover every prompt")
+    for request_index, request_itls in enumerate(itls):
+        if not isinstance(request_itls, list):
+            raise BenchmarkError(
+                f"vLLM detailed result itls[{request_index}] must be an array"
+            )
+        if args.output_len > 1 and not request_itls:
+            raise BenchmarkError(
+                "multi-token response has no inter-token latency samples at "
+                f"request index {request_index}"
+            )
+        for interval_index, value in enumerate(request_itls):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value <= 0
+            ):
+                raise BenchmarkError(
+                    "vLLM detailed result has non-positive/non-finite ITL at "
+                    f"request {request_index}, interval {interval_index}"
+                )
+
+    # vLLM does not currently emit a per-request E2EL array.  Its streaming
+    # definition is exactly TTFT plus the subsequent inter-token intervals, so
+    # reconstructing it also validates that each detailed request has a finite,
+    # positive end-to-end latency.  output_len=1 intentionally has no ITLs.
+    e2els = [
+        float(ttft) + sum(map(float, intervals))
+        for ttft, intervals in zip(ttfts, itls)
+    ]
+    if any(not math.isfinite(value) or value <= 0 for value in e2els):
+        raise BenchmarkError("derived detailed E2EL contains a non-finite value")
+
 
 def summarize_blocks(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    results = [block["result"] for block in blocks]
+    results = [block["raw_result"] for block in blocks]
     metric_names = set(SUMMARY_METRICS)
     for result in results:
         metric_names.update(key for key in result if _PERCENTILE_RESULT.match(key))
@@ -557,7 +860,7 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     )
     try:
         with os.fdopen(fd, "w") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
+            json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
             handle.write("\n")
         os.replace(temporary, path)
     except BaseException:
@@ -566,6 +869,47 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _reserve_output(path: Path, *, overwrite: bool) -> None:
+    """Atomically claim ``path`` before probes or requests begin.
+
+    ``exists()`` followed by a write has a race in which two benchmark clients
+    both believe a result name is free.  O_EXCL makes exactly one of them the
+    owner.  Explicit ``--overwrite`` opts out of that protection by design.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= os.O_TRUNC if overwrite else os.O_EXCL
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise BenchmarkError(
+            f"output already exists: {path} (pass --overwrite to replace it)"
+        ) from exc
+    with os.fdopen(descriptor, "w") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        json.dump(
+            {"schema": SCHEMA, "status": "reserved", "reserved_at": _utc_now()},
+            handle,
+            allow_nan=False,
+        )
+        handle.write("\n")
+
+
+def _json_safe(value: Any) -> Any:
+    """Preserve invalid numeric evidence without emitting invalid JSON."""
+
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return {"nonfinite_float": "NaN"}
+        return {"nonfinite_float": "Infinity" if value > 0 else "-Infinity"}
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(child) for child in value]
+    return value
 
 
 def _run_command(command: Sequence[str]) -> int:
@@ -577,10 +921,7 @@ def _run_command(command: Sequence[str]) -> int:
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     output_path = args.output.expanduser().resolve()
-    if output_path.exists() and not args.overwrite:
-        raise BenchmarkError(
-            f"output already exists: {output_path} (pass --overwrite to replace it)"
-        )
+    _reserve_output(output_path, overwrite=args.overwrite)
 
     started_at = _utc_now()
     started_clock = time.monotonic()
@@ -591,12 +932,19 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "started_at": started_at,
         "finished_at": None,
         "duration_s": None,
-        "metadata": collect_metadata(args),
+        "metadata": None,
         "blocks": [],
         "summary": None,
     }
 
     try:
+        report["metadata"] = collect_metadata(args)
+        _atomic_write_json(output_path, report)
+        if not report["metadata"]["git"]["commit"]:
+            raise BenchmarkError(
+                "Gridbook commit is unavailable; run from a checkout or pass "
+                "--git-commit"
+            )
         with tempfile.TemporaryDirectory(prefix="gridbook-bench-serve-") as raw_dir:
             result_dir = Path(raw_dir)
             for block_index in range(args.blocks):
@@ -609,35 +957,56 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 block_started = _utc_now()
                 block_clock = time.monotonic()
+                block: dict[str, Any] = {
+                    "index": block_index + 1,
+                    "dataset_seed": args.dataset_seed + block_index,
+                    "status": "running",
+                    "started_at": block_started,
+                    "finished_at": None,
+                    "wall_duration_s": None,
+                    "command": redact_command(command),
+                    "returncode": None,
+                    "raw_result": None,
+                    "validation_error": None,
+                }
+                report["blocks"].append(block)
+                # A durable checkpoint makes the in-flight command available
+                # even if the client is interrupted before vLLM returns.
+                _atomic_write_json(output_path, report)
                 print(
                     f"[{args.run_label}] block {block_index + 1}/{args.blocks} "
-                    f"seed={args.seed + block_index}",
+                    f"dataset_seed={args.dataset_seed + block_index}",
                     flush=True,
                 )
-                returncode = _run_command(command)
-                if returncode != 0:
-                    raise BenchmarkError(
-                        f"vLLM bench serve failed in block {block_index + 1} "
-                        f"with exit code {returncode}"
-                    )
-                result = _load_result(result_dir / filename)
-                validate_result(result, args)
-                report["blocks"].append(
-                    {
-                        "index": block_index + 1,
-                        "seed": args.seed + block_index,
-                        "started_at": block_started,
-                        "finished_at": _utc_now(),
-                        "wall_duration_s": time.monotonic() - block_clock,
-                        "command": command,
-                        "result": result,
-                    }
-                )
+                try:
+                    returncode = _run_command(command)
+                    block["returncode"] = returncode
+                    _atomic_write_json(output_path, report)
+                    if returncode != 0:
+                        raise BenchmarkError(
+                            f"vLLM bench serve failed in block {block_index + 1} "
+                            f"with exit code {returncode}"
+                        )
+                    try:
+                        result = _load_result(result_dir / filename)
+                        block["raw_result"] = _json_safe(result)
+                        _atomic_write_json(output_path, report)
+                        validate_result(result, args)
+                    except BenchmarkError as exc:
+                        block["validation_error"] = _redact_text(str(exc))
+                        raise
+                    block["status"] = "success"
+                except BaseException:
+                    block["status"] = "failed"
+                    raise
+                finally:
+                    block["finished_at"] = _utc_now()
+                    block["wall_duration_s"] = time.monotonic() - block_clock
         report["summary"] = summarize_blocks(report["blocks"])
         report["status"] = "success"
     except BaseException as exc:
         report["status"] = "failed"
-        report["error"] = f"{type(exc).__name__}: {exc}"
+        report["error"] = _redact_text(f"{type(exc).__name__}: {exc}")
         raise
     finally:
         report["finished_at"] = _utc_now()
