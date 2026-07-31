@@ -382,12 +382,13 @@ metadata, so supply the exact 40/64-hex commit used to build it. Set
 `vllm --version`. The byte inventory, its digest, the execution manifest, its
 digest, and paired server-evidence attachment/digest are required. The runner
 verifies their byte bindings and refuses an artifact larger than the declared
-budget before issuing a request. For a speculative cell use `--speculative-mode on
---speculative-config '{"method":"...","num_speculative_tokens":K,...}'`; the
-JSON must describe the exact server configuration, not merely say “enabled,”
-and the same strict-JSON object must appear in the recorded
-`--server-arg=--speculative-config=...`. A mismatch or a speculative server flag
-in an `off` cell fails before requests are issued.
+budget before issuing a request. For a speculative cell, use
+`--speculative-mode on` together with
+`--speculative-config '{"method":"...","num_speculative_tokens":K,...}'`.
+The JSON must describe the exact server configuration, not merely say
+“enabled,” and the same strict-JSON object must appear in the recorded
+`--server-arg=--speculative-config=...`. A mismatch or a speculative server
+flag in an `off` cell fails before requests are issued.
 Optional payload bytes use `--payload-bytes` together with a precise
 `--payload-scope`.
 
