@@ -85,7 +85,12 @@ it already fails soft.
 
 Per-artifact caveat: an artifact may contain non-CB groups served by stock
 `compressed-tensors` (the 27B's vision tower is NVFP4 W4A16). Those groups carry
-**their own** hardware requirements, independent of gridbook's kernels.
+**their own** hardware requirements, independent of gridbook's kernels. For a
+delegated NVFP4 **MoE** group those requirements are sharper than the table
+above — see [**`DELEGATED-NVFP4-MOE.md`**](DELEGATED-NVFP4-MOE.md) for the
+version-scoped GB10 backend matrix. In particular, Marlin logs a generic
+weight-only fallback but does not say that a W4A4 group's activation scales
+were discarded.
 
 ---
 

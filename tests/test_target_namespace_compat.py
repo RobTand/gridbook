@@ -64,6 +64,36 @@ if "vllm" not in sys.modules:
 
         bc.QuantizationConfig = QuantizationConfig
         bc.QuantizeMethodBase = object
+        ctu = _mod(
+            "vllm.model_executor.layers.quantization.compressed_tensors.utils")
+
+        def _stub_should_ignore(layer_name, ignore=(), fused_mapping=None):
+            try:
+                import regex as regex_engine
+            except ImportError:
+                # ``regex`` arrives with a real vLLM installation, but it is
+                # intentionally not a Gridbook dependency.  Keep the CPU-only
+                # test shim usable in the wheel's minimal dependency set.
+                import re as regex_engine
+
+            def _matches(name):
+                return any(
+                    regex_engine.match(entry[3:], name) is not None
+                    if entry.startswith("re:") else entry == name
+                    for entry in ignore)
+
+            fused_mapping = fused_mapping or {}
+            leaf = layer_name.rsplit(".", 1)[-1]
+            if leaf in fused_mapping and layer_name not in ignore:
+                stem = layer_name[:-len(leaf)]
+                verdicts = [_matches(stem + shard)
+                            for shard in fused_mapping[leaf]]
+                if len(set(verdicts)) != 1:
+                    raise ValueError("Found a different quantization schemes")
+                return verdicts[0]
+            return _matches(layer_name)
+
+        ctu.should_ignore_layer = _stub_should_ignore
         vpe = _mod("vllm.model_executor.layers.vocab_parallel_embedding")
         vpe.UnquantizedEmbeddingMethod = type("UEM", (), {})
         vpe.VocabParallelEmbedding = type("VPE", (), {})
@@ -375,3 +405,183 @@ def test_mixed_fused_formats_still_raise():
     cfg.target_scheme["language_model." + _GDN_BASE + "in_proj_z"] = other
     with pytest.raises(ValueError, match="mixed CB decode"):
         cfg._scheme_for_prefix(_GDN_SERVE)
+
+
+# ---------------------------------------------------------------------------
+# ``ignore`` follows compressed-tensors exact/regex semantics, not substrings.
+#
+# ``_is_ignored`` used to be ``any(ig in base for base in
+# _candidate_bases(prefix) for ig in self.ignore)`` — an unanchored substring
+# test. Exporters collapse ``.mlp.router.gate`` to ``.mlp.gate``, so the ignored
+# BF16 router entry ``model.layers.N.mlp.gate`` was a raw substring of the
+# QUANTIZED ``…mlp.gate_proj`` / ``…mlp.gate_up_proj``: the shared-expert stack
+# was forced to ``UnquantizedLinearMethod``, its NVFP4 tensors had nowhere to
+# land, and the load died with ``KeyError:
+# 'layers.1.mlp.shared_mlp.down_proj.input_global_scale'``.
+#
+# The same list is handed to a real ``CompressedTensorsConfig`` by
+# ``_build_ct_config``, whose matcher is exact/``re:`` — so the readings must
+# agree. These tests pin both the fix and the safety property (for non-``re:``
+# entries the new predicate is a strict subset of the old one).
+# ---------------------------------------------------------------------------
+
+_ROUTER_NS = ["model.layers.1.",
+              "language_model.model.layers.1.",
+              "model.language_model.layers.1."]
+
+
+def _ignore_config(ignore):
+    """A resolved config whose only interesting content is *ignore*."""
+    cfg = PrismaQuantConfig.from_config({
+        "quant_method": "prismaquant", "format": "nvfp4_cb",
+        "codebook_file": "cb_codebooks.pqcb",
+        "config_groups": {"cb": {"format": "FP8_CB_K44",
+                                 "targets": ["model.layers.0.mlp.down_proj"],
+                                 "scheme": dict(_SCHEME)}},
+        "ignore": list(ignore),
+    })
+    cfg._ensure_resolved()
+    return cfg
+
+
+@pytest.mark.parametrize("pre", _ROUTER_NS)
+def test_collapsed_router_does_not_ignore_the_gate_projections(pre):
+    """The regression itself: an ignored ``…mlp.gate`` must not swallow
+    ``…mlp.gate_proj`` / ``…mlp.gate_up_proj`` in ANY namespace vintage."""
+    cfg = _ignore_config(["model.layers.1.mlp.gate"])
+    assert cfg._is_ignored(pre + "mlp.gate")            # the router: still BF16
+    assert not cfg._is_ignored(pre + "mlp.gate_proj")
+    assert not cfg._is_ignored(pre + "mlp.gate_up_proj")
+
+
+def test_literal_entry_is_exact_like_compressed_tensors():
+    """A literal entry names one module; parents are not implicit globs."""
+    cfg = _ignore_config(["model.layers.0.mlp"])
+    assert cfg._is_ignored("model.layers.0.mlp")
+    assert not cfg._is_ignored("model.layers.0.mlp.down_proj")
+    assert not cfg._is_ignored("model.layers.0.mlp.shared_mlp.up_proj")
+    assert not cfg._is_ignored("model.layers.01.mlp.down_proj")
+    assert not cfg._is_ignored("model.layers.0.mlp_extra.down_proj")
+
+
+def test_exact_entry_matches_only_itself():
+    cfg = _ignore_config(["lm_head"])
+    assert cfg._is_ignored("lm_head")
+    assert not cfg._is_ignored("lm_head_proj")
+    # An entry matches the module it names and that module's descendants — not
+    # a same-suffix module elsewhere in the tree. (``lm_head`` reaches
+    # ``_is_ignored`` only if the head is a LinearBase; the
+    # VocabParallelEmbedding arm of get_quant_method never consults it.)
+    assert not cfg._is_ignored("model.lm_head")
+
+
+def test_regex_entry_uses_re_match_like_compressed_tensors():
+    """``re:`` delegates to ``re.match`` — start-anchored, NOT ``fullmatch`` —
+    because the delegated ``CompressedTensorsConfig`` reads the identical list
+    with ``re.match``. A ``fullmatch`` here would make one list mean two
+    different things in one process."""
+    cfg = _ignore_config([r"re:model\.layers\.\d+\.mlp\.gate$"])
+    assert cfg._is_ignored("model.layers.7.mlp.gate")
+    assert not cfg._is_ignored("model.layers.7.mlp.gate_proj")
+    # start-anchored, so a mid-string match does not count...
+    assert not cfg._is_ignored("prefix.model.layers.7.mlp.gate")
+    # ...but an unanchored tail does (this is re.match, not fullmatch).
+    assert _ignore_config([r"re:model\.layers\.0"])._is_ignored(
+        "model.layers.0.mlp.down_proj")
+
+
+def test_regex_entry_uses_compressed_tensors_regex_engine():
+    """``regex`` supports Unicode properties that stdlib ``re`` rejects."""
+    pytest.importorskip("regex", reason="installed with the real vLLM stack")
+    cfg = _ignore_config([r"re:model\.\p{L}+$"])
+    assert cfg._is_ignored("model.layers")
+
+
+def test_fused_regex_is_evaluated_on_unfused_shards():
+    # A regex naming only the fused spelling does not ignore its checkpoint
+    # shards.  This is compressed-tensors' fused contract.
+    cfg = _ignore_config([r"re:.*gate_up_proj$"])
+    assert not cfg._is_ignored("model.layers.0.mlp.gate_up_proj")
+
+    both = _ignore_config([
+        r"re:.*gate_proj$", r"re:.*up_proj$",
+    ])
+    assert both._is_ignored("model.layers.0.mlp.gate_up_proj")
+
+    mixed = _ignore_config([r"re:.*gate_proj$"])
+    with pytest.raises(ValueError, match="different quantization schemes"):
+        mixed._is_ignored("model.layers.0.mlp.gate_up_proj")
+
+
+def test_regex_entry_survives_the_vllm_mapper():
+    """``apply_vllm_mapper`` rewrites ignore entries; a ``re:`` entry that the
+    mapper leaves alone must still be honoured against the mapped prefix."""
+    cfg = _mapped_config([_GDN_BASE + r for r in _GDN_ROLES],
+                         ignore=("re:.*\\.mlp\\.gate$",))
+    assert cfg._is_ignored("language_model.model.layers.9.mlp.gate")
+    assert not cfg._is_ignored("language_model.model.layers.9.mlp.gate_proj")
+
+
+def test_mapper_is_never_asked_to_rewrite_regex_syntax():
+    cfg = _ignore_config([r"re:.*\.mlp\.gate$", "model.layers.0.mlp.foo"])
+
+    class _LiteralOnlyMapper:
+        def apply_list(self, names):
+            assert all(not name.startswith("re:") for name in names)
+            return ["mapped." + name for name in names]
+
+        def apply_dict(self, values):
+            return values
+
+    cfg.apply_vllm_mapper(_LiteralOnlyMapper())
+    assert r"re:.*\.mlp\.gate$" in cfg.ignore
+    assert "mapped.model.layers.0.mlp.foo" in cfg.ignore
+
+
+def test_get_quant_method_delegates_gate_projection_not_router(monkeypatch):
+    """Exercise the public dispatch order, not only the private predicate."""
+    import gridbook.config as config_mod
+
+    class _Linear:
+        pass
+
+    class _CBMethod:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    fake_linear_module = types.ModuleType("gridbook.linear")
+    fake_linear_module.PrismaQuantCBLinearMethod = _CBMethod
+    monkeypatch.setitem(sys.modules, "gridbook.linear", fake_linear_module)
+    monkeypatch.setattr(config_mod, "LinearBase", _Linear)
+
+    delegated = object()
+    ct = types.SimpleNamespace(
+        packed_modules_mapping=None,
+        get_quant_method=lambda layer, prefix: delegated,
+    )
+    cfg = _ignore_config(["model.layers.1.mlp.gate"])
+    cfg.ct_config = ct
+
+    router = cfg.get_quant_method(_Linear(), "model.layers.1.mlp.gate")
+    assert isinstance(router, config_mod.UnquantizedLinearMethod)
+    assert cfg.get_quant_method(
+        _Linear(), "model.layers.1.mlp.gate_proj") is delegated
+
+
+_SUBSET_ENTRIES = ["model.layers.1.mlp.gate", "model.layers.1.mlp", "lm_head",
+                   "mlp.down_proj", "model.layers.1"]
+_SUBSET_NAMES = ["model.layers.1.mlp.gate", "model.layers.1.mlp.gate_proj",
+                 "model.layers.1.mlp.gate_up_proj", "model.layers.1.mlp",
+                 "model.layers.1.mlp.shared_mlp.down_proj", "lm_head",
+                 "model.layers.11.mlp.gate", "language_model.model.layers.1"]
+
+
+@pytest.mark.parametrize("entry", _SUBSET_ENTRIES)
+@pytest.mark.parametrize("name", _SUBSET_NAMES)
+def test_non_regex_match_is_a_subset_of_the_old_substring_test(entry, name):
+    """Safety property: the new predicate can only ever *un*-ignore a module,
+    never newly ignore one. (Asserted, not argued.)"""
+    cfg = _ignore_config([entry])
+    new = cfg._is_ignored(name)
+    old = entry in name
+    assert not (new and not old), (entry, name)
