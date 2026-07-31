@@ -1,6 +1,6 @@
 """Correctness gate for the BATCHED-EXPERT MoE PREFILL path
 (``moe.PrismaQuantCBMoEMethod._apply_prefill_batched``, task 15 in
-docs/nvfp4-cb-plan/prod_hy3_results.md §"open").
+docs/lanes/nvfp4-cb/prod_hy3_results.md §"open").
 
 The batched path replaces the per-expert prefill loop's E Triton expands + E
 activation-QDQ passes with ONE act-QDQ over all tokens and ONE expand per

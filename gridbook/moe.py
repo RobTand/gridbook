@@ -1,5 +1,5 @@
 """``PrismaQuantCBMoEMethod`` — FusedMoE serving for stacked CB expert weights
-(docs/nvfp4-cb-plan/moe_cb_design.md §4, LAYOUT.md §3 stacked layout).
+(docs/lanes/nvfp4-cb/moe_cb_design.md §4, LAYOUT.md §3 stacked layout).
 
 Each expert stack ships as ONE tensor per role: ``<q>.cb_qweight`` uint8
 ``(E, out, (in/256)·type_size)`` (+ fp8 ``<q>.weight_scale`` ``(E, out)``), where
@@ -40,12 +40,22 @@ from vllm.model_executor.layers.fused_moe.activation import (
 from vllm.model_executor.utils import set_weight_attrs
 
 from . import codec
+from .cb_fill_guard import (
+    assert_cb_experts_filled,
+    mark_filled,
+    mark_unfilled,
+)
 from .expand import (
     expand_cb_to_fp8,
     expand_cb_to_value,
     expand_fp4_v2_to_weight,
 )
-from .moe_autotune import STOCK as _AUTO_STOCK, cb_prefill_auto
+from .moe_autotune import (
+    STOCK as _AUTO_STOCK,
+    cb_prefill_auto,
+    record_autotune_timings,
+    shape_regime as autotune_shape_regime,
+)
 from .moe_l2 import (
     L2_PIPELINE,
     cb_l2_cap_bytes,
@@ -134,12 +144,19 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             E, 2 * inter, _row_bytes(hidden_size, self.type_size),
             dtype=torch.uint8), requires_grad=False)
         set_weight_attrs(w13, {**attrs, "is_transposed": False})
+        # Fill sentinel (cb_fill_guard): False until a fill path copies
+        # checkpoint bytes in; checked in process_weights_after_loading so a
+        # missing per-arch loader opt-in fails loudly instead of serving
+        # uninitialised memory. Set AFTER set_weight_attrs — that helper asserts
+        # on overwriting an existing attribute.
+        mark_unfilled(w13)
         layer.register_parameter("w13_cb_qweight", w13)
 
         w2 = torch.nn.Parameter(torch.empty(
             E, hidden_size, _row_bytes(inter, self.type_size),
             dtype=torch.uint8), requires_grad=False)
         set_weight_attrs(w2, {**attrs, "is_transposed": False})
+        mark_unfilled(w2)
         layer.register_parameter("w2_cb_qweight", w2)
 
         if not self.is_fp4:                       # fp8: per-(expert, out) scale
@@ -184,6 +201,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                                 f"{tuple(w.shape)} != param {tuple(p.shape)}"
                                 f" — stacked (E, out, bytes) contract violated")
                         p.data.copy_(w.to(p.dtype))
+                        mark_filled(p)          # fill path 1 of 2 (per-layer)
                         yield pname
                     else:
                         deferred.append((name, w))
@@ -198,6 +216,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
     # -- per-stack codebook / compose + uniformity assert --------------------
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        # The one place a never-installed per-arch loader is detectable: vLLM
+        # calls this for every CB MoE layer on every load path, and neither fill
+        # path ran if the stacks are still unfilled. No env bypass (R10/D3).
+        assert_cb_experts_filled(layer, self.prefix)
         dev = layer.w13_cb_qweight.device
         E = layer.w13_cb_qweight.shape[0]
         codebooks = self.quant_config.get_codebooks()
@@ -294,9 +316,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 layer, x, topk_weights, topk_ids, act)
 
         # Prefill / fallback (num_tokens > 16, or no grouped-CUDA decode path).
-        # Two implementations, env-selected via PRISMAQUANT_CB_PREFILL:
+        # Implementations, env-selected via PRISMAQUANT_CB_PREFILL. THE DEFAULT
+        # IS RESOLVED AT THE BOTTOM OF THIS BLOCK: 'auto' for fp8-CB, 'loop' for
+        # fp4-CB (see the `mode = os.environ.get(...) or (...)` line). Each entry
+        # below documents one candidate; none of them is the default by virtue of
+        # being listed first.
         #
-        #   'batched' (DEFAULT) — _apply_prefill_batched. Round-1 cost model of
+        #   'batched' (opt-in) — _apply_prefill_batched. Round-1 cost model of
         #     the loop it replaces: on Hy3 (192 experts, ~all hit at prefill) the
         #     per-expert loop pays, PER HIT EXPERT, one act-QDQ + TWO Triton
         #     transient expands (w13/w2, ~192×2 launches/layer) + two F.linear +
@@ -319,10 +345,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # tolerance contract by tests/test_moe_batched_prefill.py and gated by
         # the served logprob A/B before adoption. Prefill is eager/uncaptured
         # (FULL_DECODE_ONLY), so this path needs no CUDA-graph capture-safety.
-        # Default LOOP until the batched path passes its at-scale served gate:
-        # the first 1.4k-token prefill on Hy3 crashed the serve (transient
-        # chunk tiles ~1.6 GB vs the loop's ~56 MB against thin post-KV
-        # slack, 2026-07-20). Batched stays opt-in: PRISMAQUANT_CB_PREFILL=batched.
+        # Batched never became a default and is not one now: the first
+        # 1.4k-token prefill on Hy3 crashed the serve (transient chunk tiles
+        # ~1.6 GB vs the loop's ~56 MB against thin post-KV slack, 2026-07-20),
+        # so it stays opt-in (PRISMAQUANT_CB_PREFILL=batched) pending an
+        # at-scale served gate, and it is not an 'auto' candidate.
         #
         #   'stock' — _apply_prefill_stock. The CAPTURE-SAFE successor to
         #     'batched' (task 15): transiently expand each expert-CHUNK into a
@@ -338,11 +365,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         #     codec.fp8_dynamic_act_qdq — test_stock_fp8_quant_matches_codec),
         #     fp4-v2 runs codec.fp4_group16_act_qdq explicitly on the module input
         #     AND the intermediate. Opt-in: PRISMAQUANT_CB_PREFILL=stock.
-        # Default: fp8-CB rides 'stock' (vLLM's own fused-MoE grouped kernel
-        # over CUDA-expanded e4m3 chunks — measured 5.5x the loop on
-        # Laguna-256E, 2026-07-23, with the slack-gate discipline bounding
-        # the ~1.6 GB chunk transient). fp4-CB keeps 'loop' until its stock
-        # variant (bf16 expand) gets the same at-scale measurement.
+        #     'stock' was the fp8-CB default from 2026-07-23 (vLLM's own
+        #     fused-MoE grouped kernel over CUDA-expanded e4m3 chunks — 5.5x the
+        #     loop on Laguna-256E, with the slack-gate discipline bounding the
+        #     ~1.6 GB chunk transient) until 'auto' superseded it on 2026-07-26;
+        #     it remains a candidate of 'auto' and the deterministic keep-path.
+        #     fp4-CB still defaults to 'loop' — its stock variant (bf16 expand)
+        #     has not had the same at-scale measurement.
         #
         #   'grouped_fused' — _apply_prefill_grouped_fused (round 1 of the MoE
         #     fused campaign, OPT-IN). Drops the stock path's HBM e4m3 expand
@@ -361,8 +390,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         #     launch overhead once R1 had removed the expand round-trip).
         #     'grouped_fused_r1' forces R1 — the bisection reference R2 is
         #     validated against.
-        # fp8-CB default: stock. grouped_fused won on the 35B (+9%, KL gate
-        # passed) but REGRESSED on Laguna-class (1,503 vs 1,821 tok/s @8k,
+        #     grouped_fused is NOT a fixed default (it is an 'auto' candidate):
+        # it won on the 35B (+9%, KL gate passed) but REGRESSED on
+        # Laguna-class (1,503 vs 1,821 tok/s @8k,
         # 2026-07-26): R2 re-decodes each expert's B per M-tile
         # (ceil(m_e/TileM) x) and pads to tile multiples — decode redundancy
         # scales with expert SIZE, and Laguna's experts are ~6x the 35B's.
@@ -1389,15 +1419,37 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             forced=os.environ.get("PRISMAQUANT_CB_PREFILL_AUTO_FORCE") or None,
             log=self._log_prefill_choice)
 
-    def _log_prefill_choice(self, best, timings, forced=False):
+    def _log_prefill_choice(self, best, timings, forced=False, layer=None,
+                            num_tokens=None):
         """One line per layer, to stderr like every other gate on this path.
         This is the evidence trail: a serving run must be able to show WHY it
-        picked what it picked, with the measurements that decided it."""
+        picked what it picked, with the measurements that decided it.
+
+        R21: the same measurements also go to a DURABLE sink — a per-(format,
+        shape regime, box) JSONL table — so "two boxes' cost tables disagree in
+        ranking", the forcing function for a time term in the allocator
+        objective, becomes observable instead of anecdotal. The stderr line is
+        unchanged."""
         detail = " ".join(f"{n}={timings[n]:.3f}ms" for n in sorted(timings))
         print(f"[prismaquant-cb] prefill auto {self.prefix}: "
               f"{'forced' if forced else 'chose'} {best}"
               + (f" | {detail}" if detail else ""),
               file=sys.stderr, flush=True)
+        try:
+            record_autotune_timings(
+                best, timings,
+                layer_prefix=self.prefix,
+                fmt=("NVFP4_CB_K%d" if self.is_fp4 else "FP8_CB_K%d") % self.k,
+                regime=autotune_shape_regime(
+                    num_tokens if num_tokens is not None else 0,
+                    n_experts=getattr(layer, "_cb_E", None),
+                    intermediate=getattr(layer, "_cb_inter", None),
+                ),
+                forced=forced,
+                sink_dir=os.environ.get("PRISMAQUANT_CB_ARTIFACT_DIR"),
+            )
+        except Exception:                      # noqa: BLE001 — never fail a serve
+            pass
 
     # -- prefill: per-expert loop (bisection reference) ---------------------
     def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):

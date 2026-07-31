@@ -1,5 +1,5 @@
 // Persistent-N large-M FP8_CB prefill — INV-1 reference (round-3 Task 9).
-// See docs/nvfp4-cb-plan/persistent-n-prefill.md.
+// See docs/lanes/nvfp4-cb/persistent-n-prefill.md.
 //
 // Each persistent CTA owns TILE_N output columns and grid-strides over N. Phase
 // 1 decodes packed B[n0:n0+TILE_N, :K] ONCE into a smem e4m3 tile (bit-exact to
@@ -197,5 +197,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cb_prefill_persistent_n_fp8", &cb_prefill_persistent_n_fp8,
         "persistent-N FP8_CB prefill reference (INV-1, decode-once, UNSCALED "
         "bf16 out); f32-FMA schedule/correctness reference, not the tensor-core "
-        "perf path (see docs/nvfp4-cb-plan/persistent-n-prefill.md)");
+        "perf path (see docs/lanes/nvfp4-cb/persistent-n-prefill.md)");
 }

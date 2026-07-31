@@ -63,59 +63,67 @@ def _install_on_module_classes(module_path: str) -> None:
         install_toplevel_cb_expert_loader(obj)
 
 
-def _install_toplevel_cb_expert_loaders() -> None:
-    """Install the stacked-CB top-level expert-loader wrap on every MoE arch
-    whose vLLM loader maps experts at the top level (never delegating to the
-    per-layer FusedMoE loader). Each arch is a guarded one-liner; absence of the
-    class in this vLLM build is a no-op."""
+# ---------------------------------------------------------------------------
+# The per-arch CB opt-in, as DATA (architecture re-vet R10 / debt D3).
+#
+# One entry per vLLM MODULE PATH whose model classes load MoE experts at the
+# **top level** — mapping per-expert or fused expert names in the model's own
+# ``load_weights`` and never delegating to the per-layer ``FusedMoE.load_weights``
+# (archs that DO delegate need no entry: the instance-level hook in ``moe.py``
+# already covers them, see this module's docstring).
+#
+# Module paths, not class imports: ``_install_on_module_classes`` discovers the
+# entrypoint classes a module DEFINES, so it is robust to the class renames that
+# happen across vLLM versions (Qwen3.5 alone ships ForCausalLM / MoeForCausalLM /
+# (Moe)ForConditionalGeneration variants), a missing module degrades to a no-op
+# instead of an ImportError, and over-installing on a sibling class is harmless
+# (the wrap is inert for non-CB checkpoints — see ``:44-46``).
+#
+# An in-code tuple is deliberately the whole registry: gridbook ships into the
+# vLLM container and cannot import ``prismaquant.model_profiles``, so it needs
+# its own list, and a tuple is the smallest thing that is data. If third parties
+# ever need to extend it without patching the package, promote it to a JSON
+# sidecar read at ``register()`` time — the consumer below does not care.
+#
+# A MISSING entry does not crash: it serves uninitialised expert memory. That is
+# caught at serve time by ``cb_fill_guard.assert_cb_experts_filled``
+# (``moe.py:process_weights_after_loading``), which names the module path to add.
+_CB_TOPLEVEL_MODULE_PATHS: tuple[str, ...] = (
     # HunYuan V3 (Hy3) — 80-layer MoE, experts loaded top-level.
-    try:
-        from vllm.model_executor.models.hy_v3 import HYV3ForCausalLM
-    except ImportError:
-        pass
-    else:
-        install_toplevel_cb_expert_loader(HYV3ForCausalLM)
-
-    # HunYuan V3 MTP drafter (spec decode) — the same top-level stacked-CB
-    # experts, nested one level under ``.mtp_block.`` (its ``_rewrite_spec_
-    # layer_name`` renames ``model.layers.{N}.X`` -> ``…mtp_block.X``). The
-    # wrap's spec-layer rename (moe_toplevel_loader) applies that offset before
-    # resolving, so a CB-quantized MTP module loads exactly like the body.
-    try:
-        from vllm.model_executor.models.hy_v3_mtp import HYV3MTP
-    except ImportError:
-        pass
-    else:
-        install_toplevel_cb_expert_loader(HYV3MTP)
-
+    "vllm.model_executor.models.hy_v3",
+    # Hy3 MTP drafter (spec decode) — the same top-level stacked-CB experts,
+    # nested one level under ``.mtp_block.`` (its ``_rewrite_spec_layer_name``
+    # renames ``model.layers.{N}.X`` -> ``…mtp_block.X``). The wrap's spec-layer
+    # rename (moe_toplevel_loader) applies that offset before resolving, so a
+    # CB-quantized MTP module loads exactly like the body.
+    "vllm.model_executor.models.hy_v3_mtp",
     # poolside Laguna (S/XS 2.x) — 48-layer 256-expert MoE; vLLM's class maps
-    # experts per-expert (`experts.{eid}.gate_proj`) at the top level, so the
-    # stacked-CB tensors (`experts.gate_up_proj.cb_qweight`) need the same
-    # wrap as Hy3. The DFlash drafter is a separate vLLM class; add it here
-    # when a CB-quantized drafter ships.
-    try:
-        from vllm.model_executor.models.laguna import LagunaForCausalLM
-    except ImportError:
-        pass
-    else:
-        install_toplevel_cb_expert_loader(LagunaForCausalLM)
+    # experts per-expert (``experts.{eid}.gate_proj``) at the top level, so the
+    # stacked-CB tensors need the same wrap as Hy3. Its DFlash drafter is a
+    # separate vLLM module; add that path when a CB-quantized drafter ships.
+    "vllm.model_executor.models.laguna",
+    # Qwen3.5-MoE (35B-A3B and the multimodal wrapper). Its ``Qwen3_5Model.
+    # load_weights`` matches our stacked ``experts.gate_up_proj.cb_qweight`` with
+    # the arch's *fused* expert mapping (``experts.gate_up_proj`` is a substring)
+    # and derives a DOTTED param name (``…experts.w2_weight.cb_qweight``) — in
+    # newer vLLM that lands inside ``RoutedExperts.load_weights`` as
+    # ``getattr(self, "w2_weight.cb_qweight")`` and AttributeErrors. It never
+    # reaches the instance-level CB hook, so the top-level wrap is the fix.
+    "vllm.model_executor.models.qwen3_5",
+    "vllm.model_executor.models.qwen3_5_mtp",
+    # DSv4-class: an entry the moment its vLLM module path exists in the target
+    # build — check ``vllm.model_executor.models.deepseek_v4`` (the class is
+    # top-level-expert-mapping like Hy3) and uncomment:
+    # "vllm.model_executor.models.deepseek_v4",
+)
 
-    # Qwen3.5-MoE (35B-A3B and the multimodal ForConditionalGeneration wrapper).
-    # Its ``Qwen3_5Model.load_weights`` matches our stacked
-    # ``experts.gate_up_proj.cb_qweight`` with the arch's *fused* expert mapping
-    # (``experts.gate_up_proj`` is a substring) and derives a DOTTED param name
-    # (``…experts.w2_weight.cb_qweight``) — in newer vLLM this lands inside
-    # ``RoutedExperts.load_weights`` as ``getattr(self, "w2_weight.cb_qweight")``
-    # and AttributeErrors. It never reaches the instance-level CB hook that
-    # ``moe.py`` installs on the FusedMoE, so the top-level wrap is the fix.
-    # The class names differ across vLLM versions (ForCausalLM / MoeForCausalLM /
-    # (Moe)ForConditionalGeneration), so discover them from the module rather
-    # than pinning names.
-    _install_on_module_classes("vllm.model_executor.models.qwen3_5")
-    _install_on_module_classes("vllm.model_executor.models.qwen3_5_mtp")
 
-    # DSv4-class and any future top-level-expert-mapping MoE arch: add a guarded
-    # import + install_toplevel_cb_expert_loader(<cls>) line here.
+def _install_toplevel_cb_expert_loaders() -> None:
+    """Install the stacked-CB top-level expert-loader wrap on every registered
+    module path. Absence of a module (or of matching classes within it) in this
+    vLLM build is a no-op."""
+    for module_path in _CB_TOPLEVEL_MODULE_PATHS:
+        _install_on_module_classes(module_path)
 
 
 def register() -> None:

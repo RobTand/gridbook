@@ -2,7 +2,7 @@
 
 **CORRECTNESS-FIRST PROTOTYPE — NOT PRODUCTION-ELIGIBLE.**
 
-This is prototype (i) of docs/nvfp4-cb-plan/serving-kernel.md. It exists to
+This is prototype (i) of docs/lanes/nvfp4-cb/serving-kernel.md. It exists to
 measure served KL and get a first speed reading; it is explicitly disqualified
 as the production prefill path:
 

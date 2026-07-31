@@ -5,7 +5,7 @@
  * the driver-mismatch GPU outage; iterate in the next GPU window). Derived
  * from sm120_cb_fused_mma.hpp (the mid-M decode-in-prologue collective).
  *
- * The schedule (docs/nvfp4-cb-plan/persistent-n-prefill.md §4/§7):
+ * The schedule (docs/lanes/nvfp4-cb/persistent-n-prefill.md §4/§7):
  *   - Grid = one CTA per (N-tile stream); CTA c owns N-tiles {c, c+G, ...}
  *     (block-cyclic over the N-tile axis, G = gridDim.x). For each owned
  *     N-tile it sweeps ALL M-tiles before advancing (N-major, M-innermost —

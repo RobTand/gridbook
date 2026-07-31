@@ -1,6 +1,6 @@
 """Correctness + CAPTURE-SAFETY gate for the STOCK-KERNEL MoE PREFILL path
 (``moe.PrismaQuantCBMoEMethod._apply_prefill_stock``, PRISMAQUANT_CB_PREFILL=
-stock — task 15 in docs/nvfp4-cb-plan/prod_hy3_results.md).
+stock — task 15 in docs/lanes/nvfp4-cb/prod_hy3_results.md).
 
 The stock path transiently expands each expert-CHUNK into a HARDWARE format
 (fp8-CB -> fp8 bytes; fp4-CB-v2 -> bf16) and drives vLLM's OWN fused-MoE grouped

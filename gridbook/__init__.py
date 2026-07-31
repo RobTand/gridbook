@@ -10,7 +10,13 @@ falls back to a correct-but-slow Triton path.
 (the format and correctness tests) work without vLLM installed.
 """
 
-__version__ = "0.1.1"
+# Development head, ahead of the last PyPI release (0.1.1), hence the dev suffix.
+# This file is identical in both trees that hold this package: prismaquant's
+# plugins/gridbook (where the work lands) and the RobTand/gridbook release repo
+# (which builds and publishes it). prismaquant's scripts/sync_gridbook.py is the
+# one-way path between them; tests/test_gridbook_sync.py is the drift gate.
+# Releasing — the tag and the PyPI upload — happens only in the release repo.
+__version__ = "0.2.0.dev0"
 
 
 def register() -> None:

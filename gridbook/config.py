@@ -1,5 +1,5 @@
 """``PrismaQuantConfig`` — the vLLM quantization config for the NVFP4-CB /
-FP8-CB out-of-tree lane (docs/nvfp4-cb-plan/serving-kernel.md §2, LAYOUT.md §4).
+FP8-CB out-of-tree lane (docs/lanes/nvfp4-cb/serving-kernel.md §2, LAYOUT.md §4).
 
 vLLM auto-detects us from ``quant_method == "prismaquant"``. The exporter writes
 ``config.json['quantization_config']`` as a *pointer* (``config_file`` ->

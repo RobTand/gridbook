@@ -93,6 +93,19 @@ from __future__ import annotations
 
 import torch
 
+from .cb_fill_guard import mark_filled
+
+# vLLM module paths this process actually installed the wrap on — diagnostics
+# for the serve-time fill assertion (cb_fill_guard), which prints them so an
+# unwired arch's error says exactly which list it is missing from.
+_INSTALLED_MODULE_PATHS: set[str] = set()
+
+
+def installed_module_paths() -> set[str]:
+    """The vLLM module paths whose classes carry the top-level CB wrap."""
+    return set(_INSTALLED_MODULE_PATHS)
+
+
 # Checkpoint expert-tensor suffix  ->  the registered FusedMoE param LEAF name.
 # The leading ``.experts.`` anchor is load-bearing: it excludes ``shared_mlp``
 # and dense MLP projections that share the ``gate_up_proj`` / ``down_proj`` leaf
@@ -508,10 +521,12 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
     # ForConditionalGeneration hierarchy). If the class merely INHERITS an
     # already-wrapped function there is nothing to do.
     if model_cls.__dict__.get("_pq_cb_wrapped", False):
+        _INSTALLED_MODULE_PATHS.add(getattr(model_cls, "__module__", "?"))
         return
     orig_load_weights = model_cls.load_weights
     if getattr(orig_load_weights, "_pq_cb_wrapper", False):
         model_cls._pq_cb_wrapped = True
+        _INSTALLED_MODULE_PATHS.add(getattr(model_cls, "__module__", "?"))
         return
 
     def load_weights(self, weights):  # noqa: ANN001, ANN202
@@ -563,6 +578,9 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                             f"shape {tuple(param.shape)} — stacked "
                             "(E, out, bytes) contract violated")
                     param.data.copy_(w.to(param.dtype))
+                    # fill path 2 of 2 (top-level): stamp the sentinel that
+                    # process_weights_after_loading checks (cb_fill_guard).
+                    mark_filled(param)
                     loaded.add(mapped)
                     continue
                 # Shared-expert CB tensor whose module vLLM built as plain bf16
@@ -596,3 +614,4 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
     load_weights._pq_cb_wrapper = True
     model_cls.load_weights = load_weights
     model_cls._pq_cb_wrapped = True
+    _INSTALLED_MODULE_PATHS.add(getattr(model_cls, "__module__", "?"))

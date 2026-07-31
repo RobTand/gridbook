@@ -1,5 +1,5 @@
 """Correctness gate for the FP8_CB TRANSIENT-EXPANSION prefill path
-(docs/nvfp4-cb-plan/serving-kernel.md §1a, prototype ii+).
+(docs/lanes/nvfp4-cb/serving-kernel.md §1a, prototype ii+).
 
 Two parts, split by the ``-k`` selector so each runs where it can:
 
@@ -166,8 +166,18 @@ def test_value_expand_rejects_fp4():
     CPU tensors on purpose: ``expand_cb_to_value`` rejects ``is_fp4`` on its
     first line, before it touches the device, so the argument-validation
     contract is testable without a GPU. Allocating these dummies on ``DEV`` made
-    this the one test in the file that *failed* (rather than skipped) on a
-    CUDA-less machine, which is what CI runs on."""
+    this the only test in the file that *failed* rather than skipped in the CI
+    clean room (no GPU, no vLLM, no ``prismaquant``, no artifacts), where every
+    other GPU-touching test in the file skips on its ``prismaquant``/artifact/
+    vLLM guard. Measured 2026-07-28, python:3.10-slim + installed wheel:
+    ``1 failed, 7 skipped`` before, ``1 passed, 7 skipped`` after.
+
+    Note the narrower scope: on a *monorepo* checkout with CUDA merely hidden
+    (``CUDA_VISIBLE_DEVICES=""``) four other tests here still fail with
+    ``RuntimeError: No CUDA GPUs are available`` -- they carry no cuda guard at
+    all. Measured same day: ``5 failed, 3 skipped`` before this edit,
+    ``4 failed, 1 passed, 3 skipped`` after. Guarding those is a separate
+    change; CI never hits them."""
     dummy = torch.zeros(4, 8, dtype=torch.uint8)
     cb = torch.zeros(16, dtype=torch.bfloat16)
     off = torch.zeros(4, dtype=torch.int32)

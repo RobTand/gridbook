@@ -19,12 +19,112 @@ that supplies the candidates and the layer object.
 """
 from __future__ import annotations
 
+import json
+import os
+import platform
 import sys
+import threading
 import time
 
 import torch
 
 STOCK = "stock"
+
+# ---------------------------------------------------------------------------
+# Durable timing sink (re-vet R21)
+# ---------------------------------------------------------------------------
+# The tuner's per-candidate milliseconds were a `print()` to stderr and nothing
+# else, so the only record of what the box measured was a serve log somebody
+# had to still have. This appends one JSON row per tuned layer:
+# (format, shape regime, box) -> {candidate: ms}.
+#
+# WHY THIS AND NOT THE lambda TERM. A time term in the allocator's objective
+# would optimize against a serving-cost table that does not exist, on a lane
+# that is not default, against a tax the kernel campaign moved 12x -> 1.75x in
+# one week — a heuristic in an objective's clothes. The forcing function for
+# lambda is TWO measured tables that disagree in RANKING, and this file is what
+# makes that observable. lambda stays specified-not-implemented (R21 ruling,
+# recorded in the re-vet outcome); nothing here feeds an allocator.
+#
+# Path: PRISMAQUANT_CB_AUTOTUNE_LOG, else `<artifact dir>/cb_autotune_timings.jsonl`
+# when the caller knows it (`sink_dir`), else off. Append-only JSONL: a serve
+# process crashing must not lose the rows already measured, and two processes
+# appending is a merge rather than a lost file.
+_SINK_LOCK = threading.Lock()
+
+
+def autotune_sink_path(sink_dir=None):
+    """Resolve the durable sink path, or ``None`` when there is nowhere to put
+    it (no env override and the caller does not know the artifact dir)."""
+    env = os.environ.get("PRISMAQUANT_CB_AUTOTUNE_LOG")
+    if env:
+        return env if env not in {"0", "off", "false"} else None
+    if sink_dir:
+        return os.path.join(str(sink_dir), "cb_autotune_timings.jsonl")
+    return None
+
+
+def box_id():
+    """Coarse identity of the machine a timing was taken on — the third key of
+    the (format, shape regime, box) table. A ms number is meaningless without
+    it, and 'two boxes disagree in ranking' is unanswerable without it."""
+    name = None
+    try:
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+    except Exception:                          # noqa: BLE001 — never fail a serve
+        name = None
+    return name or f"cpu:{platform.machine()}"
+
+
+def shape_regime(num_tokens, n_experts=None, intermediate=None):
+    """The shape bucket a timing belongs to. Tokens are bucketed by power of
+    two because the crossover this table exists to locate is a property of the
+    M tile, not of an exact token count; expert count and intermediate size are
+    recorded exactly because the round-2 taxes scale with expert SIZE."""
+    m = max(int(num_tokens), 1)
+    bucket = 1 << (m.bit_length() - 1)
+    return {
+        "num_tokens": int(num_tokens),
+        "m_bucket": int(bucket),
+        "n_experts": None if n_experts is None else int(n_experts),
+        "intermediate": None if intermediate is None else int(intermediate),
+    }
+
+
+def record_autotune_timings(best, timings, *, layer_prefix, fmt, regime,
+                            forced=False, sink_dir=None, path=None):
+    """Append one row to the durable sink. Returns the path written, or None.
+
+    Never raises: a serve must not die because a log directory is read-only.
+    """
+    target = path or autotune_sink_path(sink_dir)
+    if not target or not timings and not forced:
+        return None
+    row = {
+        "schema": "prismaquant.cb_autotune.v1",
+        "ts": time.time(),
+        "box": box_id(),
+        "format": fmt,
+        "layer": layer_prefix,
+        "regime": regime,
+        "chosen": best,
+        "forced": bool(forced),
+        "ms": {str(k): float(v) for k, v in (timings or {}).items()},
+    }
+    try:
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        line = json.dumps(row, sort_keys=True) + "\n"
+        with _SINK_LOCK:
+            with open(target, "a") as fh:
+                fh.write(line)
+        return target
+    except Exception as exc:                   # noqa: BLE001
+        print(f"[prismaquant-cb] autotune sink unavailable ({exc}); "
+              "timings stay on stderr only", file=sys.stderr, flush=True)
+        return None
 
 
 def cb_time_candidate(fn):
@@ -131,12 +231,29 @@ def cb_prefill_auto(layer, num_tokens, build_candidates, run_stock, *,
     ``forced`` (``PRISMAQUANT_CB_PREFILL_AUTO_FORCE``) pins a winner with no
     timing, for A/B bisection of a suspect choice.
     """
+    def _emit(best, timings, was_forced):
+        """Call the log callback, passing the layer/shape context when it can
+        take it (R21's durable sink needs it) and staying compatible with the
+        3-positional-argument callbacks that predate the sink."""
+        if not log:
+            return
+        try:
+            import inspect
+
+            params = inspect.signature(log).parameters
+            rich = "layer" in params and "num_tokens" in params
+        except (TypeError, ValueError):
+            rich = False
+        if rich:
+            log(best, timings, was_forced, layer=layer, num_tokens=num_tokens)
+        else:
+            log(best, timings, was_forced)
+
     choice = getattr(layer, "_cb_prefill_choice", None)
     if choice is None and forced:
         choice = forced
         layer._cb_prefill_choice = choice
-        if log:
-            log(choice, {}, True)
+        _emit(choice, {}, True)
 
     if choice is None:
         if num_tokens < min_m:
@@ -146,8 +263,7 @@ def cb_prefill_auto(layer, num_tokens, build_candidates, run_stock, *,
         if best is None:                       # every candidate disqualified
             return run_stock()
         layer._cb_prefill_choice = best
-        if log:
-            log(best, timings, False)
+        _emit(best, timings, False)
         return kept if kept is not None else run_stock()
 
     fn = resolve_candidate(choice, build_candidates())

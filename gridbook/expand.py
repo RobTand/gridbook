@@ -1,4 +1,4 @@
-"""Transient CB->value expander (docs/nvfp4-cb-plan/serving-kernel.md §1a,
+"""Transient CB->value expander (docs/lanes/nvfp4-cb/serving-kernel.md §1a,
 prototype ii+ / M-gated prefill dispatch).
 
 ``expand_cb_to_value`` is the existing decode-GEMM kernel MINUS the matmul MINUS
@@ -376,7 +376,7 @@ def expand_cb_to_value(
             "on the Triton decode path: a transient FP4 tile still needs the "
             "Blackwell FP4-MMA to be worth expanding (prototype iii / INV-2), "
             "and a decoded fp4 value is not a standalone tensor without its "
-            "group-16 scale plane. See docs/nvfp4-cb-plan/serving-kernel.md.")
+            "group-16 scale plane. See docs/lanes/nvfp4-cb/serving-kernel.md.")
     if K % 256 != 0:
         raise ValueError(f"K={K} must be a multiple of the 256-weight superblock")
     sub_dim = 8 // n_sub

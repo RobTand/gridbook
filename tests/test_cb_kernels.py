@@ -1,5 +1,5 @@
 """Correctness gate for the CB Triton decode-GEMM, on the REAL exported 0.6B
-tensors (docs/nvfp4-cb-plan/serving-kernel.md prototype (i)).
+tensors (docs/lanes/nvfp4-cb/serving-kernel.md prototype (i)).
 
 Run:
   PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/gridbook \

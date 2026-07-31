@@ -1,4 +1,4 @@
-"""Two-tier v2 scale coding — plugin compose path (docs/nvfp4-cb-plan/
+"""Two-tier v2 scale coding — plugin compose path (docs/lanes/nvfp4-cb/
 two-tier-scale-spec.md §4). The kernel composes the E4M3 scale plane in-register
 from the packed 9 bytes (1 E8M0 super + 8 sub nibble bytes) and must match
 `nvfp4_cb_reconstruct` bit-exactly. Venv (triton + prismaquant, no vLLM); the

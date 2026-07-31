@@ -52,6 +52,28 @@ PREFILL_M_THRESHOLD = int(os.environ.get("PRISMAQUANT_PREFILL_M_THRESHOLD", "16"
 # amortizes x across the row tile.
 CUDA_GEMV_M_MAX = int(os.environ.get("PRISMAQUANT_CB_CUDA_M_MAX", "8"))
 
+# ROCm/HIP kernels (gridbook/csrc_hip). Imported only when torch is a ROCm
+# build, so a CUDA install neither imports nor builds anything HIP; `_HIP` stays
+# None and `_apply_inline` keeps its previous behaviour exactly.
+#
+# RELEASE HOLD, and why this file is still synced verbatim. The HIP lane is
+# held out of the public gridbook project until it has a serving metric
+# (scripts/sync_gridbook.py HELD_PATHS: csrc_hip/, hip_ext.py, linear_hip.py),
+# so in the RELEASE tree `linear_hip` does not exist and this import raises
+# ImportError -> the except arm below sets `_HIP = None` -> the dispatch is
+# byte-identical to the pre-ROCm one. That degradation is what lets the hold be
+# on PATHS only. Holding these lines too would fork linear.py -- the package's
+# most-edited file, the dispatch core -- between the two trees, and the drift
+# gate would then have to carry a *content* exception it cannot check the way
+# it checks a path exception. Path hold: policy. Content fork: band-aid.
+try:                                                # pragma: no cover - env
+    if getattr(torch.version, "hip", None):
+        from . import linear_hip as _HIP
+    else:
+        _HIP = None
+except Exception:                                   # pragma: no cover - env
+    _HIP = None
+
 # NOTE on a rejected variant (2026-07-18): N-chunking the transient expand +
 # GEMM with side-stream overlap measured 0.46x (small-N GEMMs lose more than
 # the overlap hides) AND is not bit-exact — cutlass_scaled_mm picks different
@@ -352,6 +374,17 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         return self._apply_inline(layer, x, bias)
 
     def _apply_inline(self, layer, x, bias=None):
+        # ROCm/HIP: one guarded delegation, additive by construction. `_HIP` is
+        # None on a CUDA box (and whenever the HIP extension does not build), so
+        # the path below is byte-identical to what it was before ROCm support
+        # existed. See linear_hip.maybe_apply — it returns None for every rung
+        # or shape the HIP kernels do not cover, and the CUDA/Triton dispatch
+        # then runs unchanged.
+        if _HIP is not None:
+            _hip_out = _HIP.maybe_apply(self, layer, x, bias)
+            if _hip_out is not None:
+                return _hip_out
+
         N, K = layer._cb_N, layer._cb_K
         M = x.reshape(-1, K).shape[0]
         # Decode regime (M small), plus fp4-v1 which has no transient path yet

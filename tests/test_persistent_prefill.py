@@ -1,5 +1,5 @@
 """Parity gate for the persistent-N FP8_CB prefill reference kernel
-(gridbook/csrc/cb_persistent_prefill.cu). See docs/nvfp4-cb-plan/persistent-n-prefill.md.
+(gridbook/csrc/cb_persistent_prefill.cu). See docs/lanes/nvfp4-cb/persistent-n-prefill.md.
 
 Container-only (JIT-builds an isolated extension; needs nvcc):
 
