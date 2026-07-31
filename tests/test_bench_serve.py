@@ -96,8 +96,8 @@ def _argv(tmp_path):
         "NVIDIA-GB10:GPU-1234",
         "--driver-version",
         "580.00",
-        "--cuda-version",
-        "13.0",
+        "--accelerator-runtime",
+        "CUDA 13.0",
         "--execution-manifest",
         str(execution_path),
         "--execution-manifest-sha256",
@@ -105,6 +105,8 @@ def _argv(tmp_path):
         "--speculative-mode",
         "off",
         "--input-len",
+        "32",
+        "--observed-input-len",
         "32",
         "--output-len",
         "256",
@@ -161,7 +163,12 @@ def _valid_result(args, *, offset=0.0):
     e2el_ms = ttft_ms + itl_ms
     tpot_ms = itl_ms / (args.output_len - 1) if multi_token else 0.0
     duration = 4.0
-    total_input = args.num_prompts * args.input_len
+    observed_input_len = (
+        args.observed_input_len
+        if args.observed_input_len is not None
+        else args.observed_input_len_min
+    )
+    total_input = args.num_prompts * observed_input_len
     total_output = args.num_prompts * args.output_len
     result = {
         "duration": duration,
@@ -169,7 +176,7 @@ def _valid_result(args, *, offset=0.0):
         "failed": 0,
         "total_input_tokens": total_input,
         "total_output_tokens": total_output,
-        "input_lens": [args.input_len] * args.num_prompts,
+        "input_lens": [observed_input_len] * args.num_prompts,
         "output_lens": [args.output_len] * args.num_prompts,
         "errors": [""] * args.num_prompts,
         "ttfts": [ttft_ms / 1000] * args.num_prompts,
@@ -251,6 +258,32 @@ def test_command_uses_official_streaming_fixed_shape_semantics(tmp_path):
     assert "--no-stream" not in command
 
 
+def test_requested_64_observed_63_regression_is_validated_exactly(
+    tmp_path, monkeypatch
+):
+    argv = _replace_option(_argv(tmp_path), "--input-len", "64")
+    argv = _replace_option(argv, "--observed-input-len", "63")
+    args = bench_serve.parse_args(argv)
+    command = bench_serve.build_vllm_command(
+        args, block_index=0, result_dir=tmp_path, result_filename="raw.json"
+    )
+    assert _option(command, "--random-input-len") == "64"
+
+    monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: "vLLM")
+    metadata = bench_serve.collect_metadata(args, {})
+    assert metadata["workload"]["requested_random_input_len"] == 64
+    assert metadata["workload"]["observed_input_length_contract"] == {
+        "mode": "exact",
+        "value": 63,
+    }
+    assert metadata["workload"]["accepted_input_length_bounds"] == [63, 63]
+
+    result = _valid_result(args)
+    assert result["input_lens"] == [63] * args.num_prompts
+    assert result["total_input_tokens"] == 63 * args.num_prompts
+    bench_serve.validate_result(result, args)
+
+
 def test_dataset_seed_and_server_sampling_are_distinct_metadata(tmp_path, monkeypatch):
     args = _parse(tmp_path, "--dataset-seed", "900")
     monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: "vLLM")
@@ -289,6 +322,47 @@ def test_parser_rejects_ranges_that_break_a_comparable_workload(tmp_path):
             _parse(tmp_path, "--input-range-ratio", ratio)
 
 
+def test_observed_input_contract_is_required_and_unambiguous(tmp_path):
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(_without_option(_argv(tmp_path), "--observed-input-len"))
+    with pytest.raises(SystemExit):
+        _parse(tmp_path, "--observed-input-len-min", "31")
+    with pytest.raises(SystemExit):
+        _parse(
+            tmp_path,
+            "--input-range-ratio",
+            "0.25",
+            "--observed-input-len-min",
+            "24",
+            "--observed-input-len-max",
+            "40",
+        )
+
+    range_argv = _without_option(_argv(tmp_path), "--observed-input-len")
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(
+            [
+                *range_argv,
+                "--input-range-ratio",
+                "0.25",
+                "--observed-input-len-min",
+                "24",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(
+            [
+                *range_argv,
+                "--input-range-ratio",
+                "0.25",
+                "--observed-input-len-min",
+                "41",
+                "--observed-input-len-max",
+                "40",
+            ]
+        )
+
+
 def test_required_identity_strings_reject_whitespace(tmp_path):
     for option in ("--model-id", "--image-id", "--run-label"):
         with pytest.raises(SystemExit):
@@ -312,7 +386,7 @@ def test_execution_identity_and_whole_artifact_bytes_are_required(tmp_path):
         "--server-runtime-id",
         "--gpu-id",
         "--driver-version",
-        "--cuda-version",
+        "--accelerator-runtime",
         "--execution-manifest",
         "--execution-manifest-sha256",
         "--speculative-mode",
@@ -323,6 +397,14 @@ def test_execution_identity_and_whole_artifact_bytes_are_required(tmp_path):
     for option in required:
         with pytest.raises(SystemExit):
             bench_serve.parse_args(_without_option(_argv(tmp_path), option))
+
+
+def test_cuda_version_remains_a_deprecated_accelerator_runtime_alias(tmp_path):
+    argv = _argv(tmp_path)
+    index = argv.index("--accelerator-runtime")
+    argv[index] = "--cuda-version"
+    args = bench_serve.parse_args(argv)
+    assert args.accelerator_runtime == "CUDA 13.0"
 
 
 def test_whole_artifact_must_fit_exact_byte_budget(tmp_path):
@@ -653,7 +735,7 @@ def test_metadata_captures_supplied_artifact_and_server_identity(tmp_path, monke
     assert identity["hardware"] == {
         "gpu_id": "NVIDIA-GB10:GPU-1234",
         "driver_version": "580.00",
-        "cuda_version": "13.0",
+        "accelerator_runtime": "CUDA 13.0",
     }
     assert metadata["server"]["recorded_args"] == ["--enforce-eager"]
     assert metadata["dispatch"]["runner_environment"] == {
@@ -676,6 +758,11 @@ def test_metadata_captures_supplied_artifact_and_server_identity(tmp_path, monke
     }
     assert metadata["workload"]["streaming"] is True
     assert metadata["workload"]["dataset_block_seeds"] == [1234, 1235, 1236]
+    assert metadata["workload"]["requested_random_input_len"] == 32
+    assert metadata["workload"]["observed_input_length_contract"] == {
+        "mode": "exact",
+        "value": 32,
+    }
 
 
 def test_urls_commands_and_server_args_never_persist_credentials(tmp_path):
@@ -750,8 +837,18 @@ def test_redaction_covers_nested_json_headers_cookies_and_url_fragments():
     ):
         assert secret not in serialized
     assert "visible" in serialized
-    assert "mode=ok" in serialized
-    assert "view=public" in serialized
+    assert "mode=ok" not in serialized
+    assert "view=public" not in serialized
+    assert serialized.count("<redacted>") >= 2
+
+
+def test_redaction_treats_every_nonempty_url_fragment_as_opaque():
+    redacted = bench_serve._redact_url(
+        "https://example.test/path?mode=fast#opaque-unkeyed-credential"
+    )
+    assert "mode=fast" in redacted
+    assert "opaque-unkeyed-credential" not in redacted
+    assert redacted.endswith("#<redacted>")
 
 
 @pytest.mark.parametrize(
@@ -982,7 +1079,18 @@ def test_single_token_prefill_explicitly_allows_empty_itl_and_zero_tpot(tmp_path
 
 
 def test_input_range_ratio_is_passed_and_validated_as_input_only(tmp_path):
-    args = _parse(tmp_path, "--input-range-ratio", "0.25")
+    argv = _without_option(_argv(tmp_path), "--observed-input-len")
+    args = bench_serve.parse_args(
+        [
+            *argv,
+            "--input-range-ratio",
+            "0.25",
+            "--observed-input-len-min",
+            "24",
+            "--observed-input-len-max",
+            "40",
+        ]
+    )
     command = bench_serve.build_vllm_command(
         args, block_index=0, result_dir=tmp_path, result_filename="raw.json"
     )
@@ -990,14 +1098,14 @@ def test_input_range_ratio_is_passed_and_validated_as_input_only(tmp_path):
         "input": 0.25,
         "output": 0.0,
     }
-    assert bench_serve._input_length_bounds(32, 0.25) == (1, 40)
+    assert bench_serve._observed_input_length_bounds(args) == (24, 40)
     metadata = bench_serve.collect_metadata(args, {})
     assert metadata["workload"]["input_range_ratio"] == 0.25
     assert metadata["workload"]["vllm_range_ratio"] == {
         "input": 0.25,
         "output": 0.0,
     }
-    assert metadata["workload"]["accepted_input_length_bounds"] == [1, 40]
+    assert metadata["workload"]["accepted_input_length_bounds"] == [24, 40]
 
     input_lens = [24, 26, 28, 30, 32, 34, 36, 40]
     result = _valid_result(args)
@@ -1009,8 +1117,14 @@ def test_input_range_ratio_is_passed_and_validated_as_input_only(tmp_path):
     too_long = dict(result, input_lens=[41, *input_lens[1:]])
     too_long["total_input_tokens"] = sum(too_long["input_lens"])
     _reconcile_throughput(too_long)
-    with pytest.raises(bench_serve.BenchmarkError, match=r"range \[1, 40\]"):
+    with pytest.raises(bench_serve.BenchmarkError, match=r"range \[24, 40\]"):
         bench_serve.validate_result(too_long, args)
+
+    too_short = dict(result, input_lens=[23, *input_lens[1:]])
+    too_short["total_input_tokens"] = sum(too_short["input_lens"])
+    _reconcile_throughput(too_short)
+    with pytest.raises(bench_serve.BenchmarkError, match=r"range \[24, 40\]"):
+        bench_serve.validate_result(too_short, args)
 
     wrong_type = dict(result, input_lens=[24.0, *input_lens[1:]])
     with pytest.raises(bench_serve.BenchmarkError, match="unexpected input_lens"):
@@ -1184,7 +1298,7 @@ def test_individual_metadata_probe_failure_is_recorded_not_raised(
     )
 
 
-def test_nonfinite_raw_result_is_rejected_but_preserved_as_valid_json(
+def test_nonfinite_raw_result_is_rejected_at_strict_json_boundary(
     tmp_path, monkeypatch
 ):
     args = _parse(tmp_path)
@@ -1200,12 +1314,28 @@ def test_nonfinite_raw_result_is_rejected_but_preserved_as_valid_json(
 
     monkeypatch.setattr(bench_serve, "_run_command", fake_run)
     monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: None)
-    with pytest.raises(bench_serve.BenchmarkError, match="NaN/Infinity"):
+    with pytest.raises(bench_serve.BenchmarkError, match="not strict JSON"):
         bench_serve.run_benchmark(args)
     report = json.loads(args.output.read_text())
-    assert report["blocks"][0]["raw_result"]["mean_ttft_ms"] == {
-        "nonfinite_float": "NaN"
-    }
+    block = report["blocks"][0]
+    assert block["raw_result"] is None
+    assert "not strict JSON" in block["validation_error"]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        '{"duration":1,"duration":2}',
+        '{"duration":NaN}',
+        '{"duration":Infinity}',
+        '{"duration":-Infinity}',
+    ),
+)
+def test_non_strict_result_json_is_rejected_at_load_boundary(tmp_path, raw):
+    result_path = tmp_path / "invalid.json"
+    result_path.write_text(raw)
+    with pytest.raises(bench_serve.BenchmarkError, match="not strict JSON"):
+        bench_serve._load_result(result_path)
 
 
 def test_existing_report_is_never_replaced_without_opt_in(tmp_path, monkeypatch):

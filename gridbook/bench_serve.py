@@ -642,7 +642,19 @@ def build_parser() -> argparse.ArgumentParser:
     identity.add_argument("--server-runtime-id", type=_nonempty, required=True)
     identity.add_argument("--gpu-id", type=_nonempty, required=True)
     identity.add_argument("--driver-version", type=_nonempty, required=True)
-    identity.add_argument("--cuda-version", type=_nonempty, required=True)
+    accelerator_runtime = identity.add_mutually_exclusive_group(required=True)
+    accelerator_runtime.add_argument(
+        "--accelerator-runtime",
+        dest="accelerator_runtime",
+        type=_nonempty,
+        help="accelerator runtime identity, for example CUDA 13.0 or ROCm 7.0",
+    )
+    accelerator_runtime.add_argument(
+        "--cuda-version",
+        dest="accelerator_runtime",
+        type=_nonempty,
+        help="deprecated alias for --accelerator-runtime",
+    )
     identity.add_argument(
         "--execution-manifest",
         type=Path,
@@ -676,7 +688,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     workload = parser.add_argument_group("fixed workload")
-    workload.add_argument("--input-len", type=_positive_int, required=True)
+    workload.add_argument(
+        "--input-len",
+        type=_positive_int,
+        required=True,
+        help="requested vLLM random-dataset target before tokenizer adjustment",
+    )
+    workload.add_argument(
+        "--observed-input-len",
+        type=_positive_int,
+        help=(
+            "exact input_lens value expected in vLLM output; required when "
+            "--input-range-ratio=0"
+        ),
+    )
+    workload.add_argument(
+        "--observed-input-len-min",
+        type=_positive_int,
+        help=(
+            "declared inclusive lower input_lens bound; required with "
+            "--observed-input-len-max when --input-range-ratio is nonzero"
+        ),
+    )
+    workload.add_argument(
+        "--observed-input-len-max",
+        type=_positive_int,
+        help=(
+            "declared inclusive upper input_lens bound; required with "
+            "--observed-input-len-min when --input-range-ratio is nonzero"
+        ),
+    )
     workload.add_argument("--output-len", type=_positive_int, required=True)
     workload.add_argument(
         "--num-prompts",
@@ -780,6 +821,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error(f"--warmups must be at least {MIN_WARMUPS}")
     if args.blocks < MIN_BLOCKS:
         parser.error(f"--blocks must be at least {MIN_BLOCKS}")
+    if args.input_range_ratio == 0:
+        if args.observed_input_len is None:
+            parser.error("--observed-input-len is required when --input-range-ratio=0")
+        if (
+            args.observed_input_len_min is not None
+            or args.observed_input_len_max is not None
+        ):
+            parser.error(
+                "--observed-input-len-min/--observed-input-len-max are forbidden "
+                "when --input-range-ratio=0"
+            )
+    else:
+        if args.observed_input_len is not None:
+            parser.error(
+                "--observed-input-len is forbidden when --input-range-ratio is nonzero"
+            )
+        if args.observed_input_len_min is None or args.observed_input_len_max is None:
+            parser.error(
+                "--observed-input-len-min and --observed-input-len-max are required "
+                "when --input-range-ratio is nonzero"
+            )
+        if args.observed_input_len_min > args.observed_input_len_max:
+            parser.error(
+                "--observed-input-len-min cannot exceed --observed-input-len-max"
+            )
     if 95.0 not in {float(item) for item in args.percentiles.split(",")}:
         parser.error("--percentiles must include 95 for the TTFT/ITL release gates")
     server_env_names = [name for name, _ in args.server_env]
@@ -950,22 +1016,9 @@ def _redact_url(value: str) -> str:
             ],
             doseq=True,
         )
-        fragment = parsed.fragment
-        if fragment:
-            fragment_pairs = parse_qsl(fragment, keep_blank_values=True)
-            if "=" in fragment and fragment_pairs:
-                fragment = urlencode(
-                    [
-                        (
-                            key,
-                            "<redacted>" if _is_sensitive_key(key) else setting,
-                        )
-                        for key, setting in fragment_pairs
-                    ],
-                    doseq=True,
-                )
-            elif _is_sensitive_key(fragment):
-                fragment = "<redacted>"
+        # Unlike a query, a fragment is opaque to the server and may carry an
+        # unkeyed credential.  There is no sound allowlist, so fail closed.
+        fragment = "<redacted>" if parsed.fragment else ""
         return urlunsplit((parsed.scheme, netloc, parsed.path, query, fragment))
     except (TypeError, ValueError):
         return "<redacted-invalid-url>"
@@ -1235,7 +1288,7 @@ def collect_metadata(
             "hardware": {
                 "gpu_id": _redact_text(args.gpu_id),
                 "driver_version": _redact_text(args.driver_version),
-                "cuda_version": _redact_text(args.cuda_version),
+                "accelerator_runtime": _redact_text(args.accelerator_runtime),
             },
         },
         "server": {
@@ -1261,7 +1314,19 @@ def collect_metadata(
         },
         "workload": {
             "dataset": "random",
-            "input_len": args.input_len,
+            "requested_random_input_len": args.input_len,
+            "observed_input_length_contract": (
+                {
+                    "mode": "exact",
+                    "value": args.observed_input_len,
+                }
+                if args.input_range_ratio == 0
+                else {
+                    "mode": "range",
+                    "minimum": args.observed_input_len_min,
+                    "maximum": args.observed_input_len_max,
+                }
+            ),
             "output_len": args.output_len,
             "num_prompts_per_block": args.num_prompts,
             "warmups_per_block": args.warmups,
@@ -1283,11 +1348,9 @@ def collect_metadata(
                 "output": 0.0,
             },
             "input_length_validation": (
-                "exact" if args.input_range_ratio == 0 else "conservative-range"
+                "declared-exact" if args.input_range_ratio == 0 else "declared-range"
             ),
-            "accepted_input_length_bounds": list(
-                _input_length_bounds(args.input_len, args.input_range_ratio)
-            ),
+            "accepted_input_length_bounds": list(_observed_input_length_bounds(args)),
             "aggregate_reconciliation": {
                 "throughput": (
                     "duration and exact token/request totals; 1e-9 relative/absolute"
@@ -1331,11 +1394,11 @@ def collect_metadata(
 
 def _load_result(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text())
+        payload = _strict_json_loads(path.read_bytes())
     except FileNotFoundError as exc:
         raise BenchmarkError(f"vLLM did not create result file {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise BenchmarkError(f"vLLM result is not valid JSON: {path}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise BenchmarkError(f"vLLM result is not strict JSON: {path}") from exc
     # ``--append-result`` creates a list; the harness never requests it, but
     # accepting a singleton makes this resilient to vLLM version differences.
     if isinstance(payload, list) and len(payload) == 1:
@@ -1377,16 +1440,10 @@ def _percentile_result_key(percentile: str, metric: str) -> str:
     return f"p{label}_{metric}_ms"
 
 
-def _input_length_bounds(input_len: int, ratio: float) -> tuple[int, int]:
-    if ratio == 0:
-        return input_len, input_len
-    # Pinned vLLM 0.23 samples through ceil(input_len * (1 + ratio)), but its
-    # lower endpoint is computed after subtracting tokenizer-added special
-    # tokens and its decode/re-encode correction can shorten a prompt.  That
-    # special-token count is not exposed in bench-serve JSON.  One token is
-    # therefore the only universally safe lower bound; the upper bound remains
-    # exact and useful, and totals/per-request types are checked independently.
-    return 1, math.ceil(input_len * (1 + ratio))
+def _observed_input_length_bounds(args: argparse.Namespace) -> tuple[int, int]:
+    if args.input_range_ratio == 0:
+        return args.observed_input_len, args.observed_input_len
+    return args.observed_input_len_min, args.observed_input_len_max
 
 
 def _numpy_linear_percentile(samples: Sequence[float], percentile: float) -> float:
@@ -1633,7 +1690,9 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
         "total_output_tokens": args.num_prompts * args.output_len,
     }
     if args.input_range_ratio == 0:
-        expected_counts["total_input_tokens"] = args.num_prompts * args.input_len
+        expected_counts["total_input_tokens"] = (
+            args.num_prompts * args.observed_input_len
+        )
     mismatches = []
     for label, wanted in expected_counts.items():
         actual = _exact_nonnegative_int(result, label)
@@ -1651,7 +1710,7 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
         raise BenchmarkError(
             "vLLM detailed result input_lens must contain one value per prompt"
         )
-    lower, upper = _input_length_bounds(args.input_len, args.input_range_ratio)
+    lower, upper = _observed_input_length_bounds(args)
     wrong_inputs = [
         index
         for index, value in enumerate(input_lens)

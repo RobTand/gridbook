@@ -34,12 +34,12 @@ experiment, not another sample of the same experiment.
 |---|---|
 | Base model | Same architecture, tokenizer, revision, and non-quantized tensors |
 | Byte budget | Exact whole served artifact is at or below the predeclared byte budget `B` |
-| Software | Same immutable vLLM image digest, CUDA/driver, Gridbook commit, and package version |
+| Software | Same immutable vLLM image digest, accelerator runtime/driver, Gridbook commit, and package version |
 | Server | Same model length, KV dtype, eager/graph mode, memory utilization, batching and scheduler flags |
 | Execution | Explicit format/rung, serialized layout, scale coding, W/A contract, concrete backend, TP size, and fallback state |
 | Features | Prefix caching off; speculative decode, LoRA, request logging, and observability identically configured or off |
 | Hardware | Same GPU, power/clock policy, thermals, and no competing workload |
-| Client | Same input/output lengths, prompts, dataset seed, arrival rate, concurrency, warmups, and blocks |
+| Client | Same requested/observed input contract, output length, prompts, dataset seed, arrival rate, concurrency, warmups, and blocks |
 
 Use a native quantized artifact made from the same base model. The formal size
 gate is integer arithmetic: **`whole_served_artifact_bytes <= B`**.  “Whole
@@ -81,15 +81,17 @@ environments are never conflated.  `PRISMAQUANT_*` values visible to the
 benchmark process are labelled **runner environment**; add other runner values
 with `--runner-env`.  Record the actual separately managed server environment
 explicitly with repeatable `--server-env NAME=VALUE`.  Credentials, URL user
-info, sensitive URL query values, authorization headers, and secret-like
-arguments/environment keys are redacted from metadata and recorded commands.
+info, sensitive URL query values, every nonempty URL fragment, authorization
+headers, and secret-like arguments/environment keys are redacted from metadata
+and recorded commands.
 
 Format labels are not execution evidence. Every report requires the
 format/rung, serialized weight layout, scale coding, full weight/activation
 contract (`W4A4`, `W8A8`, and so on), concrete kernel/backend, tensor-parallel
 size, fallback state, exact server vLLM/runtime build, GPU identifier, driver,
-and CUDA runtime.  Client and server runtime identifiers are separate required
-fields because the benchmark may run outside the serving container.  Attach
+and accelerator runtime (for example CUDA or ROCm). Client and server runtime
+identifiers are separate required fields because the benchmark may run outside
+the serving container.  Attach
 server log lines proving the backend and fallback state; `--server-arg` and a
 filename containing “native” do not prove dispatch.
 
@@ -171,19 +173,25 @@ blocks**.  The runner derives a distinct prompt-dataset seed for each block
 Gridbook arms so every block is paired.
 This seed controls prompt construction, not generation.  Server sampling is
 separately and unconditionally pinned to greedy decoding with `--temperature
-0`.  Fixed lengths are enforced with vLLM's random dataset at range ratio zero
-plus `ignore_eos`; the runner rejects a block if completed prompts, per-request
-lengths, or total input/output tokens differ from the requested values.
+0`. `--input-len` is the value sent to vLLM as `--random-input-len`; it is a
+dataset-generation request, not an observed-token assertion. The pinned random
+dataset subtracts tokenizer special tokens, so a requested length of 64 can
+legitimately appear as 63 in `input_lens`. For every range-ratio-zero cell,
+determine that tokenizer-specific value in a dry run and provide it separately
+as `--observed-input-len`. The runner records both values and rejects a block
+unless every detailed input length and `total_input_tokens` match the declared
+observed value exactly. Output length remains exact through `ignore_eos`.
 
 For a prompt-length distribution, set `--input-range-ratio R` with
 `0 <= R < 1`.  The pinned vLLM client receives
-`{"input": R, "output": 0}`, so output length remains exact.  vLLM samples
-integer input lengths up through `ceil(input_len * (1 + R))`; its lower endpoint
-also depends on tokenizer-added special tokens and decode/re-encode correction,
-neither of which is emitted in result JSON.  The harness therefore uses the safe
-conservative envelope `[1, ceil(input_len * (1 + R))]`, requires integer positive
-per-request lengths, and requires their sum to equal `total_input_tokens`.  The
-exact per-request equality check remains exclusive to `R=0`.
+`{"input": R, "output": 0}`, so output length remains exact. Tokenizer-added
+special tokens and decode/re-encode correction make the exact observed endpoints
+tokenizer-specific. Determine them from the pinned client/tokenizer and declare
+the inclusive contract with `--observed-input-len-min` and
+`--observed-input-len-max`. The harness requires every detailed input length to
+fall within that declared range and their sum to equal `total_input_tokens`; it
+does not relabel the requested `--input-len` as an observed bound. The exact
+per-request equality contract remains exclusive to `R=0`.
 
 Keep prefix caching off for this primary matrix.  vLLM's readiness probe and
 warmups deliberately reuse the first request, so an enabled prefix cache would
@@ -280,8 +288,8 @@ gridbook-bench-serve \
   --client-runtime-id "$BENCH_CLIENT_VLLM_RUNTIME_ID" \
   --server-runtime-id "$SERVER_VLLM_RUNTIME_ID" \
   --gpu-id "$GPU_ID" \
-  --driver-version "$NVIDIA_DRIVER_VERSION" \
-  --cuda-version "$SERVER_CUDA_VERSION" \
+  --driver-version "$SERVER_DRIVER_VERSION" \
+  --accelerator-runtime "$SERVER_ACCELERATOR_RUNTIME" \
   --execution-manifest "$EXECUTION_MANIFEST_JSON" \
   --execution-manifest-sha256 "$EXECUTION_MANIFEST_SHA256" \
   --speculative-mode off \
@@ -291,6 +299,7 @@ gridbook-bench-serve \
   --server-env "CUDA_VISIBLE_DEVICES=$SERVER_CUDA_DEVICE" \
   --server-env PRISMAQUANT_CB_DECODE=cuda \
   --input-len 32 \
+  --observed-input-len "$OBSERVED_INPUT_LEN" \
   --output-len 256 \
   --num-prompts 16 \
   --max-concurrency 1 \
@@ -337,7 +346,8 @@ Each JSON report has schema `gridbook.vllm-bench-serve.v2` and contains:
   payload bytes;
 - structured format/rung, serialized layout/scale coding, W/A contract,
   concrete backend/fallback, TP size, client/server runtimes, GPU, driver, and
-  CUDA, plus the digest-bound per-serving-unit execution manifest;
+  accelerator runtime, plus the digest-bound per-serving-unit execution
+  manifest;
 - recorded server flags and dispatch environment;
 - runner environment and explicitly supplied server environment in separate
   fields;
