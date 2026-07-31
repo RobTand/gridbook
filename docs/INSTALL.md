@@ -82,7 +82,7 @@ it already fails soft.
 | **RTX 5090 `sm_120`** | ✅ CUDA | ✅ | ✅ (expected) | **USER-REPORTED** working on the 27B artifact. Note the arch flag differs (`sm_120` vs the measured `sm_121`); no speed numbers exist for this card. |
 | **H100 `sm_90`** | expected ✅ | expected ✅ | ❌ fails soft → expand path | **INFERRED, UNTESTED.** |
 | **RTX 4090 / L40S `sm_89`** | expected ✅ | expected ✅ | ❌ fails soft → expand path | **INFERRED, UNTESTED.** |
-| **A100 `sm_80`** | expected ✅ | ❌ **expected to error** — the fp8 GEMM it calls needs `sm_89+` and has no capability guard or fallback | n/a | **NOT RECOMMENDED.** The plugin declares a capability floor of 8.0 and will start, but any prompt longer than 16 tokens is expected to fail. INFERRED from code. |
+| **A100 `sm_80`** | expected ✅ for FP4-CB | ❌ FP8-CB requires `sm_89+` | n/a | **FAILS EARLY for FP8-CB.** Gridbook rejects the first FP8-CB target during model construction instead of loading a serve that will fail above 16 tokens. FP4-CB retains its BF16 fallback; untested on this card. |
 | **Older / no `nvcc` / non-NVIDIA** | Triton fallback | Triton fallback | n/a | Correct numerics, prototype speed. Not a serving target. |
 
 Per-artifact caveat: an artifact may contain non-CB groups served by stock

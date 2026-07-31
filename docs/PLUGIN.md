@@ -49,10 +49,15 @@ but several times slower and not a serving target.
   W4A16 group. **Consequence:** an artifact's hardware requirements are the union
   of gridbook's and those of its delegated groups.
 - **Single-GPU (`tp=1`) only** — there is no tensor-parallel handling for CB
-  weights. `--enforce-eager` is the published-model configuration; mode-0
+  weights, and a live TP size above one now fails during model construction.
+  `--enforce-eager` is the published-model configuration; mode-0
   `FULL_DECODE_ONLY` is also capture-correct with the default opaque dispatch
   and is being promoted through the model-size performance gates
   ([details](TROUBLESHOOTING.md#do-i-really-need---enforce-eager)).
+- **BF16 activations only** — the shipping CUDA dense and grouped-MoE bindings
+  require BF16. Gridbook no longer advertises FP16 to vLLM and therefore fails
+  at dtype validation instead of crashing or changing dtype at a dispatch
+  crossover.
 
 ## Layout / registration
 
@@ -155,7 +160,7 @@ tooling and model cards — see the README's naming section.)
 | `PRISMAQUANT_CB_EXT_DIR` | `~/.cache/prismaquant-cb-ext` | Where the JIT extensions are built and cached. Point it at a persistent, writable directory in containers to avoid a ~30 s rebuild per start. |
 | `PRISMAQUANT_CB_DECODE` | `cuda` | `triton` forces the Triton decode path (much slower; bisection only). |
 | `PRISMAQUANT_CB_GEMV` | `inherited` | Which grouped fp4-CB decode GEMV serves a layer: `inherited` \| `auto` \| `v2`. Unset/`inherited` reproduces the shipped dispatch and never attempts the experimental JIT build. Explicit `auto` or `v2` may use `cb_gemv_v2.cu` only on native Blackwell cc 12.0/12.1 devices with the required opt-in shared memory and where the compiled occupancy predicate says it wins; this PR's execution battery covers cc 12.1. FP8-only serves never build it. **Not** bit-exact against `inherited` (reassociation class). An unknown spelling raises; changing it mid-process raises. |
-| `PRISMAQUANT_CB_PREFILL` | `auto` (fp8-CB) / `loop` (fp4-CB) | MoE prefill path: `auto` \| `stock` \| `grouped_fused` \| `loop`. For fp4-CB, unset selects conservative `loop`; any explicit mode also bypasses the separate fused-FP4 opt-in attempt. `l2_pipeline` exists but is **diagnostic-only** — it wedged live serving three times. |
+| `PRISMAQUANT_CB_PREFILL` | `auto` (fp8-CB) / `loop` (fp4-CB) | MoE prefill path: `auto` \| `stock` \| `grouped_fused` \| `grouped_fused_r1` \| `loop` \| `batched` \| `l2_pipeline`. `batched`, `grouped_fused_r1`, and `l2_pipeline` are diagnostic/A-B modes; `l2_pipeline` wedged live serving three times. For fp4-CB, unset selects conservative `loop`; any explicit mode also bypasses the separate fused-FP4 opt-in attempt. Unknown spellings fail, and changing the value mid-process requires a restart. |
 | `PRISMAQUANT_CB_FUSED_FP4` | off | Dense fp4-CB native-FP4 prefill opt-in: `1` for every prefill shape or `midm` for 16 < M <= 128. Changes the activation-scale bucket (fp32 emulation to native ue4m3), so it remains off pending served KL/PPL. |
 | `PRISMAQUANT_CB_FUSED_FP4_MOE` | off | Grouped-MoE fp4-CB native-FP4 prefill opt-in: `1`/`128` selects TileM 128; `256` selects TileM 256. An ineligible attempt fails closed to `loop`. It has the same activation-contract and served-quality gate as the dense path. |
 | `PRISMAQUANT_CB_FUSED_MIDM` | `1` | `0` skips the CUTLASS mid-M fused prefill kernel — including its JIT build, which is worth doing on non-`sm_120` GPUs where the build is doomed anyway. |

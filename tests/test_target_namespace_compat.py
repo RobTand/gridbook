@@ -581,6 +581,50 @@ def test_get_quant_method_delegates_gate_projection_not_router(monkeypatch):
         _Linear(), "model.layers.1.mlp.gate_proj") is delegated
 
 
+def test_config_advertises_only_the_bf16_runtime_contract():
+    import torch
+
+    cfg = PrismaQuantConfig(_config())
+    assert cfg.get_supported_act_dtypes() == [torch.bfloat16]
+    assert torch.float16 not in cfg.get_supported_act_dtypes()
+
+
+def test_live_tensor_parallel_size_above_one_fails_before_dispatch(monkeypatch):
+    import gridbook.config as config_mod
+
+    cfg = PrismaQuantConfig(_config())
+    monkeypatch.setattr(config_mod, "_initialized_tensor_parallel_world_size",
+                        lambda: 2)
+    with pytest.raises(ValueError, match=r"TP=2"):
+        # The gate precedes config resolution and method/weight construction.
+        cfg.get_quant_method(object(), "model.layers.0.mlp.down_proj")
+
+    monkeypatch.setattr(config_mod, "_initialized_tensor_parallel_world_size",
+                        lambda: 1)
+    cfg._require_supported_tensor_parallel()
+    assert cfg._tp_world_size == 1
+
+
+def test_fp8_cb_rejects_sm80_before_the_first_prefill(monkeypatch):
+    import gridbook.config as config_mod
+
+    cfg = PrismaQuantConfig(_config())
+    monkeypatch.setattr(config_mod.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(config_mod.torch.cuda, "get_device_capability",
+                        lambda: (8, 0))
+    with pytest.raises(ValueError, match=r"sm_89\+.*sm_80"):
+        cfg._require_cb_device_capability(_SCHEME, "model.layers.0.mlp.down_proj")
+
+    monkeypatch.setattr(config_mod.torch.cuda, "get_device_capability",
+                        lambda: (8, 9))
+    cfg._require_cb_device_capability(_SCHEME, "model.layers.0.mlp.down_proj")
+
+    fp4 = {**_SCHEME, "grid": "fp4"}
+    monkeypatch.setattr(config_mod.torch.cuda, "get_device_capability",
+                        lambda: (8, 0))
+    cfg._require_cb_device_capability(fp4, "model.layers.0.mlp.down_proj")
+
+
 _SUBSET_ENTRIES = ["model.layers.1.mlp.gate", "model.layers.1.mlp", "lm_head",
                    "mlp.down_proj", "model.layers.1"]
 _SUBSET_NAMES = ["model.layers.1.mlp.gate", "model.layers.1.mlp.gate_proj",
