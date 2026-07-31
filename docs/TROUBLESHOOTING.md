@@ -15,6 +15,7 @@ for "gridbook" will find nothing. Search for **`[prismaquant-cb]`**.
 
 - [The CUDA extension did not load (Triton fallback)](#the-cuda-extension-did-not-load-triton-fallback)
 - [Broken install: CUDA sources missing from the package](#broken-install-cuda-sources-missing-from-the-package)
+- [Incompatible JIT extension: the module loaded but has the wrong API](#incompatible-jit-extension-the-module-loaded-but-has-the-wrong-api)
 - [Fused prefill extension unavailable](#fused-prefill-extension-unavailable)
 - [Invalid quantization method: gridbook](#invalid-quantization-method-gridbook)
 - [Missing codebook sidecar or quant config](#missing-codebook-sidecar-or-quant-config)
@@ -100,6 +101,59 @@ pip install --force-reinstall git+https://github.com/RobTand/gridbook
 Then re-run the [install check](INSTALL.md#verify-the-install); `cb_gemv.cu
 found` must print `True`. Do **not** work around this by copying `csrc/` into
 `site-packages` — if it recurs on a current version, it is a bug worth an issue.
+
+---
+
+## Incompatible JIT extension: the module loaded but has the wrong API
+
+**Symptom** — on stderr:
+
+```
+[prismaquant-cb] ERROR: incompatible CUDA decode-GEMV extension — the module
+loaded for cb_gemv.cu from '<module path>' does not satisfy the current call
+contract: missing ['cb_gemv_fp4_v2']; every required symbol is [...]. requested
+build directory '/opt/gridbook/ext-cache' has mode ..., owner uid:gid ..., and
+is ... by this process. Clear this extension's build directory ...
+```
+
+The persistent-TC and fused loaders report the same module path, missing
+contract, and build-directory diagnostics. They remain fail-soft and return
+`None`, so their callers take the existing correct fallback.
+
+**Cause** — this symptom proves only that a module loaded successfully but does
+not export the API the current Python code will call. A stale or corrupt build
+artifact is possible, especially when one cache is carried across upgrades or
+image versions; an unexpected module supplied by the environment is another
+possibility. The error reports both the loaded module's `__file__` and the
+requested build directory so those cases can be distinguished.
+
+The build cache is *meant* to persist across restarts
+([persisting the cache](INSTALL.md#persisting-the-jit-build-cache); the
+reference image pins `PRISMAQUANT_CB_EXT_DIR=/opt/gridbook/ext-cache`), but use
+one cache directory per gridbook version when mounting it from the host.
+
+An **unwritable cache does not by itself explain a successfully loaded old
+module**. PyTorch normally needs to acquire a lock and write build metadata or
+outputs before loading; insufficient permissions ordinarily raise during that
+lock/build phase and land in the separate *"extension could not be built"*
+warning. Check ownership when that warning contains `PermissionError`, rather
+than inferring root ownership from a missing-symbol error.
+
+**Fix** — delete the directory (or point `PRISMAQUANT_CB_EXT_DIR` at a fresh
+one) and restart; you pay one ~30 s rebuild. Compare the module path in the
+error with the requested cache path. If a build error reports permissions,
+inspect the directory from *inside* the serving container:
+
+```bash
+docker exec <container> sh -lc 'ls -ld "$PRISMAQUANT_CB_EXT_DIR"; id'
+```
+
+**Why it is reported rather than tolerated** — until the loaders checked, the
+module was returned unexamined. A missing symbol then surfaced either as
+`AttributeError: module 'prismaquant_cb_ext' has no attribute '<name>'` raised
+mid-forward from inside a custom op, or — for the optional bindings, which read
+an absent symbol as "an older build" — as no error at all and a quietly slower
+server.
 
 ---
 

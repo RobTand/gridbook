@@ -18,6 +18,12 @@ container start; mount a host dir over it to persist). Never ``/tmp``.
 (~30 s is measured: cold ``get_ext()`` in ``vllm-node:latest``, no ``--gpus``,
 ``TORCH_CUDA_ARCH_LIST=12.1`` -> 29.4 s / 29.7 s on two runs.)
 
+Every loader validates the symbols its callers will use before returning a
+module. Strict call contracts use :func:`_require_symbols`; fused FP4 uses
+independent symbol families because its dense and grouped call sites are
+separately guarded. An incompatible module would otherwise fail with
+``AttributeError`` mid-forward, or silently disable a probed fast path.
+
 No fast-math: the QDQ kernel's division/conversion rounding must match torch
 bit-for-bit.
 """
@@ -48,7 +54,13 @@ class IncompleteInstallError(FileNotFoundError):
 
 
 class StaleExtensionError(RuntimeError):
-    """A loaded JIT module does not satisfy its current call contract."""
+    """A loaded extension does not satisfy its current Python call contract.
+
+    Kept separate from :class:`IncompleteInstallError` and compiler failures:
+    loading succeeded, but the resulting Python module is incompatible. A
+    stale/corrupt cache entry is one possible cause; so is an unexpected module
+    on the import path. The diagnostic names both the module and build cache.
+    """
 
 
 # Anchor for importlib.resources. ``__spec__.parent`` is the supported way to
@@ -91,25 +103,102 @@ def _require_csrc(*names: str) -> str:
     return d
 
 
-def _require_symbols(mod, names, *, build_dir: str, source: str):
-    """Return ``mod`` only when every unconditionally-called symbol exists.
+def _cache_diagnostics(build_dir: str) -> str:
+    """Describe a JIT build directory without claiming why a load went stale.
 
-    A persistent extension directory can contain a module built from an older
-    source/API. Refusing it at load turns an otherwise mid-forward
-    ``AttributeError`` into a clean fallback with the exact cache and module
-    locations in the diagnostic. This intentionally matches the helper
-    contract used by the other extension loaders.
+    An unwritable directory normally fails while acquiring the build lock or
+    writing build products; it is not evidence that ``load`` reused an old
+    module. Reporting the observed path/mode/owner/access lets an operator
+    distinguish that build failure from a binary API mismatch.
+    """
+    path = os.path.abspath(os.path.expanduser(os.fspath(build_dir)))
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        return (f"requested build directory {path!r} cannot be stat'ed "
+                f"({type(exc).__name__}: {exc})")
+    writable = os.access(path, os.W_OK | os.X_OK)
+    return (f"requested build directory {path!r} has mode "
+            f"{info.st_mode & 0o7777:04o}, owner uid:gid "
+            f"{info.st_uid}:{info.st_gid}, and is "
+            f"{'writable' if writable else 'not writable'} by this process")
+
+
+def _module_location(mod) -> str:
+    path = getattr(mod, "__file__", None)
+    return repr(os.fspath(path)) if path is not None else "<unknown>"
+
+
+def _mismatch_message(mod, *, build_dir: str, source: str,
+                      requirement: str) -> str:
+    return (
+        f"the module loaded for {source} from {_module_location(mod)} does not "
+        f"satisfy the current call contract: {requirement}. "
+        f"{_cache_diagnostics(build_dir)}. Clear this extension's build "
+        f"directory (or choose a fresh PRISMAQUANT_CB_EXT_DIR) and restart. "
+        f"A stale/corrupt cache or unexpected module is possible. If the "
+        f"build itself reported PermissionError, fix the directory ownership "
+        f"or mode; an unwritable cache ordinarily fails at lock/build time "
+        f"rather than proving that an old binary was reused."
+    )
+
+
+def _require_symbols(mod, names, *, build_dir: str, source: str):
+    """Return ``mod``, refusing it unless it exports every name in ``names``.
+
+    ``names`` must contain only symbols called without an upstream capability
+    probe. The helper intentionally keeps a small, stable signature so new JIT
+    loaders can share the same diagnostics.
     """
     required = tuple(names)
     missing = [name for name in required if not hasattr(mod, name)]
     if missing:
-        location = getattr(mod, "__file__", None) or "<unknown>"
-        raise StaleExtensionError(
-            f"the module loaded for {source} from {location!r} is missing "
-            f"{missing}; required symbols are {list(required)}. Clear "
-            f"{os.path.abspath(build_dir)!r} (or choose a fresh "
-            f"PRISMAQUANT_CB_EXT_DIR) and restart.")
+        requirement = (f"missing {missing}; every required symbol is "
+                       f"{list(required)}")
+        raise StaleExtensionError(_mismatch_message(
+            mod, build_dir=build_dir, source=source,
+            requirement=requirement))
     return mod
+
+
+def _require_any_symbol_family(mod, families, *, build_dir: str, source: str):
+    """Return ``mod`` when at least one independent call family is complete.
+
+    ``families`` is an iterable of ``(label, required_symbols)`` pairs. A
+    fused module may legitimately carry dense-prefill bindings, grouped-MoE
+    bindings, or both. Missing an entire family preserves its call-site
+    fallback; a module with no complete useful family is refused.
+    """
+    normalized = tuple((label, tuple(names)) for label, names in families)
+    if not normalized or any(not names for _label, names in normalized):
+        raise ValueError("symbol families must be non-empty")
+    if any(all(hasattr(mod, name) for name in names)
+           for _label, names in normalized):
+        return mod
+    detail = "; ".join(
+        f"{label} needs {list(names)} (missing "
+        f"{[name for name in names if not hasattr(mod, name)]})"
+        for label, names in normalized)
+    raise StaleExtensionError(_mismatch_message(
+        mod, build_dir=build_dir, source=source,
+        requirement=f"no usable symbol family; {detail}"))
+
+
+# Symbols ``get_ext()``'s module must export, asserted on EVERY load rather
+# than only at build time. Most are dereferenced unconditionally by a custom op
+# in ``ops.py``. ``fp4_act_qdq`` does have a correct codec fallback, but keeping
+# it in the same revision contract prevents a pre-QDQ cache from being accepted
+# as the current main extension and silently losing the single-launch path.
+_EXT_SYMBOLS = (
+    "fp8_act_qdq",          # ops.fp8_act_qdq
+    "fp4_act_qdq",          # ops.fp4_act_qdq
+    "cb_gemv_fp8",          # ops.cb_gemv_fp8
+    "cb_gemv_fp4_v2",       # ops.cb_gemv_fp4_v2
+    "cb_expand_fp8",        # ops.cb_expand_fp8
+    "cb_moe_gemv_fp8",      # ops.cb_moe_gemv_fp8
+    "cb_moe_gemv_fp4_v2",   # ops.cb_moe_gemv_fp4_v2
+    "cb_moe_combine",       # ops.cb_moe_combine
+)
 
 
 def get_ext():
@@ -126,9 +215,23 @@ def get_ext():
         build_dir = os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext")
         os.makedirs(build_dir, exist_ok=True)
-        _ext = load(name="prismaquant_cb_ext", sources=[src],
-                    build_directory=build_dir,
-                    extra_cuda_cflags=["-O3"], verbose=False)
+        mod = load(name="prismaquant_cb_ext", sources=[src],
+                   build_directory=build_dir,
+                   extra_cuda_cflags=["-O3"], verbose=False)
+        # Assign only after the symbol set checks out: a module missing one of
+        # these must never become the value `get_ext()` returns.
+        _ext = _require_symbols(mod, _EXT_SYMBOLS, build_dir=build_dir,
+                                source="cb_gemv.cu")
+    except StaleExtensionError as exc:
+        # Loading succeeded, so distinguish an incompatible module from source
+        # packaging and compiler/toolchain failures.
+        print(f"[prismaquant-cb] ERROR: incompatible CUDA decode-GEMV "
+              f"extension — "
+              f"{exc} Falling back to the Triton decode path until the cache "
+              f"is cleared: correct, but not production-eligible "
+              f"(docs/BENCHMARKS.md).",
+              file=sys.stderr, flush=True)
+        _ext = None
     except IncompleteInstallError as exc:
         # The speed figure is sourced, not asserted: docs/BENCHMARKS.md records
         # the CUDA grouped-GEMV decode path taking the reference 35B MoE
@@ -257,6 +360,10 @@ def _find_cutlass_include() -> str:
 _ptc = None
 _ptc_tried = False
 
+# ops.cb_prefill_persistent_tc dereferences this straight after the None check
+# (it has no probe), and it is the only binding cb_persistent_tc.cu exports.
+_PTC_SYMBOLS = ("cb_prefill_persistent_tc",)
+
 
 def get_persistent_ext():
     """JIT build/load of the persistent-N tensor-core prefill kernel
@@ -281,11 +388,21 @@ def get_persistent_ext():
         build_dir = os.path.join(build_dir, "ptc")
         os.makedirs(build_dir, exist_ok=True)
         cut = _find_cutlass_include()
-        _ptc = load(name="pq_cb_ptc",
-                    sources=[os.path.join(src_dir, "cb_persistent_tc.cu")],
-                    extra_include_paths=[cut, src_dir],
-                    extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
-                    build_directory=build_dir, verbose=False)
+        mod = load(name="pq_cb_ptc",
+                   sources=[os.path.join(src_dir, "cb_persistent_tc.cu")],
+                   extra_include_paths=[cut, src_dir],
+                   extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+                   build_directory=build_dir, verbose=False)
+        _ptc = _require_symbols(mod, _PTC_SYMBOLS, build_dir=build_dir,
+                                source="cb_persistent_tc.cu")
+    except StaleExtensionError as exc:
+        # Worth a warning even though this ext is opt-in: without it the None
+        # return makes ops.cb_prefill_persistent_tc report "ext not enabled
+        # (PRISMAQUANT_ENABLE_PTC=1)", which is the wrong diagnosis for someone
+        # who has just set that variable.
+        import warnings
+        warnings.warn(f"incompatible persistent-TC ext — {exc}")
+        _ptc = None
     except IncompleteInstallError as exc:
         import warnings
         warnings.warn(f"broken gridbook install — {exc}")
@@ -299,6 +416,16 @@ def get_persistent_ext():
 
 _fused_fp4 = None
 _fused_fp4_tried = False
+
+
+# Both families are guarded independently at their call sites
+# (linear._try_fused_fp4 and moe._gf4_ok). A binary containing either family
+# remains useful and must not be rejected merely because the other was built
+# from a different revision.
+_FUSED_FP4_SYMBOL_FAMILIES = (
+    ("dense prefill", ("cb_fused_fp4_prefill_mm_scaled",)),
+    ("grouped MoE prefill", ("cb_fused_fp4_moe_grouped",)),
+)
 
 
 def get_fused_fp4_ext():
@@ -337,13 +464,21 @@ def get_fused_fp4_ext():
         cc = torch.cuda.get_device_capability()
         arch = f"compute_{cc[0]}{cc[1]}a"
         code = f"sm_{cc[0]}{cc[1]}a"
-        _fused_fp4 = load(
+        mod = load(
             name="pq_cb_fused_fp4",
             sources=[os.path.join(src_dir, "cb_fused_fp4_gemm.cu")],
             extra_include_paths=incs + [src_dir],
             extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr",
                                f"-gencode=arch={arch},code={code}"],
             build_directory=build_dir, verbose=False)
+        _fused_fp4 = _require_any_symbol_family(
+            mod, _FUSED_FP4_SYMBOL_FAMILIES, build_dir=build_dir,
+            source="cb_fused_fp4_gemm.cu")
+    except StaleExtensionError as exc:
+        print(f"[prismaquant-cb] ERROR: incompatible fused fp4 prefill "
+              f"extension — {exc} fp4 prefill stays on the Triton/transient "
+              f"paths.", file=sys.stderr, flush=True)
+        _fused_fp4 = None
     except IncompleteInstallError as exc:
         print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
               f"fp4 prefill stays on the Triton/transient paths.",
@@ -358,6 +493,13 @@ def get_fused_fp4_ext():
     return _fused_fp4
 
 
+# `_gf_ok` is the prerequisite for both the dense and grouped FP8 fused paths,
+# and it dereferences this binding after its capability probe. Grouped bindings
+# remain optional additions: `_gf2_ok` requires `_gf_ok` first, then probes
+# `cb_fused_moe_grouped` and `cb_fused_moe_tile_m` separately.
+_FUSED_SYMBOLS = ("cb_fused_prefill_mm_scaled",)
+
+
 def get_fused_ext():
     """The CUTLASS decode-in-prologue prefill extension (cb_fused_gemm.cu),
     or None. Separate module from the GEMV ext: it needs the CUTLASS headers
@@ -368,49 +510,42 @@ def get_fused_ext():
         return _fused
     _fused_tried = True
     try:
-        import glob
-
         import torch  # noqa: F401
-        import vllm
         from torch.utils.cpp_extension import load
 
-        vroot = os.path.dirname(os.path.abspath(vllm.__file__))
-        cut = None
-        for pat in ("third_party/fmha_sm100/cutlass", "third_party/cutlass"):
-            cand = os.path.join(vroot, pat)
-            if os.path.isdir(os.path.join(cand, "include")):
-                cut = cand
-                break
-        if cut is None:
-            hits = glob.glob(os.path.join(
-                vroot, "third_party", "**", "cutlass", "include"),
-                recursive=True)
-            if hits:
-                cut = os.path.dirname(hits[0])
-        if cut is None:
-            raise FileNotFoundError("no bundled CUTLASS under vllm/third_party")
+        cut_inc = _find_cutlass_include()
+        cut_root = os.path.dirname(cut_inc)
         src_dir = _require_csrc("cb_fused_gemm.cu")
         build_dir = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
         build_dir = os.path.join(build_dir, "fused")
         os.makedirs(build_dir, exist_ok=True)
-        _fused = load(name="pq_cb_fused",
-                      sources=[os.path.join(src_dir, "cb_fused_gemm.cu")],
-                      extra_include_paths=[os.path.join(cut, "include"),
-                                           os.path.join(cut, "tools", "util",
-                                                        "include"),
-                                           src_dir],
-                      extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
-                      build_directory=build_dir, verbose=False)
+        mod = load(name="pq_cb_fused",
+                   sources=[os.path.join(src_dir, "cb_fused_gemm.cu")],
+                   extra_include_paths=[cut_inc,
+                                        os.path.join(cut_root, "tools", "util",
+                                                     "include"),
+                                        src_dir],
+                   extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+                   build_directory=build_dir, verbose=False)
+        _fused = _require_symbols(mod, _FUSED_SYMBOLS,
+                                  build_dir=build_dir,
+                                  source="cb_fused_gemm.cu")
+    except StaleExtensionError as exc:
+        print(f"[prismaquant-cb] ERROR: incompatible fused prefill "
+              f"extension — {exc} Fused dense and grouped prefill stay on "
+              f"their fallback paths.",
+              file=sys.stderr, flush=True)
+        _fused = None
     except IncompleteInstallError as exc:
         print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
-              f"Mid-M prefill stays on the transient expand path.",
+              f"Fused dense and grouped prefill stay on their fallback paths.",
               file=sys.stderr, flush=True)
         _fused = None
     except Exception as exc:  # noqa: BLE001
         print(f"[prismaquant-cb] WARNING: fused prefill extension unavailable "
-              f"({type(exc).__name__}: {exc}); mid-M stays on the transient "
-              f"expand path (the shipping default — this is expected on "
+              f"({type(exc).__name__}: {exc}); fused dense and grouped "
+              f"prefill stay on their fallback paths (this is expected on "
               f"non-sm_120 GPUs and without nvcc).",
               file=sys.stderr, flush=True)
         _fused = None
