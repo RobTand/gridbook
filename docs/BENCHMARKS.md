@@ -1,5 +1,11 @@
 # Benchmarks
 
+For new native-performance work, use the reproducible streaming
+[native-parity protocol](NATIVE-PARITY.md). It fixes request shapes and seeds,
+runs independent blocks through `vllm bench serve`, and records the artifact,
+image, dispatch, software, and server provenance alongside true TTFT/TPOT/ITL/
+E2EL metrics.
+
 All results are from a **single NVIDIA GB10 / DGX Spark** (Blackwell `sm_121`,
 128 GB unified memory, ~273 GB/s). Published-model rows use vLLM with
 `--enforce-eager`; the explicitly labelled CUDA-graph canary does not. Read the
@@ -45,12 +51,15 @@ and ten measured repetitions, not TTFT/TPOT measurements.
 
 ## What is being compared, and how
 
-- **Matched-bpp baseline.** Every quality comparison is against an artifact of the
-  **same model at the same bits-per-weight**, quantized to stock per-Linear
-  **NVFP4/FP8** and served natively by vLLM's `compressed-tensors` path. This
-  isolates the one variable that matters: the *same byte budget* spent on codebook
-  formats versus scalar formats. (It is **not** a comparison to BF16 or to a
-  smaller/larger model.)
+- **Matched-rate baseline.** Quality rows compare the same model family against a
+  stock per-Linear **NVFP4/FP8** assignment served by vLLM's
+  `compressed-tensors` path. Historical tables generally match quantizable-body
+  bpp or body bytes, not a canonical whole-artifact inventory. They also compare
+  complete execution contracts—often native W4A4 against CB W8A8—not weight
+  encoding alone. Treat each row according to its stated byte scope and W/A
+  contract; only an inventory-derived whole-artifact match can pass the formal
+  [native-parity gate](NATIVE-PARITY.md). The published “native” baselines are
+  generally mixed NVFP4/FP8 assignments, not pure-NVFP4 artifacts.
 - **KL-vs-BF16.** Exact full-vocab (top-20) KL divergence between the quantized
   model's next-token distribution and the BF16 model's, on held-out WikiText
   (8176 positions), against the *same* BF16 reference dump per model. Lower is
@@ -79,8 +88,9 @@ disk — noted per model below.
 
 A 27B hybrid model (attention + gated linear-attention, with a vision tower),
 quantized at **5.5 bpp**. The allocator placed the **entire quantizable body on
-FP8-CB codebook rungs** and **zero** stock NVFP4/FP8 — the codebook formats won
-every Linear on cost.
+FP8-CB codebook rungs** and **zero** stock NVFP4/FP8 under that run's
+accuracy-only allocation objective. The teacher-backed comparison below is the
+quality evidence; the zero-native assignment by itself is not a speed claim.
 
 > **Which build is this?** The A/B in this section is the **2026-07-18** run,
 > whose CB arm was allocated from a 4-rung menu (`FP8_CB_K36/K40/K44/K48`, 386 CB
@@ -93,7 +103,8 @@ every Linear on cost.
 
 **Matched-bpp denominator (from the safetensors headers):** the CB body is
 **16.713 GB**, the NVFP4/FP8 baseline body is **16.707 GB** — a 0.04% difference.
-This is a genuine matched-bytes comparison.
+This is a close quantized-body byte match for the quality comparison, not a
+canonical whole-artifact inventory match.
 
 | | confident-KL | ALL-KL | conf top-1 | ALL top-1 | PPL | NLL |
 |---|---|---|---|---|---|---|
@@ -117,8 +128,9 @@ body-byte difference cannot explain a 58% KL move.
 | NVFP4/FP8 baseline (native) | **0.746 s** | 10.26 |
 | **CB (ours)** | 1.075 s | **10.27-10.30** |
 
-- **Decode is at/above native parity** (10.3 vs 10.26). At matched body bytes,
-  parity is the ceiling for a bandwidth-bound decode — reached.
+- **Measured batch-1 decode is at/above the native row in this historical cell**
+  (10.3 vs 10.26). This does not establish parity for batched/speculative decode,
+  tail ITL, other prompt distributions, or a formal whole-artifact byte match.
 - **Prefill is ~1.44× the native baseline** (1.075 s vs 0.746 s). The residual is
   the transient-expand path's doubled memory traffic; closing it is the
   fused-prologue / persistent-N kernel work in [`KERNELS.md`](KERNELS.md). (The
@@ -268,10 +280,11 @@ FP8-CB K44 MTP draft).
   (which GGUF cannot carry) closes most of the gap on natural text: 16.1
   tok/s** with the FP8-CB K44 draft at k=1, and becomes a straight multiplier
   once vLLM captures drafter CUDA graphs.
-- The joint-menu allocation experiment is also worth citing: offered vanilla
-  NVFP4 and FP8 alongside the codebook rungs, the measured allocator gave 36
-  Linears to vanilla FP8 and **zero to vanilla NVFP4** — at matched bits the
-  codebook dominates the fixed grid on every unit of a 295B.
+- The joint-menu allocation experiment gave 36 Linears to vanilla FP8 and zero
+  to vanilla NVFP4. That is an accuracy-only allocator outcome, so zero NVFP4 is
+  circular evidence about that objective—not proof that CB dominates native on
+  latency or on every unit. This 295B result has fit/serve/TEB evidence and no
+  BF16-teacher quality claim.
 - **ToolEvalBench: the shipped joint-menu artifact scored 88/100 (130/148)** on
   the ship config, against the GGUF IQ build's 87 (129/148) and k-quant's 86
   (128/148), under the identical protocol below. Zero errors, all 74 scenarios
@@ -344,14 +357,16 @@ runs as the tables above.
 - **TEB is base-model-dominated at matched bytes.** Tool-use parity across
   quantizations of the same base model is the expected result; treat TEB as a "does
   not regress" gate, not a quantization-quality discriminator.
-- **Speed status is honest and uneven.** Decode is at/above native parity (dense
-  and MoE). Large-M dense **prefill is not yet at native parity**: ~1.44× on the
-  27B (traffic-bound transient expand). MoE prefill was the worst gap and is now
-  the default CUDA chunk-expander path (Laguna 117B: 293 → 1,821 tok/s at 8k) —
-  the 35B TTFT row above predates it. The GGUF prefill comparison (the 295B
-  ~2.6×) is against a *different* serving stack (llama.cpp CUDA-core IQ dequant),
-  and is the clean "why native tiles win" number; it is not a claim of parity
-  with vLLM's own native NVFP4/FP8 GEMM at large M.
+- **Speed status is honest and uneven.** Historical batch-1 cells reached or
+  exceeded their native decode rows, but batched/speculative decode, tail ITL,
+  and the formal exact-byte workload matrix remain open. Large-M dense
+  **prefill is not yet at native parity**: ~1.44× on the 27B (traffic-bound
+  transient expand). MoE prefill was the worst gap and is now the default CUDA
+  chunk-expander path (Laguna 117B: 293 → 1,821 tok/s at 8k)—the 35B TTFT row
+  above predates it. The GGUF prefill comparison (the 295B ~2.6×) is against a
+  *different* serving stack (llama.cpp CUDA-core IQ dequant), and is the clean
+  "why native tiles win" number; it is not a claim of parity with vLLM's own
+  native NVFP4/FP8 GEMM at large M.
 - **bpp vs disk size differ by the BF16 floor.** Reported bpp is over quantizable
   params; embeddings/`lm_head`/norms/non-CB Linears are excluded from bpp but
   resident on disk, so `bpp × params` understates the artifact size.
