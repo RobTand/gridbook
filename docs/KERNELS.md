@@ -66,15 +66,15 @@ the CUDA-graph section for why this host-side branch matters.
 
 ---
 
-## Prefill path (large M): transient-expand + native GEMM
+## Prefill path (large M): transient expansion
 
 The default prefill **expands one layer's weight tile transiently** into a scratch
-buffer — decode CB → native FP4/FP8 codes + the (composed) E4M3 scale plane — then
-runs the stock native tensor-core GEMM on it, and frees the buffer. Memory stays
-bounded (INV-1); the tensor cores do the matmul (INV-2). For FP4-CB the expander
-emits an FP4-packed tile plus the swizzled E4M3 scale layout the block-scaled MMA
-expects, then calls the native FP4 GEMM; for FP8-CB it expands **directly to FP8**
-(the codebook values are already on the E4M3 grid), skipping any BF16 intermediate.
+buffer, runs a GEMM, and frees the buffer. Memory stays bounded (INV-1). FP8-CB
+expands **directly to FP8** (the codebook values are already on the E4M3 grid)
+and calls the stock native tensor-core GEMM (INV-2). FP4-CB v2 currently expands
+to BF16 and calls cuBLAS; that is a correctness-first fallback which does not yet
+meet INV-2. The native-FP4 decode-in-prologue kernel described below is opt-in
+because it changes the served activation bucket and still needs a quality A/B.
 
 The honest limitation of transient-expand is **memory traffic**: the tile is
 written to HBM and then read back by the GEMM, so prefill moves roughly 2× the
@@ -158,9 +158,10 @@ at 8k** and **207 → 1,822 tok/s at 63k**. Chunked prefill re-expands per
 microbatch, so `--max-num-batched-tokens 16384` matters for this path.
 
 **fp4**-CB MoE prefill can explicitly ride the same chunked `stock` path. The
-current unset policy remains fused-FP4 first, with `loop` on a constraint miss;
-an explicit `PRISMAQUANT_CB_PREFILL` bypasses that fused default so the selector
-is a reliable bisection control. Stock's transient is a bf16 expand rather than
+unset policy is the conservative per-expert `loop`. The native-FP4 grouped path
+is enabled with `PRISMAQUANT_CB_FUSED_FP4_MOE=1` (or `128`/`256` to select its
+tile), while an explicit `PRISMAQUANT_CB_PREFILL` remains authoritative and is a
+reliable bisection control. Stock's transient is a bf16 expand rather than
 the fp8-direct CUDA one, at 2 B/elt, so its chunk is sized from a **byte budget**
 (`PRISMAQUANT_CB_PREFILL_CHUNK_BYTES`, default 1 GiB) instead of the fp8 lane's
 flat 256: on a 192-expert Hy3-class band that is 1,184 MiB of measured
