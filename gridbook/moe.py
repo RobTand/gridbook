@@ -490,8 +490,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # producer/prologue. Values: "1"/"128" tile_m=128, "256" tile_m=256.
         # NOTE the activation bucket changes on this path (native NVFP4 quant,
         # not codec.fp4_group16_act_qdq). An explicit PRISMAQUANT_CB_PREFILL
-        # is authoritative and bypasses this default, so stock/loop remain
-        # real bisection controls rather than being silently preempted.
+        # is authoritative and bypasses this opt-in attempt, so stock/loop
+        # remain real bisection controls rather than being silently preempted.
         # Explicit opt-in until a served quality gate and routing-shape ladder
         # pass. Tile 128 is 5.2-5.6x faster than the per-expert loop on the
         # measured shapes, but its padding cost has a sharp token-count cliff.
@@ -507,10 +507,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 if out is not None:
                     return out
 
-        # Preserve current policy: fp8 uses measured auto; fp4 first tries its
-        # default fused path above and falls back to the conservative loop on a
-        # constraint miss. Stock remains explicitly selectable, now with safe
-        # byte budgeting and a zero-copy packed view.
+        # Preserve current policy: fp8 uses measured auto; fp4 defaults to the
+        # conservative loop. Only the explicit FUSED_FP4_MOE gate above tries
+        # the fused path, falling back here on a constraint miss. Stock remains
+        # explicitly selectable, with safe byte budgeting and a zero-copy view.
         mode = requested_mode or ("auto" if not self.is_fp4 else "loop")
         if mode == "auto":
             return self._apply_prefill_auto(
