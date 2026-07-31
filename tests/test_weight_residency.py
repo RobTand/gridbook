@@ -250,3 +250,225 @@ def test_weight_scale_is_not_duplicated():
     layer, _ = _loaded_layer()
     assert (layer._cb_scale.untyped_storage().data_ptr()
             == layer.weight_scale.data.untyped_storage().data_ptr())
+
+
+# ---------------------------------------------------------------------------
+# 3. fused roles: exact codebook references share one LUT block safely
+# ---------------------------------------------------------------------------
+
+_FUSED_K = 28
+_FUSED_TYPE_SIZE = 4 * _FUSED_K
+_FUSED_SCHEME = {
+    "grid": "fp8", "mode": "product", "k": _FUSED_K, "n_sub": 4,
+    "type_size": _FUSED_TYPE_SIZE, "group_size": 0, "vec_dim": 8,
+    "codebook_group": "attn", "codebook_source": "learned",
+}
+_FUSED_PREFIX = "model.layers.0.self_attn.qkv_proj"
+_FUSED_ROLES = [
+    "model.layers.0.self_attn.q_proj",
+    "model.layers.0.self_attn.k_proj",
+    "model.layers.0.self_attn.v_proj",
+]
+_REF_A = tuple(f"cb.a.sub{i}" for i in range(4))
+_REF_B = tuple(f"cb.b.sub{i}" for i in range(4))
+_FUSED_WIDTHS = (3, 5, 4)
+_FUSED_BLOCK_VALUES = 4 * (2 ** (_FUSED_K // 4)) * 2
+
+
+def _fused_loaded_layer(role_refs):
+    """Load a three-role fused dense layer without touching CUDA or vLLM TP."""
+    target_scheme = {
+        role: {**_FUSED_SCHEME, "codebook_ref": list(ref)}
+        for role, ref in zip(_FUSED_ROLES, role_refs)
+    }
+    all_names = {name for ref in role_refs for name in ref}
+    codebooks = {
+        name: torch.full(
+            (2 ** (_FUSED_K // 4), 2),
+            # Deliberately identical contents across differently named refs:
+            # deduplication is by provenance identity, never by current value.
+            1.0,
+            dtype=torch.bfloat16,
+        )
+        for name in all_names
+    }
+
+    class _FusedConfig:
+        def __init__(self):
+            self.target_scheme = target_scheme
+
+        def shard_target_keys(self, prefix, *, unfused_fallback=False):
+            assert prefix == _FUSED_PREFIX
+            assert unfused_fallback
+            return list(_FUSED_ROLES)
+
+        def get_codebooks(self):
+            return codebooks
+
+    method = PrismaQuantCBLinearMethod(
+        _FusedConfig(),
+        {**_FUSED_SCHEME, "codebook_ref": list(role_refs[0])},
+        _FUSED_PREFIX,
+    )
+    layer = _Layer()
+    rows = sum(_FUSED_WIDTHS)
+    row_bytes = (_K // codec.SUPERBLOCK) * _FUSED_TYPE_SIZE
+    layer.cb_qweight = torch.nn.Parameter(
+        torch.randint(0, 256, (rows, row_bytes), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.linspace(0.5, 1.5, rows), requires_grad=False)
+    layer.logical_widths = list(_FUSED_WIDTHS)
+    layer._cb_input_size = _K
+    method.process_weights_after_loading(layer)
+    return method, layer, codebooks
+
+
+def _flat_for_ref(ref, codebooks):
+    return codec.build_flat_codebook(
+        [codebooks[name] for name in ref], _FUSED_PREFIX, "fp8")
+
+
+def test_identical_fused_refs_deduplicate_block_and_offsets():
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+    assert layer._cb_flat.numel() == _FUSED_BLOCK_VALUES
+    assert torch.equal(
+        layer._cb_row_offset,
+        torch.zeros(sum(_FUSED_WIDTHS), dtype=torch.int32),
+    )
+    assert layer._cb_fp8_fused_lut_ok is True
+    assert method._fused_fp8_lut_ok(layer) is True
+
+
+def test_distinct_fused_refs_keep_distinct_blocks_and_offsets():
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_B, _REF_A])
+    expected_offsets = torch.tensor(
+        [0] * _FUSED_WIDTHS[0]
+        + [_FUSED_BLOCK_VALUES] * _FUSED_WIDTHS[1]
+        + [0] * _FUSED_WIDTHS[2],
+        dtype=torch.int32,
+    )
+    assert layer._cb_flat.numel() == 2 * _FUSED_BLOCK_VALUES
+    assert torch.equal(layer._cb_row_offset, expected_offsets)
+    assert layer._cb_fp8_fused_lut_ok is False
+    assert method._fused_fp8_lut_ok(layer) is False
+
+
+def test_codebook_ref_order_is_part_of_dedup_identity():
+    reversed_ref = tuple(reversed(_REF_A))
+    method, layer, _ = _fused_loaded_layer([_REF_A, reversed_ref, _REF_A])
+    assert layer._cb_flat.numel() == 2 * _FUSED_BLOCK_VALUES
+    assert torch.equal(
+        layer._cb_row_offset,
+        torch.tensor(
+            [0] * _FUSED_WIDTHS[0]
+            + [_FUSED_BLOCK_VALUES] * _FUSED_WIDTHS[1]
+            + [0] * _FUSED_WIDTHS[2],
+            dtype=torch.int32,
+        ),
+    )
+    assert method._fused_fp8_lut_ok(layer) is False
+
+
+@pytest.mark.parametrize("role_refs", [
+    (_REF_A, _REF_A, _REF_A),
+    (_REF_A, _REF_B, _REF_A),
+])
+def test_dedup_preserves_every_rows_addressed_lut(role_refs):
+    """The compact layout addresses the same LUT as the old concatenation."""
+    _method, layer, codebooks = _fused_loaded_layer(role_refs)
+    legacy_blocks = [_flat_for_ref(ref, codebooks) for ref in role_refs]
+    legacy_flat = torch.cat(legacy_blocks)
+    legacy_base = 0
+    row = 0
+    for width, block in zip(_FUSED_WIDTHS, legacy_blocks):
+        new_bases = layer._cb_row_offset[row:row + width]
+        assert bool((new_bases == new_bases[0]).all())
+        new_base = int(new_bases[0])
+        assert torch.equal(
+            layer._cb_flat[new_base:new_base + block.numel()],
+            legacy_flat[legacy_base:legacy_base + block.numel()],
+        )
+        legacy_base += block.numel()
+        row += width
+
+
+def _mock_fp8_ops(monkeypatch, N):
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp8_quant = lambda x, **kw: (
+        x, torch.ones(x.shape[0], 1, dtype=torch.float32))
+    vops.cutlass_scaled_mm = lambda xq, wt, sa, ws, dtype, bias: torch.full(
+        (xq.shape[0], N), 7.0, dtype=torch.bfloat16)
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    return vops
+
+
+def test_same_ref_fused_roles_enter_midm_kernel(monkeypatch):
+    from gridbook import cuda_ext
+
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+    N, K, M = layer._cb_N, layer._cb_K, 32
+    _mock_fp8_ops(monkeypatch, N)
+    calls = []
+
+    class _FusedExt:
+        @staticmethod
+        def cb_fused_prefill_mm_scaled(xq, qw, cb, sa, ws, n, k, k_bits):
+            calls.append((qw, cb, n, k, k_bits))
+            return torch.full((M, N), 11.0, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(cuda_ext, "get_fused_ext", lambda: _FusedExt())
+    monkeypatch.setattr(
+        sys.modules["gridbook.linear"], "expand_cb_to_fp8",
+        lambda *a, **kw: pytest.fail("eligible shared LUT fell back"),
+    )
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "1")
+    out = method._apply_inline(layer, torch.zeros(M, K, dtype=torch.bfloat16))
+    assert len(calls) == 1
+    assert calls[0][1] is layer._cb_flat_fp8
+    assert torch.equal(out, torch.full_like(out, 11.0))
+
+
+def test_distinct_ref_fused_roles_fall_back_before_extension(monkeypatch):
+    from gridbook import cuda_ext
+
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_B, _REF_A])
+    N, K, M = layer._cb_N, layer._cb_K, 32
+    _mock_fp8_ops(monkeypatch, N)
+    monkeypatch.setattr(
+        cuda_ext, "get_fused_ext",
+        lambda: pytest.fail("offset-unsafe fused extension was queried"),
+    )
+    fallback_calls = []
+
+    def _expand(*args, **kwargs):
+        fallback_calls.append((args, kwargs))
+        return torch.zeros(N, K, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        sys.modules["gridbook.linear"], "expand_cb_to_fp8", _expand)
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "1")
+    out = method._apply_inline(layer, torch.zeros(M, K, dtype=torch.bfloat16))
+    assert len(fallback_calls) == 1
+    assert torch.equal(out, torch.full_like(out, 7.0))
+
+
+def test_fused_lut_guard_rejects_uniform_nonzero_base():
+    """The kernel starts at cb[0]; merely uniform offsets are insufficient."""
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+    del layer._cb_fp8_fused_lut_ok
+    layer._cb_row_offset.fill_(_FUSED_BLOCK_VALUES)
+    assert method._fused_fp8_lut_ok(layer) is False
+
+
+@pytest.mark.parametrize("attr,value", [
+    ("n_sub", 2),
+    ("type_size", _FUSED_TYPE_SIZE + 16),
+])
+def test_fused_lut_guard_rejects_incompatible_fp8_layout(attr, value):
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+    setattr(method, attr, value)
+    assert method._fused_fp8_lut_ok(layer) is False
