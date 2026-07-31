@@ -253,7 +253,7 @@ def fp4_act_qdq_or_codec(x: torch.Tensor) -> torch.Tensor:
     OUTSIDE the kernel precisely so CUDA-vs-Triton numerics stay aligned, so a
     tolerance here would silently break that contract.
     """
-    if x.dtype is torch.bfloat16 and fp4_act_qdq_ok():
+    if x.is_cuda and x.dtype is torch.bfloat16 and fp4_act_qdq_ok():
         return fp4_act_qdq(x)
     from . import codec
     return codec.fp4_group16_act_qdq(x).to(torch.bfloat16)

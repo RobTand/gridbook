@@ -529,13 +529,20 @@ __global__ __launch_bounds__(kThreads) void fp4_group16_act_qdq_kernel(
     const float v = live ? bf16_to_f32(row[i]) : 0.0f;
 
     float amax = fabsf(v);
+    int has_nan = isnan(v) ? 1 : 0;
 #pragma unroll
     for (int off = 8; off > 0; off >>= 1) {
       amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+      has_nan |= __shfl_xor_sync(0xffffffffu, has_nan, off);
     }
     if (!live) continue;
 
-    const float scale = __fmul_rn(fmaxf(amax, 1e-8f), 1.0f / 6.0f);
+    // torch.amax propagates NaN while CUDA fmaxf deliberately ignores it.
+    // Preserve the codec's group semantics: one NaN makes the scale, and thus
+    // every output in that group, NaN.
+    const float scale = has_nan
+        ? nanf("")
+        : __fmul_rn(fmaxf(amax, 1e-8f), 1.0f / 6.0f);
     orow[i] = f32_to_bf16_rn(
         __fmul_rn(fp4_rtn_e2m1(__fdiv_rn(v, scale)), scale));
   }
@@ -565,13 +572,17 @@ torch::Tensor fp4_act_qdq(torch::Tensor x) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16,
               "fp4_act_qdq wants a CUDA bf16 tensor");
   auto x2 = x.contiguous();
+  TORCH_CHECK(x2.dim() >= 1,
+              "fp4_act_qdq needs at least one dimension");
   const int64_t K = x2.size(-1);
+  TORCH_CHECK(K > 0,
+              "fp4_act_qdq needs a positive last dimension");
   TORCH_CHECK(K % 16 == 0,
               "fp4_act_qdq needs a last dim that is a multiple of the fp4 "
               "group (16); got ", K);
   const int64_t M = x2.numel() / K;
   auto out = torch::empty_like(x2);
-  if (M == 0 || K == 0) return out;
+  if (M == 0) return out;
   const c10::cuda::OptionalCUDAGuard guard(x2.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   fp4_group16_act_qdq_kernel<<<(unsigned)M, kThreads, 0, stream>>>(

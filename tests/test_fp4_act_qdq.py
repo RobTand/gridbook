@@ -111,6 +111,29 @@ def test_reciprocal_scale_midpoint_case():
         f"  got={got.flatten().tolist()}")
 
 
+def test_nonfinite_groups_match_codec_classification():
+    """NaN propagation must match ``torch.amax`` group semantics.
+
+    CUDA ``fmaxf`` ignores a lone NaN, whereas the codec's ``torch.amax``
+    propagates it.  Without an explicit group flag the fused path would return
+    plausible finite values for a group the reference turns entirely into NaN.
+    NaN payload bits are not part of the contract, but the value classes and
+    all finite outputs are.
+    """
+    rows = torch.tensor([
+        [float("nan"), 1.0] + [0.0] * 14,
+        [float("inf"), -1.0] + [0.0] * 14,
+        [float("-inf"), 1.0] + [0.0] * 14,
+    ], device=DEV, dtype=torch.bfloat16)
+    ref = codec.fp4_group16_act_qdq(rows).to(torch.bfloat16)
+    got = ext.fp4_act_qdq(rows)
+    assert torch.equal(torch.isnan(ref), torch.isnan(got))
+    assert torch.equal(torch.isposinf(ref), torch.isposinf(got))
+    assert torch.equal(torch.isneginf(ref), torch.isneginf(got))
+    finite = torch.isfinite(ref)
+    assert torch.equal(ref[finite], got[finite])
+
+
 def test_refuses_k_not_multiple_of_group():
     """A last dim that is not a multiple of 16 must raise, not silently corrupt."""
     x = torch.randn(1, 30, device=DEV, dtype=torch.bfloat16)
@@ -124,6 +147,18 @@ def test_refuses_non_bf16():
         ext.fp4_act_qdq(x)
 
 
+def test_refuses_zero_last_dim_without_dividing_by_zero():
+    x = torch.empty(2, 0, device=DEV, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="positive last dimension"):
+        ext.fp4_act_qdq(x)
+
+
+def test_accepts_empty_leading_dimension():
+    x = torch.empty(0, 32, device=DEV, dtype=torch.bfloat16)
+    got = ext.fp4_act_qdq(x)
+    assert got.shape == x.shape and got.dtype == x.dtype and got.numel() == 0
+
+
 def test_resolver_matches_codec():
     """``ops.fp4_act_qdq_or_codec`` is bit-identical on both of its branches."""
     from gridbook import ops
@@ -134,6 +169,12 @@ def test_resolver_matches_codec():
     xf = x.float()
     ref32 = codec.fp4_group16_act_qdq(xf).to(torch.bfloat16)
     assert torch.equal(ref32, ops.fp4_act_qdq_or_codec(xf))
+
+    # An available CUDA extension must not make a CPU bf16 tensor call a CUDA-
+    # only op.  The resolver's eager fallback is device-generic.
+    x_cpu = torch.randn(2, 32, dtype=torch.bfloat16)
+    ref_cpu = codec.fp4_group16_act_qdq(x_cpu).to(torch.bfloat16)
+    assert torch.equal(ref_cpu, ops.fp4_act_qdq_or_codec(x_cpu))
 
 
 def _host_us(fn, x, iters=300, warmup=30):
