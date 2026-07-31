@@ -19,6 +19,7 @@ for "gridbook" will find nothing. Search for **`[prismaquant-cb]`**.
 - [Fused prefill extension unavailable](#fused-prefill-extension-unavailable)
 - [Invalid quantization method: gridbook](#invalid-quantization-method-gridbook)
 - [Missing codebook sidecar or quant config](#missing-codebook-sidecar-or-quant-config)
+- [Codebook provenance mismatch](#codebook-provenance-mismatch)
 - [Out of memory on a 32 GB card](#out-of-memory-on-a-32-gb-card)
 - [Out of memory / box hang on a DGX Spark](#out-of-memory--box-hang-on-a-dgx-spark)
 - [Serving is far slower than the published numbers](#serving-is-far-slower-than-the-published-numbers)
@@ -251,6 +252,47 @@ huggingface-cli download rdtand/Qwen3.6-27B-prismaquant-gridbook-5.5bit-vllm \
 
 Serving by Hub id (`vllm serve rdtand/...`) also works — the sidecars are fetched
 from the Hub automatically in that case.
+
+---
+
+## Codebook provenance mismatch
+
+**Symptom** — model load aborts with:
+
+```
+ValueError: [prismaquant-cb] ERROR: codebook provenance mismatch for
+<path>/cb_codebooks.pqcb (... expected <digest>, computed <digest> ...)
+```
+
+**What it means** — the per-table hashes in
+`quant_config.json["provenance"]["codebook_sha256"]` do not match the codebook
+sidecar ([SPEC.md §4.1](SPEC.md)). The usual causes are a hand-assembled model
+directory that picked up a `.pqcb` from a *different* artifact, a stale sidecar
+left behind when the model was re-encoded, and length-preserving data corruption
+(a bad disk or an interrupted in-place sync).
+
+**Why this is an error and not a warning** — wrong codebook *values* cannot be
+caught any later. A `k`-bit codeword indexes a `2^k`-row table, so every index
+is in range by construction and a wrong table decodes to a correctly-shaped
+tensor of structured garbage: the server starts, the weights "load", and
+generation is quietly wrong. See
+[the model loads but generates garbage](#the-model-loads-but-generates-garbage)
+for the other member of that family. (Structural damage was never the problem —
+a byte-truncated `.pqcb` already fails to deserialize with
+`SafetensorError: MetadataIncompleteBuffer`.)
+
+**Fix** — re-download the complete artifact, including both `quant_config.json`
+and `cb_codebooks.pqcb` (see
+[missing sidecar](#missing-codebook-sidecar-or-quant-config)). To verify a local
+artifact without starting a server (no GPU or vLLM needed):
+
+```bash
+python scripts/verify_codebooks.py /path/to/model-directory
+```
+
+There is no serve-anyway switch: a declared mismatch would otherwise silently
+decode every affected weight with wrong values. Legacy artifacts whose config
+does not declare `codebook_sha256` remain supported and load without the check.
 
 ---
 

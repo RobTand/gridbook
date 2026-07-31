@@ -100,6 +100,10 @@ Notes for this model:
   [`docs/KERNELS.md` §CUDA-graph safety rules](https://github.com/RobTand/gridbook/blob/master/docs/KERNELS.md#cuda-graph-safety-rules).
 - **Vision tower** is NVFP4 weight-only (W4A16) and verified on image inputs; it
   needs a Blackwell-class or Marlin-supported path. Not tested on Ada.
+  "Blackwell-class" is not one family — `sm_100` is capability family 10 and
+  `sm_120`/`sm_121` is family 12, and vLLM's gates test the family, not the
+  vendor name:
+  [the GB10 capability-family rule](https://github.com/RobTand/gridbook/blob/master/docs/DELEGATED-NVFP4-MOE.md#why-gb10-is-family-120).
 - **MTP draft block ships in BF16** but no speculative-decoding invocation is
   published for this artifact — the command above serves drafter-free.
 
