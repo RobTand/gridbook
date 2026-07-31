@@ -596,7 +596,8 @@ def test_live_tensor_parallel_size_above_one_fails_before_dispatch(monkeypatch):
     monkeypatch.setattr(config_mod, "_initialized_tensor_parallel_world_size",
                         lambda: 2)
     with pytest.raises(ValueError, match=r"TP=2"):
-        cfg._require_supported_tensor_parallel()
+        # The gate precedes config resolution and method/weight construction.
+        cfg.get_quant_method(object(), "model.layers.0.mlp.down_proj")
 
     monkeypatch.setattr(config_mod, "_initialized_tensor_parallel_world_size",
                         lambda: 1)
