@@ -35,6 +35,7 @@ import threading
 
 _ext = None
 _tried = False
+_ext_lock = threading.Lock()
 
 _NVCC_HINT = (
     "install a CUDA toolchain matching your torch build (distro `cuda-toolkit` "
@@ -203,10 +204,17 @@ _EXT_SYMBOLS = (
 
 def get_ext():
     """The compiled extension module, or None if unavailable."""
-    global _ext, _tried
     if _tried:
         return _ext
-    _tried = True
+    with _ext_lock:
+        if _tried:
+            return _ext
+        return _load_ext_locked()
+
+
+def _load_ext_locked():
+    """Build and publish the main extension with ``_ext_lock`` held."""
+    global _ext, _tried
     try:
         import torch  # noqa: F401  (must import before cpp_extension)
         from torch.utils.cpp_extension import load
@@ -251,6 +259,8 @@ def get_ext():
               f"get the CUDA path: {_NVCC_HINT}.",
               file=sys.stderr, flush=True)
         _ext = None
+    finally:
+        _tried = True
     return _ext
 
 
@@ -336,6 +346,7 @@ def get_ext_v2():
 
 _fused = None
 _fused_tried = False
+_fused_lock = threading.Lock()
 
 
 def _find_cutlass_include() -> str:
@@ -359,6 +370,7 @@ def _find_cutlass_include() -> str:
 
 _ptc = None
 _ptc_tried = False
+_ptc_lock = threading.Lock()
 
 # ops.cb_prefill_persistent_tc dereferences this straight after the None check
 # (it has no probe), and it is the only binding cb_persistent_tc.cu exports.
@@ -368,15 +380,23 @@ _PTC_SYMBOLS = ("cb_prefill_persistent_tc",)
 def get_persistent_ext():
     """JIT build/load of the persistent-N tensor-core prefill kernel
     (gridbook/csrc/cb_persistent_tc.cu, #4b v1). Fail-soft like the fused ext."""
-    global _ptc, _ptc_tried
     if _ptc_tried:
         return _ptc
-    _ptc_tried = True
+    with _ptc_lock:
+        if _ptc_tried:
+            return _ptc
+        return _load_persistent_ext_locked()
+
+
+def _load_persistent_ext_locked():
+    """Build and publish the persistent extension with ``_ptc_lock`` held."""
+    global _ptc, _ptc_tried
     # QUARANTINE (2026-07-23): a boot wedged minutes after this kernel's
     # bench container exited; until the canary ladder clears it, the ext
     # builds only on explicit opt-in.
     if os.environ.get("PRISMAQUANT_ENABLE_PTC") != "1":
         _ptc = None
+        _ptc_tried = True
         return None
     try:
         import torch  # noqa: F401
@@ -411,11 +431,14 @@ def get_persistent_ext():
         import warnings
         warnings.warn(f"persistent-TC ext unavailable: {exc}")
         _ptc = None
+    finally:
+        _ptc_tried = True
     return _ptc
 
 
 _fused_fp4 = None
 _fused_fp4_tried = False
+_fused_fp4_lock = threading.Lock()
 
 
 # Both families are guarded independently at their call sites
@@ -438,10 +461,17 @@ def get_fused_fp4_ext():
     arch-specific target — the block-scaled MMA is an arch-'a' instruction,
     so the build pins the current device's compute_XYa. Fail-soft: serving
     falls back to the Triton/transient fp4 paths."""
-    global _fused_fp4, _fused_fp4_tried
     if _fused_fp4_tried:
         return _fused_fp4
-    _fused_fp4_tried = True
+    with _fused_fp4_lock:
+        if _fused_fp4_tried:
+            return _fused_fp4
+        return _load_fused_fp4_ext_locked()
+
+
+def _load_fused_fp4_ext_locked():
+    """Build and publish fused FP4 with ``_fused_fp4_lock`` held."""
+    global _fused_fp4, _fused_fp4_tried
     try:
         import torch
         from torch.utils.cpp_extension import load
@@ -490,6 +520,8 @@ def get_fused_fp4_ext():
               f"on the Triton/transient paths (expected off Blackwell or "
               f"without nvcc).", file=sys.stderr, flush=True)
         _fused_fp4 = None
+    finally:
+        _fused_fp4_tried = True
     return _fused_fp4
 
 
@@ -505,10 +537,17 @@ def get_fused_ext():
     or None. Separate module from the GEMV ext: it needs the CUTLASS headers
     (taken from the vLLM install's bundled copy) and a longer JIT build.
     Fail-soft like get_ext — serving falls back to the transient-expand path."""
-    global _fused, _fused_tried
     if _fused_tried:
         return _fused
-    _fused_tried = True
+    with _fused_lock:
+        if _fused_tried:
+            return _fused
+        return _load_fused_ext_locked()
+
+
+def _load_fused_ext_locked():
+    """Build and publish fused FP8 with ``_fused_lock`` held."""
+    global _fused, _fused_tried
     try:
         import torch  # noqa: F401
         from torch.utils.cpp_extension import load
@@ -549,4 +588,6 @@ def get_fused_ext():
               f"non-sm_120 GPUs and without nvcc).",
               file=sys.stderr, flush=True)
         _fused = None
+    finally:
+        _fused_tried = True
     return _fused
