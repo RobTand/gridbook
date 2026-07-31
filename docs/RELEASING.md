@@ -84,22 +84,21 @@ publisher on the project. Nothing further to do.
 
 `README.md`, `docs/INSTALL.md`, `docs/TROUBLESHOOTING.md` and `ROADMAP.md` assert
 packaging facts as **true today**: that the CUDA sources ship at
-`gridbook/csrc/`, that a non-editable install resolves them, that the version is
-`0.1.0`, that `gridbook[serve]` exists. Those are properties of the plugin tree
-inside PrismaQuant. They become true here **only after the sync in §2.1**.
+`gridbook/csrc/`, that a non-editable install resolves them, that the packaged
+version matches the release tag, and that `gridbook[serve]` exists. Those are
+properties of the plugin tree inside PrismaQuant. They become true here **only
+after the sync in §2.1**.
 
 Publishing docs ahead of that sync ships a README whose headline install command
 produces exactly the broken install `TROUBLESHOOTING.md` declares fixed. So:
 
 > **Sync the code first, or in the same commit. Never docs-first.**
 
-One command tells you which side of the line this tree is on:
+The PrismaQuant sync tool is the authoritative drift check:
 
 ```bash
-test -f gridbook/csrc/cb_gemv.cu \
-  && grep -q '__version__ = "0.1.0"' gridbook/__init__.py \
-  && echo "SYNCED — docs are true here" \
-  || echo "NOT SYNCED — do not publish the docs yet"
+python3 /path/to/prismaquant/scripts/sync_gridbook.py \
+  --check --dest "$PWD"
 ```
 
 ### 2.1 Bump the version — one place
@@ -236,10 +235,10 @@ vLLM, and asserts `cuda_ext.csrc_dir()` resolves to a directory that actually
 contains `cb_gemv.cu`.
 
 **Test selection.** The suite selects itself at runtime — every CUDA, vLLM or
-artifact-backed test is already guarded by `pytest.skip` / `importorskip` /
+artifact-backed test is guarded by `pytest.skip` / `importorskip` /
 `skipif(not cuda_ok)` — so no marker scheme was added; markers would duplicate
-that logic across the 16 test files (15 of which CI runs) for no extra signal.
-Two mechanical facts drive `run_cpu_tests.sh`:
+that logic for no extra signal. One mechanical fact drives
+`run_cpu_tests.sh`:
 
 - **One pytest process per file.** `test_target_namespace_compat.py` injects stub
   `vllm.*` modules into `sys.modules` so it can exercise the config resolver
@@ -250,16 +249,10 @@ Two mechanical facts drive `run_cpu_tests.sh`:
   process → 3 failed, 31 passed, 4 skipped. The 3 failures are spurious —
   `ModuleNotFoundError: No module named 'vllm._custom_ops'` in tests the stub
   let past their `importorskip`.
-- **`test_cb_kernels.py` is excluded.** It imports `prismaquant.nvfp4_cb_formats`
-  at module scope — a hard collection *error*, not a skip, anywhere the
-  PrismaQuant package is not importable, which is everywhere outside the
-  monorepo.
-
-Measured green baseline — `docker run --rm python:3.10-slim` and
-`python:3.13-slim`, no `--gpus`, torch 2.13.0+cpu, triton 3.7.1, the built wheel
-installed with its dependencies and run from outside the checkout, no GPU /
-nvcc / vLLM / `prismaquant` / artifacts. **Both interpreters: 15 files,
-156 passed, 136 skipped, 0 failed**, `run_cpu_tests.sh` exit 0.
+Every optional monorepo dependency in `test_cb_kernels.py` is now guarded, so
+the installed-wheel matrix collects every test module. Current CI runs the
+suite on Python 3.10–3.13 from outside the checkout, with one pytest process per
+file.
 
 ### `release.yml` — tag pushes matching `v*` only
 

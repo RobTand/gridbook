@@ -1,9 +1,11 @@
 # Installing gridbook
 
-gridbook is a **plugin for vLLM**, not a runtime. You install it *into an
-environment that already has vLLM and a working PyTorch*. It never installs or
-upgrades torch/vLLM itself, and it deliberately declares no version pins on them
-(see [Why nothing is pinned](#why-nothing-is-pinned)).
+gridbook is a **plugin for vLLM**, not a runtime. Install it *into an environment
+that already has vLLM and a compatible PyTorch*. It deliberately declares no
+version pins for torch or vLLM, and vLLM is not a hard dependency. In a fresh
+environment pip may resolve generic torch/triton builds, so use the established
+serving environment and `--no-deps` when its stack is already managed (see
+[Why nothing is pinned](#why-nothing-is-pinned)).
 
 - [Requirements](#requirements)
 - [Tested software stack](#tested-software-stack)
@@ -22,7 +24,7 @@ upgrades torch/vLLM itself, and it deliberately declares no version pins on them
 | | Requirement | Notes |
 |---|---|---|
 | **OS** | Linux | Only Linux is tested; the package declares `Operating System :: POSIX :: Linux`. |
-| **Python** | ≥ 3.10 | Measured on 3.12.3. 3.10/3.11 satisfy the code (no newer-syntax constructs) but have not been executed. |
+| **Python** | ≥ 3.10 | Installed-wheel CPU CI covers 3.10–3.13; GPU serving is measured on 3.12.3. |
 | **GPU** | NVIDIA Blackwell `sm_120` / `sm_121` for the native path | Other NVIDIA cards: see the [hardware matrix](#hardware-matrix). Non-NVIDIA is unsupported. |
 | **CUDA toolchain** | `nvcc` on `PATH` (or `CUDA_HOME` set) **in the serving process** | The kernels are JIT-compiled at runtime, not at install time. Missing `nvcc` is not an install error — it is a silent downgrade to the Triton path. |
 | **PyTorch** | the build your vLLM uses | Measured: `2.11.0+cu130`. Installing gridbook into a fresh environment can pull a *generic* PyPI torch that does not match your CUDA — install into the vLLM environment instead. |
@@ -109,13 +111,18 @@ addition if you want to be certain pip touches nothing else:
 pip install --no-deps git+https://github.com/RobTand/gridbook
 ```
 
-### 2. From PyPI — planned, not yet published
+### 2. From PyPI — recommended
 
 ```bash
-pip install gridbook          # not on PyPI yet — see ROADMAP.md
+pip install gridbook
 ```
 
-Until that lands, route 1 is the equivalent.
+For an already-pinned serving environment, this avoids asking pip to resolve
+torch, triton, or other runtime packages again:
+
+```bash
+pip install --no-deps gridbook
+```
 
 ### 3. Container
 

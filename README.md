@@ -47,12 +47,15 @@ Install **into the environment that already has vLLM and torch** — gridbook do
 not pin either.
 
 ```bash
-pip install git+https://github.com/RobTand/gridbook
+pip install gridbook
 ```
 
-That is the only route that works today. `pip install gridbook` is **planned but
-not yet published** — the PyPI name is unclaimed, so that command fails right
-now. Track it on the [roadmap](ROADMAP.md#distribution).
+PyPI is the recommended stable install route. To test the current development
+head instead, install directly from GitHub:
+
+```bash
+pip install git+https://github.com/RobTand/gridbook
+```
 
 There is nothing else to configure: the plugin registers itself through vLLM's
 `vllm.general_plugins` entry point, and vLLM auto-detects a gridbook checkpoint
@@ -69,7 +72,7 @@ image — see **[`docs/CONTAINER.md`](docs/CONTAINER.md)**.
 ## Quickstart — serve a real model
 
 ```bash
-pip install git+https://github.com/RobTand/gridbook
+pip install gridbook
 
 vllm serve rdtand/Qwen3.6-27B-prismaquant-gridbook-5.5bit-vllm \
   --host 0.0.0.0 --port 8000 \

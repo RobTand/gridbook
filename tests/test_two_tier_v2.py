@@ -17,6 +17,8 @@ fmt = pytest.importorskip("prismaquant.nvfp4_cb_formats")
 
 cb_decode_linear = kernels.cb_decode_linear
 DEV = "cuda"
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA device unavailable")
 
 
 def test_compose_table_matches_reference():
@@ -29,6 +31,7 @@ def test_compose_table_matches_reference():
     assert tuple(codec.TWO_TIER_SUB_TABLE) == tuple(fmt.TWO_TIER_SUB_TABLE)
 
 
+@requires_cuda
 @pytest.mark.parametrize("k", [13, 16, 17, 18, 20, 24])
 @pytest.mark.parametrize("M", [1, 17])
 def test_v2_decode_matches_reconstruct(k, M):
@@ -60,6 +63,7 @@ def test_v2_decode_matches_reconstruct(k, M):
     assert rel <= 1e-2, f"k={k} M={M}: v2 decode rel err {rel:.4e}"
 
 
+@requires_cuda
 def test_v2_scale_extraction_bitexact():
     """Mirror the kernel's super/sub byte extraction in torch and confirm the
     composed scales equal the reference fields['scales'] exactly."""
@@ -85,6 +89,7 @@ def test_v2_scale_extraction_bitexact():
     assert torch.equal(got, fields["scales"].to(DEV).float())
 
 
+@requires_cuda
 @pytest.mark.parametrize("k", [13, 16, 24])
 def test_v2_transient_weight_matches_reconstruct(k):
     """fp4-v2 transient prefill: the expanded [N,K] bf16 weight (value × composed

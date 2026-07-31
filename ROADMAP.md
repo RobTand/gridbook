@@ -62,11 +62,12 @@ practice rather than in principle.
 
 ### Distribution
 
-- **PyPI.** The package is prepared (`gridbook`, version 0.1.0) but not yet
-  published; `pip install git+https://github.com/RobTand/gridbook` is the route
-  today.
-- **Tagged releases and a changelog.** There are currently no tags, so a bug fix
-  cannot be referred to by version and model cards pin the plugin by *date*.
+- **PyPI — done.** Stable releases are published as `gridbook`; use
+  `pip install gridbook` inside the environment that already owns the serving
+  torch/vLLM stack.
+- **Tagged releases — done.** Versioned GitHub releases carry wheel and sdist
+  artifacts. Release highlights and contributor attribution are maintained in
+  [`CHANGELOG.md`](CHANGELOG.md).
 - **CI.** GitHub Actions now build the sdist and wheel, assert both really
   contain `gridbook/csrc/*.cu`, install the wheel **non-editably** into a clean
   environment and re-resolve the sources from `site-packages`, check the
