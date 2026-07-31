@@ -307,6 +307,29 @@ def test_stock_expand_matches_decode(cfg, which):
             f"{cfg}/{which}: sliced expand expert {e} != _decode_expert")
 
 
+def test_stock_prefill_constant_buffers_reuse_device_storage():
+    """The hot stock path reuses exact-device expert maps and row-zero vectors."""
+    _require_stack()
+    m, layer, _ = _build("fp8")
+
+    map_a = m._stock_chunk_expert_map(layer, 1, 5, layer._cb_E, DEV)
+    map_b = m._stock_chunk_expert_map(layer, 1, 5, layer._cb_E, DEV)
+    assert map_a.data_ptr() == map_b.data_ptr()
+
+    first = m._expand_stack_slice(layer, "w13", 1, 5, to_fp8=True)
+    cached_before = {
+        key: value.data_ptr()
+        for key, value in layer._cb_row_offset_cache.items()
+    }
+    second = m._expand_stack_slice(layer, "w13", 1, 5, to_fp8=True)
+    cached_after = {
+        key: value.data_ptr()
+        for key, value in layer._cb_row_offset_cache.items()
+    }
+    assert cached_after == cached_before
+    assert torch.equal(first, second)
+
+
 # --------------------------------------------------------------------------- #
 # 4 — loop vs stock parity across rungs and token distributions.                #
 # --------------------------------------------------------------------------- #

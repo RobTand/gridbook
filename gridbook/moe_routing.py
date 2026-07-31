@@ -1,13 +1,99 @@
-"""Padded, block-aligned MoE routing for the ROUND-2 grouped-fused prefill.
+"""Torch-only MoE routing construction and immutable routing constants.
 
 Lives in its own module rather than in ``moe.py`` because ``moe.py`` imports
 vLLM at module scope: keeping this torch-only makes the routing construction —
 the part with all the index arithmetic and therefore all the risk — testable in
-the build venv on CPU, with no vLLM and no GPU. ``moe.py`` re-exports it.
+the build venv on CPU, with no vLLM and no GPU.  The cached tensors below are
+likewise pure routing/expander metadata: read-only after construction and keyed
+by exact shape and device. ``moe.py`` consumes them directly.
 """
 from __future__ import annotations
 
+import threading
+import weakref
+
 import torch
+
+
+# Deduplicate the much larger row-zero constants across identically shaped
+# layers without making this module their owner.  Each consuming layer keeps a
+# strong reference in its private cache (which is what stabilises pointers for
+# graph capture); this process-wide index is weak so unloading the last model
+# also releases the Tensor objects.  The lock covers the rare first creation so
+# concurrent layer initialisation cannot allocate duplicate GPU buffers.
+_ROW_OFFSET_POOL: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+_ROW_OFFSET_POOL_LOCK = threading.Lock()
+_LAYER_CACHE_INIT_LOCK = threading.Lock()
+
+
+def _layer_tensor_cache(layer, attr: str) -> dict:
+    """Return a private per-layer tensor cache, creating it on first use."""
+    cache = getattr(layer, attr, None)
+    if cache is None:
+        # Layer warmup is normally serial, but make first use convergent even
+        # when two request threads reach a previously untouched layer together.
+        with _LAYER_CACHE_INIT_LOCK:
+            cache = getattr(layer, attr, None)
+            if cache is None:
+                cache = {}
+                setattr(layer, attr, cache)
+    if not isinstance(cache, dict):
+        raise TypeError(f"{attr} must be a dict, got {type(cache).__name__}")
+    return cache
+
+
+def cb_cached_expert_map(layer, c0: int, c1: int, E: int,
+                         device) -> torch.Tensor:
+    """Read-only global-to-local map for stock-prefill expert chunk ``[c0,c1)``.
+
+    The chunk loop's bounds and expert count are Python/config integers, and a
+    model layer does not change device while serving.  The exact tuple is the
+    cache key nevertheless: a changed chunk override, a moved layer, or two
+    same-sized but differently positioned chunks can never alias.  Retaining
+    every exact tensor (rather than growing/replacing one buffer) also keeps a
+    captured graph's pointer alive for the layer's lifetime.
+    """
+    c0, c1, E = int(c0), int(c1), int(E)
+    if not 0 <= c0 <= c1 <= E:
+        raise ValueError(f"invalid expert chunk [{c0}, {c1}) for E={E}")
+    dev = torch.device(device)
+    cache = _layer_tensor_cache(layer, "_cb_stock_expert_maps")
+    key = (dev, c0, c1, E)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    value = torch.full((E,), -1, dtype=torch.int32, device=dev)
+    value[c0:c1] = torch.arange(c1 - c0, dtype=torch.int32, device=dev)
+    # ``setdefault`` makes a concurrent first construction converge on one
+    # persistent object.  Either contender is byte-identical and read-only.
+    return cache.setdefault(key, value)
+
+
+def cb_cached_row_offsets(layer, rows: int, device) -> torch.Tensor:
+    """Return an exact-size, read-only int32 zero vector for CB expanders.
+
+    Every row in a stacked stock-prefill decode uses codebook row zero.  The old
+    path allocated and zero-filled this constant once per projection and chunk.
+    Exact-size/device keys avoid stride tricks, mutable slicing, cross-device
+    reuse, and pointer replacement under graph capture.  Layers retain strong
+    references, while a weak process-wide pool shares identical immutable
+    buffers across layers and stops owning them when the last model unloads.
+    """
+    rows = int(rows)
+    if rows < 0:
+        raise ValueError(f"rows must be non-negative, got {rows}")
+    dev = torch.device(device)
+    cache = _layer_tensor_cache(layer, "_cb_row_offset_cache")
+    key = (dev, rows)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    with _ROW_OFFSET_POOL_LOCK:
+        value = _ROW_OFFSET_POOL.get(key)
+        if value is None:
+            value = torch.zeros(rows, dtype=torch.int32, device=dev)
+            _ROW_OFFSET_POOL[key] = value
+    return cache.setdefault(key, value)
 
 
 def cb_grouped_pad_routing(topk_ids: torch.Tensor, E: int, tile_m: int):
