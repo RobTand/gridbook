@@ -17,8 +17,9 @@ to the streaming client in **`vllm bench serve`**.  Consequently:
 
 Do not replace TPOT with `whole request wall time / output tokens`.  That folds
 prefill into decode and can make a faster prefill path look like a faster decode
-kernel.  The report retains vLLM's raw detailed results as well as block-level
-summaries.
+kernel. The report retains vLLM's detailed metric evidence as well as
+block-level summaries, but deliberately omits generated completions and
+redacts non-empty server error bodies.
 
 The command surface in this protocol is parser-validated against vLLM
 `0.23.1rc1.dev764+g54b16d8a9.d20260703`.  The report records the client version;
@@ -354,7 +355,8 @@ Each JSON report has schema `gridbook.vllm-bench-serve.v2` and contains:
 - the exact workload controls, structured speculation mode/config, block seeds,
   and full vLLM command for each block;
 - the input-length ratio, validation envelope, and observed per-request lengths;
-- raw vLLM detailed output for each block; and
+- sanitized vLLM detailed metric output for each block (generated text omitted,
+  non-empty server error bodies redacted); and
 - mean, median, min, max, NumPy-linear block p05/p95, and sample standard
   deviation across block metrics.
 
@@ -364,7 +366,7 @@ requested percentile must be finite; TTFT and E2EL must be positive.  A
 multi-token response must also contain positive per-request ITL samples.
 One-token prefill probes are explicitly exempt from ITL/TPOT positivity because
 there is no post-first-token interval.  A partial/failure report retains the
-redacted command, return code, raw result when one exists, and validation error
+redacted command, return code, sanitized result when one exists, and validation error
 so the run cannot be mistaken for missing data.  The output name is atomically
 reserved before probes begin, preventing concurrent clients from both claiming
 it; existing reports are never overwritten unless `--overwrite` is explicit.
@@ -384,12 +386,11 @@ Request, output-token, and total-token throughput are independently recomputed
 from the finite positive raw duration and exact detailed totals. These checks
 reject contradictory summary data without inventing one ITL per token.
 
-Reports are created with mode `0600`, but treat them as **sensitive raw output**.
-`--save-detailed` includes generated model text and server error strings, which
-the harness cannot safely infer are public.  Review or remove those fields
-before attaching a report to an issue or publishing it.  Metadata credentials
-are redacted; arbitrary secrets echoed inside generated text or a server error
-are not.
+Reports are created with mode `0600`. The runner strips `generated_texts` and
+replaces non-empty values in `errors` before the first result checkpoint, then
+recursively applies the same metadata redaction to the remaining result. Treat
+reports as potentially sensitive anyway: no generic redactor can certify every
+future field a vLLM version may add. Review a report before publishing it.
 
 For each paired block compute `Gridbook / native` for throughput and
 `native / Gridbook` for latency, so values above 1 consistently mean Gridbook

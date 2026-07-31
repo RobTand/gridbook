@@ -1984,6 +1984,35 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _sanitize_result_for_report(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain metric evidence without persisting arbitrary model/server text.
+
+    ``vllm bench serve --save-detailed`` includes generated completions and may
+    include an arbitrary server error body. Neither is needed to reconstruct
+    the performance metrics, and generic credential-pattern redaction cannot
+    prove such free text is safe to publish. Keep their cardinality/position
+    evidence while omitting their contents, then apply the normal recursive
+    redaction and non-finite JSON conversion to every remaining field.
+    """
+
+    sanitized = dict(result)
+    generated = sanitized.pop("generated_texts", None)
+    if generated is not None:
+        sanitized["generated_texts_omitted"] = {
+            "count": len(generated) if isinstance(generated, list) else None,
+            "reason": "arbitrary model output is not performance evidence",
+        }
+
+    errors = sanitized.get("errors")
+    if isinstance(errors, list):
+        sanitized["errors"] = [
+            value if value is None or value == "" else "<redacted-server-error>"
+            for value in errors
+        ]
+
+    return _json_safe(_redact_structured(sanitized))
+
+
 def _run_command(command: Sequence[str]) -> int:
     try:
         return subprocess.run(command, check=False).returncode
@@ -2065,7 +2094,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                         )
                     try:
                         result = _load_result(result_dir / filename)
-                        block["raw_result"] = _json_safe(result)
+                        block["raw_result"] = _sanitize_result_for_report(result)
                         _atomic_write_json(output_path, report)
                         validate_result(result, args)
                     except BenchmarkError as exc:

@@ -1221,6 +1221,27 @@ def test_run_writes_a_complete_report_without_vllm_or_server(tmp_path, monkeypat
     assert os.stat(args.output).st_mode & 0o777 == 0o600
 
 
+def test_report_omits_generated_text_and_arbitrary_server_errors():
+    result = {
+        "completed": 2,
+        "generated_texts": ["private completion", "https://host/#raw-secret"],
+        "errors": [None, "Authorization: Bearer unstructured-secret"],
+        "model_url": "https://user:password@example.test/model#fragment-secret",
+    }
+
+    sanitized = bench_serve._sanitize_result_for_report(result)
+    serialized = json.dumps(sanitized)
+
+    assert "generated_texts" not in sanitized
+    assert sanitized["generated_texts_omitted"]["count"] == 2
+    assert sanitized["errors"] == [None, "<redacted-server-error>"]
+    assert "private completion" not in serialized
+    assert "unstructured-secret" not in serialized
+    assert "raw-secret" not in serialized
+    assert "fragment-secret" not in serialized
+    assert "password" not in serialized
+
+
 def test_failed_block_leaves_a_structured_failure_report(tmp_path, monkeypatch):
     args = _parse(tmp_path)
     monkeypatch.setattr(bench_serve, "_run_command", lambda command: 7)
