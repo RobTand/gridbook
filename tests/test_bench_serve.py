@@ -917,8 +917,10 @@ def test_metadata_captures_supplied_artifact_and_server_identity(tmp_path, monke
     )
 
     assert metadata["git"]["commit"] == GRIDBOOK_COMMIT
-    assert metadata["git"]["release_eligible"] is True
     assert metadata["git"]["source"] in {"argument", "argument+checkout"}
+    assert metadata["git"]["release_eligible"] is (
+        metadata["git"]["source"] == "argument+checkout"
+    )
     assert metadata["git"]["dirty"] in {None, False}
     assert metadata["software"]["gridbook_version"] == "0.3.0"
     assert metadata["software"]["runner_vllm_cli_probe"] == CLIENT_RUNTIME_ID
