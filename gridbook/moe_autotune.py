@@ -131,12 +131,12 @@ def cb_time_candidate(fn):
     """Run ``fn`` ONCE and return ``(output, milliseconds)``, or ``None`` if the
     candidate is unavailable (returned ``None``) or raised.
 
-    ISOLATION. The candidate is bracketed by a full ``torch.cuda.synchronize()``
-    on both sides of a CUDA-event pair, so the number contains this candidate's
-    device work and nothing queued before or after it. Events (not the wall
-    clock) are what make it a device duration rather than a launch duration.
-    Without CUDA it falls back to a wall clock — meaningless as a real decision,
-    but it keeps the machinery runnable off-GPU.
+    ISOLATION. CUDA events are recorded on the stream that is current when the
+    candidate starts.  Synchronising ONLY the end event waits for that stream's
+    candidate work without draining unrelated streams or the whole device.
+    Events (not the wall clock) are what make it a device duration rather than a
+    launch duration.  Without CUDA it falls back to a wall clock — meaningless
+    as a real decision, but it keeps the machinery runnable off-GPU.
 
     A raising candidate is DISQUALIFIED rather than fatal: an extension build may
     not have compiled some (TileM, k_bits) pair (shared-memory limits), and that
@@ -144,13 +144,13 @@ def cb_time_candidate(fn):
     """
     try:
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            stream = torch.cuda.current_stream()
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
-            start.record()
+            start.record(stream)
             out = fn()
-            end.record()
-            torch.cuda.synchronize()
+            end.record(stream)
+            end.synchronize()
             return None if out is None else (out, start.elapsed_time(end))
         t0 = time.perf_counter()
         out = fn()
@@ -173,9 +173,29 @@ def cb_autotune_prefill(candidates, keep: str = STOCK, timer=None):
     an ordinary call. Timing ties break on the candidate NAME, not on iteration
     order, for the same reason.
 
+    A singleton candidate is run directly, with NO timer events or
+    synchronisation: there is no ranking decision to measure.  It is still
+    cached by the caller, and a raising/``None`` singleton is disqualified just
+    like a timed candidate.
+
     ``(None, {}, None)`` means every candidate was disqualified; the caller runs
     its default path. ``timer`` is injectable for testing.
     """
+    candidates = list(candidates)
+
+    if len(candidates) == 1:
+        name, fn = candidates[0]
+        try:
+            out = fn()
+        except Exception as exc:  # noqa: BLE001 — same fallback as timed paths
+            print(f"[prismaquant-cb] prefill candidate disqualified "
+                  f"({type(exc).__name__}: {exc})",
+                  file=sys.stderr, flush=True)
+            return None, {}, None
+        if out is None:
+            return None, {}, None
+        return name, {}, out if name == keep else None
+
     timer = timer or cb_time_candidate
     timings: dict[str, float] = {}
     kept = None

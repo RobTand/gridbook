@@ -65,7 +65,11 @@ from .moe_l2 import (
     cb_l2_pin_action,
     cb_l2_plan,
 )
-from .moe_routing import cb_grouped_pad_routing
+from .moe_routing import (
+    cb_cached_expert_map,
+    cb_cached_row_offsets,
+    cb_grouped_pad_routing,
+)
 from .ops import dispatch_via_op, fp4_act_qdq_or_codec
 
 
@@ -317,7 +321,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # w13 in=hidden (gate_up), w2 in=inter (down).
         in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
         qwp = codec.pad_qweight(qw.contiguous())
-        row0 = torch.zeros(out, dtype=torch.int32, device=qw.device)
+        row0 = cb_cached_row_offsets(layer, out, qw.device)
         if self.is_fp4:                                        # fp4 v2
             W = expand_fp4_v2_to_weight(
                 qwp, layer._cb_flat, row0, layer._cb_compose,
@@ -633,6 +637,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         expert_ids, row_src, is_pad, n_blocks = cb_grouped_pad_routing(
             topk_ids, E, tile_m)
         if os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1":
+            # Kept intentionally: a host-read-free replacement must either
+            # launch the full static-capacity tail (a performance change) or
+            # teach the grouped kernel to consume n_blocks on device. A tensor
+            # slice bound still performs this same host conversion implicitly.
             nb = int(n_blocks.item())                # THE one sync (optional)
             expert_ids = expert_ids[:nb].contiguous()
             row_src = row_src[:nb * tile_m]
@@ -1008,6 +1016,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             topk_ids, E, tile_m)
 
         if os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1":
+            # Kept intentionally: a host-read-free replacement must either
+            # launch the full static-capacity tail (a performance change) or
+            # teach the grouped kernel to consume n_blocks on device. A tensor
+            # slice bound still performs this same host conversion implicitly.
             nb = int(n_blocks.item())                # THE one sync (optional)
             expert_ids = expert_ids[:nb].contiguous()
             row_src = row_src[:nb * tile_m]
@@ -1811,6 +1823,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         C, out_f = packed.shape[0], packed.shape[1]
         in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
         qwp = codec.pad_qweight(packed.reshape(C * out_f, -1).contiguous())
+        # ``C`` is routing-dependent on this legacy hit-expert path.  Do not
+        # retain an exact-size cache here: many request distributions could
+        # otherwise accumulate one buffer for every C in [1, E].  The stock
+        # path below has static chunk shapes and is safe to cache.
         row0 = torch.zeros(C * out_f, dtype=torch.int32, device=packed.device)
         if self.is_fp4:                                        # fp4 two-tier v2
             W = expand_fp4_v2_to_weight(
@@ -1994,7 +2010,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
         for c0 in range(0, E, chunk):                 # FIXED trip = ceil(E/chunk)
             c1 = min(E, c0 + chunk)
-            expert_map = self._stock_chunk_expert_map(c0, c1, E, dev)
+            expert_map = self._stock_chunk_expert_map(
+                layer, c0, c1, E, dev)
             # Device-side routing for THIS expert shard (local ids, out-of-chunk
             # pairs excluded). Shared verbatim by both projections.
             if _timing: _t0 = _time.time()
@@ -2168,14 +2185,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         return max(1, min(E, budget // max(1, per_expert)))
 
     @staticmethod
-    def _stock_chunk_expert_map(c0: int, c1: int, E: int,
+    def _stock_chunk_expert_map(layer, c0: int, c1: int, E: int,
                                 dev) -> torch.Tensor:
         """global->local expert_map for one chunk shard: experts [c0, c1) map to
-        [0, c1-c0), all others -1. Built from python ints only (no tensor read),
-        so it is a constant of the captured graph."""
-        m = torch.full((E,), -1, dtype=torch.int32, device=dev)
-        m[c0:c1] = torch.arange(c1 - c0, dtype=torch.int32, device=dev)
-        return m
+        [0, c1-c0), all others -1. Built from python ints only (no tensor read)
+        and cached by exact layer/device/bounds, so it is a persistent constant
+        of the captured graph."""
+        return cb_cached_expert_map(layer, c0, c1, E, dev)
 
     def _expand_stack_slice(self, layer, which: str, c0: int, c1: int, *,
                             to_fp8: bool) -> torch.Tensor:
@@ -2220,7 +2236,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         nE = c1 - c0
         out_f = packed.shape[1]
         in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
-        row0 = torch.zeros(nE * out_f, dtype=torch.int32, device=packed.device)
+        row0 = cb_cached_row_offsets(layer, nE * out_f, packed.device)
         _expand_env = os.environ.get("PRISMAQUANT_CB_EXPAND")
         if to_fp8:                                                # fp8 bytes
             # CUDA expander (2.1x the Triton one, byte-identical) on the RAW
