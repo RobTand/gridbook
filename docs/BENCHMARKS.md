@@ -308,9 +308,10 @@ on the artifact.** `_cuda_moe_ok()` in `gridbook/moe.py` returns `False` when
 `get_ext() is None`, and the call falls through to the prefill-family paths:
 
 - **fp8-CB** defaults to `auto`, whose candidates include chunked `stock`.
-- **fp4-CB** first tries the default fused-FP4 prefill kernel. If that kernel is
-  ineligible, it falls back to the conservative per-expert `loop`; operators can
-  explicitly select the now byte-budgeted `stock` path for a measured A/B.
+- **fp4-CB** defaults to the conservative per-expert `loop`. Only an explicit
+  `PRISMAQUANT_CB_FUSED_FP4_MOE=1` (or `128`/`256`) attempts the fused-FP4
+  kernel; an ineligible opt-in falls back to `loop`. Operators can explicitly
+  select the now byte-budgeted `stock` path for a measured A/B.
   Expect a large regression when the grouped decode kernel is gone, but its
   exact size depends on the selected fallback and **has not been measured**.
 - The **3.52 tok/s** figure that used to be quoted here is the per-expert
