@@ -99,40 +99,10 @@ def _disable_grouped_mm(exc) -> None:
     _GROUPED_MM_OK = False
 
 
-# The codebook-table casts at load are proven exact only for LATTICE tables.
-# ``codec.build_flat_codebook`` casts every sub-table to **bf16**, and
-# ``_stock_cb_flat_fp8`` casts that flat table to **e4m3**; both are exact for
-# values that already sit on those grids, which is why every artifact shipped
-# to date passes by construction (their metadata says ``codebook_source:
-# "lattice"``). A LEARNED table can carry off-grid values that these casts
-# round silently at load — the packed weight bytes are untouched, every shape
-# and uniformity assert still passes, and the decode is then "correct" against
-# a table that is not the one the model was quantized with. Nothing downstream
-# can see that, so check the casts here instead: raise, with the numbers, and
-# leave one env escape for debugging.
-def _assert_cast_lossless(raw, cast, what: str, prefix: str) -> None:
-    """``cast`` must represent ``raw`` exactly.  Raises ``ValueError`` unless
-    ``PRISMAQUANT_SKIP_CB_CAST_CHECK=1``, in which case it warns on stderr."""
-    a = raw.float().reshape(-1)
-    b = cast.float().reshape(-1)
-    same_size = a.numel() == b.numel()
-    if same_size and torch.equal(a, b):
-        return
-    n = int((a != b).sum()) if same_size else -1
-    worst = float((a - b).abs().max()) if same_size else -1.0
-    rel = float((a - b).abs().div(a.abs().clamp_min(1e-12)).max()) \
-        if same_size else -1.0
-    msg = (f"[prismaquant] {prefix}: the {what} codebook cast is LOSSY — "
-           f"{n} of {a.numel()} table values do not survive it "
-           f"(max abs {worst:.3e}, max rel {rel:.3e}). The cast is exact only "
-           f"for on-grid (lattice) tables; a LEARNED codebook must be emitted "
-           f"on the target grid by the encoder, or every CB weight decodes "
-           f"against a silently-rounded table. "
-           f"PRISMAQUANT_SKIP_CB_CAST_CHECK=1 overrides (debug only).")
-    if os.environ.get("PRISMAQUANT_SKIP_CB_CAST_CHECK") == "1":
-        print("WARNING " + msg, file=sys.stderr, flush=True)
-    else:
-        raise ValueError(msg)
+# Backward-compatible private name for the integrated follow-on patch and its
+# focused tests.  The implementation lives in codec so dense, MoE and
+# top-level-loader codebook construction all enforce the same contract.
+_assert_cast_lossless = codec.assert_cast_lossless
 
 
 class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
@@ -266,11 +236,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         ref = self.scheme["codebook_ref"]
         names = ref if isinstance(ref, list) else [ref]
         subs = [codebooks[n].to(dev) for n in names]
-        layer._cb_flat = codec.build_flat_codebook(subs)
-        # build_flat_codebook casts to bf16 — prove it, do not assume it.
-        _assert_cast_lossless(
-            torch.cat([t.reshape(-1).float() for t in subs]), layer._cb_flat,
-            "bf16 flat", self.prefix)
+        layer._cb_flat = codec.build_flat_codebook(subs, self.prefix)
         layer._cb_row0 = torch.zeros(1, dtype=torch.int32, device=dev)
         if self.is_v2:
             layer._cb_compose = codec.build_compose_table(
@@ -2158,7 +2124,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         ok = PrismaQuantCBMoEMethod._EXPAND_EXT_OK
         if ok is None:
             from .cuda_ext import get_ext
-            ok = get_ext() is not None
+            ext = get_ext()
+            ok = ext is not None and hasattr(ext, "cb_expand_fp8")
             if not ok:
                 print("[prismaquant-cb] WARNING: CUDA expand extension "
                       "unavailable — stock prefill falls back to the padded "
@@ -2177,11 +2144,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         and the check wants the layer prefix for its message.)"""
         cb = getattr(layer, "_cb_flat_fp8", None)
         if cb is None:
-            cb = layer._cb_flat.to(torch.float8_e4m3fn).view(
-                torch.uint8).contiguous()
-            _assert_cast_lossless(layer._cb_flat,
-                                  cb.view(torch.float8_e4m3fn), "e4m3 flat",
-                                  self.prefix)
+            cb = codec.flat_codebook_fp8(layer._cb_flat, self.prefix)
             layer._cb_flat_fp8 = cb
         return cb
 

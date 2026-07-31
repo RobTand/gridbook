@@ -200,6 +200,25 @@ def test_process_weights_bf16_cast_is_checked():
             codec.build_flat_codebook(subs_off), "bf16 flat", "t")
 
 
+def test_build_flat_codebook_checks_every_runtime_caller():
+    """The bf16 check belongs in the shared codec helper, not only MoE."""
+    with pytest.raises(ValueError, match="bf16 flat"):
+        codec.build_flat_codebook(
+            [torch.tensor([1.0000001], dtype=torch.float32)], "dense.layer")
+
+
+def test_build_flat_codebook_does_not_pre_round_float64_input():
+    raw = torch.tensor([1.0 + 2.0 ** -40], dtype=torch.float64)
+    with pytest.raises(ValueError, match="bf16 flat"):
+        codec.build_flat_codebook([raw], "float64.layer")
+
+
+def test_shared_fp8_reencode_helper_checks_dense_and_moe_callers():
+    flat = torch.tensor([0.53125], dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="e4m3 flat"):
+        codec.flat_codebook_fp8(flat, "dense.layer")
+
+
 # ------------------------------------------------- (1) the expand fail-soft
 def test_ops_cb_expand_fp8_without_ext_raises(monkeypatch):
     """THE failure this PR is about: ops.cb_expand_fp8 has no None check --
@@ -225,6 +244,13 @@ def test_expand_ext_probe_is_false_and_loud(monkeypatch, capsys):
                         lambda: pytest.fail("probe was not cached"))
     assert cls._cb_expand_ext_ok() is False
     assert capsys.readouterr().err == ""
+
+
+def test_expand_ext_probe_requires_the_called_symbol(monkeypatch, capsys):
+    monkeypatch.setattr(cuda_ext, "get_ext", lambda: object())
+    cls = moe.PrismaQuantCBMoEMethod
+    assert cls._cb_expand_ext_ok() is False
+    assert "CUDA expand extension" in capsys.readouterr().err
 
 
 def test_expand_stack_slice_falls_back_to_triton_without_ext(monkeypatch,
@@ -259,7 +285,8 @@ def test_expand_stack_slice_uses_the_cuda_op_when_the_ext_is_present(
         monkeypatch):
     """The guard must not cost the fast path: with an extension loaded the
     branch still goes to ops.cb_expand_fp8 on the RAW unpadded slice view."""
-    monkeypatch.setattr(cuda_ext, "get_ext", lambda: object())
+    monkeypatch.setattr(
+        cuda_ext, "get_ext", lambda: types.SimpleNamespace(cb_expand_fp8=True))
     ops = pytest.importorskip("gridbook.ops")
     monkeypatch.setattr(moe, "expand_cb_to_fp8", lambda *a, **kw: pytest.fail(
         "fell back to Triton with the extension available"))
@@ -285,7 +312,8 @@ def test_expand_env_override_still_forces_triton(monkeypatch):
     """PRISMAQUANT_CB_EXPAND=triton keeps working with the extension loaded
     (the bisection lever upstream documents)."""
     monkeypatch.setenv("PRISMAQUANT_CB_EXPAND", "triton")
-    monkeypatch.setattr(cuda_ext, "get_ext", lambda: object())
+    monkeypatch.setattr(
+        cuda_ext, "get_ext", lambda: types.SimpleNamespace(cb_expand_fp8=True))
     ops = pytest.importorskip("gridbook.ops")
     monkeypatch.setattr(ops, "cb_expand_fp8", lambda *a, **kw: pytest.fail(
         "env override ignored"))
