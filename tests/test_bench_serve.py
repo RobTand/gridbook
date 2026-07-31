@@ -1731,6 +1731,35 @@ def test_evidence_mutation_during_measurement_invalidates_the_report(
     assert provenance["digest_bound_inputs_verified_after_requests"] is False
 
 
+def test_client_runtime_change_during_measurement_invalidates_the_report(
+    tmp_path, monkeypatch
+):
+    args = _parse(tmp_path)
+
+    def fake_run(command):
+        path = Path(_option(command, "--result-dir")) / _option(
+            command, "--result-filename"
+        )
+        path.write_text(json.dumps(_valid_result(args)))
+        return 0
+
+    runtime_probes = iter((CLIENT_RUNTIME_ID, CLIENT_RUNTIME_ID + "-changed"))
+    monkeypatch.setattr(bench_serve, "_run_command", fake_run)
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: next(runtime_probes)
+    )
+    with pytest.raises(bench_serve.BenchmarkError, match="runtime identity changed"):
+        bench_serve.run_benchmark(args)
+
+    report = json.loads(args.output.read_text())
+    assert report["status"] == "failed"
+    assert report["measurement_valid"] is False
+    provenance = report["metadata"]["measurement_provenance"]
+    assert provenance["digest_bound_inputs_verified_after_requests"] is True
+    assert provenance["git_state_verified_after_requests"] is True
+    assert provenance["client_runtime_verified_after_requests"] is False
+
+
 def test_report_omits_generated_text_and_arbitrary_server_errors():
     result = {
         "completed": 2,

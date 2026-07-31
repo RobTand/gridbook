@@ -2691,6 +2691,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     block["finished_at"] = _utc_now()
                     block["wall_duration_s"] = time.monotonic() - block_clock
         _revalidate_bound_inputs(args)
+        provenance = report["metadata"]["measurement_provenance"]
+        provenance["digest_bound_inputs_verified_after_requests"] = True
         ending_git = _git_state(
             args.git_commit,
             allow_dirty=args.allow_dirty,
@@ -2700,14 +2702,12 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             raise BenchmarkError(
                 "Gridbook source provenance changed during the benchmark"
             )
+        provenance["git_state_verified_after_requests"] = True
         ending_client_runtime = _vllm_version(args.vllm_executable)
         if ending_client_runtime != args.client_runtime_id:
             raise BenchmarkError(
                 "vLLM client runtime identity changed during the benchmark"
             )
-        provenance = report["metadata"]["measurement_provenance"]
-        provenance["digest_bound_inputs_verified_after_requests"] = True
-        provenance["git_state_verified_after_requests"] = True
         provenance["client_runtime_verified_after_requests"] = True
         report["summary"] = summarize_blocks(report["blocks"])
         report["status"] = "success"
