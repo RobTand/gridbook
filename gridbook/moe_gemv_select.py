@@ -10,15 +10,15 @@ but the standard library, exactly as ``moe_routing.py`` / ``moe_autotune.py`` /
 calls :func:`cb_gemv_choice` once per stack at load and stores the answer on
 the layer.
 
-Nothing here imports torch at module scope either: the two functions that need
-the extension (:func:`cb_gemv_v2_available`, :func:`cb_gemv_choice`) import it
-inside the call, so a process that never serves a CB MoE layer never pays the
-JIT build.
+Nothing here imports torch at module scope either: the functions that inspect a
+device or need the extension import it inside the call, so a process that never
+opts in to the experimental CB MoE kernel never pays the JIT build.
 """
 from __future__ import annotations
 
 import os
 import sys
+import threading
 
 
 # CB-GEMV-v2 DISPATCH — which grouped fp4-v2 decode GEMV a (layer, stack) runs.
@@ -36,25 +36,23 @@ import sys
 # schedule — that is a reassociation-class difference.
 #
 # Selector (resolve once per process, whitelist, fail loud, one log line):
-#   auto       — the shipping default. NOT "prefer v2": see cb_gemv_choice —
-#                auto only reaches v2 when the extension built AND the
-#                occupancy predicate says it wins.
-#   v2         — as auto, but self-describing in the log so an A/B arm is
-#                identifiable from the serve output alone.
-#   inherited  — the KILL SWITCH and the A/B control. Never probes, never
-#                builds the v2 extension, and reproduces today's dispatch
-#                exactly. This is the arm that proves a v2 regression is a v2
-#                regression.
+#   inherited  — the SHIPPING DEFAULT, kill switch and A/B control. Never
+#                probes or builds the v2 extension and reproduces the pre-PR
+#                dispatch exactly.
+#   auto       — EXPLICIT experimental opt-in. Uses v2 only on supported GB10
+#                devices and where the compiled predicate says it wins.
+#   v2         — same guarded policy, with an explicit A/B-arm label in logs.
 # The switch exists so an A/B is ONE serve session per arm with an otherwise
 # byte-identical process shape — swapping plugin trees between arms would
 # confound the measurement with a rebuild.
-_CB_GEMV_VALUES = ("auto", "v2", "inherited")
+_CB_GEMV_VALUES = ("inherited", "auto", "v2")
 _CB_GEMV: str | None = None
 
 
 def cb_gemv_mode() -> str:
     """The process-wide CB GEMV kernel selection ("auto" | "v2" |
-    "inherited"), resolved once from ``PRISMAQUANT_CB_GEMV`` (unset -> "auto").
+    "inherited"), resolved once from ``PRISMAQUANT_CB_GEMV``
+    (unset -> "inherited").
 
     Raises ``ValueError`` on an unknown spelling and ``RuntimeError`` on a
     mid-process change. Both matter: under mixed dispatch one model runs BOTH
@@ -65,7 +63,7 @@ def cb_gemv_mode() -> str:
     """
     global _CB_GEMV
     raw = os.environ.get("PRISMAQUANT_CB_GEMV")
-    val = (raw if raw is not None else "auto").strip().lower()
+    val = (raw if raw is not None else "inherited").strip().lower()
     if _CB_GEMV is None:
         if val not in _CB_GEMV_VALUES:
             raise ValueError(
@@ -75,7 +73,7 @@ def cb_gemv_mode() -> str:
                 f"inherited kernel and be read as a null result.")
         _CB_GEMV = val
         print(f"[prismaquant-cb] cb_gemv={val}"
-              + (" (env unset -> auto default)" if raw is None else ""),
+              + (" (env unset -> inherited default)" if raw is None else ""),
               flush=True)
     elif val != _CB_GEMV:
         raise RuntimeError(
@@ -84,25 +82,6 @@ def cb_gemv_mode() -> str:
             f"selection is resolved ONCE per process; a mid-serve change would "
             f"split the dispatch across kernels. Restart with the env pinned.")
     return _CB_GEMV
-
-
-def decode_contract_v2_arg() -> int:
-    """The int64 ``v2`` argument a ``cb_moe_gemv_v2`` call MUST pass.
-
-    The inherited kernel resolves the decode contract itself, from the
-    environment, PER LAUNCH — ``pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT",
-    "v2")`` at cb_gemv.cu:471/760/1357/1437. The v2 kernel takes it as an
-    argument instead, so under a MIXED dispatch (one model, both kernels) the
-    two must agree or the serve runs v1 per-weight rounding on some layers and
-    v2 on others — a systematic, silent, ulp-class divergence.
-
-    Agreement is therefore by CONSTRUCTION here: ``pq_env_is`` is a bare
-    ``strcmp`` against ``"v2"``, so this is a bare ``== "v2"``. Deliberately no
-    ``.strip()`` and no ``.lower()`` — "V2" or " v2" is v1 to the inherited
-    kernel, and normalising here would make it v2 to ours, which is exactly the
-    split this function exists to prevent.
-    """
-    return 1 if os.environ.get("PRISMAQUANT_CB_DECODE_CONTRACT") == "v2" else 0
 
 
 # Availability probe. An OLD extension (or an old plugin tree) under a NEW
@@ -116,50 +95,111 @@ def decode_contract_v2_arg() -> int:
 #     symbol                                                     (old .so)
 # Every one of those degrades to the inherited kernel with a loud one-time
 # warning rather than raising — the inherited path is exactly today's serve, so
-# degrading is CORRECT, only slower.
-_CB_GEMV_V2_OK: bool | None = None
+# degrading is CORRECT, only slower. Availability is per device: setting the
+# dynamic-smem attributes is a CUDA-device operation, and heterogeneous hosts
+# must never inherit another GPU's verdict.
+_CB_GEMV_V2_OK: dict[int, bool] = {}
+_CB_GEMV_V2_LOCK = threading.Lock()
+_CB_GEMV_V2_WARNED: set[tuple[int | None, str]] = set()
+_CB_GEMV_V2_CAPABILITIES = frozenset({(12, 0), (12, 1)})
+_CB_GEMV_V2_SMEM_BYTES = 99 * 1024
 
 
-def cb_gemv_v2_available() -> bool:
+def _warn_unavailable(device_index: int | None, why: str) -> None:
+    key = (device_index, why)
+    if key in _CB_GEMV_V2_WARNED:
+        return
+    _CB_GEMV_V2_WARNED.add(key)
+    where = (f" on cuda:{device_index}" if device_index is not None else "")
+    print(f"[prismaquant-cb] WARNING: CB-GEMV-v2 unavailable{where} ({why}); "
+          f"every CB layer on that device decodes on the INHERITED kernel. "
+          f"Serving is correct and unchanged, but this serve carries no v2 "
+          f"delta — do not report it as a v2 arm.",
+          file=sys.stderr, flush=True)
+
+
+def cb_gemv_v2_device_support(device=None) -> tuple[bool, str, int | None]:
+    """Return ``(supported, reason, device_index)`` without building anything.
+
+    The kernel is restricted to the plugin's Blackwell native target family,
+    cc 12.0/12.1; the regression suite in this PR exercises cc 12.1. Both the
+    compute capability and the device's advertised opt-in shared-memory limit
+    are checked before the JIT loader is reached. This makes an explicit opt-in
+    fail closed on other GPUs instead of compiling a binary whose launch
+    contract has never been established.
+    """
+    try:
+        import torch
+
+        dev = torch.device(device) if device is not None else torch.device(
+            "cuda", torch.cuda.current_device())
+        if dev.type != "cuda":
+            return False, f"device {dev} is not CUDA", None
+        index = dev.index
+        if index is None:
+            index = torch.cuda.current_device()
+        capability = tuple(torch.cuda.get_device_capability(index))
+        if capability not in _CB_GEMV_V2_CAPABILITIES:
+            return (False,
+                    f"compute capability {capability} is outside the supported "
+                    f"native targets {sorted(_CB_GEMV_V2_CAPABILITIES)}",
+                    index)
+        props = torch.cuda.get_device_properties(index)
+        optin = int(getattr(props, "shared_memory_per_block_optin", 0))
+        if optin < _CB_GEMV_V2_SMEM_BYTES:
+            return (False,
+                    f"opt-in shared memory {optin} B is below the required "
+                    f"{_CB_GEMV_V2_SMEM_BYTES} B", index)
+        return True, (f"compute capability {capability}, opt-in shared memory "
+                      f"{optin} B"), index
+    except Exception as exc:  # noqa: BLE001 — support probe fails closed
+        return False, f"device capability probe failed: {type(exc).__name__}: {exc}", None
+
+
+def cb_gemv_v2_available(device=None) -> bool:
     """True iff the whole v2 path — custom op, JIT module and both host
     symbols — is present and loadable. Probed once, never raises."""
-    global _CB_GEMV_V2_OK
-    if _CB_GEMV_V2_OK is not None:
-        return _CB_GEMV_V2_OK
+    supported, support_reason, device_index = cb_gemv_v2_device_support(device)
+    if not supported:
+        _warn_unavailable(device_index, support_reason)
+        return False
+    assert device_index is not None
+    if device_index in _CB_GEMV_V2_OK:
+        return _CB_GEMV_V2_OK[device_index]
     why = None
-    try:
-        from . import cuda_ext
-        from . import ops as pq_ops
-        get_v2 = getattr(cuda_ext, "get_ext_v2", None)
-        if get_v2 is None:
-            why = ("gridbook.cuda_ext has no get_ext_v2() — plugin tree "
-                   "predates cb_gemv_v2")
-        elif getattr(pq_ops, "cb_moe_gemv_v2", None) is None:
-            why = ("gridbook.ops has no cb_moe_gemv_v2 custom op — plugin tree "
-                   "predates cb_gemv_v2")
-        else:
-            ext = get_v2()
-            if ext is None:
-                why = "get_ext_v2() returned None (JIT build unavailable)"
+    with _CB_GEMV_V2_LOCK:
+        if device_index in _CB_GEMV_V2_OK:
+            return _CB_GEMV_V2_OK[device_index]
+        try:
+            import torch
+            from . import cuda_ext
+            from . import ops as pq_ops
+            get_v2 = getattr(cuda_ext, "get_ext_v2", None)
+            if get_v2 is None:
+                why = ("gridbook.cuda_ext has no get_ext_v2() — plugin tree "
+                       "predates cb_gemv_v2")
+            elif getattr(pq_ops, "cb_moe_gemv_v2", None) is None:
+                why = ("gridbook.ops has no cb_moe_gemv_v2 custom op — plugin "
+                       "tree predates cb_gemv_v2")
             else:
-                for sym in ("cb_gemv_v2", "cb_gemv_v2_prefers_inherited"):
-                    if not hasattr(ext, sym):
-                        why = (f"the loaded prismaquant_cb_v2_ext exports no "
-                               f"{sym}() — stale .so in the build cache")
-                        break
-    except Exception as exc:                  # noqa: BLE001 — probe never raises
-        why = f"{type(exc).__name__}: {exc}"
+                ext = get_v2()
+                if ext is None:
+                    why = "get_ext_v2() returned None (JIT build unavailable)"
+                else:
+                    # Attribute setup is device-specific and deliberately
+                    # occurs at model load, before compile/capture.
+                    with torch.cuda.device(device_index):
+                        ext.cb_gemv_v2_prepare()
+        except Exception as exc:              # noqa: BLE001 — probe never raises
+            why = f"{type(exc).__name__}: {exc}"
+        _CB_GEMV_V2_OK[device_index] = why is None
     if why is not None:
-        print(f"[prismaquant-cb] WARNING: CB-GEMV-v2 unavailable ({why}); "
-              f"every CB layer decodes on the INHERITED kernel. Serving is "
-              f"correct and unchanged, but this serve carries no v2 delta — "
-              f"do not report it as a v2 arm.", file=sys.stderr, flush=True)
-    _CB_GEMV_V2_OK = why is None
-    return _CB_GEMV_V2_OK
+        _warn_unavailable(device_index, why)
+    return _CB_GEMV_V2_OK[device_index]
 
 
 def cb_gemv_choice(k_bits: int, n_sub: int, type_size: int,
-                   in_features: int) -> tuple[bool, str]:
+                   in_features: int, device=None) -> tuple[bool, str]:
     """``(use_v2, reason)`` for one (layer, stack).
 
     THE FALLBACK PREDICATE. Resolved on the HOST, ONCE, at load — never at
@@ -204,7 +244,7 @@ def cb_gemv_choice(k_bits: int, n_sub: int, type_size: int,
         return False, f"n_sub={n_sub} (v2 is product-mode only)"
     if type_size != 4 * k_bits + 9:
         return False, f"type_size={type_size} != 4k+9 (not fp4-v2)"
-    if not cb_gemv_v2_available():
+    if not cb_gemv_v2_available(device):
         return False, "v2 extension unavailable"
     from .cuda_ext import get_ext_v2
     if get_ext_v2().cb_gemv_v2_prefers_inherited(

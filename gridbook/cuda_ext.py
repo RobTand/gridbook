@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 
 _ext = None
 _tried = False
@@ -44,6 +45,10 @@ class IncompleteInstallError(FileNotFoundError):
     property of the user's machine, and it is reported differently so the two
     are never confused.
     """
+
+
+class StaleExtensionError(RuntimeError):
+    """A loaded JIT module does not satisfy its current call contract."""
 
 
 # Anchor for importlib.resources. ``__spec__.parent`` is the supported way to
@@ -84,6 +89,27 @@ def _require_csrc(*names: str) -> str:
             f"toolchain — reinstall gridbook (`pip install --force-reinstall "
             f"gridbook`) or install from a checkout.")
     return d
+
+
+def _require_symbols(mod, names, *, build_dir: str, source: str):
+    """Return ``mod`` only when every unconditionally-called symbol exists.
+
+    A persistent extension directory can contain a module built from an older
+    source/API. Refusing it at load turns an otherwise mid-forward
+    ``AttributeError`` into a clean fallback with the exact cache and module
+    locations in the diagnostic. This intentionally matches the helper
+    contract used by the other extension loaders.
+    """
+    required = tuple(names)
+    missing = [name for name in required if not hasattr(mod, name)]
+    if missing:
+        location = getattr(mod, "__file__", None) or "<unknown>"
+        raise StaleExtensionError(
+            f"the module loaded for {source} from {location!r} is missing "
+            f"{missing}; required symbols are {list(required)}. Clear "
+            f"{os.path.abspath(build_dir)!r} (or choose a fresh "
+            f"PRISMAQUANT_CB_EXT_DIR) and restart.")
+    return mod
 
 
 def get_ext():
@@ -127,6 +153,7 @@ def get_ext():
 
 _ext_v2 = None
 _tried_v2 = False
+_ext_v2_lock = threading.Lock()
 
 # Symbols cb_gemv_v2.cu must export, checked on EVERY load rather than only in
 # a build script. ``PRISMAQUANT_CB_EXT_DIR`` is normally a PERSISTENT directory
@@ -136,7 +163,12 @@ _tried_v2 = False
 # that is not in it — a stale-artefact failure, mid-forward, on a JIT artefact.
 # Failing here instead routes every CB layer to the inherited kernel with a
 # loud reason.
-_V2_SYMBOLS = ("cb_gemv_v2", "cb_gemv_v2_prefers_inherited", "cb_expand_v2")
+_V2_SYMBOLS = (
+    "cb_gemv_v2",
+    "cb_gemv_v2_prefers_inherited",
+    "cb_gemv_v2_prepare",
+    "cb_expand_v2",
+)
 
 
 def get_ext_v2():
@@ -157,39 +189,45 @@ def get_ext_v2():
     global _ext_v2, _tried_v2
     if _tried_v2:
         return _ext_v2
-    _tried_v2 = True
-    try:
-        import torch  # noqa: F401  (must import before cpp_extension)
-        from torch.utils.cpp_extension import load
+    with _ext_v2_lock:
+        if _tried_v2:
+            return _ext_v2
+        try:
+            import torch  # noqa: F401  (must import before cpp_extension)
+            from torch.utils.cpp_extension import load
 
-        src = os.path.join(_require_csrc("cb_gemv_v2.cu"), "cb_gemv_v2.cu")
-        build_dir = os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
-            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext")
-        build_dir = os.path.join(build_dir, "v2")
-        os.makedirs(build_dir, exist_ok=True)
-        mod = load(name="prismaquant_cb_v2_ext", sources=[src],
-                   build_directory=build_dir,
-                   extra_cuda_cflags=["-O3"], verbose=False)
-        missing = [s for s in _V2_SYMBOLS if not hasattr(mod, s)]
-        if missing:
-            raise AttributeError(
-                f"prismaquant_cb_v2_ext loaded from {build_dir} exports none "
-                f"of {missing} — a STALE .so from an older cb_gemv_v2.cu is in "
-                f"the persistent build cache. Clear it and restart.")
-        _ext_v2 = mod
-    except IncompleteInstallError as exc:
-        print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
-              f"Every CB layer decodes on the inherited GEMV kernel.",
-              file=sys.stderr, flush=True)
-        _ext_v2 = None
-    except Exception as exc:  # noqa: BLE001 — any build/env failure -> fallback
-        print(f"[prismaquant-cb] WARNING: the CB-GEMV-v2 extension could not "
-              f"be built ({type(exc).__name__}: {exc}); every CB layer decodes "
-              f"on the inherited GEMV kernel (this is expected on non-sm_120/"
-              f"sm_121 GPUs and without nvcc). To get the v2 path: "
-              f"{_NVCC_HINT}.",
-              file=sys.stderr, flush=True)
-        _ext_v2 = None
+            src = os.path.join(
+                _require_csrc("cb_gemv_v2.cu"), "cb_gemv_v2.cu")
+            build_dir = os.environ.get(
+                "PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+                    os.path.expanduser("~"), ".cache", "prismaquant-cb-ext")
+            build_dir = os.path.join(build_dir, "v2")
+            os.makedirs(build_dir, exist_ok=True)
+            mod = load(name="prismaquant_cb_v2_ext", sources=[src],
+                       build_directory=build_dir,
+                       extra_cuda_cflags=["-O3"], verbose=False)
+            _ext_v2 = _require_symbols(
+                mod, _V2_SYMBOLS, build_dir=build_dir,
+                source="cb_gemv_v2.cu")
+        except StaleExtensionError as exc:
+            print(f"[prismaquant-cb] ERROR: incompatible CB-GEMV-v2 "
+                  f"extension — {exc} Every CB layer decodes on the inherited "
+                  f"GEMV kernel.", file=sys.stderr, flush=True)
+            _ext_v2 = None
+        except IncompleteInstallError as exc:
+            print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
+                  f"Every CB layer decodes on the inherited GEMV kernel.",
+                  file=sys.stderr, flush=True)
+            _ext_v2 = None
+        except Exception as exc:  # noqa: BLE001 — build/env failure -> fallback
+            print(f"[prismaquant-cb] WARNING: the CB-GEMV-v2 extension could "
+                  f"not be built ({type(exc).__name__}: {exc}); every CB layer "
+                  f"decodes on the inherited GEMV kernel (this is expected on "
+                  f"non-sm_120/sm_121 GPUs and without nvcc). To get the v2 "
+                  f"path: {_NVCC_HINT}.", file=sys.stderr, flush=True)
+            _ext_v2 = None
+        finally:
+            _tried_v2 = True
     return _ext_v2
 
 

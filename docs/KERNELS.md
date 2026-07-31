@@ -136,10 +136,14 @@ already uses (`csrc/cutlass_fork/sm120_cb_fused_mma.hpp`, where it removed the
 k48 L1 cliff), applied to the M≤16 decode regime. It opts in to the sm_121a
 99 KB dynamic-smem budget, which the shipped decode GEMV does not (it caps its
 rowpack request at 48 KB), so the k20/k24 staged configurations are only
-expressible in the new kernel. It is **not** bit-exact against the default
+expressible in the new kernel. The loader admits only the native Blackwell
+target capabilities (12.0/12.1) with at least 99 KiB opt-in shared memory; this
+PR's execution battery covers cc 12.1, not cc 12.0. It
+is **not** bit-exact against the default
 grouped schedule — reassociation class, same as CUDA-vs-Triton — and it is
-**not** a default: `auto` reaches it only where a compiled occupancy predicate
-says it wins, and `PRISMAQUANT_CB_GEMV=inherited` is the kill switch. The
+**not** a default: unset means `inherited`. Explicit `auto` or `v2` reaches it
+only where the hardware gate and compiled occupancy predicate both pass;
+`PRISMAQUANT_CB_GEMV=inherited` is the kill switch. The
 selection resolves once per process and is fixed per (layer, stack) at load, so
 the call-site branch is a trace-time constant and FULL-decode cudagraphs are
 unaffected.

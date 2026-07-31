@@ -60,11 +60,22 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+#include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <mutex>
 
 #define DEVINL __device__ __forceinline__
 
 namespace {
+
+inline bool pq_env_is(const char* name, const char* val) {
+  const char* e = std::getenv(name);
+  return e != nullptr && std::strcmp(e, val) == 0;
+}
 
 DEVINL float bf16_to_f32(uint16_t v) {
   __nv_bfloat16_raw r; r.x = v;
@@ -410,6 +421,55 @@ static inline int cbv2_blocks_per_sm(size_t stage_bytes, int slot_bytes,
   if (b > 48 / warps) b = 48 / warps;    // cc 12.x 48-warp/SM cap
   return b < 1 ? 1 : b;
 }
+
+// cudaFuncSetAttribute is device-specific state. The submitted implementation
+// used one process-global bool per residency template, so the first GPU to run
+// could make every later GPU skip its own setup; two first launches could also
+// race. Prepare all call families once per device under a mutex, then make the
+// hot/capture path a single acquire-load. Model loading calls the exported
+// prepare binding before capture; the launch-side ensure is a defensive guard
+// for direct pybind users and tests.
+constexpr int CBV2_MAX_TRACKED_DEVICES = 64;
+std::array<std::atomic<bool>, CBV2_MAX_TRACKED_DEVICES> cbv2_prepared{};
+std::mutex cbv2_prepare_mutex;
+
+static void cbv2_prepare_device(int device) {
+  TORCH_CHECK(device >= 0 && device < CBV2_MAX_TRACKED_DEVICES,
+              "CB-GEMV-v2 cannot track CUDA device index ", device,
+              " (maximum ", CBV2_MAX_TRACKED_DEVICES - 1, ")");
+  if (cbv2_prepared[device].load(std::memory_order_acquire)) return;
+  std::lock_guard<std::mutex> lock(cbv2_prepare_mutex);
+  if (cbv2_prepared[device].load(std::memory_order_relaxed)) return;
+
+  const c10::cuda::OptionalCUDAGuard guard(c10::Device(c10::kCUDA, device));
+  cudaDeviceProp prop{};
+  C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+  TORCH_CHECK(prop.major == 12 && (prop.minor == 0 || prop.minor == 1),
+              "CB-GEMV-v2 supports only native compute capability 12.0/12.1, "
+              "but cuda:", device, " reports ", prop.major, ".",
+              prop.minor);
+  TORCH_CHECK(prop.sharedMemPerBlockOptin >= CBV2_SMEM_BUDGET,
+              "CB-GEMV-v2 requires ", CBV2_SMEM_BUDGET,
+              " B opt-in shared memory, but cuda:", device, " advertises ",
+              prop.sharedMemPerBlockOptin, " B");
+
+#define CBV2_SET_MAX_SMEM(FN)                                                \
+  C10_CUDA_CHECK(cudaFuncSetAttribute(                                      \
+      FN, cudaFuncAttributeMaxDynamicSharedMemorySize, CBV2_SMEM_BUDGET))
+  CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 0>));
+  CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 1>));
+  CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 2>));
+  CBV2_SET_MAX_SMEM((cb_expand_v2_kernel<8>));
+#undef CBV2_SET_MAX_SMEM
+
+  cbv2_prepared[device].store(true, std::memory_order_release);
+}
+
+void cb_gemv_v2_prepare() {
+  int device = -1;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  cbv2_prepare_device(device);
+}
 // dict_mode: 0 = auto (the measured policy below — smem only while the dict
 // still leaves >=3 blocks/SM of the 99 KB budget, else global).
 // Forced modes map `ds = dict_mode - 1`, and ds is the STAGE size, so:
@@ -425,23 +485,53 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
                          torch::Tensor cb_flat, torch::Tensor compose,
                          torch::Tensor pair_expert, torch::Tensor pair_xrow,
                          int64_t k_bits, int64_t type_size, int64_t rpb,
-                         int64_t v2, int64_t dict_mode) {
-  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16);
+                         int64_t dict_mode) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 &&
+              x.dim() == 2 && x.is_contiguous(),
+              "x must be a contiguous CUDA bf16 [rows,K] tensor");
   TORCH_CHECK(qw_stack.dim() == 3 && qw_stack.scalar_type() == torch::kUInt8 &&
-              qw_stack.is_contiguous());
-  TORCH_CHECK(cb_flat.scalar_type() == torch::kBFloat16 &&
-              cb_flat.is_contiguous());
-  TORCH_CHECK(compose.scalar_type() == torch::kFloat32 &&
-              compose.numel() == 256 * 16);
-  TORCH_CHECK(pair_expert.scalar_type() == torch::kInt32);
-  TORCH_CHECK(pair_xrow.scalar_type() == torch::kInt32);
+              qw_stack.is_cuda() && qw_stack.is_contiguous(),
+              "qw_stack must be a contiguous CUDA uint8 [E,N,row_bytes] tensor");
+  TORCH_CHECK(cb_flat.is_cuda() && cb_flat.scalar_type() == torch::kBFloat16 &&
+              cb_flat.dim() == 1 && cb_flat.is_contiguous(),
+              "cb_flat must be a contiguous CUDA bf16 vector");
+  TORCH_CHECK(compose.is_cuda() && compose.scalar_type() == torch::kFloat32 &&
+              compose.numel() == 256 * 16 && compose.is_contiguous(),
+              "compose must be a contiguous CUDA float32 tensor with 4096 elements");
+  TORCH_CHECK(pair_expert.is_cuda() &&
+              pair_expert.scalar_type() == torch::kInt32 &&
+              pair_expert.dim() == 1 && pair_expert.is_contiguous(),
+              "pair_expert must be a contiguous CUDA int32 vector");
+  TORCH_CHECK(pair_xrow.is_cuda() && pair_xrow.scalar_type() == torch::kInt32 &&
+              pair_xrow.dim() == 1 && pair_xrow.is_contiguous(),
+              "pair_xrow must be a contiguous CUDA int32 vector");
+  TORCH_CHECK(x.device() == qw_stack.device() &&
+              x.device() == cb_flat.device() && x.device() == compose.device() &&
+              x.device() == pair_expert.device() &&
+              x.device() == pair_xrow.device(),
+              "all CB-GEMV-v2 tensors must be on the same CUDA device");
+  TORCH_CHECK(k_bits > 0 && k_bits <= 24,
+              "k_bits must be in [1,24], got ", k_bits);
   TORCH_CHECK(type_size == 4 * k_bits + 9, "fp4-v2 type_size must be 4k+9");
+  TORCH_CHECK(dict_mode >= 0 && dict_mode <= 3,
+              "dict_mode must be 0(auto), 1(global), 2(half), or 3(full)");
+  TORCH_CHECK(rpb >= 0 && rpb <= 1024,
+              "rpb must be in [0,1024] (0 selects auto)");
+  TORCH_CHECK(qw_stack.size(0) > 0, "qw_stack must contain at least one expert");
   const int64_t Nout = qw_stack.size(1);
   const int64_t row_bytes = qw_stack.size(2);
-  TORCH_CHECK(row_bytes % type_size == 0);
+  TORCH_CHECK(row_bytes > 0 && row_bytes % type_size == 0,
+              "row_bytes must be a positive multiple of type_size");
   const int64_t K = (row_bytes / type_size) << 8;
-  TORCH_CHECK(x.size(-1) == K, "x width != decoded row width");
+  TORCH_CHECK(K > 0 && K % 256 == 0 &&
+              K <= std::numeric_limits<int>::max(),
+              "decoded K must be a positive int-sized multiple of 256");
+  TORCH_CHECK(row_bytes <= std::numeric_limits<int>::max() - 32,
+              "packed row is too wide for the kernel's slot indexing");
+  TORCH_CHECK(x.size(1) == K, "x width != decoded row width");
   const int64_t P = pair_expert.numel();
+  TORCH_CHECK(pair_xrow.numel() == P,
+              "pair_expert and pair_xrow must have the same length");
   const int64_t cb_elems = cb_flat.numel();
   TORCH_CHECK((cb_elems * 2) % 16 == 0, "cb bytes must be 16B-aligned");
   const int expect =
@@ -450,9 +540,10 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
               " != product-mode expectation ", expect, " for k=", k_bits);
 
   const c10::cuda::OptionalCUDAGuard guard(x.device());
+  cbv2_prepare_device(x.get_device());
   auto stream = at::cuda::getCurrentCUDAStream();
   auto y = torch::empty({P, Nout}, x.options());
-  if (P == 0) return y;
+  if (P == 0 || Nout == 0) return y;
 
   constexpr int WARPS = 8;
   const int slot_bytes = cbv2_slot_bytes(row_bytes);
@@ -551,20 +642,12 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
   // NOTE this is the opt-in the inherited decode GEMV never takes: its rowpack
   // schedule caps itself at 48 KB (cb_gemv.cu:1445) and therefore cannot host
   // the k20/k24 staged-dictionary configurations at all.
-  static bool granted[3] = {false, false, false};
-#define CBV2_SETUP(DSV)                                                      \
-  do {                                                                       \
-    if (!granted[DSV]) {                                                     \
-      cudaFuncSetAttribute(cb_gemv_v2_kernel<WARPS, DSV>,                    \
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,      \
-                           (int)(99 * 1024));                                \
-      granted[DSV] = true;                                                   \
-    }                                                                        \
-  } while (0)
-
   const int64_t nbp = (Nout + rpb - 1) / rpb;
+  TORCH_CHECK(nbp > 0 &&
+              P <= std::numeric_limits<int>::max() / nbp,
+              "CB-GEMV-v2 launch grid exceeds CUDA's x dimension");
+  const int v2 = pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2") ? 1 : 0;
 #define LAUNCH_CBV2(DS)                                                      \
-  CBV2_SETUP(DS);                                                            \
   cb_gemv_v2_kernel<WARPS, DS><<<(unsigned)(P * nbp), WARPS * 32, smem,      \
                                  stream>>>(                                  \
       reinterpret_cast<const uint16_t*>(x.data_ptr()),                       \
@@ -579,7 +662,6 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
   else if (ds == 1) { LAUNCH_CBV2(1); }
   else { LAUNCH_CBV2(0); }
 #undef LAUNCH_CBV2
-#undef CBV2_SETUP
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
 }
@@ -617,8 +699,9 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
 // formula.
 bool cb_gemv_v2_prefers_inherited(int64_t k_bits, int64_t type_size,
                                   int64_t in_features) {
+  if (k_bits <= 0 || k_bits > 24) return true;         // keep shifts in range
   if (type_size != 4 * k_bits + 9) return true;        // not fp4-v2 product mode
-  if (in_features % 256 != 0) return true;             // not a whole superblock
+  if (in_features <= 0 || in_features % 256 != 0) return true;
   const int64_t row_bytes = (in_features >> 8) * type_size;
   const int slot_bytes = cbv2_slot_bytes(row_bytes);
   const size_t dict_bytes =
@@ -633,18 +716,48 @@ torch::Tensor cb_expand_v2(torch::Tensor qw_flat, torch::Tensor cb_flat,
                            torch::Tensor compose, int64_t row0, int64_t nrows,
                            int64_t K, int64_t k_bits, int64_t type_size) {
   TORCH_CHECK(qw_flat.is_cuda() && qw_flat.scalar_type() == torch::kUInt8 &&
-              qw_flat.is_contiguous());
-  TORCH_CHECK(cb_flat.scalar_type() == torch::kBFloat16);
-  TORCH_CHECK(type_size == 4 * k_bits + 9);
+              qw_flat.dim() >= 1 && qw_flat.is_contiguous(),
+              "qw_flat must be a contiguous CUDA uint8 tensor");
+  TORCH_CHECK(cb_flat.is_cuda() && cb_flat.scalar_type() == torch::kBFloat16 &&
+              cb_flat.dim() == 1 && cb_flat.is_contiguous(),
+              "cb_flat must be a contiguous CUDA bf16 vector");
+  TORCH_CHECK(compose.is_cuda() && compose.scalar_type() == torch::kFloat32 &&
+              compose.numel() == 256 * 16 && compose.is_contiguous(),
+              "compose must be a contiguous CUDA float32 tensor with 4096 elements");
+  TORCH_CHECK(qw_flat.device() == cb_flat.device() &&
+              qw_flat.device() == compose.device(),
+              "qw_flat, cb_flat and compose must share a CUDA device");
+  TORCH_CHECK(k_bits > 0 && k_bits <= 24,
+              "k_bits must be in [1,24], got ", k_bits);
+  TORCH_CHECK(type_size == 4 * k_bits + 9,
+              "fp4-v2 type_size must be 4k+9");
+  TORCH_CHECK(K > 0 && K % 256 == 0 &&
+              K <= std::numeric_limits<int>::max(),
+              "K must be a positive int-sized multiple of 256");
   const int64_t row_bytes = (K >> 8) * type_size;
+  TORCH_CHECK(row_bytes > 0 && qw_flat.numel() % row_bytes == 0,
+              "packed byte count must be divisible by row_bytes");
   const int64_t rows_total = qw_flat.numel() / row_bytes;
-  TORCH_CHECK(row0 >= 0 && row0 + nrows <= rows_total);
+  TORCH_CHECK(row0 >= 0 && nrows >= 0 && row0 <= rows_total &&
+              nrows <= rows_total - row0,
+              "requested row0=", row0, " and nrows=", nrows,
+              " are outside a packed tensor with ", rows_total, " rows");
+  TORCH_CHECK(nrows <= std::numeric_limits<int>::max(),
+              "nrows exceeds CUDA's grid dimension");
   const int64_t cb_elems = cb_flat.numel();
+  const int64_t expect =
+      (4ll << ((k_bits + 1) / 2)) + (4ll << (k_bits / 2));
+  TORCH_CHECK(cb_elems == expect, "cb_flat elems ", cb_elems,
+              " != product-mode expectation ", expect, " for k=", k_bits);
+  TORCH_CHECK((cb_elems * 2) % 16 == 0,
+              "cb bytes must be 16B-aligned");
 
   const c10::cuda::OptionalCUDAGuard guard(qw_flat.device());
+  cbv2_prepare_device(qw_flat.get_device());
   auto stream = at::cuda::getCurrentCUDAStream();
   auto w = torch::empty({nrows, K},
                         torch::dtype(torch::kBFloat16).device(qw_flat.device()));
+  if (nrows == 0) return w;
   constexpr int WARPS = 8;
   const size_t smem = (size_t)cb_elems * 2;
   // The oracle always stages the FULL dict, so it has no residency fallback:
@@ -652,9 +765,6 @@ torch::Tensor cb_expand_v2(torch::Tensor qw_flat, torch::Tensor cb_flat,
   TORCH_CHECK(smem <= CBV2_SMEM_BUDGET, "cb_expand_v2 needs ", smem,
               " B of shared memory for the flat codebook, over the 99KB "
               "sm_121a cap (k=", k_bits, ")");
-  cudaFuncSetAttribute(cb_expand_v2_kernel<WARPS>,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       (int)(99 * 1024));
   cb_expand_v2_kernel<WARPS><<<(unsigned)nrows, WARPS * 32, smem, stream>>>(
       qw_flat.data_ptr<uint8_t>(),
       reinterpret_cast<const uint16_t*>(cb_flat.data_ptr()),
@@ -667,49 +777,72 @@ torch::Tensor cb_expand_v2(torch::Tensor qw_flat, torch::Tensor cb_flat,
 
 double bw_read(torch::Tensor a, int64_t iters) {
   TORCH_CHECK(a.is_cuda() && a.scalar_type() == torch::kUInt8 &&
-              a.numel() % 16 == 0);
+              a.is_contiguous() && a.numel() >= 16 && a.numel() % 16 == 0,
+              "a must be contiguous CUDA uint8 with a positive 16B-aligned size");
+  TORCH_CHECK(iters > 0, "iters must be positive");
+  const c10::cuda::OptionalCUDAGuard guard(a.device());
   auto o = torch::zeros({1}, torch::dtype(torch::kFloat32).device(a.device()));
   auto stream = at::cuda::getCurrentCUDAStream();
   const int64_t n4 = a.numel() / 16;
   cudaEvent_t t0, t1;
-  cudaEventCreate(&t0); cudaEventCreate(&t1);
+  C10_CUDA_CHECK(cudaEventCreate(&t0));
+  C10_CUDA_CHECK(cudaEventCreate(&t1));
   // warmup
   bw_read_kernel<<<1024, 256, 0, stream>>>(
       reinterpret_cast<const uint4*>(a.data_ptr()), o.data_ptr<float>(), n4);
-  cudaEventRecord(t0, stream);
+  C10_CUDA_CHECK(cudaEventRecord(t0, stream));
   for (int64_t i = 0; i < iters; ++i)
     bw_read_kernel<<<1024, 256, 0, stream>>>(
         reinterpret_cast<const uint4*>(a.data_ptr()), o.data_ptr<float>(), n4);
-  cudaEventRecord(t1, stream);
-  cudaEventSynchronize(t1);
-  float ms = 0.f; cudaEventElapsedTime(&ms, t0, t1);
-  cudaEventDestroy(t0); cudaEventDestroy(t1);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_CUDA_CHECK(cudaEventRecord(t1, stream));
+  C10_CUDA_CHECK(cudaEventSynchronize(t1));
+  float ms = 0.f;
+  C10_CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+  C10_CUDA_CHECK(cudaEventDestroy(t0));
+  C10_CUDA_CHECK(cudaEventDestroy(t1));
+  TORCH_CHECK(ms > 0.f, "bandwidth timer returned zero elapsed time");
   return (double)a.numel() * iters / ((double)ms * 1e6);   // GB/s
 }
 
 double bw_triad(torch::Tensor a, torch::Tensor b, torch::Tensor c,
                 int64_t iters) {
-  TORCH_CHECK(a.is_cuda() && a.scalar_type() == torch::kFloat32);
-  TORCH_CHECK(a.numel() % 4 == 0 && a.numel() == b.numel() &&
-              a.numel() == c.numel());
+  TORCH_CHECK(a.is_cuda() && b.is_cuda() && c.is_cuda() &&
+              a.scalar_type() == torch::kFloat32 &&
+              b.scalar_type() == torch::kFloat32 &&
+              c.scalar_type() == torch::kFloat32 &&
+              a.is_contiguous() && b.is_contiguous() && c.is_contiguous(),
+              "a, b and c must be contiguous CUDA float32 tensors");
+  TORCH_CHECK(a.device() == b.device() && a.device() == c.device(),
+              "a, b and c must share a CUDA device");
+  TORCH_CHECK(a.numel() >= 4 && a.numel() % 4 == 0 &&
+              a.numel() == b.numel() && a.numel() == c.numel(),
+              "triad tensors must have the same positive 16B-aligned size");
+  TORCH_CHECK(iters > 0, "iters must be positive");
+  const c10::cuda::OptionalCUDAGuard guard(a.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   const int64_t n4 = a.numel() / 4;
   cudaEvent_t t0, t1;
-  cudaEventCreate(&t0); cudaEventCreate(&t1);
+  C10_CUDA_CHECK(cudaEventCreate(&t0));
+  C10_CUDA_CHECK(cudaEventCreate(&t1));
   bw_triad_kernel<<<1024, 256, 0, stream>>>(
       reinterpret_cast<const float4*>(a.data_ptr()),
       reinterpret_cast<const float4*>(b.data_ptr()),
       reinterpret_cast<float4*>(c.data_ptr()), 1.5f, n4);
-  cudaEventRecord(t0, stream);
+  C10_CUDA_CHECK(cudaEventRecord(t0, stream));
   for (int64_t i = 0; i < iters; ++i)
     bw_triad_kernel<<<1024, 256, 0, stream>>>(
         reinterpret_cast<const float4*>(a.data_ptr()),
         reinterpret_cast<const float4*>(b.data_ptr()),
         reinterpret_cast<float4*>(c.data_ptr()), 1.5f, n4);
-  cudaEventRecord(t1, stream);
-  cudaEventSynchronize(t1);
-  float ms = 0.f; cudaEventElapsedTime(&ms, t0, t1);
-  cudaEventDestroy(t0); cudaEventDestroy(t1);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_CUDA_CHECK(cudaEventRecord(t1, stream));
+  C10_CUDA_CHECK(cudaEventSynchronize(t1));
+  float ms = 0.f;
+  C10_CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+  C10_CUDA_CHECK(cudaEventDestroy(t0));
+  C10_CUDA_CHECK(cudaEventDestroy(t1));
+  TORCH_CHECK(ms > 0.f, "bandwidth timer returned zero elapsed time");
   return (double)a.numel() * 4 * 3 * iters / ((double)ms * 1e6);  // GB/s
 }
 
@@ -717,10 +850,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cb_gemv_v2", &cb_gemv_v2,
         "grouped fp4-v2 CB decode GEMV, smem-resident dict "
         "(x, qw[E,N,rb], cb_flat bf16, compose, pair_expert, pair_xrow, "
-        "k, type_size, rpb, v2, dict_mode) -> y[P,N]; rpb<=0 = auto");
+        "k, type_size, rpb, dict_mode) -> y[P,N]; rpb=0 = auto; the decode "
+        "contract is read from PRISMAQUANT_CB_DECODE_CONTRACT per call");
   m.def("cb_gemv_v2_prefers_inherited", &cb_gemv_v2_prefers_inherited,
         "dispatch predicate: true -> route (k, type_size, K) to the inherited "
         "kernel (the k24 long-K occupancy wall)");
+  m.def("cb_gemv_v2_prepare", &cb_gemv_v2_prepare,
+        "validate the current GB10 device and configure all v2 kernels' "
+        "opt-in dynamic shared-memory attributes once for that device");
   m.def("cb_expand_v2", &cb_expand_v2,
         "bit-exactness oracle: decode rows [row0,row0+nrows) to bf16");
   m.def("bw_read", &bw_read, "peak read bandwidth probe (GB/s)");

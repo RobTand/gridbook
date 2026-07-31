@@ -9,6 +9,9 @@ differ), so it has to be pinned by test rather than by observation.
 """
 import importlib.util
 import pathlib
+from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,7 +19,6 @@ sel = pytest.importorskip("gridbook.moe_gemv_select",
                           reason="gridbook not importable")
 
 ENV = "PRISMAQUANT_CB_GEMV"
-CONTRACT_ENV = "PRISMAQUANT_CB_DECODE_CONTRACT"
 
 
 @pytest.fixture(autouse=True)
@@ -27,16 +29,16 @@ def _isolate(monkeypatch):
     contract), so the fixture — not the test — owns the reset.
     """
     monkeypatch.delenv(ENV, raising=False)
-    monkeypatch.delenv(CONTRACT_ENV, raising=False)
     monkeypatch.setattr(sel, "_CB_GEMV", None, raising=False)
-    monkeypatch.setattr(sel, "_CB_GEMV_V2_OK", None, raising=False)
+    monkeypatch.setattr(sel, "_CB_GEMV_V2_OK", {}, raising=False)
+    monkeypatch.setattr(sel, "_CB_GEMV_V2_WARNED", set(), raising=False)
     yield
 
 
 # --- the selector -----------------------------------------------------------
 
-def test_mode_defaults_to_auto_when_unset():
-    assert sel.cb_gemv_mode() == "auto"
+def test_mode_defaults_to_inherited_when_unset():
+    assert sel.cb_gemv_mode() == "inherited"
 
 
 @pytest.mark.parametrize("val", ["auto", "v2", "inherited"])
@@ -80,37 +82,104 @@ def test_mode_rejects_mid_process_change(monkeypatch):
 
 
 def test_mode_rejects_unset_after_resolution(monkeypatch):
-    """Deleting the env is a mid-process change too (it re-defaults to auto)."""
-    monkeypatch.setenv(ENV, "inherited")
-    assert sel.cb_gemv_mode() == "inherited"
+    """Deleting an explicit opt-in reverts to inherited and must be rejected."""
+    monkeypatch.setenv(ENV, "v2")
+    assert sel.cb_gemv_mode() == "v2"
     monkeypatch.delenv(ENV)
     with pytest.raises(RuntimeError):
         sel.cb_gemv_mode()
 
 
-# --- the decode-contract argument -------------------------------------------
-# The inherited kernel resolves this itself, per launch, with a bare strcmp
-# (`pq_env_is(...)` at csrc/cb_gemv.cu:471/760/1357/1437). The v2 kernel takes
-# it as an argument. Under a mixed dispatch the two MUST agree, so the python
-# side is a bare `== "v2"` — normalising case or whitespace here would make
-# " v2" mean v2 to one kernel and v1 to the other, per weight, silently.
+# --- device support / preparation ------------------------------------------
 
-@pytest.mark.parametrize("raw,expect", [
-    (None, 0),
-    ("v1", 0),
-    ("v2", 1),
-    ("V2", 0),
-    (" v2", 0),
-    ("v2 ", 0),
-    ("", 0),
-])
-def test_decode_contract_arg_matches_pq_env_is_exactly(monkeypatch, raw,
-                                                       expect):
-    if raw is None:
-        monkeypatch.delenv(CONTRACT_ENV, raising=False)
-    else:
-        monkeypatch.setenv(CONTRACT_ENV, raw)
-    assert sel.decode_contract_v2_arg() == expect
+def _fake_cuda_device(monkeypatch, capability=(12, 1), optin=101376):
+    import torch
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability",
+                        lambda index: capability)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda index: SimpleNamespace(
+                            shared_memory_per_block_optin=optin))
+
+
+def test_device_support_accepts_validated_gb10(monkeypatch):
+    _fake_cuda_device(monkeypatch)
+    ok, why, index = sel.cb_gemv_v2_device_support("cuda:0")
+    assert ok is True and index == 0
+    assert "(12, 1)" in why and "101376" in why
+
+
+@pytest.mark.parametrize("capability", [(8, 9), (9, 0), (10, 0), (12, 2)])
+def test_device_support_rejects_unvalidated_capability(monkeypatch, capability):
+    _fake_cuda_device(monkeypatch, capability=capability)
+    ok, why, index = sel.cb_gemv_v2_device_support("cuda:0")
+    assert ok is False and index == 0
+    assert "outside the supported" in why
+
+
+def test_device_support_rejects_insufficient_optin_smem(monkeypatch):
+    _fake_cuda_device(monkeypatch, optin=96 * 1024)
+    ok, why, index = sel.cb_gemv_v2_device_support("cuda:0")
+    assert ok is False and index == 0
+    assert "below the required" in why
+
+
+def test_unsupported_device_never_builds(monkeypatch):
+    monkeypatch.setattr(sel, "cb_gemv_v2_device_support",
+                        lambda device=None: (False, "unsupported test GPU", 3))
+    cuda_ext = pytest.importorskip("gridbook.cuda_ext")
+    monkeypatch.setattr(cuda_ext, "get_ext_v2", _explode)
+    assert sel.cb_gemv_v2_available("cuda:3") is False
+
+
+def test_availability_prepares_once_per_device_thread_safely(monkeypatch):
+    import torch
+    cuda_ext = pytest.importorskip("gridbook.cuda_ext")
+
+    class PreparedExt:
+        def __init__(self):
+            self.prepares = 0
+
+        def cb_gemv_v2_prepare(self):
+            self.prepares += 1
+
+    ext = PreparedExt()
+    monkeypatch.setattr(
+        sel, "cb_gemv_v2_device_support",
+        lambda device=None: (True, "test GB10", int(str(device).split(":")[-1])))
+    monkeypatch.setattr(torch.cuda, "device", lambda index: nullcontext())
+    monkeypatch.setattr(cuda_ext, "get_ext_v2", lambda: ext)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        got = list(pool.map(lambda _: sel.cb_gemv_v2_available("cuda:0"),
+                            range(16)))
+    assert all(got)
+    assert ext.prepares == 1
+    assert sel.cb_gemv_v2_available("cuda:1") is True
+    assert ext.prepares == 2
+
+
+def test_v2_loader_contract_requires_prepare_symbol():
+    cuda_ext = pytest.importorskip("gridbook.cuda_ext")
+    mod = SimpleNamespace(
+        cb_gemv_v2=object(), cb_gemv_v2_prefers_inherited=object(),
+        cb_expand_v2=object(), __file__="/tmp/stale-v2.so")
+    with pytest.raises(cuda_ext.StaleExtensionError) as exc:
+        cuda_ext._require_symbols(
+            mod, cuda_ext._V2_SYMBOLS, build_dir="/tmp/v2-cache",
+            source="cb_gemv_v2.cu")
+    assert "cb_gemv_v2_prepare" in str(exc.value)
+    assert "/tmp/v2-cache" in str(exc.value)
+
+
+def test_decode_contract_is_resolved_in_cpp_per_call():
+    """Do not regress to a Python/load-time cached contract while inherited
+    resolves the same env switch in its C++ launcher on every call."""
+    source = (pathlib.Path(__file__).resolve().parents[1] / "gridbook" /
+              "csrc" / "cb_gemv_v2.cu").read_text()
+    assert ('pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2")'
+            in source)
+    assert "decode_contract_v2_arg" not in source
 
 
 # --- the per-(layer, stack) choice ------------------------------------------
@@ -129,7 +198,7 @@ class _FakeExt:
 
 def _install_ext(monkeypatch, verdict):
     ext = _FakeExt(verdict)
-    monkeypatch.setattr(sel, "cb_gemv_v2_available", lambda: True)
+    monkeypatch.setattr(sel, "cb_gemv_v2_available", lambda device=None: True)
     cuda_ext = pytest.importorskip("gridbook.cuda_ext")
     monkeypatch.setattr(cuda_ext, "get_ext_v2", lambda: ext)
     return ext
@@ -149,8 +218,19 @@ def test_kill_switch_never_probes_the_extension(monkeypatch):
     assert "kill switch" in why
 
 
+def test_unset_default_never_probes_or_builds(monkeypatch):
+    """The regression guard for the submitted rollout: an absent variable is
+    the inherited path, not an implicit experimental ``auto`` opt-in."""
+    monkeypatch.delenv(ENV, raising=False)
+    monkeypatch.setattr(sel, "cb_gemv_v2_available", _explode)
+    use_v2, why = sel.cb_gemv_choice(16, 2, 73, 4096, "cuda:0")
+    assert use_v2 is False
+    assert "kill switch" in why
+
+
 @pytest.mark.parametrize("n_sub", [1, 4])
 def test_non_product_mode_rejected_before_the_probe(monkeypatch, n_sub):
+    monkeypatch.setenv(ENV, "v2")
     monkeypatch.setattr(sel, "cb_gemv_v2_available", _explode)
     use_v2, why = sel.cb_gemv_choice(16, n_sub, 4 * 16 + 9, 4096)
     assert use_v2 is False
@@ -159,6 +239,7 @@ def test_non_product_mode_rejected_before_the_probe(monkeypatch, n_sub):
 
 def test_wrong_type_size_rejected_before_the_probe(monkeypatch):
     """type_size != 4k+9 is not the fp4 two-tier v2 plane the kernel decodes."""
+    monkeypatch.setenv(ENV, "v2")
     monkeypatch.setattr(sel, "cb_gemv_v2_available", _explode)
     use_v2, why = sel.cb_gemv_choice(16, 2, 64, 4096)
     assert use_v2 is False
@@ -166,7 +247,9 @@ def test_wrong_type_size_rejected_before_the_probe(monkeypatch):
 
 
 def test_unavailable_extension_falls_back(monkeypatch):
-    monkeypatch.setattr(sel, "cb_gemv_v2_available", lambda: False)
+    monkeypatch.setenv(ENV, "v2")
+    monkeypatch.setattr(sel, "cb_gemv_v2_available",
+                        lambda device=None: False)
     use_v2, why = sel.cb_gemv_choice(16, 2, 73, 4096)
     assert use_v2 is False
     assert "unavailable" in why
@@ -181,6 +264,16 @@ def test_verdict_is_delegated_to_the_compiled_predicate(monkeypatch):
     use_v2, why = sel.cb_gemv_choice(16, 2, 73, 4096)
     assert use_v2 is True and why == "mode=auto"
     assert ext.calls == [(16, 73, 4096)]
+
+
+def test_choice_passes_layer_device_to_support_probe(monkeypatch):
+    monkeypatch.setenv(ENV, "v2")
+    seen = []
+    monkeypatch.setattr(
+        sel, "cb_gemv_v2_available",
+        lambda device=None: seen.append(device) is None and False)
+    assert sel.cb_gemv_choice(16, 2, 73, 4096, "cuda:7")[0] is False
+    assert seen == ["cuda:7"]
 
 
 def test_predicate_veto_is_honoured(monkeypatch):

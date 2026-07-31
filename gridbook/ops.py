@@ -215,9 +215,9 @@ def _cb_moe_gemv_fp4_v2_fake(xq, qw, cb_flat, compose, pair_expert, pair_xrow,
 # ``cb_moe_gemv_fp4_v2`` above — it is the smem-resident-dictionary
 # reimplementation, and ``moe_gemv_select.cb_gemv_choice`` picks between the
 # two per (layer, stack). Differences in the SIGNATURE only: no ``n_sub`` (v2 is
-# product-mode only), plus ``rpb`` / ``v2`` / ``dict_mode`` (rpb<=0 and
-# dict_mode==0 select the kernel's measured auto policies; ``v2`` is the decode
-# contract, which the inherited kernel reads from the environment per launch).
+# product-mode only), plus ``rpb`` / ``dict_mode`` (rpb<=0 and dict_mode==0
+# select the kernel's measured auto policies). The C++ launcher reads the
+# decode contract from the environment per call, like the inherited kernel.
 #
 # It MUST carry the same ``_PQ_UNSAFE`` tagging as every op above — see the
 # module header: tagging these ops ``cudagraph_unsafe`` under
@@ -233,19 +233,19 @@ def _cb_moe_gemv_fp4_v2_fake(xq, qw, cb_flat, compose, pair_expert, pair_xrow,
 def cb_moe_gemv_v2(xq: torch.Tensor, qw: torch.Tensor,
                    cb_flat: torch.Tensor, compose: torch.Tensor,
                    pair_expert: torch.Tensor, pair_xrow: torch.Tensor,
-                   k_bits: int, type_size: int, rpb: int, v2: int,
+                   k_bits: int, type_size: int, rpb: int,
                    dict_mode: int) -> torch.Tensor:
     """Grouped MoE decode GEMV, fp4-CB two-tier v2, smem-resident-dictionary
     kernel (act-QDQ outside)."""
     from .cuda_ext import get_ext_v2
     return get_ext_v2().cb_gemv_v2(xq, qw, cb_flat, compose, pair_expert,
-                                   pair_xrow, k_bits, type_size, rpb, v2,
+                                   pair_xrow, k_bits, type_size, rpb,
                                    dict_mode)
 
 
 @cb_moe_gemv_v2.register_fake
 def _cb_moe_gemv_v2_fake(xq, qw, cb_flat, compose, pair_expert, pair_xrow,
-                         k_bits, type_size, rpb, v2, dict_mode):
+                         k_bits, type_size, rpb, dict_mode):
     return torch.empty((pair_expert.shape[0], qw.shape[1]), dtype=xq.dtype,
                        device=xq.device)
 

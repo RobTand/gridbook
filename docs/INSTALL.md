@@ -159,7 +159,7 @@ Nothing is compiled at `pip install` time. The extensions are built lazily by
 | Extension | Sources | Built when | Cost |
 |---|---|---|---|
 | `prismaquant_cb_ext` (decode GEMV, MoE grouped GEMV, prefill expander) | `gridbook/csrc/cb_gemv.cu` | **at weight load**, deliberately warmed there so it does not poison the first request | **~30 s** once — see below |
-| `prismaquant_cb_v2_ext` (smem-resident-dictionary MoE decode GEMV) | `gridbook/csrc/cb_gemv_v2.cu` | at weight load, and only for an **fp4**-CB two-tier MoE layer with `PRISMAQUANT_CB_GEMV` left at `auto` or set to `v2` | comparable to `prismaquant_cb_ext`; a failed build degrades to the shipped kernel with one stderr warning |
+| `prismaquant_cb_v2_ext` (experimental smem-resident-dictionary MoE decode GEMV) | `gridbook/csrc/cb_gemv_v2.cu` | at weight load only for an **fp4**-CB two-tier MoE layer with `PRISMAQUANT_CB_GEMV=auto` or `v2`; unset stays on the inherited kernel and does not build this extension | comparable to `prismaquant_cb_ext`; unsupported devices and failed builds degrade to the shipped kernel with one stderr warning |
 | `pq_cb_fused` (mid-M CUTLASS fused prefill) | `gridbook/csrc/cb_fused_gemm.cu` + `csrc/cutlass_fork/*.hpp` | first prefill with 16 < tokens ≤ 128 | longer (a CUTLASS collective); not separately timed |
 | `pq_cb_ptc` (persistent-N prefill) | `gridbook/csrc/cb_persistent_tc.cu` | only when `PRISMAQUANT_ENABLE_PTC=1` | **quarantined, off by default** — measured negative for performance and under an open stability quarantine. Do not enable it. |
 
