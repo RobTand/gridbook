@@ -296,8 +296,13 @@ separate research pipeline that *produces* gridbook artifacts —
 - The plugin **does not patch vLLM core**. It does install a thin `load_weights`
   wrapper on specific *model classes* (HunYuan-V3, Laguna, Qwen3.5-MoE and their
   MTP drafters) whose loaders map MoE experts at the top level and would
-  otherwise not recognise stacked codebook expert tensors. That wrap is inert for
-  non-CB checkpoints. Nothing in `vllm/` is modified.
+  otherwise not recognise stacked codebook expert tensors. It also has a
+  compatibility-only path for externally authored fused native-NVFP4 expert
+  stacks, restricted to vLLM's compressed-tensors method with `TP=EP=1`, no
+  padding, exact dtypes/shapes, and a complete eight-tensor stack. PrismaQuant's
+  current native exporter uses per-expert tensors and its mixed streaming
+  exporter rejects stock expert stacks, so this is not a producer capability.
+  Nothing in `vllm/` is modified.
 - This repository **serves** the format; it does not yet **produce** artifacts.
   A reference encoder is a roadmap item — until then, artifacts come from the
   authors' pipeline, and the [spec](docs/SPEC.md) is published so an encoder can

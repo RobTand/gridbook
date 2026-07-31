@@ -739,13 +739,12 @@ def test_install_wraps_subclass_with_own_load_weights():
 
 
 # ---------------------------------------------------------------------------
-# Fused NATIVE-NVFP4 expert stacks. A heterogeneous artifact leaves some layers
-# on stock compressed-tensors NVFP4; those experts are written as ONE 3D tensor
-# per role (…experts.gate_up_proj.weight_packed, …), which vLLM's per-expert
-# ``expert_params_mapping`` never matches -> the arch loader KeyErrors. The
-# params are the ones CompressedTensorsW4A4Nvfp4MoEMethod.create_weights
-# registers, and their shapes/order are identical to the whole-stack tensor, so
-# the same plain copy_ path serves them.
+# Fused NATIVE-NVFP4 expert stacks (legacy/external compatibility only).
+# vLLM's per-expert ``expert_params_mapping`` cannot match one 3D tensor per
+# role. Raw whole-stack copy is accepted only when vLLM's registered metadata
+# proves compressed-tensors NVFP4, TP=EP=1, no padding, exact dtype/shape and a
+# complete eight-tensor stack. Current PrismaQuant producers do not emit this
+# layout; see the module documentation.
 # ---------------------------------------------------------------------------
 
 def test_map_cb_expert_name_native_nvfp4_fused_stack():
@@ -784,102 +783,305 @@ def test_map_cb_expert_name_nvfp4_excludes_non_experts():
         assert map_cb_expert_name(n) is None, n
 
 
-def test_wrapper_routes_native_nvfp4_fused_stack():
-    """End-to-end: the eight fused native-NVFP4 tensors land in the eight params
-    CompressedTensorsW4A4Nvfp4MoEMethod registers, none leaks to the original."""
-    E, HID, INTER, GROUP = 4, 32, 16, 16
-    P = "model.layers.42.mlp.experts.routed_experts."   # SharedFusedMoE nesting
+class CompressedTensorsW4A4Nvfp4MoEMethod:
+    """Name-compatible stand-in for the import-light unit tests below."""
 
+
+class _FakeNativeNvfp4Owner:
+    """Minimum metadata vLLM attaches through each param's weight_loader."""
+
+    def __init__(self, *, experts, hidden, intermediate, tp=1, ep=1,
+                 use_ep=False, enable_eplb=False, hidden_unpadded=None,
+                 intermediate_unpadded=None):
+        self.quant_method = CompressedTensorsW4A4Nvfp4MoEMethod()
+        self.hidden_size = hidden
+        self.intermediate_size_per_partition = intermediate
+        self.moe_config = types.SimpleNamespace(
+            num_experts=experts,
+            num_local_experts=experts,
+            num_logical_experts=experts,
+            hidden_dim=hidden,
+            hidden_dim_unpadded=(hidden if hidden_unpadded is None
+                                 else hidden_unpadded),
+            intermediate_size_per_partition=intermediate,
+            intermediate_size_per_partition_unpadded=(
+                intermediate if intermediate_unpadded is None
+                else intermediate_unpadded),
+            moe_parallel_config=types.SimpleNamespace(
+                tp_size=tp, ep_size=ep, use_ep=use_ep,
+                enable_eplb=enable_eplb),
+        )
+        self.weight_loader_calls = 0
+
+    def weight_loader(self, *args, **kwargs):
+        self.weight_loader_calls += 1
+        raise AssertionError(
+            "whole fused stacks must not be fed to the per-expert loader")
+
+
+def _native_nvfp4_params(prefix, *, experts=3, hidden=32, intermediate=16,
+                         **owner_kwargs):
+    group = 16
+    params = {
+        prefix + "w13_weight_packed": torch.zeros(
+            experts, 2 * intermediate, hidden // 2, dtype=torch.uint8),
+        prefix + "w2_weight_packed": torch.zeros(
+            experts, hidden, intermediate // 2, dtype=torch.uint8),
+        prefix + "w13_weight_scale": torch.zeros(
+            experts, 2 * intermediate, hidden // group,
+            dtype=torch.float8_e4m3fn),
+        prefix + "w2_weight_scale": torch.zeros(
+            experts, hidden, intermediate // group,
+            dtype=torch.float8_e4m3fn),
+        prefix + "w13_weight_global_scale": torch.zeros(experts, 2),
+        prefix + "w2_weight_global_scale": torch.zeros(experts),
+        prefix + "w13_input_global_scale": torch.zeros(experts, 2),
+        prefix + "w2_input_global_scale": torch.zeros(experts),
+    }
+    owner = _FakeNativeNvfp4Owner(
+        experts=experts, hidden=hidden, intermediate=intermediate,
+        **owner_kwargs)
+    for param in params.values():
+        param.weight_loader = owner.weight_loader
+    return params, owner
+
+
+def _pack_nvfp4_codes(codes):
+    """Pack independent E2M1-code nibbles, low column first."""
+    return (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
+
+
+def _native_nvfp4_fixture(prefix, *, experts=3, hidden=32, intermediate=16):
+    """Producer-shaped fused fixture with traceable expert/gate/up patterns.
+
+    This is intentionally independent of the loader mapping: it first builds
+    semantic gate/up/down code planes, packs adjacent input nibbles, and only
+    then gives them checkpoint names. Uniform fill tensors would not detect a
+    swapped expert, gate/up row block, or packed input pair.
+    """
+    def codes(rows, seed):
+        e = torch.arange(experts)[:, None, None]
+        r = torch.arange(rows)[None, :, None]
+        c = torch.arange(hidden)[None, None, :]
+        return ((seed + 5 * e + 3 * r + 7 * c) % 16).to(torch.uint8)
+
+    gate = codes(intermediate, 1)
+    up = codes(intermediate, 9)
+    down_e = torch.arange(experts)[:, None, None]
+    down_r = torch.arange(hidden)[None, :, None]
+    down_c = torch.arange(intermediate)[None, None, :]
+    down = ((4 + 5 * down_e + 3 * down_r + 7 * down_c) % 16).to(
+        torch.uint8)
+
+    scale_grid = torch.tensor([0.5, 1.0, 2.0, 4.0])
+    w13_scale_idx = (
+        torch.arange(experts)[:, None, None]
+        + torch.arange(2 * intermediate)[None, :, None]
+        + torch.arange(hidden // 16)[None, None, :]) % len(scale_grid)
+    w2_scale_idx = (
+        2 * torch.arange(experts)[:, None, None]
+        + torch.arange(hidden)[None, :, None]
+        + torch.arange(intermediate // 16)[None, None, :]) % len(scale_grid)
+
+    return {
+        prefix + "gate_up_proj.weight_packed": _pack_nvfp4_codes(
+            torch.cat([gate, up], dim=1)),
+        prefix + "down_proj.weight_packed": _pack_nvfp4_codes(down),
+        prefix + "gate_up_proj.weight_scale": scale_grid[
+            w13_scale_idx].to(torch.float8_e4m3fn),
+        prefix + "down_proj.weight_scale": scale_grid[
+            w2_scale_idx].to(torch.float8_e4m3fn),
+        prefix + "gate_up_proj.weight_global_scale": torch.stack([
+            torch.arange(experts, dtype=torch.float32) + 11,
+            torch.arange(experts, dtype=torch.float32) + 21,
+        ], dim=1),
+        prefix + "down_proj.weight_global_scale": (
+            torch.arange(experts, dtype=torch.float32) + 31),
+        prefix + "gate_up_proj.input_global_scale": torch.stack([
+            torch.arange(experts, dtype=torch.float32) + 41,
+            torch.arange(experts, dtype=torch.float32) + 51,
+        ], dim=1),
+        prefix + "down_proj.input_global_scale": (
+            torch.arange(experts, dtype=torch.float32) + 61),
+    }
+
+
+def _make_native_model(params, mapper=None):
     class _FakeCausalLM:
         def __init__(self):
-            self._params = {
-                P + "w13_weight_packed":
-                    torch.zeros(E, 2 * INTER, HID // 2, dtype=torch.uint8),
-                P + "w2_weight_packed":
-                    torch.zeros(E, HID, INTER // 2, dtype=torch.uint8),
-                P + "w13_weight_scale":
-                    torch.zeros(E, 2 * INTER, HID // GROUP,
-                                dtype=torch.float8_e4m3fn),
-                P + "w2_weight_scale":
-                    torch.zeros(E, HID, INTER // GROUP,
-                                dtype=torch.float8_e4m3fn),
-                P + "w13_weight_global_scale": torch.zeros(E, 2),
-                P + "w2_weight_global_scale": torch.zeros(E),
-                P + "w13_input_global_scale": torch.zeros(E, 2),
-                P + "w2_input_global_scale": torch.zeros(E),
-                "model.layers.42.mlp.gate.weight": torch.zeros(E, HID),
-            }
+            self._params = params
             self.delegated = []
 
         def named_parameters(self):
             return list(self._params.items())
 
-        def load_weights(self, weights):     # ORIGINAL (stub stock loader)
+        def load_weights(self, weights):
             loaded = set()
-            for name, w in weights:
+            for name, weight in weights:
                 self.delegated.append(name)
                 if name in self._params:
-                    self._params[name].copy_(w)
+                    self._params[name].copy_(weight)
                     loaded.add(name)
             return loaded
 
+    if mapper is not None:
+        _FakeCausalLM.hf_to_vllm_mapper = mapper
     install_toplevel_cb_expert_loader(_FakeCausalLM)
-    m = _FakeCausalLM()
-    C = "model.layers.42.mlp.experts."        # checkpoint: flat, no nesting
-    loaded = m.load_weights(iter([
-        (C + "gate_up_proj.weight_packed",
-         torch.full((E, 2 * INTER, HID // 2), 7, dtype=torch.uint8)),
-        (C + "down_proj.weight_packed",
-         torch.full((E, HID, INTER // 2), 9, dtype=torch.uint8)),
-        (C + "gate_up_proj.weight_scale",
-         torch.full((E, 2 * INTER, HID // GROUP), 2.0).to(torch.float8_e4m3fn)),
-        (C + "down_proj.weight_scale",
-         torch.full((E, HID, INTER // GROUP), 3.0).to(torch.float8_e4m3fn)),
-        (C + "gate_up_proj.weight_global_scale", torch.full((E, 2), 4.0)),
-        (C + "down_proj.weight_global_scale", torch.full((E,), 5.0)),
-        (C + "gate_up_proj.input_global_scale", torch.full((E, 2), 6.0)),
-        (C + "down_proj.input_global_scale", torch.full((E,), 8.0)),
-        ("model.layers.42.mlp.gate.weight", torch.full((E, HID), 1.0)),
-    ]))
-
-    assert torch.all(m._params[P + "w13_weight_packed"] == 7)
-    assert torch.all(m._params[P + "w2_weight_packed"] == 9)
-    assert torch.all(m._params[P + "w13_weight_scale"].float() == 2.0)
-    assert torch.all(m._params[P + "w2_weight_scale"].float() == 3.0)
-    assert torch.all(m._params[P + "w13_weight_global_scale"] == 4.0)
-    assert torch.all(m._params[P + "w2_weight_global_scale"] == 5.0)
-    assert torch.all(m._params[P + "w13_input_global_scale"] == 6.0)
-    assert torch.all(m._params[P + "w2_input_global_scale"] == 8.0)
-    # router still delegates; no expert tensor leaks (no double-load)
-    assert m.delegated == ["model.layers.42.mlp.gate.weight"]
-    assert loaded == set(m._params)
+    return _FakeCausalLM()
 
 
-def test_wrapper_nvfp4_sharded_param_raises_diagnosable_error():
-    """A TP/EP-sharded param holds only this rank's slice, so a whole-stack
-    copy_ would silently place the wrong rows. The shape guard must fire, and
-    say so."""
-    E, HID, INTER = 4, 32, 16
+def test_wrapper_routes_native_nvfp4_fused_stack_without_weight_loader():
+    experts, hidden, intermediate = 3, 32, 16
+    checkpoint_prefix = "model.layers.42.mlp.experts."
+    param_prefix = "model.layers.42.mlp.experts.routed_experts."
+    params, owner = _native_nvfp4_params(
+        param_prefix, experts=experts, hidden=hidden,
+        intermediate=intermediate)
+    router = "model.layers.42.mlp.gate.weight"
+    params[router] = torch.zeros(experts, hidden)
+    source = _native_nvfp4_fixture(
+        checkpoint_prefix, experts=experts, hidden=hidden,
+        intermediate=intermediate)
+    source[router] = torch.arange(experts * hidden, dtype=torch.float32).reshape(
+        experts, hidden)
 
-    class _FakeCausalLM:
-        def __init__(self):
-            self._params = {           # EP=2: half the experts on this rank
-                "model.layers.42.mlp.experts.w13_weight_packed":
-                    torch.zeros(E // 2, 2 * INTER, HID // 2, dtype=torch.uint8),
-            }
+    model = _make_native_model(params)
+    loaded = model.load_weights(iter(source.items()))
 
-        def named_parameters(self):
-            return list(self._params.items())
+    suffix_to_leaf = {
+        suffix: leaf for suffix, leaf in
+        moe_toplevel_loader._NATIVE_NVFP4_EXPERT_SUFFIX_TO_LEAF.items()
+    }
+    for name, expected in source.items():
+        if name == router:
+            assert torch.equal(params[router], expected)
+            continue
+        suffix = next(s for s in suffix_to_leaf if name.endswith(s))
+        actual = params[param_prefix + suffix_to_leaf[suffix]]
+        assert torch.equal(actual, expected), suffix
+    # Gate/up have deliberately distinct rows/scale columns, so equality above
+    # proves the raw copy retained their producer-side order.
+    assert not torch.equal(
+        params[param_prefix + "w13_weight_packed"][:, :intermediate],
+        params[param_prefix + "w13_weight_packed"][:, intermediate:])
+    assert owner.weight_loader_calls == 0
+    assert model.delegated == [router]
+    assert loaded == set(params)
 
-        def load_weights(self, weights):
-            for _ in weights:
-                pass
-            return set()
 
-    install_toplevel_cb_expert_loader(_FakeCausalLM)
-    m = _FakeCausalLM()
-    with pytest.raises(ValueError, match="TP/EP-sharded"):
-        m.load_weights(iter([
-            ("model.layers.42.mlp.experts.gate_up_proj.weight_packed",
-             torch.zeros(E, 2 * INTER, HID // 2, dtype=torch.uint8)),
-        ]))
+def test_wrapper_native_nvfp4_rejects_incomplete_stack():
+    checkpoint_prefix = "model.layers.5.mlp.experts."
+    param_prefix = "model.layers.5.mlp.experts.routed_experts."
+    params, _ = _native_nvfp4_params(param_prefix)
+    source = _native_nvfp4_fixture(checkpoint_prefix)
+    source.pop(checkpoint_prefix + "down_proj.input_global_scale")
+    model = _make_native_model(params)
+
+    with pytest.raises(ValueError, match=r"incomplete.*input_global_scale"):
+        model.load_weights(iter(source.items()))
+
+
+def test_wrapper_native_nvfp4_rejects_duplicate_stack_tensor():
+    checkpoint_prefix = "model.layers.5.mlp.experts."
+    param_prefix = "model.layers.5.mlp.experts.routed_experts."
+    params, _ = _native_nvfp4_params(param_prefix)
+    first = next(iter(_native_nvfp4_fixture(checkpoint_prefix).items()))
+    model = _make_native_model(params)
+
+    with pytest.raises(ValueError, match="duplicate tensor suffix"):
+        model.load_weights(iter([first, first]))
+
+
+@pytest.mark.parametrize(
+    ("owner_kwargs", "message"),
+    [
+        ({"tp": 2}, r"TP=EP=1.*TP=2"),
+        ({"ep": 2, "use_ep": True}, r"TP=EP=1.*EP=2"),
+        ({"hidden_unpadded": 24}, r"padded MoE dimensions"),
+        ({"intermediate_unpadded": 8}, r"padded MoE dimensions"),
+        ({"enable_eplb": True}, r"EPLB"),
+    ],
+)
+def test_wrapper_native_nvfp4_rejects_parallel_or_padded_target(
+        owner_kwargs, message):
+    checkpoint_prefix = "model.layers.6.mlp.experts."
+    param_prefix = "model.layers.6.mlp.experts.routed_experts."
+    params, _ = _native_nvfp4_params(param_prefix, **owner_kwargs)
+    model = _make_native_model(params)
+    first = next(iter(_native_nvfp4_fixture(checkpoint_prefix).items()))
+
+    with pytest.raises(ValueError, match=message):
+        model.load_weights(iter([first]))
+
+
+def test_wrapper_native_nvfp4_shape_dtype_and_metadata_fail_closed():
+    checkpoint_prefix = "model.layers.7.mlp.experts."
+    param_prefix = "model.layers.7.mlp.experts.routed_experts."
+
+    params, _ = _native_nvfp4_params(param_prefix)
+    model = _make_native_model(params)
+    source = _native_nvfp4_fixture(checkpoint_prefix)
+    key = checkpoint_prefix + "gate_up_proj.weight_packed"
+    with pytest.raises(ValueError, match="checkpoint shape"):
+        model.load_weights(iter([(key, source[key][:, :-1].contiguous())]))
+
+    params, _ = _native_nvfp4_params(param_prefix)
+    model = _make_native_model(params)
+    with pytest.raises(ValueError, match="checkpoint dtype"):
+        model.load_weights(iter([(key, source[key].to(torch.int16))]))
+
+    params, _ = _native_nvfp4_params(param_prefix)
+    model = _make_native_model(params)
+    noncontiguous = torch.empty(
+        source[key].shape[0], source[key].shape[1],
+        source[key].shape[2] * 2, dtype=source[key].dtype)[..., ::2]
+    noncontiguous.copy_(source[key])
+    assert not noncontiguous.is_contiguous()
+    with pytest.raises(ValueError, match="non-contiguous"):
+        model.load_weights(iter([(key, noncontiguous)]))
+
+    params, _ = _native_nvfp4_params(param_prefix)
+    del params[param_prefix + "w13_weight_packed"].weight_loader
+    model = _make_native_model(params)
+    with pytest.raises(ValueError, match="no inspectable.*metadata"):
+        model.load_weights(iter([(key, source[key])]))
+
+    params, owner = _native_nvfp4_params(param_prefix)
+    owner.moe_config.num_local_experts -= 1
+    model = _make_native_model(params)
+    with pytest.raises(ValueError, match="expert counts must be identical"):
+        model.load_weights(iter([(key, source[key])]))
+
+
+def test_wrapper_routes_native_nvfp4_after_hf_mapper_rename():
+    experts, hidden, intermediate = 3, 32, 16
+    checkpoint_prefix = "model.language_model.layers.8.mlp.experts."
+    param_prefix = (
+        "language_model.model.layers.8.mlp.experts.routed_experts.")
+    params, _ = _native_nvfp4_params(
+        param_prefix, experts=experts, hidden=hidden,
+        intermediate=intermediate)
+    source = _native_nvfp4_fixture(
+        checkpoint_prefix, experts=experts, hidden=hidden,
+        intermediate=intermediate)
+    model = _make_native_model(params, mapper=_QWEN35_MAPPER)
+
+    loaded = model.load_weights(iter(source.items()))
+
+    assert model.delegated == []
+    assert loaded == set(params)
+    assert torch.equal(
+        params[param_prefix + "w13_weight_global_scale"],
+        source[checkpoint_prefix + "gate_up_proj.weight_global_scale"])
+
+
+def test_wrapper_defers_mapper_dropped_native_nvfp4_name():
+    mapper = _FakeWeightsMapper({"drop.this.": None})
+    name = "drop.this.layers.0.mlp.experts.gate_up_proj.weight_packed"
+    model = _make_native_model({}, mapper=mapper)
+
+    loaded = model.load_weights(iter([(name, torch.zeros(2, 4, 4,
+                                                          dtype=torch.uint8))]))
+
+    assert loaded == set()
+    assert model.delegated == [name]

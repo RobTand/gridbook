@@ -70,8 +70,12 @@ but several times slower and not a serving target.
 - **No vLLM-core files are patched.** The plugin does wrap `load_weights` on
   specific *model classes* (HunYuan-V3 + its MTP drafter, Laguna, Qwen3.5-MoE +
   its MTP) whose loaders map MoE experts at the top level and would otherwise not
-  recognise stacked codebook expert tensors. The wrap is inert for non-CB
-  checkpoints.
+  recognise stacked codebook expert tensors. A compatibility-only interception
+  also recognises externally authored fused native-NVFP4 expert stacks, but only
+  for `CompressedTensorsW4A4Nvfp4MoEMethod` at `TP=EP=1`, without padding, with
+  exact dtypes/shapes and all eight stack tensors. Current PrismaQuant native
+  exports are per-expert, and its mixed streaming exporter rejects stock expert
+  stacks; the interception does not add that producer capability.
 
 ## CUDA kernel set (decode-GEMV + prefill)
 

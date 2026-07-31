@@ -36,14 +36,19 @@ the original loader. One line per arch registers it
 (``install_toplevel_cb_expert_loader(SomeForCausalLM)``); DSv4 and any other
 top-level-expert-mapping MoE arch reuse it as-is.
 
-The same KeyError hits FUSED **native-NVFP4** expert stacks
-(``…experts.gate_up_proj.weight_packed`` and friends), which a heterogeneous
-artifact carries for the layers left on stock compressed-tensors instead of CB:
-they too are one 3D tensor per role, and vLLM's ``expert_params_mapping`` too
-matches only per-expert names. Those land on the params that
-``CompressedTensorsW4A4Nvfp4MoEMethod.create_weights`` registers
-(``w13_weight_packed``/``w2_weight_packed`` + the global-scale stacks) — see
-``_CB_EXPERT_SUFFIX_TO_LEAF`` below for the shape/order proof.
+The same KeyError can hit a legacy or externally-authored FUSED
+**native-NVFP4** expert stack (``…experts.gate_up_proj.weight_packed`` and
+friends): vLLM's top-level ``expert_params_mapping`` matches per-expert names,
+not one tensor holding every expert. The compatibility path below accepts that
+layout only when it can prove that the target was registered by
+``CompressedTensorsW4A4Nvfp4MoEMethod``, TP=EP=1, no dimension was padded, all
+eight tensors are present, and every shape and dtype is exact.
+
+This is deliberately not advertised as a PrismaQuant producer path. The
+current native compressed-tensors exporter splits non-BF16 packed experts into
+per-expert tensors, while the mixed streaming CB exporter rejects stock expert
+stacks. The interception exists for compatible external/legacy artifacts; it
+does not make a currently unsupported producer layout supported by itself.
 
 **Shared-expert (``shared_mlp``) CB tensors — the second interception.** HunYuan
 V3 passes ``shared_experts=self.shared_mlp`` into ``FusedMoE``; the shared MLP is
@@ -121,15 +126,10 @@ def installed_module_paths() -> set[str]:
 # names (e.g. ``…mlp.shared_mlp.gate_proj.cb_qweight``,
 # ``…layers.0.mlp.down_proj.cb_qweight``), which must go to the ORIGINAL loader.
 #
-# NATIVE-NVFP4 FUSED STACKS (the ``weight_packed`` block below).
-# A heterogeneous artifact leaves some layers on stock compressed-tensors NVFP4
-# rather than CB. Those layers are written in the SAME fused 3D stacked layout
-# as our CB experts, and vLLM's ``CompressedTensorsW4A4Nvfp4MoEMethod.
-# create_weights`` registers params that match them EXACTLY (vLLM
-# ``model_executor/layers/quantization/compressed_tensors/
-# compressed_tensors_moe/compressed_tensors_moe_w4a4_nvfp4.py``:82/95/109/125/
-# 136/145/156/165). Shapes below are that method's own, for E experts, hidden
-# ``H``, per-partition intermediate ``I``, group size ``g``:
+# NATIVE-NVFP4 FUSED STACKS (compatibility-only).
+# vLLM's ``CompressedTensorsW4A4Nvfp4MoEMethod.create_weights`` registers the
+# following whole-stack params for E experts, hidden H, intermediate I and
+# group size g:
 #
 #   checkpoint suffix                          shape          dtype   -> param
 #   .experts.gate_up_proj.weight_packed        (E, 2I, H//2)  u8       w13_weight_packed
@@ -141,45 +141,163 @@ def installed_module_paths() -> set[str]:
 #   .experts.gate_up_proj.input_global_scale   (E, 2)         f32      w13_input_global_scale
 #   .experts.down_proj.input_global_scale      (E,)           f32      w2_input_global_scale
 #
-# Row/shard ORDER is gate-first, and that is what stock vLLM expects, so a
-# whole-stack ``copy_`` reproduces byte-for-byte what the per-expert
-# weight_loader would have built — no de-fusing and no re-fusing. Read out of
-# vLLM ``model_executor/layers/fused_moe/routed_experts.py``: ``_load_w13``
-# (:436) narrows ``w1``/gate_proj to rows ``[0:I]`` and ``w3``/up_proj to
-# ``[I:2I]``, and ``_load_per_tensor_weight_scale`` (:278) uses
-# ``idx = 0 if shard_id == "w1" else 1`` — i.e. ``[:, 0] = gate, [:, 1] = up``
-# for the two ``(E, 2)`` global-scale stacks.
+# The external layout must be gate-first: rows [0:I] and scale column 0 are
+# gate/w1, rows [I:2I] and column 1 are up/w3. This is the convention vLLM's
+# per-expert ``RoutedExperts.weight_loader`` builds. We intentionally do not
+# call that loader here: its public inputs are one expert + one shard, while
+# this checkpoint tensor is already fused. Decomposing and feeding it back
+# through that API would duplicate vLLM's TP/EP/padding policy in this shim.
+# Exact raw copy is the smaller contract, so it is allowed only after the
+# metadata checks in ``_validate_native_nvfp4_target`` prove TP=EP=1 and no
+# padding. A shape match alone is not evidence of gate/up order.
 #
-# Why these need an entry at all: ``FusedMoE.make_expert_params_mapping``
-# (routed_experts.py:906) emits weight names of the form
-# ``experts.{expert_id}.{proj}.`` only, so a FUSED stack matches nothing there
-# and falls through to the arch loader's final ``params_dict[name]`` ->
-# ``KeyError``. ``resolve_cb_expert_param`` below is purely table-driven, so
-# extending this table IS the whole fix, and it is generic: any fused
-# native-NVFP4 MoE export benefits; nothing here is arch-specific.
-#
-# The ``weight_scale`` pair is shared by both lanes: CB fp8 rungs and native
-# NVFP4 both land on ``w13_weight_scale`` / ``w2_weight_scale``, and the
-# resolver keys on the param that actually exists, so one entry serves both.
-_CB_EXPERT_SUFFIX_TO_LEAF: dict[str, str] = {
-    ".experts.gate_up_proj.cb_qweight": "w13_cb_qweight",
-    ".experts.down_proj.cb_qweight": "w2_cb_qweight",
-    ".experts.gate_up_proj.weight_scale": "w13_weight_scale",
-    ".experts.down_proj.weight_scale": "w2_weight_scale",
-    # -- native NVFP4 fused stacks (stock compressed-tensors MoE method) --
+# The current PrismaQuant native exporter writes per-expert tensors and the
+# mixed streaming exporter rejects stock expert stacks. These suffixes are for
+# compatible legacy/external artifacts, not a promise that PrismaQuant emits
+# this layout today.
+_NATIVE_NVFP4_EXPERT_SUFFIX_TO_LEAF: dict[str, str] = {
     ".experts.gate_up_proj.weight_packed": "w13_weight_packed",
     ".experts.down_proj.weight_packed": "w2_weight_packed",
+    ".experts.gate_up_proj.weight_scale": "w13_weight_scale",
+    ".experts.down_proj.weight_scale": "w2_weight_scale",
     ".experts.gate_up_proj.weight_global_scale": "w13_weight_global_scale",
     ".experts.down_proj.weight_global_scale": "w2_weight_global_scale",
     ".experts.gate_up_proj.input_global_scale": "w13_input_global_scale",
     ".experts.down_proj.input_global_scale": "w2_input_global_scale",
 }
 
+_CB_EXPERT_SUFFIX_TO_LEAF: dict[str, str] = {
+    ".experts.gate_up_proj.cb_qweight": "w13_cb_qweight",
+    ".experts.down_proj.cb_qweight": "w2_cb_qweight",
+    ".experts.gate_up_proj.weight_scale": "w13_weight_scale",
+    ".experts.down_proj.weight_scale": "w2_weight_scale",
+    **_NATIVE_NVFP4_EXPERT_SUFFIX_TO_LEAF,
+}
+
+_NATIVE_NVFP4_METHOD = "CompressedTensorsW4A4Nvfp4MoEMethod"
+
+
+def _native_nvfp4_suffix(name: str, param) -> str | None:
+    """The native fused suffix represented by *(name, param)*, if any.
+
+    ``weight_scale`` is shared with FP8-CB stacks. Native NVFP4 scales are 3-D
+    ``(E, out, groups)`` while FP8-CB scales are 2-D ``(E, out)``, so the
+    registered target disambiguates that pair without importing vLLM.
+    """
+    for suffix in _NATIVE_NVFP4_EXPERT_SUFFIX_TO_LEAF:
+        if not name.endswith(suffix):
+            continue
+        if suffix.endswith(".weight_scale") and param.ndim != 3:
+            return None
+        return suffix
+    return None
+
+
+def _native_nvfp4_owner(param):
+    """Owner of vLLM's bound per-expert ``weight_loader``, or ``None``."""
+    loader = getattr(param, "weight_loader", None)
+    return getattr(loader, "__self__", None)
+
+
+def _validate_native_nvfp4_target(name: str, mapped: str, param, weight) -> None:
+    """Fail closed unless raw whole-stack copy is provably safe.
+
+    The registered ``weight_loader`` is deliberately not invoked. It accepts a
+    per-expert, per-shard input and applies rank slicing/padding; the incoming
+    tensor is already a fused whole stack. Direct copy avoids reimplementing
+    that policy, but only for the one-rank, unpadded, exact-layout case.
+    """
+    if tuple(param.shape) != tuple(weight.shape):
+        raise ValueError(
+            f"prismaquant fused native-NVFP4 expert '{name}' -> '{mapped}': "
+            f"checkpoint shape {tuple(weight.shape)} != param shape "
+            f"{tuple(param.shape)}; whole-stack loading requires an exact "
+            "unsharded, unpadded shape")
+    if param.dtype != weight.dtype:
+        raise ValueError(
+            f"prismaquant fused native-NVFP4 expert '{name}' -> '{mapped}': "
+            f"checkpoint dtype {weight.dtype} != param dtype {param.dtype}; "
+            "packed/scaling tensors are never cast implicitly")
+    if not weight.is_contiguous():
+        raise ValueError(
+            f"prismaquant fused native-NVFP4 expert '{name}': checkpoint "
+            "tensor is non-contiguous; the whole-stack byte-layout contract "
+            "requires contiguous tensors")
+
+    owner = _native_nvfp4_owner(param)
+    moe_config = getattr(owner, "moe_config", None)
+    parallel = getattr(moe_config, "moe_parallel_config", None)
+    quant_method = getattr(owner, "quant_method", None)
+    if owner is None or moe_config is None or parallel is None or \
+            quant_method is None:
+        raise ValueError(
+            f"prismaquant fused native-NVFP4 expert '{name}': target "
+            "parameter has no inspectable vLLM MoE weight-loader metadata; "
+            "refusing an unverified raw whole-stack copy")
+    method_name = quant_method.__class__.__name__
+    if method_name != _NATIVE_NVFP4_METHOD:
+        raise ValueError(
+            f"prismaquant fused native-NVFP4 expert '{name}': target method "
+            f"is {method_name}, expected {_NATIVE_NVFP4_METHOD}")
+
+    tp_size = getattr(parallel, "tp_size", None)
+    ep_size = getattr(parallel, "ep_size", None)
+    if tp_size != 1 or ep_size != 1 or bool(getattr(parallel, "use_ep", False)):
+        raise ValueError(
+            f"prismaquant fused native-NVFP4 expert '{name}': whole-stack "
+            f"compatibility loading supports TP=EP=1 only (got TP={tp_size}, "
+            f"EP={ep_size}, use_ep={getattr(parallel, 'use_ep', None)})")
+    if bool(getattr(parallel, "enable_eplb", False)):
+        raise ValueError(
+            f"prismaquant fused native-NVFP4 expert '{name}': EPLB may "
+            "remap/redundantly materialize experts and is unsupported by raw "
+            "whole-stack copy")
+
+    hidden = getattr(owner, "hidden_size", getattr(moe_config, "hidden_dim", None))
+    hidden_unpadded = getattr(moe_config, "hidden_dim_unpadded", None)
+    inter = getattr(owner, "intermediate_size_per_partition", getattr(
+        moe_config, "intermediate_size_per_partition", None))
+    inter_unpadded = getattr(
+        moe_config, "intermediate_size_per_partition_unpadded", None)
+    if None in (hidden, hidden_unpadded, inter, inter_unpadded):
+        raise ValueError(
+            f"prismaquant fused native-NVFP4 expert '{name}': vLLM did not "
+            "expose padded/unpadded dimensions; refusing raw whole-stack copy")
+    if int(hidden) != int(hidden_unpadded) or int(inter) != int(inter_unpadded):
+        raise ValueError(
+            f"prismaquant fused native-NVFP4 expert '{name}': padded MoE "
+            "dimensions are unsupported (hidden "
+            f"{hidden_unpadded}->{hidden}, intermediate "
+            f"{inter_unpadded}->{inter})")
+
+    counts = (
+        getattr(moe_config, "num_experts", None),
+        getattr(moe_config, "num_local_experts", None),
+        getattr(moe_config, "num_logical_experts", None),
+    )
+    if any(v is None for v in counts) or len({int(v) for v in counts}) != 1 or \
+            int(param.shape[0]) != int(counts[0]):
+        raise ValueError(
+            f"prismaquant fused native-NVFP4 expert '{name}': global/local/"
+            "logical/parameter expert counts must be identical, got "
+            f"config={counts}, param={param.shape[0]}")
+
+
+def _validate_complete_native_nvfp4_stacks(
+        seen: dict[str, set[str]]) -> None:
+    expected = set(_NATIVE_NVFP4_EXPERT_SUFFIX_TO_LEAF)
+    for prefix, suffixes in seen.items():
+        missing = sorted(expected - suffixes)
+        if missing:
+            raise ValueError(
+                f"prismaquant fused native-NVFP4 expert stack '{prefix}' is "
+                f"incomplete; missing checkpoint tensor suffixes {missing}")
+
 
 def resolve_cb_expert_param(name: str,
                             param_names) -> str | None:
-    """Resolve a stacked-CB expert checkpoint tensor name to the registered
-    FusedMoE param name, by matching against the model's ACTUAL parameter names.
+    """Resolve a stacked CB/compatible-native checkpoint tensor name to its
+    registered FusedMoE param, using the model's ACTUAL parameter names.
 
     The checkpoint writes ``…mlp.experts.<proj>.cb_qweight`` (flat), but vLLM
     may nest the routed FusedMoE one level deeper — HunYuan V3's SharedFusedMoE
@@ -206,7 +324,7 @@ def resolve_cb_expert_param(name: str,
             return matches[0]
         if len(matches) > 1:
             raise ValueError(
-                f"prismaquant CB expert '{name}': ambiguous target params "
+                f"prismaquant fused expert '{name}': ambiguous target params "
                 f"{matches} — layer structure differs from the "
                 "one-FusedMoE-per-layer assumption")
         return None                                        # missing on rank
@@ -604,6 +722,7 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
         rename = _compose_renames(_hf_mapper_rename(self),
                                   _spec_layer_rename(self))
         loaded: set[str] = set()
+        native_nvfp4_seen: dict[str, set[str]] = {}
         # Shared-expert CB tensors (…shared_mlp.*.cb_qweight / .weight_scale):
         # vLLM built bf16 Linears for these (no cb_qweight param). Buffer them
         # (~0.58 GB total — held owned CPU tensors; safetensors yields copies),
@@ -628,18 +747,29 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                 mapped = resolve_cb_expert_param(res_name, param_names)
                 if mapped is not None:
                     param = params_dict[mapped]
-                    if tuple(param.shape) != tuple(w.shape):
+                    native_suffix = _native_nvfp4_suffix(res_name, param)
+                    if native_suffix is not None:
+                        _validate_native_nvfp4_target(
+                            name, mapped, param, w)
+                        native_prefix = (
+                            res_name[:-len(native_suffix)] + ".experts")
+                        suffixes = native_nvfp4_seen.setdefault(
+                            native_prefix, set())
+                        if native_suffix in suffixes:
+                            raise ValueError(
+                                f"prismaquant fused native-NVFP4 expert stack "
+                                f"'{native_prefix}' contains duplicate tensor "
+                                f"suffix {native_suffix}")
+                        suffixes.add(native_suffix)
+                    elif tuple(param.shape) != tuple(w.shape):
                         raise ValueError(
-                            f"prismaquant fused expert '{name}' -> "
+                            f"prismaquant CB expert '{name}' -> "
                             f"'{mapped}': checkpoint shape {tuple(w.shape)} "
-                            f"!= param shape {tuple(param.shape)} — fused "
-                            "whole-stack contract violated. This is the "
-                            "INTENDED failure when the param is TP/EP-sharded "
-                            "(the param holds this rank's slice, so a "
-                            "whole-stack copy_ would silently place the wrong "
-                            "rows), or when gate/up are ordered differently "
-                            "from vLLM's gate-first w13 convention.")
-                    param.data.copy_(w.to(param.dtype))
+                            f"!= param shape {tuple(param.shape)} — stacked "
+                            "expert contract violated (the target may be "
+                            "sharded or padded)")
+                    param.data.copy_(w if native_suffix is not None
+                                     else w.to(param.dtype))
                     # fill path 2 of 2 (top-level): stamp the sentinel that
                     # process_weights_after_loading checks (cb_fill_guard).
                     mark_filled(param)
@@ -664,6 +794,7 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
         # return None (HYV3MTP's drafter loader) — tolerate both; our own
         # `loaded` set still reports the tensors WE placed.
         ret = orig_load_weights(self, _passthrough())
+        _validate_complete_native_nvfp4_stacks(native_nvfp4_seen)
         if ret:
             loaded |= set(ret)
         if shared_cb_buf:
