@@ -184,11 +184,13 @@ def _require_any_symbol_family(mod, families, *, build_dir: str, source: str):
 
 
 # Symbols ``get_ext()``'s module must export, asserted on EVERY load rather
-# than only at build time. Each is dereferenced unconditionally by a custom op
-# in ``ops.py`` -- there is no probe upstream of these, so a module missing one
-# is strictly worse than no module at all:
+# than only at build time. Most are dereferenced unconditionally by a custom op
+# in ``ops.py``. ``fp4_act_qdq`` does have a correct codec fallback, but keeping
+# it in the same revision contract prevents a pre-QDQ cache from being accepted
+# as the current main extension and silently losing the single-launch path.
 _EXT_SYMBOLS = (
     "fp8_act_qdq",          # ops.fp8_act_qdq
+    "fp4_act_qdq",          # ops.fp4_act_qdq
     "cb_gemv_fp8",          # ops.cb_gemv_fp8
     "cb_gemv_fp4_v2",       # ops.cb_gemv_fp4_v2
     "cb_expand_fp8",        # ops.cb_expand_fp8

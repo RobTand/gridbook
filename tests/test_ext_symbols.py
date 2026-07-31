@@ -208,6 +208,26 @@ def test_main_optional_bindings_stay_optional():
         assert name not in cuda_ext._EXT_SYMBOLS
 
 
+def test_main_contract_rejects_pre_fp4_qdq_revision(monkeypatch, capsys,
+                                                     tmp_path):
+    """The activation binding arrived after the original decode extension.
+
+    A cached module from that earlier revision must be diagnosed as stale
+    instead of being accepted and silently dropping the single-launch QDQ.
+    """
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    old_symbols = tuple(name for name in cuda_ext._EXT_SYMBOLS
+                        if name != "fp4_act_qdq")
+    stale = _stub("main", old_symbols,
+                  path=tmp_path / "prismaquant_cb_ext.so")
+    _patch_load(monkeypatch, stale)
+
+    assert cuda_ext.get_ext() is None
+    error = capsys.readouterr().err
+    assert "incompatible CUDA decode-GEMV" in error
+    assert "fp4_act_qdq" in error
+
+
 def test_fp8_grouped_bindings_stay_optional_after_dense_prerequisite():
     for name in ("cb_fused_moe_grouped", "cb_fused_moe_tile_m",
                  "cb_fused_moe_tile_sizes",
