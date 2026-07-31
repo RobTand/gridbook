@@ -103,7 +103,7 @@ Notes for this model:
   "Blackwell-class" is not one family — `sm_100` is capability family 10 and
   `sm_120`/`sm_121` is family 12, and vLLM's gates test the family, not the
   vendor name:
-  [what a delegated NVFP4 group gets on GB10](https://github.com/RobTand/gridbook/blob/master/docs/DELEGATED-NVFP4-MOE.md#1-the-capability-family-formula).
+  [the GB10 capability-family rule](https://github.com/RobTand/gridbook/blob/master/docs/DELEGATED-NVFP4-MOE.md#why-gb10-is-family-120).
 - **MTP draft block ships in BF16** but no speculative-decoding invocation is
   published for this artifact — the command above serves drafter-free.
 
