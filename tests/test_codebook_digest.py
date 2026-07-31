@@ -1,187 +1,290 @@
-"""The ``.pqcb`` sidecar is bound to its own declared ``cb_tables_sha256``.
+"""CPU coverage for external per-table codebook provenance."""
+from __future__ import annotations
 
-Wrong codebook *values* are invisible at decode time — a ``k``-bit codeword
-indexes a ``2^k``-row table, so every index is in range by construction and a
-sidecar with the right shapes but the wrong numbers yields a correctly-shaped
-tensor of structured garbage rather than an error. These tests pin the three
-behaviours that close that hole:
+import hashlib
+import json
+import os
+import struct
+import subprocess
+import sys
+from pathlib import Path
 
-  * declared digest matches            -> loads
-  * declared digest does NOT match     -> ValueError (refuse to serve)
-  * no digest declared at all          -> loads (backward compatibility)
-
-CPU-only, and deliberately vLLM-free: ``gridbook.cb_digest`` imports no serving
-symbols, so this file injects no ``vllm`` stubs into ``sys.modules`` and cannot
-perturb any other test file sharing the process.
-"""
 import pytest
 
 torch = pytest.importorskip("torch")
-st = pytest.importorskip("safetensors.torch")
+pytest.importorskip("safetensors.torch")
 
 from gridbook.cb_digest import (  # noqa: E402
-    CB_DIGEST_META_KEY,
-    SKIP_DIGEST_ENV,
-    codebook_digest,
+    codebook_tensor_sha256,
     load_codebooks,
-    read_declared_digest,
+    verify_codebook_hashes,
 )
 
 _SUB0 = "cb_codebook.lattice.NVFP4_CB_K16.sub0"
 _SUB1 = "cb_codebook.lattice.NVFP4_CB_K16.sub1"
 
 
-def _tables():
-    """Two tables of different dtype, deterministic."""
-    g = torch.Generator().manual_seed(0)
+def _audit_script() -> Path:
+    # CI deliberately stages tests outside the checkout to exercise the wheel;
+    # GITHUB_WORKSPACE is the authoritative location of repository scripts.
+    root = Path(os.environ.get(
+        "GITHUB_WORKSPACE", Path(__file__).resolve().parents[1]))
+    script = root / "scripts" / "verify_codebooks.py"
+    if not script.is_file():
+        pytest.skip("repository audit script is not available")
+    return script
+
+
+def _tables(seed: int = 0) -> dict[str, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
     return {
-        _SUB0: torch.randn(16, 8, generator=g),
-        _SUB1: torch.randn(16, 8, generator=g).to(torch.float16),
+        _SUB0: torch.randn(16, 8, generator=generator).to(torch.float16),
+        _SUB1: torch.randn(16, 8, generator=generator).to(torch.float16),
     }
 
 
-def _write(tmp_path, tables, digest):
-    path = str(tmp_path / "cb_codebooks.pqcb")
-    meta = {} if digest is None else {CB_DIGEST_META_KEY: digest}
-    st.save_file(tables, path, metadata=meta)
+def _hashes(tables: dict[str, torch.Tensor]) -> dict[str, str]:
+    return {name: codebook_tensor_sha256(table)
+            for name, table in tables.items()}
+
+
+def _self_digest_from_submitted_patch(
+        tables: dict[str, torch.Tensor]) -> str:
+    """Reproduce the aggregate digest that bundle 02 originally proposed."""
+    digest = hashlib.sha256()
+    for name in sorted(tables):
+        table = tables[name].detach().cpu().contiguous()
+        digest.update(name.encode())
+        digest.update(str(table.dtype).encode())
+        digest.update(str(tuple(table.shape)).encode())
+        digest.update(bytes(table.view(torch.uint8).reshape(-1)))
+    return digest.hexdigest()
+
+
+def _write(directory: Path, tables: dict[str, torch.Tensor], *,
+           metadata: dict[str, str] | None = None) -> Path:
+    """Write the tiny F16 fixture without safetensors' optional NumPy writer.
+
+    Gridbook only reads sidecars, and NumPy is deliberately absent from its
+    runtime dependencies. Building fixtures through ``save_file`` would make
+    this suite stricter than the installed package: safetensors currently
+    imports NumPy only on its write path.
+    """
+    path = directory / "cb_codebooks.pqcb"
+    header: dict[str, object] = {}
+    payload = bytearray()
+    for name, table in tables.items():
+        data = table.detach().to(device="cpu", dtype=torch.float16).contiguous()
+        raw = bytes(data.view(torch.uint8).reshape(-1).tolist())
+        start = len(payload)
+        payload.extend(raw)
+        header[name] = {
+            "dtype": "F16",
+            "shape": list(data.shape),
+            "data_offsets": [start, len(payload)],
+        }
+    if metadata is not None:
+        header["__metadata__"] = metadata
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * (-len(encoded) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
     return path
 
 
-# -- the digest construction (docs/SPEC.md 4.1) -----------------------------
-
-def test_digest_is_insertion_order_independent():
-    t = _tables()
-    reversed_order = {k: t[k] for k in reversed(list(t))}
-    assert list(reversed_order) != list(t)
-    assert codebook_digest(reversed_order) == codebook_digest(t)
-
-
-def test_digest_changes_on_value_dtype_shape_and_membership():
-    base = codebook_digest(_tables())
-
-    t = _tables()
-    t[_SUB0] = t[_SUB0].clone()
-    t[_SUB0][0, 0] += 1.0
-    assert codebook_digest(t) != base, "value change must change the digest"
-
-    t = _tables()
-    t[_SUB0] = t[_SUB0].to(torch.float64)
-    assert codebook_digest(t) != base, "dtype change must change the digest"
-
-    t = _tables()
-    t[_SUB0] = t[_SUB0].reshape(8, 16)
-    assert codebook_digest(t) != base, "reshape must change the digest"
-
-    t = _tables()
-    t["cb_codebook.lattice.NVFP4_CB_K16.sub2"] = t[_SUB0].clone()
-    assert codebook_digest(t) != base, "extra table must change the digest"
-
-    t = _tables()
-    t[f"{_SUB0}.renamed"] = t.pop(_SUB0)
-    assert codebook_digest(t) != base, "rename must change the digest"
+def test_fixed_vector_matches_exporter_bytes():
+    table = torch.tensor([0.0, 1.0, -2.0, 0.5], dtype=torch.float32)
+    assert struct.pack("<4e", 0.0, 1.0, -2.0, 0.5).hex() == \
+        "0000003c00c00038"
+    assert codebook_tensor_sha256(table) == \
+        "58e0b63dabbfe62f04be297478992b1c1d301fc4c3c4c1c8abe3f431b322cce5"
 
 
-def test_digest_hashes_bfloat16_tables():
-    """``Tensor.numpy()`` raises on bfloat16; the uint8 view must not."""
-    assert len(codebook_digest({"cb": torch.randn(16, 8).to(torch.bfloat16)})) == 64
+def test_hash_matches_exporter_conversion_and_needs_no_numpy(monkeypatch):
+    source = torch.arange(24, dtype=torch.float32).reshape(4, 6).t()
+    assert not source.is_contiguous()
+    expected_bytes = struct.pack(
+        "<24e", *source.to(torch.float16).contiguous().reshape(-1).tolist())
+    expected = hashlib.sha256(expected_bytes).hexdigest()
+
+    def forbidden_numpy(self):  # pragma: no cover - only called on regression
+        raise AssertionError("NumPy must not be required for provenance")
+
+    monkeypatch.setattr(torch.Tensor, "numpy", forbidden_numpy)
+    assert codebook_tensor_sha256(source) == expected
+    # The published producer deliberately normalizes dtype to fp16.
+    assert codebook_tensor_sha256(source.to(torch.float64)) == expected
 
 
-def test_digest_matches_raw_numpy_bytes_for_numpy_dtypes():
-    """The uint8 view is byte-identical to ``Tensor.numpy().tobytes()``, so
-    this cannot invalidate a digest an existing encoder already wrote."""
-    import hashlib
+def test_empty_tensor_has_standard_empty_sha256():
+    assert codebook_tensor_sha256(torch.empty(0)) == hashlib.sha256(b"").hexdigest()
+
+
+def test_matching_external_mapping_loads_from_one_open(tmp_path, monkeypatch):
     tables = _tables()
-    h = hashlib.sha256()
-    for n in sorted(tables):
-        t = tables[n].cpu().contiguous()
-        h.update(n.encode())
-        h.update(str(t.dtype).encode())
-        h.update(str(tuple(t.shape)).encode())
-        h.update(t.numpy().tobytes())
-    assert h.hexdigest() == codebook_digest(tables)
+    path = _write(tmp_path, tables)
 
+    import safetensors
+    real_safe_open = safetensors.safe_open
+    opens = []
 
-# -- the binding at load ----------------------------------------------------
+    def counted_safe_open(*args, **kwargs):
+        opens.append(args[0])
+        return real_safe_open(*args, **kwargs)
 
-def test_matching_digest_loads(tmp_path):
-    tables = _tables()
-    declared = codebook_digest(tables)
-    path = _write(tmp_path, tables, declared)
-    assert read_declared_digest(path) == declared
-    got = load_codebooks(path)
+    monkeypatch.setattr(safetensors, "safe_open", counted_safe_open)
+    got = load_codebooks(path, _hashes(tables))
+    assert opens == [str(path)]
     assert sorted(got) == sorted(tables)
-    for k in tables:
-        assert torch.equal(got[k], tables[k])
+    assert all(torch.equal(got[name], tables[name]) for name in tables)
 
 
-def test_absent_digest_still_loads(tmp_path, capsys):
-    """Backward compatibility: every artifact published before the binding
-    existed carries no metadata and MUST keep loading."""
+def test_absent_mapping_is_backward_compatible(tmp_path):
     tables = _tables()
-    path = _write(tmp_path, tables, None)
-    assert read_declared_digest(path) is None
-    got = load_codebooks(path)
-    assert sorted(got) == sorted(tables)
-    assert CB_DIGEST_META_KEY in capsys.readouterr().err
+    got = load_codebooks(_write(tmp_path, tables), expected_sha256=None)
+    assert all(torch.equal(got[name], tables[name]) for name in tables)
 
 
-def test_wrong_digest_is_refused(tmp_path):
+def test_intact_wrong_sidecar_with_matching_self_digest_is_refused(tmp_path):
+    """A self-digest cannot bind a sidecar to the intended artifact."""
+    intended = _tables(seed=1)
+    wrong = _tables(seed=2)
+    wrong_self_digest = _self_digest_from_submitted_patch(wrong)
+    path = _write(
+        tmp_path, wrong, metadata={"cb_tables_sha256": wrong_self_digest})
+
+    with pytest.raises(ValueError, match="provenance mismatch") as exc:
+        load_codebooks(path, _hashes(intended))
+    assert _SUB0 in str(exc.value)
+
+
+def test_length_preserving_value_change_is_refused(tmp_path):
+    intended = _tables()
+    changed = {name: table.clone() for name, table in intended.items()}
+    changed[_SUB1][3, 4] += 1
+    path = _write(tmp_path, changed)
+    with pytest.raises(ValueError, match="stale, corrupt"):
+        load_codebooks(path, _hashes(intended))
+
+
+@pytest.mark.parametrize("declared, message", [
+    ({_SUB0}, "not bound by provenance"),
+    ({_SUB0, _SUB1, "cb.missing"}, "missing from sidecar"),
+])
+def test_present_mapping_must_cover_sidecar_exactly(tmp_path, declared, message):
     tables = _tables()
-    path = _write(tmp_path, tables, "0" * 64)
-    with pytest.raises(ValueError) as exc:
-        load_codebooks(path)
-    msg = str(exc.value)
-    assert CB_DIGEST_META_KEY in msg
-    assert codebook_digest(tables) in msg
-    assert "0" * 64 in msg
+    all_hashes = _hashes(tables)
+    expected = {name: all_hashes.get(name, "0" * 64) for name in declared}
+    with pytest.raises(ValueError, match=message):
+        load_codebooks(_write(tmp_path, tables), expected)
 
 
-def test_wrong_values_are_refused(tmp_path):
-    """THE case that motivates all of this: names, shapes and dtypes are all
-    correct, the declaration is honest, only the numbers are wrong. Nothing
-    downstream of the load can tell — every codeword still indexes in range."""
+@pytest.mark.parametrize("expected, message", [
+    ({}, "present but empty"),
+    ([], "must be an object"),
+    ({_SUB0: "A" * 64}, "lowercase"),
+    ({_SUB0: "0" * 63}, "exactly 64"),
+    ({_SUB0: 123}, "exactly 64"),
+    ({"": "0" * 64}, "invalid tensor name"),
+])
+def test_malformed_present_mapping_fails_closed(expected, message):
+    with pytest.raises(ValueError, match=message):
+        verify_codebook_hashes({_SUB0: torch.zeros(1)}, expected)
+
+
+def test_malformed_mapping_is_rejected_before_path_is_opened(monkeypatch):
+    import safetensors
+    monkeypatch.setattr(
+        safetensors, "safe_open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("malformed provenance must fail before file I/O")))
+    with pytest.raises(ValueError, match="present but empty"):
+        load_codebooks("attacker-controlled.pqcb", {})
+
+
+def test_loaded_tables_are_cloned_before_handle_closes(monkeypatch):
+    original = torch.tensor([1.0, 2.0], dtype=torch.float16)
+    mapped = original.clone()
+
+    class MutatingHandle:
+        def __enter__(self):
+            return self
+
+        def keys(self):
+            return [_SUB0]
+
+        def get_tensor(self, name):
+            assert name == _SUB0
+            return mapped
+
+        def __exit__(self, *_exc):
+            mapped.fill_(99)
+
+    import safetensors
+    monkeypatch.setattr(safetensors, "safe_open",
+                        lambda *_args, **_kwargs: MutatingHandle())
+    got = load_codebooks("replaced-after-open.pqcb",
+                         {_SUB0: codebook_tensor_sha256(original)})
+    assert torch.equal(got[_SUB0], original)
+    assert not torch.equal(got[_SUB0], mapped)
+
+
+def test_read_only_cli_verifies_and_never_offers_stamp(tmp_path):
     tables = _tables()
-    declared = codebook_digest(tables)
-    wrong = dict(tables)
-    wrong[_SUB0] = wrong[_SUB0].clone()
-    wrong[_SUB0][3, 3] = 42.0
-    path = _write(tmp_path, wrong, declared)
-    from safetensors.torch import load_file
-    raw = load_file(path)                       # a plain load sees nothing amiss
-    assert sorted(raw) == sorted(tables)
-    assert all(raw[k].shape == tables[k].shape for k in tables)
-    assert all(raw[k].dtype == tables[k].dtype for k in tables)
-    with pytest.raises(ValueError):
-        load_codebooks(path)
+    _write(tmp_path, tables)
+    (tmp_path / "quant_config.json").write_text(json.dumps({
+        "codebook_file": "cb_codebooks.pqcb",
+        "provenance": {"codebook_sha256": _hashes(tables)},
+    }), encoding="utf-8")
+    script = _audit_script()
+    victim = tmp_path / "must-not-be-overwritten"
+    victim.write_text("sentinel", encoding="utf-8")
+    old_stamp_path = tmp_path / "cb_codebooks.pqcb.stamp.tmp"
+    old_stamp_path.symlink_to(victim)
+
+    result = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)],
+        text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "verified 2 codebook table(s)" in result.stdout
+    assert victim.read_text(encoding="utf-8") == "sentinel"
+    assert old_stamp_path.is_symlink()
+
+    help_result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        text=True, capture_output=True, check=False)
+    assert help_result.returncode == 0
+    assert "stamp" not in help_result.stdout.lower()
 
 
-def test_missing_table_is_refused(tmp_path):
+def test_read_only_cli_rejects_mismatch_and_reports_unbound_legacy(tmp_path):
     tables = _tables()
-    declared = codebook_digest(tables)
-    with pytest.raises(ValueError):
-        load_codebooks(_write(tmp_path, {_SUB0: tables[_SUB0]}, declared))
+    _write(tmp_path, tables)
+    config_path = tmp_path / "quant_config.json"
+    script = _audit_script()
+
+    config_path.write_text(json.dumps({
+        "provenance": {"codebook_sha256": {
+            name: "0" * 64 for name in tables}},
+    }), encoding="utf-8")
+    mismatch = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)],
+        text=True, capture_output=True, check=False)
+    assert mismatch.returncode == 1
+    assert "provenance mismatch" in mismatch.stderr
+
+    config_path.write_text("{}", encoding="utf-8")
+    legacy = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)],
+        text=True, capture_output=True, check=False)
+    assert legacy.returncode == 2
+    assert "has no external codebook binding" in legacy.stderr
 
 
-def test_skip_env_downgrades_to_warning(tmp_path, monkeypatch, capsys):
-    tables = _tables()
-    path = _write(tmp_path, tables, "0" * 64)
-    monkeypatch.setenv(SKIP_DIGEST_ENV, "1")
-    got = load_codebooks(path)
-    assert sorted(got) == sorted(tables)
-    err = capsys.readouterr().err
-    assert SKIP_DIGEST_ENV in err and "WARNING" in err
-
-
-def test_skip_env_only_honours_exactly_one(tmp_path, monkeypatch):
-    path = _write(tmp_path, _tables(), "0" * 64)
-    for val in ("0", "", "true", "yes"):
-        monkeypatch.setenv(SKIP_DIGEST_ENV, val)
-        with pytest.raises(ValueError):
-            load_codebooks(path)
-
-
-def test_module_needs_no_vllm():
-    """Guards the property that lets this file stay stub-free."""
-    import sys
-    assert "gridbook.cb_digest" in sys.modules
-    assert not any(m == "vllm" or m.startswith("vllm.") for m in sys.modules)
+def test_digest_module_imports_no_vllm():
+    check = subprocess.run([
+        sys.executable, "-c",
+        "import sys, gridbook.cb_digest; "
+        "assert not any(n == 'vllm' or n.startswith('vllm.') "
+        "for n in sys.modules)",
+    ], text=True, capture_output=True, check=False)
+    assert check.returncode == 0, check.stderr

@@ -1,123 +1,145 @@
-"""Integrity binding for the ``cb_codebooks.pqcb`` sidecar (docs/SPEC.md §4.1).
+"""Verify codebook sidecars against artifact-external provenance.
 
-**Wrong codebook VALUES are undetectable at decode time.** A ``k``-bit codeword
-indexes a ``2^k``-row table (SPEC §1.1), so every index is in range by
-construction: substitute a table of the right names and shapes but the wrong
-numbers and decode still produces a correctly-shaped, correctly-typed tensor —
-filled with structured garbage. The server starts, the weights "load", and
-generation is quietly wrong. That is the same silent-wrong-weights family
-docs/TROUBLESHOOTING.md "The model loads but generates garbage" already warns
-about.
+PrismaQuant exporters record one SHA-256 per sidecar tensor in
+``quant_config.json["provenance"]["codebook_sha256"]``.  Keeping the expected
+digest outside ``cb_codebooks.pqcb`` is essential: a digest stored only in the
+file it describes can be updated along with wrong or stale table values and
+therefore does not bind the sidecar to the rest of the model artifact.
 
-The reachable cases are mundane: a ``.pqcb`` copied in from a *different*
-checkpoint at the same rung; a stale sidecar left behind when a model was
-re-encoded with re-fit codebooks; length-preserving data corruption (measured:
-safetensors loads a byte-flipped payload without complaint, names and shapes
-unchanged).
-
-Structural damage is already caught and this module claims no credit for it:
-byte-truncation raises ``SafetensorError: MetadataIncompleteBuffer`` in
-safetensors itself, and a table missing by name raises downstream. Values are
-the hole.
-
-The sidecar therefore declares a digest of its own tables in its safetensors
-``__metadata__`` header, and :func:`load_codebooks` refuses to serve a file that
-does not hash to its own declaration.
-
-Deliberately vLLM-free: this module is importable (and testable) without the
-serving stack, so producer-side tooling can share exactly the runtime's digest
-construction rather than reimplementing it. See ``scripts/cb_digest.py``.
+This module deliberately has no vLLM dependency.  The serving config and the
+read-only audit script both use the same verifier.
 """
 from __future__ import annotations
 
+import ctypes
 import hashlib
+import hmac
 import os
-import sys
+import re
+from collections.abc import Mapping
+from typing import TypeAlias
 
 import torch
 
-# safetensors metadata key holding the digest of the tables the file carries.
-# OPTIONAL: a sidecar without it still loads (every artifact published before
-# the binding existed has no key).
-CB_DIGEST_META_KEY = "cb_tables_sha256"
+CodebookHashes: TypeAlias = Mapping[str, str]
 
-# Downgrades a digest mismatch to a warning. Debug only — it re-opens exactly
-# the silent-wrong-weights hole the check exists to close.
-SKIP_DIGEST_ENV = "PRISMAQUANT_SKIP_CB_DIGEST"
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
-def codebook_digest(tables: dict[str, torch.Tensor]) -> str:
-    """sha256 over the codebook tables (docs/SPEC.md §4.1, normative).
+def codebook_tensor_sha256(table: torch.Tensor) -> str:
+    """Return the digest emitted by PrismaQuant's codebook exporters.
 
-    For each tensor name in ``sorted()`` order, absorb the name as UTF-8, then
-    ``str(dtype)``, then ``str(tuple(shape))``, then the tensor's raw contiguous
-    C-order bytes.
+    The producer construction is SHA-256 over the tensor converted to a
+    contiguous CPU ``float16`` array, in C order, with no name/shape framing.
+    The mapping is per tensor, so framing multiple tables is neither needed nor
+    compatible with already-published artifacts.
 
-    Sorting makes the digest independent of dict insertion order. Absorbing
-    dtype and shape makes it a *layout* digest rather than merely a byte
-    digest: a sidecar reshaped or re-typed under a fixed byte budget is a
-    different codebook and must not hash the same.
-
-    The raw bytes are taken through a ``uint8`` view rather than
-    ``Tensor.numpy()`` only so that ``bfloat16`` tables can be hashed —
-    ``numpy()`` raises ``TypeError: Got unsupported ScalarType BFloat16``. For
-    every dtype numpy *does* support the two yield identical bytes (one
-    contiguous buffer, read as-is), so this cannot change the digest of a
-    sidecar an existing encoder already stamped.
+    ``ctypes.string_at`` copies the contiguous buffer without NumPy.  NumPy is
+    intentionally not a gridbook dependency, and ``Tensor.numpy()`` is not
+    available for every PyTorch dtype.
     """
-    h = hashlib.sha256()
-    for n in sorted(tables):
-        t = tables[n].detach().cpu().contiguous()
-        h.update(n.encode())
-        h.update(str(t.dtype).encode())
-        h.update(str(tuple(t.shape)).encode())
-        h.update(t.reshape(-1).view(torch.uint8).numpy().tobytes())
-    return h.hexdigest()
+    if not isinstance(table, torch.Tensor):
+        raise TypeError("codebook table must be a torch.Tensor")
+    data = table.detach().to(device="cpu", dtype=torch.float16).contiguous()
+    nbytes = data.numel() * data.element_size()
+    raw = ctypes.string_at(data.data_ptr(), nbytes) if nbytes else b""
+    return hashlib.sha256(raw).hexdigest()
 
 
-def read_declared_digest(path: str) -> str | None:
-    """The digest the ``.pqcb`` at *path* declares, or ``None`` if it declares
-    none. Reads only the safetensors header, not the tensor data."""
+def _validated_hashes(expected: CodebookHashes) -> dict[str, str]:
+    if not isinstance(expected, Mapping):
+        raise ValueError(
+            "provenance.codebook_sha256 must be an object mapping tensor "
+            "names to lowercase SHA-256 digests")
+    if not expected:
+        raise ValueError(
+            "provenance.codebook_sha256 is present but empty; omit the field "
+            "for an unbound legacy artifact")
+
+    validated: dict[str, str] = {}
+    for name, digest in expected.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                "provenance.codebook_sha256 contains an invalid tensor name")
+        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+            raise ValueError(
+                "provenance.codebook_sha256[%r] must be exactly 64 lowercase "
+                "hexadecimal characters" % name)
+        validated[name] = digest
+    return validated
+
+
+def verify_codebook_hashes(
+    tables: Mapping[str, torch.Tensor],
+    expected: CodebookHashes,
+    *,
+    source: str | os.PathLike[str] = "cb_codebooks.pqcb",
+) -> None:
+    """Verify a complete per-table provenance mapping.
+
+    A present provenance mapping is required to cover the sidecar exactly.
+    Silently accepting an unbound extra table would recreate the wrong-values
+    hole for any scheme referencing that table.  Legacy configs remain
+    supported by passing ``None`` to :func:`load_codebooks` instead.
+    """
+    want = _validated_hashes(expected)
+    actual_names = set(tables)
+    expected_names = set(want)
+    if actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        unbound = sorted(actual_names - expected_names)
+        details = []
+        if missing:
+            details.append("missing from sidecar: " + ", ".join(missing))
+        if unbound:
+            details.append("not bound by provenance: " + ", ".join(unbound))
+        raise ValueError(
+            f"[prismaquant-cb] ERROR: codebook provenance for {source} does "
+            f"not cover the sidecar exactly ({'; '.join(details)})")
+
+    mismatches: list[tuple[str, str, str]] = []
+    for name in sorted(want):
+        got = codebook_tensor_sha256(tables[name])
+        if not hmac.compare_digest(got, want[name]):
+            mismatches.append((name, want[name], got))
+    if mismatches:
+        preview = "; ".join(
+            f"{name}: expected {declared}, computed {computed}"
+            for name, declared, computed in mismatches[:3])
+        if len(mismatches) > 3:
+            preview += f"; and {len(mismatches) - 3} more"
+        raise ValueError(
+            f"[prismaquant-cb] ERROR: codebook provenance mismatch for "
+            f"{source} ({preview}). The sidecar is stale, corrupt, or belongs "
+            f"to another artifact; refusing to decode with wrong tables.")
+
+
+def load_codebooks(
+    path: str | os.PathLike[str],
+    expected_sha256: CodebookHashes | None = None,
+) -> dict[str, torch.Tensor]:
+    """Load one stable sidecar snapshot and optionally verify its provenance.
+
+    ``safe_open`` opens the sidecar once.  Each table is cloned while that one
+    handle is live, so verification and later decoding use the same in-memory
+    bytes even if the path is atomically replaced after the load.  This is an
+    accidental-corruption check, not an authenticity or hostile-filesystem
+    boundary.
+
+    ``expected_sha256=None`` is the backward-compatible legacy path.  A mapping
+    that is present but malformed, incomplete, or mismatched fails closed.
+    """
     from safetensors import safe_open
-    with safe_open(path, framework="pt") as f:
-        meta = f.metadata() or {}
-    return meta.get(CB_DIGEST_META_KEY)
 
-
-def load_codebooks(path: str) -> dict[str, torch.Tensor]:
-    """Load the codebook tables from *path*, bound to their declared digest.
-
-    Backward-compatible by construction: the check can only fire on a file that
-    asked to be checked. A sidecar with no declared digest loads exactly as
-    before (a plain ``safetensors.torch.load_file``), with one informational
-    line on stderr.
-
-    Raises ``ValueError`` when a declared digest does not match the tables,
-    unless ``PRISMAQUANT_SKIP_CB_DIGEST=1``.
-    """
-    from safetensors.torch import load_file
-
-    tables = load_file(path)
-    want = read_declared_digest(path)
-    if want is None:
-        print(f"[prismaquant-cb] {path}: no {CB_DIGEST_META_KEY} metadata "
-              f"(sidecar predates digest binding) — integrity check skipped.",
-              file=sys.stderr, flush=True)
-        return tables
-    got = codebook_digest(tables)
-    if got == want:
-        return tables
-    if os.environ.get(SKIP_DIGEST_ENV) == "1":
-        print(f"[prismaquant-cb] WARNING: {path}: {CB_DIGEST_META_KEY} "
-              f"mismatch (declared {want[:16]}..., computed {got[:16]}...) ignored "
-              f"because {SKIP_DIGEST_ENV}=1. Output is not trustworthy.",
-              file=sys.stderr, flush=True)
-        return tables
-    raise ValueError(
-        f"[prismaquant-cb] ERROR: {path}: the codebook tables hash to {got} "
-        f"but the file's own {CB_DIGEST_META_KEY} metadata declares {want} — "
-        f"this sidecar is corrupted, or belongs to a different checkpoint or a "
-        f"different encode of this one. Serving it would decode every codebook "
-        f"weight to structured garbage, so it is refused. Re-download the "
-        f"artifact; set {SKIP_DIGEST_ENV}=1 to downgrade this to a warning "
-        f"(debug only — the resulting output is not trustworthy).")
+    path = os.fspath(path)
+    # Reject malformed declarations before opening a config-controlled path.
+    expected = (_validated_hashes(expected_sha256)
+                if expected_sha256 is not None else None)
+    with safe_open(path, framework="pt", device="cpu") as sidecar:
+        tables = {
+            name: sidecar.get_tensor(name).detach().clone().contiguous()
+            for name in sidecar.keys()
+        }
+    if expected is not None:
+        verify_codebook_hashes(tables, expected, source=path)
+    return tables

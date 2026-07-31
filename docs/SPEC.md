@@ -312,7 +312,7 @@ All **non-target tensors** (norms, embeddings, `lm_head`, BF16-assigned Linears)
 are copied verbatim (BF16 passthrough) and their module names **MUST** appear in
 the config `ignore` set (§5).
 
-### 4.1 Codebook sidecar digest (`cb_tables_sha256`)
+### 4.1 External codebook provenance (`codebook_sha256`)
 
 Wrong codebook **values** are not detectable at decode time: a `k`-bit codeword
 indexes a `2^k`-row table (§1.1), so every index is in range by construction and
@@ -321,60 +321,51 @@ sidecar, one from a different checkpoint at the same rung, or length-preserving
 data corruption — decodes to a correctly-shaped tensor of structured garbage
 rather than raising. (Structural damage is already caught: a byte-truncated
 safetensors file fails to deserialize, and a table missing by name fails at
-lookup.) The sidecar therefore carries a digest of its own tables, in the
-**safetensors `__metadata__` header** of the `.pqcb` itself:
+lookup.)
 
-| Metadata key | Value |
-|---|---|
-| `cb_tables_sha256` | lowercase hex sha256 over the sidecar's tables, constructed as below |
+The full quant config therefore **SHOULD** carry an artifact-external digest for
+every table in `cb_codebooks.pqcb`:
 
-Producers **SHOULD** write it; runtimes **MUST**, when it is present, verify it
-before use and refuse to serve on a mismatch. It is **OPTIONAL** for backward
-compatibility — a `.pqcb` without the key **MUST** still load (a runtime MAY
-warn), since every artifact published before this section existed has no key.
+```json
+"provenance": {
+  "codebook_sha256": {
+    "cb_codebook.lattice.NVFP4_CB_K16.sub0": "<64 lowercase hex characters>",
+    "cb_codebook.lattice.NVFP4_CB_K16.sub1": "<64 lowercase hex characters>"
+  }
+}
+```
 
-**Construction (normative).** Over the tensor names in `sorted()` order, absorb
-per table: the name as UTF-8, then `str(dtype)`, then `str(tuple(shape))`, then
-the tensor's raw contiguous C-order bytes.
+The expected values live in `quant_config.json`, not in safetensors metadata
+inside the file they describe. A self-declared digest cannot distinguish the
+intended sidecar from a different intact sidecar carrying its own matching
+declaration.
+
+**Construction (normative, per table).** Convert the table to IEEE-754
+binary16 (`fp16`), contiguous row-major (C) order, serialize its raw
+little-endian bytes with no framing, and compute SHA-256 over those bytes. This
+is the construction used by the PrismaQuant exporters:
 
 ```python
 import hashlib, torch
-def codebook_digest(tables: dict[str, torch.Tensor]) -> str:
-    h = hashlib.sha256()
-    for n in sorted(tables):
-        t = tables[n].detach().cpu().contiguous()
-        h.update(n.encode())
-        h.update(str(t.dtype).encode())          # e.g. "torch.float16"
-        h.update(str(tuple(t.shape)).encode())   # e.g. "(65536, 8)"
-        h.update(t.reshape(-1).view(torch.uint8).numpy().tobytes())
-    return h.hexdigest()
+def codebook_sha256(table: torch.Tensor) -> str:
+    raw = table.to(torch.float16).cpu().contiguous().numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()
 ```
 
-The two string forms are pinned so a non-Python producer can reproduce them
-byte-for-byte:
+The tensor name is the key in the mapping and is not absorbed into its digest.
+Shape and dtype are validated elsewhere by the format contract; all conforming
+sidecar tables are already `fp16` (§4). The explicit conversion is retained to
+match existing exporter output byte-for-byte.
 
-- **dtype** — the PyTorch spelling: `torch.float16`, `torch.float32`,
-  `torch.bfloat16`, `torch.uint8`. Per the table above a conforming `.pqcb`
-  carries `fp16` tables, so in practice this is always `torch.float16`.
-- **shape** — Python's tuple repr: `(65536, 8)` for 2-D, `(16,)` for 1-D
-  (note the trailing comma), `()` for a scalar. Comma-space separated.
+If `provenance.codebook_sha256` is present, a runtime **MUST** require it to
+cover the sidecar's tensor names exactly, verify every digest before use, and
+refuse a malformed, incomplete, or mismatched mapping. The field remains
+**OPTIONAL** for backward compatibility: a config with no mapping **MUST** load
+without this integrity check. An empty mapping is not the same as absence.
 
-Sorting is Python's `sorted()`, i.e. by Unicode code point — codebook tensor
-names are ASCII (§4), where that is identical to byte order. It makes the digest
-independent of dict insertion order. Absorbing dtype and shape makes it a
-*layout* digest, not merely a byte digest: a sidecar reshaped or re-typed under
-a fixed byte budget is a different codebook and **MUST NOT** hash the same. The
-`uint8` view is used instead of `Tensor.numpy()` only so that `bfloat16` tables
-can be hashed (`numpy()` raises on that dtype); for every dtype numpy supports
-the two yield identical bytes.
-
-This is the enforceable form of the `provenance.codebook_sha256` field
-sketched in §5 — that field is per-tensor, has no defined construction and no
-reader, and remains RECOMMENDED-only provenance metadata.
-
-`scripts/cb_digest.py` in this repository is a reference producer/auditor for
-the key (`show` / `verify` / `stamp`); it imports the same construction the
-runtime uses, so the two cannot drift.
+This binding detects accidental corruption and a sidecar swapped independently
+of its config. It is not a signature: replacing both files with a mutually
+consistent pair is outside its scope.
 
 ---
 
