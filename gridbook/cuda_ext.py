@@ -32,20 +32,6 @@ from __future__ import annotations
 import os
 import sys
 import threading
-from functools import wraps
-
-
-def _serialized_loader(lock, is_complete):
-    """Hold ``lock`` across one loader's cold build and state publication."""
-    def decorate(loader):
-        @wraps(loader)
-        def serialized():
-            if is_complete():
-                return loader()
-            with lock:
-                return loader()
-        return serialized
-    return decorate
 
 _ext = None
 _tried = False
@@ -216,12 +202,19 @@ _EXT_SYMBOLS = (
 )
 
 
-@_serialized_loader(_ext_lock, lambda: _tried)
 def get_ext():
     """The compiled extension module, or None if unavailable."""
-    global _ext, _tried
     if _tried:
         return _ext
+    with _ext_lock:
+        if _tried:
+            return _ext
+        return _load_ext_locked()
+
+
+def _load_ext_locked():
+    """Build and publish the main extension with ``_ext_lock`` held."""
+    global _ext, _tried
     try:
         import torch  # noqa: F401  (must import before cpp_extension)
         from torch.utils.cpp_extension import load
@@ -384,13 +377,20 @@ _ptc_lock = threading.Lock()
 _PTC_SYMBOLS = ("cb_prefill_persistent_tc",)
 
 
-@_serialized_loader(_ptc_lock, lambda: _ptc_tried)
 def get_persistent_ext():
     """JIT build/load of the persistent-N tensor-core prefill kernel
     (gridbook/csrc/cb_persistent_tc.cu, #4b v1). Fail-soft like the fused ext."""
-    global _ptc, _ptc_tried
     if _ptc_tried:
         return _ptc
+    with _ptc_lock:
+        if _ptc_tried:
+            return _ptc
+        return _load_persistent_ext_locked()
+
+
+def _load_persistent_ext_locked():
+    """Build and publish the persistent extension with ``_ptc_lock`` held."""
+    global _ptc, _ptc_tried
     # QUARANTINE (2026-07-23): a boot wedged minutes after this kernel's
     # bench container exited; until the canary ladder clears it, the ext
     # builds only on explicit opt-in.
@@ -451,7 +451,6 @@ _FUSED_FP4_SYMBOL_FAMILIES = (
 )
 
 
-@_serialized_loader(_fused_fp4_lock, lambda: _fused_fp4_tried)
 def get_fused_fp4_ext():
     """The NVFP4_CB fused BLOCK-SCALED prefill extension
     (cb_fused_fp4_gemm.cu), or None. Separate module from the fp8 fused ext
@@ -462,9 +461,17 @@ def get_fused_fp4_ext():
     arch-specific target — the block-scaled MMA is an arch-'a' instruction,
     so the build pins the current device's compute_XYa. Fail-soft: serving
     falls back to the Triton/transient fp4 paths."""
-    global _fused_fp4, _fused_fp4_tried
     if _fused_fp4_tried:
         return _fused_fp4
+    with _fused_fp4_lock:
+        if _fused_fp4_tried:
+            return _fused_fp4
+        return _load_fused_fp4_ext_locked()
+
+
+def _load_fused_fp4_ext_locked():
+    """Build and publish fused FP4 with ``_fused_fp4_lock`` held."""
+    global _fused_fp4, _fused_fp4_tried
     try:
         import torch
         from torch.utils.cpp_extension import load
@@ -525,15 +532,22 @@ def get_fused_fp4_ext():
 _FUSED_SYMBOLS = ("cb_fused_prefill_mm_scaled",)
 
 
-@_serialized_loader(_fused_lock, lambda: _fused_tried)
 def get_fused_ext():
     """The CUTLASS decode-in-prologue prefill extension (cb_fused_gemm.cu),
     or None. Separate module from the GEMV ext: it needs the CUTLASS headers
     (taken from the vLLM install's bundled copy) and a longer JIT build.
     Fail-soft like get_ext — serving falls back to the transient-expand path."""
-    global _fused, _fused_tried
     if _fused_tried:
         return _fused
+    with _fused_lock:
+        if _fused_tried:
+            return _fused
+        return _load_fused_ext_locked()
+
+
+def _load_fused_ext_locked():
+    """Build and publish fused FP8 with ``_fused_lock`` held."""
+    global _fused, _fused_tried
     try:
         import torch  # noqa: F401
         from torch.utils.cpp_extension import load

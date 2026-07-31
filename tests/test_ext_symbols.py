@@ -80,20 +80,21 @@ def _prepare_fp4_loader(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "loader_name,value_name,tried_name,symbols,prepare",
+    "loader_name,value_name,tried_name,lock_name,symbols,prepare",
     [
-        ("get_ext", "_ext", "_tried", "_EXT_SYMBOLS", "main"),
-        ("get_persistent_ext", "_ptc", "_ptc_tried", "_PTC_SYMBOLS",
-         "ptc"),
+        ("get_ext", "_ext", "_tried", "_ext_lock", "_EXT_SYMBOLS",
+         "main"),
+        ("get_persistent_ext", "_ptc", "_ptc_tried", "_ptc_lock",
+         "_PTC_SYMBOLS", "ptc"),
         ("get_fused_fp4_ext", "_fused_fp4", "_fused_fp4_tried",
-         "_FUSED_FP4_SYMBOL_FAMILIES", "fp4"),
-        ("get_fused_ext", "_fused", "_fused_tried", "_FUSED_SYMBOLS",
-         "fused"),
+         "_fused_fp4_lock", "_FUSED_FP4_SYMBOL_FAMILIES", "fp4"),
+        ("get_fused_ext", "_fused", "_fused_tried", "_fused_lock",
+         "_FUSED_SYMBOLS", "fused"),
     ],
 )
 def test_cold_load_is_published_once_to_concurrent_callers(
-        monkeypatch, tmp_path, loader_name, value_name, tried_name, symbols,
-        prepare):
+        monkeypatch, tmp_path, loader_name, value_name, tried_name, lock_name,
+        symbols, prepare):
     """No caller may observe the in-progress loader's initial ``None``.
 
     Model construction can ask several layers for the same extension at once.
@@ -116,7 +117,23 @@ def test_cold_load_is_published_once_to_concurrent_callers(
     good = _stub(loader_name, declared)
     started = threading.Event()
     release = threading.Event()
+    waiter_blocked = threading.Event()
     calls = []
+
+    raw_lock = threading.Lock()
+
+    class ObservedLock:
+        def __enter__(self):
+            if raw_lock.locked():
+                waiter_blocked.set()
+            raw_lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            raw_lock.release()
+            return False
+
+    monkeypatch.setattr(cuda_ext, lock_name, ObservedLock())
 
     pytest.importorskip("torch")
     cpp_extension = pytest.importorskip("torch.utils.cpp_extension")
@@ -138,6 +155,8 @@ def test_cold_load_is_published_once_to_concurrent_callers(
         # if the second worker happens to start late on a loaded CI host.
         assert getattr(cuda_ext, tried_name) is False
         second = pool.submit(loader)
+        assert waiter_blocked.wait(timeout=10), \
+            "second caller did not wait for the cold loader"
         release.set()
         assert first.result(timeout=10) is good
         assert second.result(timeout=10) is good
@@ -179,7 +198,18 @@ def test_concurrent_failed_load_is_memoized_once(monkeypatch, capsys,
     assert "deliberate cold-build failure" in capsys.readouterr().err
 
 
-def test_completed_loader_fast_path_does_not_take_mutex():
+@pytest.mark.parametrize(
+    "loader_name,value_name,tried_name,lock_name",
+    [
+        ("get_ext", "_ext", "_tried", "_ext_lock"),
+        ("get_persistent_ext", "_ptc", "_ptc_tried", "_ptc_lock"),
+        ("get_fused_fp4_ext", "_fused_fp4", "_fused_fp4_tried",
+         "_fused_fp4_lock"),
+        ("get_fused_ext", "_fused", "_fused_tried", "_fused_lock"),
+    ],
+)
+def test_completed_loader_fast_path_does_not_take_mutex(
+        monkeypatch, loader_name, value_name, tried_name, lock_name):
     class ExplodingLock:
         def __enter__(self):
             raise AssertionError("memoized loader acquired the cold-path lock")
@@ -188,12 +218,11 @@ def test_completed_loader_fast_path_does_not_take_mutex():
             return False
 
     sentinel = object()
+    setattr(cuda_ext, value_name, sentinel)
+    setattr(cuda_ext, tried_name, True)
+    monkeypatch.setattr(cuda_ext, lock_name, ExplodingLock())
 
-    @cuda_ext._serialized_loader(ExplodingLock(), lambda: True)
-    def completed_loader():
-        return sentinel
-
-    assert completed_loader() is sentinel
+    assert getattr(cuda_ext, loader_name)() is sentinel
 
 
 # ---------------------------------------------------------------------------
