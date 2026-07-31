@@ -25,7 +25,8 @@ from vllm.model_executor.parameter import (
 
 from . import codec
 from .expand import expand_cb_to_fp8, expand_fp4_v2_to_weight
-from .ops import cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op
+from .ops import (cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op,
+                  fp4_act_qdq_or_codec)
 
 # NOTE: the fused-sibling fallback map (qkv_proj, gate_up_proj, in_proj_qkvz,
 # in_proj_ba) used to be duplicated here. It — and the namespace handling around
@@ -263,7 +264,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             ref = self.quant_config.target_scheme[sp]["codebook_ref"]
             names = ref if isinstance(ref, list) else [ref]
             subs = [codebooks[n].to(dev) for n in names]
-            flat = codec.build_flat_codebook(subs)
+            flat = codec.build_flat_codebook(
+                subs, self.prefix, "fp4" if self.is_fp4 else "fp8")
             blocks.append(flat)
             w = shard_widths[i]
             # cumulative base (not i*cb_total): correct even if per-shard
@@ -304,8 +306,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # E4M3-byte codebook for the fp8-direct transient expand and the
             # CUDA GEMV (exact: every codebook value is on the e4m3 grid, so
             # bf16 -> fp8 is a lossless re-encoding of the same table).
-            layer._cb_flat_fp8 = cb_flat.to(torch.float8_e4m3fn).view(
-                torch.uint8).contiguous()
+            layer._cb_flat_fp8 = codec.flat_codebook_fp8(
+                cb_flat, self.prefix)
             # Warm the CUDA-GEMV JIT build at LOAD time — otherwise the ~30 s
             # in-container build fires on the first decode step and poisons
             # the first request's latency (seen live: 1.89 tok/s rep 1).
@@ -504,11 +506,14 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             if M <= CUDA_GEMV_M_MAX and self._cuda_gemv_ok():
                 if self.is_fp4:
                     # fp4-v2 CUDA GEMV: act-QDQ (fp4 group-16 RTN) runs OUTSIDE
-                    # the kernel via codec — exactly as the Triton fp4 path — so
-                    # CUDA-vs-Triton numerics stay aligned. The kernel gathers
-                    # the bf16 codebook and composes the two-tier scale
+                    # the kernel — exactly as the Triton fp4 path — so
+                    # CUDA-vs-Triton numerics stay aligned. The resolver picks
+                    # the fused CUDA op when the ext has it and the eager codec
+                    # otherwise; the two are bit-identical (tests/
+                    # test_fp4_act_qdq.py asserts torch.equal). The kernel
+                    # gathers the bf16 codebook and composes the two-tier scale
                     # in-register from the packed 9-byte plane.
-                    xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+                    xq = fp4_act_qdq_or_codec(x)
                     y = cb_gemv_fp4_v2(xq, layer._cb_qw_padded, layer._cb_flat,
                                        layer._cb_row_offset, layer._cb_compose,
                                        N, K, self.k, self.n_sub, self.type_size)
@@ -539,7 +544,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # the [N,K] tile is bounded to one layer, freed per forward. (bf16
             # MMA — INV-2 waived; the FP4-MMA CUTLASS prefill is prototype iii.)
             import torch.nn.functional as F
-            xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+            xq = fp4_act_qdq_or_codec(x)
             W = expand_fp4_v2_to_weight(
                 layer._cb_qw_padded, layer._cb_flat, layer._cb_row_offset,
                 layer._cb_compose, N, K, self.k, self.n_sub, self.type_size)

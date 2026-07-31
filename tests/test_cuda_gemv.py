@@ -28,6 +28,9 @@ codec = pytest.importorskip(
 kernels = pytest.importorskip("gridbook.kernels")
 from gridbook.cuda_ext import get_ext  # noqa: E402
 
+if not torch.cuda.is_available():
+    pytest.skip("CUDA device unavailable", allow_module_level=True)
+
 ext = get_ext()
 if ext is None:
     pytest.skip("CUDA extension unavailable (no nvcc?)",
