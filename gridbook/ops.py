@@ -7,10 +7,12 @@ vLLM import here, so the op is usable from the standalone correctness tests too.
 """
 from __future__ import annotations
 
-import torch
-
+import itertools
 import os
 import sys
+import weakref
+
+import torch
 
 from .kernels import cb_decode_linear
 
@@ -378,7 +380,9 @@ def _cb_moe_combine_fake(y, pair_w, tok_start, T):
 # carries only (tensors..., layer_id) and the impl/fake consult the registry.
 # The id is a python int baked per call site — each layer module passes its
 # own — so the traced graph binds each site to its layer statically.
-_LAYER_REGISTRY: dict = {}
+_LAYER_REGISTRY: dict[int, tuple[weakref.ReferenceType,
+                                 weakref.ReferenceType]] = {}
+_LAYER_IDS = itertools.count()
 _DISPATCH_VIA_OP: list = []
 
 
@@ -390,20 +394,55 @@ def dispatch_via_op() -> bool:
 
 
 def register_cb_layer(method, layer) -> int:
-    layer_id = len(_LAYER_REGISTRY)
-    _LAYER_REGISTRY[layer_id] = (method, layer)
+    """Register one compiled-dispatch target without owning its model.
+
+    vLLM can load and unload several engines in one Python process.  Strong
+    references here used to pin every method, layer, parameter, and associated
+    GPU allocation until process exit.  The module/quant-method ownership graph
+    is authoritative; this registry is only an integer indirection for custom
+    ops, so both references must be weak.
+
+    IDs are monotonic rather than derived from ``len(_LAYER_REGISTRY)``.  A
+    captured graph containing an expired ID can therefore never alias a newly
+    loaded layer after the weakref callback removes its old entry.
+    """
+    layer_id = next(_LAYER_IDS)
+
+    def expire(_ref, *, expected_id=layer_id):
+        _LAYER_REGISTRY.pop(expected_id, None)
+
+    method_ref = weakref.ref(method, expire)
+    layer_ref = weakref.ref(layer, expire)
+    _LAYER_REGISTRY[layer_id] = (method_ref, layer_ref)
     return layer_id
+
+
+def _lookup_cb_layer(layer_id: int):
+    entry = _LAYER_REGISTRY.get(layer_id)
+    if entry is None:
+        raise RuntimeError(
+            f"CB dispatch layer id {layer_id} is stale or unknown; the model "
+            "may have been unloaded")
+    method = entry[0]()
+    layer = entry[1]()
+    if method is None or layer is None:
+        # A callback normally removes the entry first.  Keep this explicit for
+        # finalizer ordering and interpreter-shutdown edge cases.
+        _LAYER_REGISTRY.pop(layer_id, None)
+        raise RuntimeError(
+            f"CB dispatch layer id {layer_id} expired after model unload")
+    return method, layer
 
 
 @torch.library.custom_op("prismaquant::cb_linear_forward", mutates_args=())
 def cb_linear_forward(x: torch.Tensor, layer_id: int) -> torch.Tensor:
-    method, layer = _LAYER_REGISTRY[layer_id]
+    method, layer = _lookup_cb_layer(layer_id)
     return method._apply_inline(layer, x)
 
 
 @cb_linear_forward.register_fake
 def _cb_linear_forward_fake(x, layer_id):
-    _method, layer = _LAYER_REGISTRY[layer_id]
+    _method, layer = _lookup_cb_layer(layer_id)
     return torch.empty((*x.shape[:-1], layer._cb_N), dtype=x.dtype,
                        device=x.device)
 
@@ -411,7 +450,7 @@ def _cb_linear_forward_fake(x, layer_id):
 @torch.library.custom_op("prismaquant::cb_moe_forward", mutates_args=())
 def cb_moe_forward(x: torch.Tensor, topk_weights: torch.Tensor,
                    topk_ids: torch.Tensor, layer_id: int) -> torch.Tensor:
-    method, layer = _LAYER_REGISTRY[layer_id]
+    method, layer = _lookup_cb_layer(layer_id)
     return method._apply_inline(layer, x, topk_weights, topk_ids)
 
 
