@@ -28,16 +28,21 @@
 # test is guarded by pytest.skip / importorskip / skipif(not cuda_ok).  Run
 # per-file on a machine with no GPU, no nvcc, no vLLM and no artifacts, each
 # file is all-pass-or-skip.  A marker layer on top would duplicate that logic
-# across the 16 test files (15 of which run here) for no added signal, so it
+# across the test modules for no added signal, so it
 # was not added -- see docs/RELEASING.md.
 set -uo pipefail
 
 TESTS="${1:?usage: run_cpu_tests.sh <tests-dir>}"
 
-# The only file that cannot run outside the private monorepo: it imports
-# `prismaquant.nvfp4_cb_formats` at module scope, which is a hard collection
-# ERROR (not a skip) anywhere `prismaquant` is not importable.
-EXCLUDE=("test_cb_kernels.py")
+# Every optional monorepo/GPU dependency is guarded with importorskip/skip, so
+# every test module can be collected in the released-package environment.
+EXCLUDE=()
+
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "python interpreter not found: $PYTHON_BIN" >&2
+  exit 2
+fi
 
 if [ ! -d "$TESTS" ]; then
   echo "no such tests dir: $TESTS" >&2
@@ -62,7 +67,7 @@ for f in "$TESTS"/test_*.py; do
     fi
   done
   echo "::group::$base"
-  python -m pytest "$f" -q --no-header -rs -p no:cacheprovider
+  "$PYTHON_BIN" -m pytest "$f" -q --no-header -rs -p no:cacheprovider
   rc=$?
   echo "::endgroup::"
   # 0 = passed (or everything skipped), 5 = no tests collected.

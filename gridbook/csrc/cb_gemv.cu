@@ -429,19 +429,167 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Fused group-16 fp4 (E2M1) activation QDQ — bit-exact mirror of
+// codec.fp4_group16_act_qdq.
+//
+// WHY THIS EXISTS.  The fp8 lane has had a CUDA act-QDQ since day one
+// (fp8_act_qdq_kernel above), so an fp8-CB projection costs ONE launch.  The
+// fp4 lane had no twin, so every fp4-CB projection ran
+// `codec.fp4_group16_act_qdq` — roughly two dozen eager tensor ops (count them
+// over codec.py:126-133: float/reshape/abs/amax/clamp/div/div/contiguous/
+// bucketize/2x gather/2x clamp/2x sub/2x abs/lt/where/mul/reshape/cast) plus
+// the matching allocator round-trips, PER MODULE CALL, in eager mode.  The
+// grouped MoE decode path calls it twice per layer per token (moe.py:1959 for
+// the module input, moe.py:1977 for the intermediate), so a model with L CB'd
+// MoE layers pays 2L such call chains per decoded token, all of it host
+// dispatch on a tensor that a single block can chew through.
+//
+// BIT-EXACTNESS CONTRACT.  linear.py:362-366 and moe.py:1955-1958 both document
+// that the fp4 act-QDQ runs OUTSIDE the kernel specifically so CUDA-vs-Triton
+// numerics stay aligned.  This kernel therefore reproduces the python EXACTLY,
+// not approximately:
+//   scale = fmaxf(amax_over_16, 1e-8f) * (1/6)           (clamp THEN scale)
+//   idx   = lower_bound(grid, v)                          (torch.bucketize,
+//                                                          right=False)
+//   lo    = grid[max(idx-1, 0)],  hi = grid[min(idx, 14)]
+//   q     = (|hi - v| <  |v - lo|) ? hi : lo              (STRICT <, so an exact
+//                                                          tie resolves LOW,
+//                                                          matching torch.where)
+//   out   = f32_to_bf16_rn(q * scale)
+// grid is sorted({+/-x for x in (0,.5,1,1.5,2,3,4,6)}) = 15 entries (+0 and -0
+// collapse to one), i.e. codec._fp4_qdq_grid.  Any deviation here is a numerics
+// change, not an optimisation — tests/test_fp4_act_qdq.py compares against the
+// codec element-wise through the raw bf16 bits, never a tolerance.
+//
+// THE SCALE IS A **MULTIPLY BY THE RECIPROCAL**, NOT A DIVIDE.  This is the
+// single most load-bearing line in the file.
+//
+// codec.py:127 writes `amax.clamp_min(1e-8) / NVFP4_GRID_MAX`, which LOOKS like
+// a division -- but torch lowers tensor-by-SCALAR division to a multiply by the
+// float32 reciprocal, and `1.0f/6.0f` (0x3E2AAAAB) is very slightly ABOVE 1/6.
+// So torch's scale is one ulp HIGHER than the correctly rounded quotient.
+// `__fdiv_rn(amax, 6.0f)` is correctly rounded, i.e. one ulp LOWER, and that
+// single ulp is enough to change the answer:
+//
+//   amax = 1.7265625, x = -amax/8  ->  the exact quotient x/(amax/6) is EXACTLY
+//   -0.75, a grid midpoint.  With torch's (larger) scale it computes to
+//   -0.7499999404, a hair on the -0.5 side, and torch picks hi = -0.5.  With the
+//   correctly-rounded (smaller) scale it lands at or past -0.75 and picks
+//   lo = -1.0.  Adjacent rungs 0.5 and 1.0 differ by exactly 2x, which is why
+//   every mismatching element is wrong by exactly 2x -- the signature that
+//   identifies this bug if anyone "simplifies" the line.
+//
+// The failing set is precisely `x == +/-amax/8`; nothing else reaches a
+// midpoint.  Rare, entirely value-dependent, and invisible to any tolerance-
+// based test -- which is why the battery asserts torch.equal.
+//
+// The `v / scale` division, by contrast, IS a real tensor-by-TENSOR division in
+// torch and must stay `__fdiv_rn`.  The two lines are deliberately asymmetric.
+// Do not "simplify" either back to a bare operator, and do not reach for
+// -prec-div/-fmad flags instead: those are file-wide and would silently move the
+// GEMV kernels' numerics too.
+//
+// Layout: one block per token row; 16 lanes cooperate on one group of 16 so the
+// loads coalesce.  The trip count is uniform across the block, and the `live`
+// guard is applied only AFTER the shuffle reduction, so every lane named in the
+// 0xffffffff mask is active at the shuffle even when nGroups is not a multiple
+// of (blockDim.x / 16).
+// ---------------------------------------------------------------------------
+DEVINL float fp4_rtn_e2m1(float v) {
+  const float g[15] = {-6.0f, -4.0f, -3.0f, -2.0f, -1.5f, -1.0f, -0.5f, 0.0f,
+                       0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f};
+  int idx = 15;                       // torch.bucketize(v, grid, right=False)
+#pragma unroll
+  for (int i = 14; i >= 0; --i) {
+    if (g[i] >= v) idx = i;
+  }
+  const float lo = g[idx > 0 ? idx - 1 : 0];
+  const float hi = g[idx < 15 ? idx : 14];
+  return (fabsf(__fsub_rn(hi, v)) < fabsf(__fsub_rn(v, lo))) ? hi : lo;
+}
+
+__global__ __launch_bounds__(kThreads) void fp4_group16_act_qdq_kernel(
+    const uint16_t* __restrict__ x,   // [M, K] bf16 (as u16)
+    uint16_t* __restrict__ out,       // [M, K] bf16 (as u16)
+    int64_t K) {
+  const int64_t m = blockIdx.x;
+  const uint16_t* row = x + m * K;
+  uint16_t* orow = out + m * K;
+
+  const int64_t nGroups = K >> 4;              // K % 16 == 0 checked host-side
+  const int lane = threadIdx.x & 15;
+  const int gSlot = threadIdx.x >> 4;
+  const int gStride = blockDim.x >> 4;
+  const int64_t iters = (nGroups + gStride - 1) / gStride;
+
+  for (int64_t it = 0; it < iters; ++it) {
+    const int64_t g = (int64_t)gSlot + it * gStride;
+    const bool live = g < nGroups;
+    const int64_t i = (g << 4) + lane;
+    const float v = live ? bf16_to_f32(row[i]) : 0.0f;
+
+    float amax = fabsf(v);
+    int has_nan = isnan(v) ? 1 : 0;
+#pragma unroll
+    for (int off = 8; off > 0; off >>= 1) {
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+      has_nan |= __shfl_xor_sync(0xffffffffu, has_nan, off);
+    }
+    if (!live) continue;
+
+    // torch.amax propagates NaN while CUDA fmaxf deliberately ignores it.
+    // Preserve the codec's group semantics: one NaN makes the scale, and thus
+    // every output in that group, NaN.
+    const float scale = has_nan
+        ? nanf("")
+        : __fmul_rn(fmaxf(amax, 1e-8f), 1.0f / 6.0f);
+    orow[i] = f32_to_bf16_rn(
+        __fmul_rn(fp4_rtn_e2m1(__fdiv_rn(v, scale)), scale));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Host launchers
 // ---------------------------------------------------------------------------
 torch::Tensor fp8_act_qdq(torch::Tensor x) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16,
               "fp8_act_qdq wants a CUDA bf16 tensor");
   auto x2 = x.contiguous();
+  TORCH_CHECK(x2.dim() >= 1,
+              "fp8_act_qdq needs at least one dimension");
   const int64_t K = x2.size(-1);
+  TORCH_CHECK(K > 0,
+              "fp8_act_qdq needs a positive last dimension");
   const int64_t M = x2.numel() / K;
   auto out = torch::empty_like(x2);
-  if (M == 0 || K == 0) return out;
+  if (M == 0) return out;
   const c10::cuda::OptionalCUDAGuard guard(x2.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   fp8_act_qdq_kernel<<<(unsigned)M, kThreads, 0, stream>>>(
+      reinterpret_cast<const uint16_t*>(x2.data_ptr()),
+      reinterpret_cast<uint16_t*>(out.data_ptr()), K);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+torch::Tensor fp4_act_qdq(torch::Tensor x) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16,
+              "fp4_act_qdq wants a CUDA bf16 tensor");
+  auto x2 = x.contiguous();
+  TORCH_CHECK(x2.dim() >= 1,
+              "fp4_act_qdq needs at least one dimension");
+  const int64_t K = x2.size(-1);
+  TORCH_CHECK(K > 0,
+              "fp4_act_qdq needs a positive last dimension");
+  TORCH_CHECK(K % 16 == 0,
+              "fp4_act_qdq needs a last dim that is a multiple of the fp4 "
+              "group (16); got ", K);
+  const int64_t M = x2.numel() / K;
+  auto out = torch::empty_like(x2);
+  if (M == 0) return out;
+  const c10::cuda::OptionalCUDAGuard guard(x2.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  fp4_group16_act_qdq_kernel<<<(unsigned)M, kThreads, 0, stream>>>(
       reinterpret_cast<const uint16_t*>(x2.data_ptr()),
       reinterpret_cast<uint16_t*>(out.data_ptr()), K);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1873,6 +2021,9 @@ torch::Tensor qdq_scale_probe(torch::Tensor x) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp8_act_qdq", &fp8_act_qdq,
         "Fused per-token fp8 dynamic QDQ (bit-exact to codec.fp8_dynamic_act_qdq)");
+  m.def("fp4_act_qdq", &fp4_act_qdq,
+        "Fused group-16 fp4 E2M1 activation QDQ (bit-exact to "
+        "codec.fp4_group16_act_qdq)");
   m.def("cb_gemv_fp8", &cb_gemv_fp8,
         "FP8_CB product-mode decode GEMV (bandwidth-bound, INV-1)");
   m.def("cb_gemv_fp4_v2", &cb_gemv_fp4_v2,

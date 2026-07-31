@@ -32,7 +32,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
-
 try:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
 except Exception:  # pragma: no cover - older vLLM
@@ -252,17 +251,56 @@ class PrismaQuantConfig(QuantizationConfig):
     # -- codebook sidecar (loaded once, shared across all layers) ------------
     def get_codebooks(self) -> dict[str, torch.Tensor]:
         if self._codebooks is None:
-            from safetensors.torch import load_file
             from vllm.config import get_current_vllm_config
+
+            from .cb_digest import load_codebooks
+
+            # Resolve the full quant config before opening the sidecar: the
+            # expected per-table hashes live outside the .pqcb in
+            # quant_config.json.  A digest carried only by the sidecar would
+            # attest to the wrong file just as readily as the right one.
+            self._ensure_resolved()
+            provenance = self._full_config.get("provenance")
+            if provenance is None:
+                expected_sha256 = None       # legacy, intentionally optional
+            elif not isinstance(provenance, dict):
+                raise ValueError(
+                    "provenance must be an object when it is present")
+            elif ("codebook_sha256" in provenance
+                  and provenance["codebook_sha256"] is None):
+                raise ValueError(
+                    "provenance.codebook_sha256 must be an object when "
+                    "declared; omit the field for a legacy artifact")
+            else:
+                expected_sha256 = provenance.get("codebook_sha256")
             model_dir = get_current_vllm_config().model_config.model
-            self._codebooks = load_file(
-                _resolve_model_file(model_dir, self.codebook_file))
+            # This is the single choke point used by linear.py, moe.py, and
+            # moe_toplevel_loader.py, and it is memoized after verification.
+            self._codebooks = load_codebooks(
+                _resolve_model_file(model_dir, self.codebook_file),
+                expected_sha256=expected_sha256)
         return self._codebooks
 
     # -- per-prefix scheme resolution (handles vLLM fused qkv/gate_up) -------
     def _is_ignored(self, prefix: str) -> bool:
-        return any(ig in base for base in _candidate_bases(prefix)
-                   for ig in self.ignore)
+        """Read ``ignore`` exactly as delegated compressed-tensors does.
+
+        In particular, fused modules are checked through their unfused shard
+        names and regexes use compressed-tensors' ``regex`` engine.  Keeping a
+        local near-copy caused the same list to mean different things on the CB
+        and stock sides of one mixed artifact.
+        """
+        # Lazy so codec/config tests that provide the repository's minimal
+        # vLLM stubs can still import this module without having to recreate
+        # compressed-tensors' entire package tree. Production always has the
+        # helper because compressed-tensors is a supported vLLM dependency.
+        from vllm.model_executor.layers.quantization.compressed_tensors.utils import (  # noqa: E501
+            should_ignore_layer,
+        )
+        fused = dict(_FUSED_FALLBACK)
+        fused.update(getattr(self, "packed_modules_mapping", {}) or {})
+        return any(should_ignore_layer(base, self.ignore, fused)
+                   for base in _candidate_bases(prefix))
 
     def shard_target_keys(self, prefix: str, *,
                           unfused_fallback: bool = False) -> list[str]:
@@ -335,7 +373,7 @@ class PrismaQuantConfig(QuantizationConfig):
 
         if isinstance(layer, LinearBase):
             # 1) CB target (has a "scheme") — ours (precise, fused-aware; ahead
-            #    of the substring ignore test).
+            #    of the ignore test).
             scheme = self._scheme_for_prefix(prefix)
             if os.environ.get("PRISMAQUANT_DEBUG_PREFIXES") == "1":
                 import sys
@@ -413,11 +451,21 @@ class PrismaQuantConfig(QuantizationConfig):
         # applied. For hybrid/VLM checkpoints that means the module-nesting
         # prefix (e.g. Qwen3-VL: ``model.language_model.`` -> ``language_model.
         # model.``) must be applied to the CB target keys too: _scheme_for_prefix
-        # matches serve-time prefixes EXACTLY (unlike the substring ignore test),
+        # matches serve-time prefixes EXACTLY (the ignore test additionally
+        # accepts a parent-module entry and ``re:`` patterns — see
+        # ``_ignore_entry_matches`` — but neither path is a substring search),
         # so an un-remapped key silently falls through to unquantized and the
         # cb_qweight load then fails ("no parameter named …cb_qweight"). Mirror
         # exactly what the delegated stock-CT config does for its own targets.
-        self.ignore = hf_to_vllm_mapper.apply_list(self.ignore)
+        # vLLM's compressed-tensors mapper deliberately leaves regex entries
+        # untouched: a name mapper cannot safely rewrite regex syntax.  Mirror
+        # that rule before handing the same list to our own ignore check.
+        regex_ignores = [name for name in self.ignore
+                         if name.startswith("re:")]
+        literal_ignores = [name for name in self.ignore
+                           if not name.startswith("re:")]
+        self.ignore = (hf_to_vllm_mapper.apply_list(literal_ignores)
+                       + regex_ignores)
         self.target_scheme = hf_to_vllm_mapper.apply_dict(self.target_scheme)
         self._cb_targets = set(
             hf_to_vllm_mapper.apply_list(sorted(self._cb_targets)))
