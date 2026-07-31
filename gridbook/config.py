@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from typing import Any
 
 import torch
@@ -33,7 +32,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
-
 try:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
 except Exception:  # pragma: no cover - older vLLM
@@ -261,53 +259,25 @@ class PrismaQuantConfig(QuantizationConfig):
         return self._codebooks
 
     # -- per-prefix scheme resolution (handles vLLM fused qkv/gate_up) -------
-    @staticmethod
-    def _ignore_entry_matches(entry: str, name: str) -> bool:
-        """Does one ``ignore`` entry match module *name*, on SEGMENT boundaries?
-
-        Semantics are deliberately those of compressed-tensors' own matcher
-        (``vllm…quantization.compressed_tensors.utils._is_equal_or_regex_match``),
-        because ``_build_ct_config`` hands the very same ``ignore`` list to a
-        real ``CompressedTensorsConfig`` — two different readings of one list
-        in one process is how dispatch becomes incoherent.
-
-          * ``re:<pattern>``  ->  ``re.match(pattern, name)``  (as upstream:
-            ``re.match``, NOT ``fullmatch`` — upstream anchors at the start
-            only, and diverging here would re-open the same asymmetry)
-          * otherwise         ->  exact equality,
-
-        widened by exactly one case that CT does not have but the old substring
-        test did, and that artifacts may already depend on: an entry naming a
-        PARENT module (``…layers.0.mlp``) also ignores its children
-        (``…layers.0.mlp.down_proj``). Keeping it makes this change purely
-        subtractive; dropping it would *additionally* un-ignore every module
-        whose parent is listed, which is a far larger behaviour change than the
-        bug warrants. It is a dotted-SEGMENT prefix — never a raw character
-        prefix.
-
-        WHY THIS EXISTS.  The predicate used to be ``entry in name`` — an
-        unanchored substring — and it is why a HunYuan-V3-shaped artifact could
-        not serve at all. Exporters collapse ``.mlp.router.gate`` to
-        ``.mlp.gate`` (and ``_alias_collapsed_shared_prefixes`` above collapses
-        ``.mlp.shared_mlp.X`` to ``.mlp.X``), so the ignored BF16 router entry
-        ``model.layers.N.mlp.gate`` is a raw substring of the *quantized*
-        ``model.layers.N.mlp.gate_proj`` / ``…mlp.gate_up_proj``. The whole
-        shared-expert stack was therefore forced to ``UnquantizedLinearMethod``
-        and its NVFP4 tensors had nowhere to land (``KeyError:
-        'layers.1.mlp.shared_mlp.down_proj.input_global_scale'``).
-
-        Note for reviewers: for non-``re:`` entries this predicate is a strict
-        SUBSET of the old substring test, so it can only ever *un*-ignore a
-        module, never newly ignore one.
-        """
-        if entry.startswith("re:"):
-            return re.match(entry[3:], name) is not None
-        return name == entry or name.startswith(entry + ".")
-
     def _is_ignored(self, prefix: str) -> bool:
-        return any(self._ignore_entry_matches(ig, base)
-                   for base in _candidate_bases(prefix)
-                   for ig in self.ignore)
+        """Read ``ignore`` exactly as delegated compressed-tensors does.
+
+        In particular, fused modules are checked through their unfused shard
+        names and regexes use compressed-tensors' ``regex`` engine.  Keeping a
+        local near-copy caused the same list to mean different things on the CB
+        and stock sides of one mixed artifact.
+        """
+        # Lazy so codec/config tests that provide the repository's minimal
+        # vLLM stubs can still import this module without having to recreate
+        # compressed-tensors' entire package tree. Production always has the
+        # helper because compressed-tensors is a supported vLLM dependency.
+        from vllm.model_executor.layers.quantization.compressed_tensors.utils import (  # noqa: E501
+            should_ignore_layer,
+        )
+        fused = dict(_FUSED_FALLBACK)
+        fused.update(getattr(self, "packed_modules_mapping", {}) or {})
+        return any(should_ignore_layer(base, self.ignore, fused)
+                   for base in _candidate_bases(prefix))
 
     def shard_target_keys(self, prefix: str, *,
                           unfused_fallback: bool = False) -> list[str]:
@@ -464,7 +434,15 @@ class PrismaQuantConfig(QuantizationConfig):
         # so an un-remapped key silently falls through to unquantized and the
         # cb_qweight load then fails ("no parameter named …cb_qweight"). Mirror
         # exactly what the delegated stock-CT config does for its own targets.
-        self.ignore = hf_to_vllm_mapper.apply_list(self.ignore)
+        # vLLM's compressed-tensors mapper deliberately leaves regex entries
+        # untouched: a name mapper cannot safely rewrite regex syntax.  Mirror
+        # that rule before handing the same list to our own ignore check.
+        regex_ignores = [name for name in self.ignore
+                         if name.startswith("re:")]
+        literal_ignores = [name for name in self.ignore
+                           if not name.startswith("re:")]
+        self.ignore = (hf_to_vllm_mapper.apply_list(literal_ignores)
+                       + regex_ignores)
         self.target_scheme = hf_to_vllm_mapper.apply_dict(self.target_scheme)
         self._cb_targets = set(
             hf_to_vllm_mapper.apply_list(sorted(self._cb_targets)))
