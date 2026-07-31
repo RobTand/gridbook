@@ -198,9 +198,18 @@ def test_registry_is_data_not_a_try_except_chain():
     which this venv does not have, and the point of the check is the literal.
     """
     import ast
+    import importlib.util
     import pathlib
 
-    src = pathlib.Path(__file__).resolve().parents[1] / "gridbook" / "plugin.py"
+    # Resolve through the PACKAGE, not a repo-relative sibling path: the
+    # release pipeline's "verify installed wheel" job runs this suite against
+    # the installed distribution, where tests/ and gridbook/ are not siblings
+    # and `parents[1]/"gridbook"/"plugin.py"` does not exist. find_spec locates
+    # the file without importing the submodule (which would need vLLM).
+    spec = importlib.util.find_spec("gridbook.plugin")
+    if spec is None or not spec.origin:            # pragma: no cover - env
+        pytest.skip("gridbook.plugin source not locatable")
+    src = pathlib.Path(spec.origin)
     tree = ast.parse(src.read_text())
     paths = None
     for node in ast.walk(tree):
