@@ -203,6 +203,8 @@ unmeasured warmup prompts per block, dataset seed 1234, and **at least three
 blocks**.  The runner derives a distinct prompt-dataset seed for each block
 (`1234`, `1235`, `1236`, ...); use the same base seed for the native and
 Gridbook arms so every block is paired.
+The runner also pins vLLM request burstiness to `1.0` explicitly and reconciles
+that saved-result field instead of relying on a client-version default.
 This seed controls prompt construction, not generation.  Server sampling is
 separately and unconditionally pinned to greedy decoding with `--temperature
 0`. `--input-len` is the value sent to vLLM as `--random-input-len`; it is a

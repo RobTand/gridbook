@@ -338,6 +338,8 @@ def test_command_uses_official_streaming_fixed_shape_semantics(tmp_path):
         "output": 0.0,
     }
     assert _option(command, "--num-warmups") == "4"
+    assert _option(command, "--request-rate") == "inf"
+    assert _option(command, "--burstiness") == "1.0"
     assert _option(command, "--seed") == "902"
     assert _option(command, "--temperature") == "0"
     assert _option(command, "--percentile-metrics") == "ttft,tpot,itl,e2el"
@@ -1191,6 +1193,7 @@ def test_pinned_vllm_saved_invocation_envelope_is_reconciled_exactly(tmp_path):
         "tokenizer_id": "other/tokenizer",
         "num_prompts": True,
         "request_rate": "2.5",
+        "burstiness": 2.0,
         "max_concurrency": 1.0,
     }
     for field, bad_value in mutations.items():

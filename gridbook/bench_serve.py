@@ -40,6 +40,7 @@ STREAMING_METRICS = "ttft,tpot,itl,e2el"
 DEFAULT_PERCENTILES = "50,90,95,99"
 MIN_WARMUPS = 4
 MIN_BLOCKS = 3
+REQUEST_BURSTINESS = 1.0
 
 # These are stable vLLM result names.  Percentile keys are added dynamically
 # below because the selected percentiles are configurable.
@@ -1171,6 +1172,8 @@ def build_vllm_command(
         str(args.max_concurrency),
         "--request-rate",
         args.request_rate,
+        "--burstiness",
+        str(REQUEST_BURSTINESS),
         "--seed",
         str(dataset_seed),
         "--temperature",
@@ -1631,6 +1634,7 @@ def collect_metadata(
                 "sampling_seed": None,
             },
             "request_rate": args.request_rate,
+            "request_burstiness": REQUEST_BURSTINESS,
             "input_range_ratio": args.input_range_ratio,
             "vllm_range_ratio": {
                 "input": args.input_range_ratio,
@@ -1788,6 +1792,15 @@ def _validate_result_invocation(
         )
     if not request_rate_matches:
         mismatches.append("request_rate")
+
+    burstiness = result.get("burstiness")
+    if (
+        isinstance(burstiness, bool)
+        or not isinstance(burstiness, (int, float))
+        or not math.isfinite(float(burstiness))
+        or float(burstiness) != REQUEST_BURSTINESS
+    ):
+        mismatches.append("burstiness")
 
     if mismatches:
         raise BenchmarkError(
