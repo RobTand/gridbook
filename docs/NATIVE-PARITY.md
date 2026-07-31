@@ -423,8 +423,9 @@ Each JSON report has schema `gridbook.vllm-bench-serve.v2` and contains:
 - the input-length ratio, validation envelope, observed per-request lengths, and
   for ranged cells the expected and observed canonical vector digests by block;
 - exact reconciliation of pinned vLLM's saved `backend`, `endpoint_type`,
-  `label`, `model_id`, `tokenizer_id`, `num_prompts`, `request_rate`, and
-  `max_concurrency` invocation fields before metrics are accepted;
+  `label`, `model_id`, `tokenizer_id`, `num_prompts`, `request_rate`,
+  `burstiness`, and `max_concurrency` invocation fields before metrics are
+  accepted;
 - sanitized vLLM detailed metric output for each block (generated text omitted,
   the complete `errors` field omitted regardless of type); and
 - mean, median, min, max, NumPy-linear block p05/p95, and sample standard
@@ -434,6 +435,12 @@ A nonzero client exit, failed request, missing streaming metric, early EOS, or
 length mismatch makes the report `failed`.  Required throughput and every
 requested percentile must be finite; TTFT and E2EL must be positive.  A
 multi-token response must also contain positive per-request ITL samples.
+The saved-result object must have the exact field envelope emitted by the
+pinned client: append-style arrays, unrequested metadata/ramp fields, and extra
+percentile labels fail. Its timestamp shape, generated-text/start-time
+cardinality, null unrequested goodput, text-dataset `rtfx`, and finite peak
+diagnostics are validated before arbitrary completion and error text is
+discarded.
 One-token prefill probes are explicitly exempt from ITL/TPOT positivity because
 there is no post-first-token interval.  A partial/failure report retains the
 redacted command, return code, sanitized result when one exists, and validation error

@@ -266,7 +266,7 @@ def _valid_result(args, *, offset=0.0):
         "request_goodput": None,
         "max_output_tokens_per_s": total_output / duration,
         "max_concurrent_requests": args.max_concurrency,
-        "rtfx": [1.0] * args.num_prompts,
+        "rtfx": 0.0,
         "ttfts": [ttft_ms / 1000] * args.num_prompts,
         "itls": [
             [itl_ms / 1000] if multi_token else [] for _ in range(args.num_prompts)
@@ -1264,6 +1264,22 @@ def test_pinned_vllm_saved_invocation_envelope_is_reconciled_exactly(tmp_path):
         with pytest.raises(bench_serve.BenchmarkError, match=field):
             bench_serve.validate_result(missing, args)
 
+    ancillary_mutations = {
+        "date": "2026-07-31",
+        "request_goodput": 1.0,
+        "generated_texts": result["generated_texts"][:-1],
+        "start_times": [-1.0, *result["start_times"][1:]],
+        "max_output_tokens_per_s": -1.0,
+        "max_concurrent_requests": True,
+        "rtfx": 0.1,
+    }
+    for field, bad_value in ancillary_mutations.items():
+        with pytest.raises(bench_serve.BenchmarkError, match=field):
+            bench_serve.validate_result({**result, field: bad_value}, args)
+
+    with pytest.raises(bench_serve.BenchmarkError, match="unexpected=metadata"):
+        bench_serve.validate_result({**result, "metadata": "not requested"}, args)
+
 
 def test_validate_result_requires_detailed_positive_streaming_arrays(tmp_path):
     args = _parse(tmp_path)
@@ -1413,6 +1429,10 @@ def test_percentile_labels_match_pinned_vllm_without_collisions(tmp_path):
     )
     assert "p1e-07_ttft_ms" in summary["metrics"]
     assert "p99.9999999_e2el_ms" in summary["metrics"]
+
+    unexpected = dict(result, p97_ttft_ms=result["p95_ttft_ms"])
+    with pytest.raises(bench_serve.BenchmarkError, match="unexpected=p97_ttft_ms"):
+        bench_serve.validate_result(unexpected, args)
 
 
 def test_itl_chunk_count_is_not_assumed_to_equal_output_tokens(tmp_path):
@@ -1891,6 +1911,13 @@ def test_non_strict_result_json_is_rejected_at_load_boundary(tmp_path, raw):
     result_path = tmp_path / "invalid.json"
     result_path.write_text(raw)
     with pytest.raises(bench_serve.BenchmarkError, match="not strict JSON"):
+        bench_serve._load_result(result_path)
+
+
+def test_result_loader_rejects_append_style_singleton_lists(tmp_path):
+    result_path = tmp_path / "unexpected-list.json"
+    result_path.write_text('[{"duration":1}]')
+    with pytest.raises(bench_serve.BenchmarkError, match="one object"):
         bench_serve._load_result(result_path)
 
 

@@ -75,6 +75,7 @@ REQUIRED_THROUGHPUT_RESULTS = (
 _PERCENTILE_RESULT = re.compile(
     r"^p(?:\d+(?:\.\d+)?(?:e[+-]?\d+)?)_(?:ttft|tpot|itl|e2el)_ms$"
 )
+_VLLM_RESULT_DATE = re.compile(r"^\d{8}-\d{6}$")
 _SENSITIVE_SEGMENTS = {
     "AUTH",
     "AUTHORIZATION",
@@ -127,6 +128,38 @@ _EXECUTION_ASSIGNMENT_FIELDS = (
     "quant_contract",
     "kernel_backend",
     "fallback_state",
+)
+
+_PINNED_RESULT_FIELDS = frozenset(
+    {
+        "date",
+        "endpoint_type",
+        "backend",
+        "label",
+        "model_id",
+        "tokenizer_id",
+        "num_prompts",
+        "request_rate",
+        "burstiness",
+        "max_concurrency",
+        "duration",
+        "completed",
+        "failed",
+        "total_input_tokens",
+        "total_output_tokens",
+        "request_goodput",
+        "input_lens",
+        "output_lens",
+        "ttfts",
+        "itls",
+        "start_times",
+        "generated_texts",
+        "errors",
+        "max_output_tokens_per_s",
+        "max_concurrent_requests",
+        "rtfx",
+        *SUMMARY_METRICS,
+    }
 )
 
 
@@ -1781,10 +1814,6 @@ def _load_result(path: Path) -> dict[str, Any]:
         raise BenchmarkError(f"vLLM did not create result file {path}") from exc
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         raise BenchmarkError(f"vLLM result is not strict JSON: {path}") from exc
-    # ``--append-result`` creates a list; the harness never requests it, but
-    # accepting a singleton makes this resilient to vLLM version differences.
-    if isinstance(payload, list) and len(payload) == 1:
-        payload = payload[0]
     if not isinstance(payload, dict):
         raise BenchmarkError("vLLM result JSON must contain one object")
     return payload
@@ -2065,6 +2094,85 @@ def _validate_speculative_result(
         )
 
 
+def _validate_result_envelope(
+    result: Mapping[str, Any], args: argparse.Namespace
+) -> None:
+    """Validate the complete saved-result shape of the pinned vLLM client."""
+
+    expected_fields = set(_PINNED_RESULT_FIELDS)
+    for percentile in args.percentiles.split(","):
+        for metric in ("ttft", "tpot", "itl", "e2el"):
+            expected_fields.add(_percentile_result_key(percentile, metric))
+    if args.speculative_mode == "on":
+        expected_fields.update(_SPEC_RESULT_FIELDS)
+
+    observed_fields = set(result)
+    missing = sorted(expected_fields - observed_fields)
+    unexpected = sorted(observed_fields - expected_fields)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append("missing=" + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected=" + ", ".join(unexpected))
+        raise BenchmarkError(
+            "vLLM result envelope disagrees with the pinned client: "
+            + "; ".join(details)
+        )
+
+    date = result.get("date")
+    if not isinstance(date, str) or not _VLLM_RESULT_DATE.fullmatch(date):
+        raise BenchmarkError("vLLM result date does not use YYYYMMDD-HHMMSS")
+
+    generated_texts = result.get("generated_texts")
+    if (
+        not isinstance(generated_texts, list)
+        or len(generated_texts) != args.num_prompts
+        or any(not isinstance(value, str) for value in generated_texts)
+    ):
+        raise BenchmarkError(
+            "vLLM detailed result generated_texts must contain one string per prompt"
+        )
+
+    start_times = result.get("start_times")
+    if not isinstance(start_times, list) or len(start_times) != args.num_prompts:
+        raise BenchmarkError(
+            "vLLM detailed result start_times must contain one value per prompt"
+        )
+    bad_start_times = [
+        index
+        for index, value in enumerate(start_times)
+        if isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < 0
+    ]
+    if bad_start_times:
+        raise BenchmarkError(
+            "vLLM detailed result has invalid start_times at request index: "
+            + ", ".join(str(index) for index in bad_start_times[:5])
+        )
+
+    if result.get("request_goodput") is not None:
+        raise BenchmarkError(
+            "vLLM result request_goodput must be null without a goodput command"
+        )
+    peak_output = _number(result, "max_output_tokens_per_s")
+    if peak_output is None or peak_output < 0:
+        raise BenchmarkError(
+            "vLLM result max_output_tokens_per_s must be finite and non-negative"
+        )
+    peak_concurrency = _exact_nonnegative_int(result, "max_concurrent_requests")
+    if peak_concurrency is None or not 1 <= peak_concurrency <= args.num_prompts:
+        raise BenchmarkError(
+            "vLLM result max_concurrent_requests must be a positive integer no "
+            "larger than num_prompts"
+        )
+    rtfx = _number(result, "rtfx")
+    if rtfx != 0:
+        raise BenchmarkError("vLLM result rtfx must be zero for the random text dataset")
+
+
 def validate_result(
     result: Mapping[str, Any], args: argparse.Namespace, *, block_index: int = 0
 ) -> None:
@@ -2336,6 +2444,7 @@ def validate_result(
         requested_percentiles,
         args.output_len,
     )
+    _validate_result_envelope(result, args)
 
 
 def summarize_blocks(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
