@@ -176,7 +176,7 @@ def test_grouped_decode_passes_each_stack_its_own_lut_and_format(monkeypatch):
     assert calls[1][0] == layer._cb_flat_fp8_w2.data_ptr()
 
 
-def test_default_fused_fp4_launches_with_each_stack_format(monkeypatch):
+def test_graded_fused_fp4_launches_with_each_stack_format(monkeypatch):
     w13 = _scheme("fp4", 12, 2, 57, ("a", "b"))
     w2 = _scheme("fp4", 16, 2, 73, ("c", "d"))
     method = _method(w13, w2)
@@ -221,7 +221,7 @@ def test_default_fused_fp4_launches_with_each_stack_format(monkeypatch):
     assert calls[1][3] is lut2 and calls[1][4] is compose2
 
 
-def test_unset_fp4_prefill_selects_the_graded_fused_path(monkeypatch):
+def test_explicit_fp4_prefill_selects_the_graded_fused_path(monkeypatch):
     w13 = _scheme("fp4", 12, 2, 57, ("a", "b"))
     w2 = _scheme("fp4", 16, 2, 73, ("c", "d"))
     method = _method(w13, w2)
@@ -235,8 +235,8 @@ def test_unset_fp4_prefill_selects_the_graded_fused_path(monkeypatch):
 
     method._apply_prefill_grouped_fused_fp4 = fused
     method._apply_prefill_loop = lambda *_args: pytest.fail(
-        "unset mode should not fall through to loop when fused succeeds")
-    monkeypatch.delenv("PRISMAQUANT_CB_FUSED_FP4_MOE", raising=False)
+        "explicit fused mode should not fall through when it succeeds")
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", "1")
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
     layer = types.SimpleNamespace(
         activation=types.SimpleNamespace(value="silu"),
@@ -246,6 +246,26 @@ def test_unset_fp4_prefill_selects_the_graded_fused_path(monkeypatch):
         torch.zeros(17, 1, dtype=torch.long))
     assert out is sentinel
     assert seen == {"tile_m": 128}
+
+
+def test_unset_fp4_prefill_keeps_graded_fused_fail_closed(monkeypatch):
+    w13 = _scheme("fp4", 12, 2, 57, ("a", "b"))
+    w2 = _scheme("fp4", 16, 2, 73, ("c", "d"))
+    method = _method(w13, w2)
+    method._cuda_moe_ok = lambda _layer: False
+    sentinel = torch.full((17, 256), 4.0)
+    method._apply_prefill_grouped_fused_fp4 = lambda *_args, **_kwargs: (
+        pytest.fail("unproven graded fused path must be off when env is unset"))
+    method._apply_prefill_loop = lambda *_args: sentinel
+    monkeypatch.delenv("PRISMAQUANT_CB_FUSED_FP4_MOE", raising=False)
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
+    layer = types.SimpleNamespace(
+        activation=types.SimpleNamespace(value="silu"),
+        apply_router_weight_on_input=False)
+    out = method._apply_inline(
+        layer, torch.zeros(17, 256), torch.ones(17, 1),
+        torch.zeros(17, 1, dtype=torch.long))
+    assert out is sentinel
 
 
 def test_graded_autotune_sink_records_both_rungs(tmp_path, monkeypatch):

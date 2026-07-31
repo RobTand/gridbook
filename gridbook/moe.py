@@ -569,22 +569,24 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # still wedges despite non-default-stream test battery green). The
         # L2-residency hypothesis remains unmeasured; do not add it to auto
         # candidates until a live serve survives a full prefill battery.
-        # fp4-MMA fused MoE prefill (OPT-IN, default OFF — the fp4 default
-        # below stays 'loop' and is byte-identical until
-        # PRISMAQUANT_CB_FUSED_FP4_MOE is set). One tile-indexed grouped
+        # fp4-MMA fused MoE prefill. One tile-indexed grouped
         # block-scaled launch per projection stage (OMMA.SF.16864, k=64),
         # the fp8 grouped_fused_v2 mechanism with the packed-CB decode in the
         # producer/prologue. Values: "1"/"128" tile_m=128, "256" tile_m=256.
         # NOTE the activation bucket changes on this path (native NVFP4 quant,
         # not codec.fp4_group16_act_qdq) — served-KL A/B required before any
         # promotion; any constraint miss falls through SILENTLY to the modes
-        # below (no behaviour change when the env is unset).
-        # DEFAULT-ON since 2026-07-31 (Robert's call); tile 128 is the measured
-        # best (5.2-5.6x the per-expert loop). PRISMAQUANT_CB_FUSED_FP4_MOE=0
-        # restores the per-expert loop. Same unvalidated-on-serving-metric
-        # caveat as the dense gate in linear.py applies.
+        # below. Uniform stacks remain DEFAULT-ON since 2026-07-31 (tile 128
+        # measured best at 5.2-5.6x the per-expert loop). Graded stacks are
+        # fail-closed by default: the per-stack argument wiring is implemented,
+        # but the current grouped extension fails CUTLASS initialization on
+        # GB10 even in its pre-existing uniform parity test. Explicitly setting
+        # PRISMAQUANT_CB_FUSED_FP4_MOE opts a graded stack into that experimental
+        # path; "0" restores the per-expert loop for every stack layout.
         if self.is_fp4 and num_tokens > 16:
-            gf4 = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "1").strip()
+            gf4_default = "1" if self._stack_formats_match else "0"
+            gf4 = os.environ.get(
+                "PRISMAQUANT_CB_FUSED_FP4_MOE", gf4_default).strip()
             if gf4 in ("1", "128", "256"):
                 out = self._apply_prefill_grouped_fused_fp4(
                     layer, x, topk_weights, topk_ids, act,
