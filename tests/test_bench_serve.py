@@ -17,7 +17,43 @@ import pytest
 from gridbook import bench_serve
 
 CLIENT_RUNTIME_ID = "vLLM 0.23.1rc1.dev764+g54b16d8a9.d20260703"
-GRIDBOOK_COMMIT = "d" * 40
+
+
+def _gridbook_commit_for_test_process():
+    """Use the exact checkout commit when the tests import a source tree.
+
+    Installed-wheel CI runs outside a checkout, where an explicit synthetic
+    commit is the intended provenance fixture.  A source-tree run must instead
+    agree with the checkout that actually supplied ``bench_serve.py``.
+    """
+
+    source = Path(bench_serve.__file__).resolve()
+    checkout = source.parents[1]
+    try:
+        top_level = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "d" * 40
+    if Path(top_level).resolve() != checkout or not bench_serve._GIT_COMMIT.fullmatch(
+        commit
+    ):
+        return "d" * 40
+    return commit.lower()
+
+
+GRIDBOOK_COMMIT = _gridbook_commit_for_test_process()
 
 
 def _argv(tmp_path):
@@ -866,12 +902,10 @@ def test_metadata_captures_supplied_artifact_and_server_identity(tmp_path, monke
         {"PRISMAQUANT_CB_DECODE": "cuda", "CUDA_VISIBLE_DEVICES": "0"},
     )
 
-    assert metadata["git"] == {
-        "commit": GRIDBOOK_COMMIT,
-        "dirty": None,
-        "source": "argument",
-        "release_eligible": True,
-    }
+    assert metadata["git"]["commit"] == GRIDBOOK_COMMIT
+    assert metadata["git"]["release_eligible"] is True
+    assert metadata["git"]["source"] in {"argument", "argument+checkout"}
+    assert metadata["git"]["dirty"] in {None, False}
     assert metadata["software"]["gridbook_version"] == "0.3.0"
     assert metadata["software"]["runner_vllm_cli_probe"] == CLIENT_RUNTIME_ID
     assert metadata["artifacts"]["image_id"].endswith("sha256:abc")
@@ -971,6 +1005,8 @@ def test_git_state_only_autodetects_the_exact_clean_source_checkout(
         "source": "checkout",
         "release_eligible": True,
     }
+    with pytest.raises(bench_serve.BenchmarkError, match="disagrees"):
+        bench_serve._git_state("b" * 40)
 
     state["dirty"] = " M gridbook/bench_serve.py\n"
     with pytest.raises(bench_serve.BenchmarkError, match="checkout is dirty"):

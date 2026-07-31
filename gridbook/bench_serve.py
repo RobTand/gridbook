@@ -1395,6 +1395,15 @@ def _git_state(
             "Gridbook checkout is dirty; commit the changes or pass --allow-dirty "
             "for research-only evidence"
         )
+    if (
+        commit_override is not None
+        and detected_commit is not None
+        and commit_override.lower() != detected_commit.lower()
+    ):
+        raise BenchmarkError(
+            "explicit Gridbook commit disagrees with the exact source checkout: "
+            f"argument={commit_override.lower()}, checkout={detected_commit.lower()}"
+        )
     if commit_override:
         return {
             "commit": commit_override.lower(),
