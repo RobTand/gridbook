@@ -349,6 +349,17 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         uniform = (_scheme_signature(stack_scheme["w13"])
                    == _scheme_signature(stack_scheme["w2"]))
         layer._cb_stack_uniform = uniform
+        # ``process_weights_after_loading`` is normally one-shot, but reload and
+        # test harnesses can reuse a module.  Resident encodings and eligibility
+        # answers are derived from the just-installed per-stack tables/formats;
+        # retaining any old one would silently undo the graded resolution.
+        for attr in (
+                "_cb_flat_fp8_w13", "_cb_flat_fp8_w2",
+                "_cb_fp4_gf_w13", "_cb_fp4_gf_w2", "_cb_fp4_gf_ones",
+                "_cb_gf4_ok", "_cb_gf_ok", "_cb_gf2_ok", "_cb_gf2_tiles",
+                "_cb_l2_ok"):
+            if hasattr(layer, attr):
+                delattr(layer, attr)
         for attr in ("_cb_flat", "_cb_compose", "_cb_flat_fp8"):
             if hasattr(layer, attr):
                 delattr(layer, attr)
@@ -664,6 +675,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         cached = getattr(layer, attr, None)
         if cached is not None:
             return cached
+        if which == "w2" and getattr(layer, "_cb_stack_uniform", False):
+            cached = getattr(layer, "_cb_fp4_gf_w13", None)
+            if cached is not None:
+                setattr(layer, attr, cached)
+                return cached
         k, n_sub, _type_size = self._fmt(which)
         scheme = (getattr(self, "stack_scheme", None)
                   or {"w13": self.scheme, "w2": self.scheme})[which]
@@ -2312,7 +2328,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if cb is None:
             legacy = getattr(layer, "_cb_flat_fp8", None)
             specific = getattr(layer, f"_cb_flat_{which}", None)
-            if specific is None and legacy is not None:
+            if legacy is not None and (
+                    specific is None
+                    or getattr(layer, "_cb_stack_uniform", False)):
                 cb = legacy
             else:
                 cb = self._cb(layer, "flat", which).to(

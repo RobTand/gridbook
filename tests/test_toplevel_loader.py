@@ -18,6 +18,7 @@ import torch
 import types
 
 from gridbook import moe_toplevel_loader
+from gridbook.cb_fill_guard import mark_unfilled
 from gridbook.moe_toplevel_loader import (
     _build_reverse_fusion,
     _load_shared_cb,
@@ -127,6 +128,48 @@ def test_wrapper_routes_experts_and_delegates_rest():
         "model.layers.0.mlp.down_proj.cb_qweight",
         "model.embed_tokens.weight",
     }
+
+
+def test_wrapper_fills_graded_stacks_with_different_row_widths():
+    """The top-level fill path copies each stack independently; it must not
+    assume w13 and w2 share a last dimension, and both fill sentinels must land."""
+    E, hidden, inter = 2, 256, 128
+    width13, width2 = 128, 112
+    prefix = "model.layers.1.mlp.experts."
+
+    class _FakeCausalLM:
+        def __init__(self):
+            self._params = {
+                prefix + "w13_cb_qweight": torch.zeros(
+                    E, 2 * inter, width13, dtype=torch.uint8),
+                prefix + "w2_cb_qweight": torch.zeros(
+                    E, hidden, width2, dtype=torch.uint8),
+            }
+            for param in self._params.values():
+                mark_unfilled(param)
+
+        def named_parameters(self):
+            return list(self._params.items())
+
+        def modules(self):
+            return []
+
+        def load_weights(self, weights):
+            return {name for name, _weight in weights}
+
+    install_toplevel_cb_expert_loader(_FakeCausalLM)
+    model = _FakeCausalLM()
+    loaded = model.load_weights(iter([
+        (prefix + "gate_up_proj.cb_qweight",
+         torch.full((E, 2 * inter, width13), 7, dtype=torch.uint8)),
+        (prefix + "down_proj.cb_qweight",
+         torch.full((E, hidden, width2), 9, dtype=torch.uint8)),
+    ]))
+    assert loaded == {prefix + "w13_cb_qweight", prefix + "w2_cb_qweight"}
+    assert torch.all(model._params[prefix + "w13_cb_qweight"] == 7)
+    assert torch.all(model._params[prefix + "w2_cb_qweight"] == 9)
+    assert all(getattr(param, "_pq_cb_filled", False)
+               for param in model._params.values())
 
 
 def test_wrapper_defers_unmappable_expert_name():
