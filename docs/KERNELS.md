@@ -136,10 +136,11 @@ cached for the process. Measured on Laguna-S-2.1 (117B MoE): **293 → 1,821 tok
 at 8k** and **207 → 1,822 tok/s at 63k**. Chunked prefill re-expands per
 microbatch, so `--max-num-batched-tokens 16384` matters for this path.
 
-**fp4**-CB MoE prefill now rides the same chunked `stock` path (default
-`PRISMAQUANT_CB_PREFILL=stock`, not `auto` — every other `auto` candidate is
-gated on fp8-CB). Its transient is a bf16 expand rather than the fp8-direct
-CUDA one, at 2 B/elt, so the chunk is sized from a **byte budget**
+**fp4**-CB MoE prefill can explicitly ride the same chunked `stock` path. The
+current unset policy remains fused-FP4 first, with `loop` on a constraint miss;
+an explicit `PRISMAQUANT_CB_PREFILL` bypasses that fused default so the selector
+is a reliable bisection control. Stock's transient is a bf16 expand rather than
+the fp8-direct CUDA one, at 2 B/elt, so its chunk is sized from a **byte budget**
 (`PRISMAQUANT_CB_PREFILL_CHUNK_BYTES`, default 1 GiB) instead of the fp8 lane's
 flat 256: on a 192-expert Hy3-class band that is 1,184 MiB of measured
 transient rather than 4,736 MiB, at no measured time cost. The fp4 branch also
@@ -217,5 +218,5 @@ serving; it is documented in [`BENCHMARKS.md`](BENCHMARKS.md) too.
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
 | Fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — persistent-N is the answer |
 | Persistent-N large-M dense prefill | **Built and MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. Quarantined behind `PRISMAQUANT_ENABLE_PTC=1` as a schedule reference; do not enable it. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
-| MoE prefill | **Shipped**: CUDA chunk-expander into vLLM's fused-MoE grouped kernel; fp8-CB default is `auto` (measured per-layer path selection). Laguna-S-2.1 117B: 293 → 1,821 tok/s @8k, 207 → 1,822 @63k. fp4-CB rides the same chunked `stock` path with a byte-budgeted expert chunk (1,184 MiB vs 4,736 MiB measured transient on a 192-expert band) and no pad copy |
+| MoE prefill | **Shipped**: CUDA chunk-expander into vLLM's fused-MoE grouped kernel; fp8-CB default is `auto` (measured per-layer path selection). Laguna-S-2.1 117B: 293 → 1,821 tok/s @8k, 207 → 1,822 @63k. fp4-CB defaults to fused-FP4 with loop fallback; explicit `stock` uses a byte-budgeted expert chunk (1,184 MiB vs 4,736 MiB measured transient on a 192-expert band) and no pad copy |
 | Triton fallbacks | **Shipped** for every path (correctness/CI; not INV-2-eligible) |

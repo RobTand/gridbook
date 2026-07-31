@@ -1,12 +1,9 @@
-"""CPU gate for the fp4-CB stock-prefill promotion (no GPU, no vLLM needed).
+"""CPU gate for safe fp4-CB stock prefill (no GPU, no vLLM needed).
 
-Three things move when fp4-CB stops defaulting to the per-expert ``loop``, and
-all three are decidable on CPU from shapes and config ints alone:
+Three things are decidable on CPU from shapes and config ints alone:
 
-  1. ``_apply_inline``'s prefill-mode default — fp4-CB now resolves to 'stock',
-     while fp8-CB must KEEP the measured per-layer 'auto' promoted in de10a2d.
-     A single unconditional ``or 'stock'`` would silently revert that, so the
-     fp8 arm is pinned here as a regression guard, not as an afterthought.
+  1. ``_apply_inline``'s mode precedence — an explicit stock/loop request must
+     bypass the default fused-FP4 path; an unset request keeps current policy.
   2. ``_stock_chunk_default`` — the fp4 bf16 chunk transient is 2 B/elt, so the
      fp8 lane's flat 256 holds every expert of a large MoE live at once. The
      fp4 chunk is byte-budgeted instead; fp8 keeps its 256 verbatim.
@@ -115,7 +112,7 @@ def _layer(E=HY3["E"], hidden=HY3["hidden"], inter=HY3["inter"]):
 # --------------------------------------------------------------------------- #
 # 1 — the prefill-mode default.                                                 #
 # --------------------------------------------------------------------------- #
-def _dispatch_mode(moe, monkeypatch, m):
+def _dispatch_mode(moe, monkeypatch, m, fused_fp4="fused_fp4"):
     """Run ``_apply_inline`` far enough to see which prefill arm it picks.
 
     32 tokens (> the 16-token decode cut-off) with every arm replaced by a
@@ -128,6 +125,14 @@ def _dispatch_mode(moe, monkeypatch, m):
             cls, f"_apply_prefill_{arm}",
             (lambda tag: lambda self, *a, **kw: tag)(arm),
             raising=True)
+    # ``grouped_fused`` first tries its v2 implementation; report the public
+    # selector name so this helper describes dispatch policy, not internals.
+    monkeypatch.setattr(
+        cls, "_apply_prefill_grouped_fused_v2",
+        lambda self, *a, **kw: "grouped_fused", raising=True)
+    monkeypatch.setattr(
+        cls, "_apply_prefill_grouped_fused_fp4",
+        lambda self, *a, **kw: fused_fp4, raising=True)
     monkeypatch.setattr(cls, "_cuda_moe_ok", lambda self, layer: False)
     lay = _layer()
     lay._cb_layer_id = None
@@ -139,10 +144,15 @@ def _dispatch_mode(moe, monkeypatch, m):
     return m._apply_inline(lay, x, w, ids)
 
 
-def test_default_prefill_mode_fp4_is_stock(moe, monkeypatch):
-    """The promotion itself: fp4-CB no longer defaults to the per-expert loop."""
+def test_unset_fp4_keeps_current_fused_default(moe, monkeypatch):
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
-    assert _dispatch_mode(moe, monkeypatch, _fp4(moe)) == "stock"
+    assert _dispatch_mode(moe, monkeypatch, _fp4(moe)) == "fused_fp4"
+
+
+def test_unset_fp4_fused_miss_falls_back_to_loop(moe, monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
+    assert _dispatch_mode(
+        moe, monkeypatch, _fp4(moe), fused_fp4=None) == "loop"
 
 
 def test_default_prefill_mode_fp8_is_still_auto(moe, monkeypatch):
@@ -154,11 +164,16 @@ def test_default_prefill_mode_fp8_is_still_auto(moe, monkeypatch):
     assert _dispatch_mode(moe, monkeypatch, _fp8(moe)) == "auto"
 
 
-@pytest.mark.parametrize("method", ["fp4", "fp8"])
-def test_env_still_overrides_the_default(moe, monkeypatch, method):
+@pytest.mark.parametrize("mode", ["stock", "loop", "batched",
+                                  "grouped_fused", "l2_pipeline"])
+def test_explicit_fp4_mode_bypasses_fused_default(moe, monkeypatch, mode):
+    monkeypatch.setenv("PRISMAQUANT_CB_PREFILL", mode)
+    assert _dispatch_mode(moe, monkeypatch, _fp4(moe)) == mode
+
+
+def test_fp8_explicit_mode_still_overrides_auto(moe, monkeypatch):
     monkeypatch.setenv("PRISMAQUANT_CB_PREFILL", "loop")
-    m = _fp4(moe) if method == "fp4" else _fp8(moe)
-    assert _dispatch_mode(moe, monkeypatch, m) == "loop"
+    assert _dispatch_mode(moe, monkeypatch, _fp8(moe)) == "loop"
 
 
 # --------------------------------------------------------------------------- #
@@ -195,15 +210,40 @@ def test_stock_chunk_env_overrides(moe, monkeypatch):
     assert m._stock_chunk_default(lay, torch.bfloat16) == 7
 
 
-def test_stock_chunk_never_zero_or_over_e(moe, monkeypatch):
+@pytest.mark.parametrize("name", ["PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK",
+                                  "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES"])
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-int"])
+def test_stock_chunk_rejects_invalid_environment(moe, monkeypatch, name,
+                                                  value):
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", raising=False)
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES", raising=False)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=f"{name} must be a positive integer"):
+        _fp4(moe)._stock_chunk_default(_layer(), torch.bfloat16)
+
+
+def test_stock_chunk_never_zero_or_over_e(moe, monkeypatch, capsys):
     """A budget smaller than one expert still runs (chunk 1), and a budget
     bigger than the whole stack never exceeds E."""
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", raising=False)
     m = _fp4(moe)
+    monkeypatch.setattr(moe.PrismaQuantCBMoEMethod,
+                        "_STOCK_BUDGET_WARNED", False)
     monkeypatch.setenv("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES", "1")
     assert m._stock_chunk_default(_layer(), torch.bfloat16) == 1
+    assert "budget cannot be met" in capsys.readouterr().err
+    assert m._stock_chunk_default(_layer(), torch.bfloat16) == 1
+    assert capsys.readouterr().err == ""
     monkeypatch.setenv("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES", str(1 << 40))
     assert m._stock_chunk_default(_layer(), torch.bfloat16) == HY3["E"]
+
+
+def test_stock_chunk_uses_bf16_tile_size_for_fp32_inputs(moe, monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", raising=False)
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES", raising=False)
+    m = _fp4(moe)
+    assert m._stock_chunk_default(_layer(), torch.float32) == 42
+    assert m._stock_chunk_default(_layer(), torch.bfloat16) == 42
 
 
 # --------------------------------------------------------------------------- #

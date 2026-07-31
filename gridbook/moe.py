@@ -123,6 +123,8 @@ def _disable_grouped_mm(exc) -> None:
 class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
     """CB decode for RoutedExperts (FusedMoE) — one uniform CB format per layer."""
 
+    _STOCK_BUDGET_WARNED = False
+
     def __init__(self, quant_config, moe: FusedMoEConfig, scheme: dict,
                  prefix: str) -> None:
         super().__init__(moe)
@@ -386,34 +388,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         #     codec.fp8_dynamic_act_qdq — test_stock_fp8_quant_matches_codec),
         #     fp4-v2 runs codec.fp4_group16_act_qdq explicitly on the module input
         #     AND the intermediate. Opt-in: PRISMAQUANT_CB_PREFILL=stock.
-        # Default: fp8-CB rides 'stock' (vLLM's own fused-MoE grouped kernel
-        # over CUDA-expanded e4m3 chunks — measured 5.5x the loop on
-        # Laguna-256E, 2026-07-23, with the slack-gate discipline bounding
-        # the ~1.6 GB chunk transient); superseded by 'auto' further down.
-        # fp4-CB NOW RIDES 'stock' TOO (2026-07-25, GB10/sm_121a, real
-        # checkpoint bytes at the real CB-band shape: E=192, w13 3072x4096,
-        # w2 4096x1536, M=2048, top_k=8). What the deferral above asked for:
-        #   * numerics AT SCALE — against an fp32-dequant oracle the stock
-        #     path is MORE faithful than the loop it replaces (rel-norm
-        #     2.72/2.71/2.77e-2 vs the loop's 3.11/3.10/3.17e-2 on the three
-        #     probed layers). Synthetic-fixture stock-vs-loop agreement is
-        #     1.64e-2 (uniform rung) / 3.24e-2 (mixed rung) — the mutual gap
-        #     is their bf16-vs-grouped accumulation, not a fidelity loss, so
-        #     the oracle statistic is the one that decides.
-        #   * TRANSIENT MEMORY AT SCALE — the reason this could not just be
-        #     switched on: the fp4 chunk tile is bf16 (2 B/elt), so the flat
-        #     chunk=256 the fp8 lane uses holds all 192 experts live —
-        #     4,736 MiB allocator-measured, ~3x the ~1.6 GB slack gate above
-        #     and the same class of transient that crashed the 1.4k-token
-        #     Hy3 prefill on 2026-07-20. _stock_chunk_default (below) sizes
-        #     the fp4 chunk from a BYTE budget instead: chunk 42, 1,184 MiB
-        #     measured (1.175x the analytic tile), flat across layers, and
-        #     0.283 s vs 0.302 s per prefill forward — 4.0x less transient
-        #     at no time cost.
-        # fp4 goes to 'stock', NOT 'auto': every other auto candidate is
-        # fp8-CB-only (_gf2_ok -> _gf_ok's "fp8-CB only" gate; _l2_ok's
-        # `not self.is_fp4`), so 'auto' on fp4 would time a one-candidate
-        # list and pay a tuning call for nothing.
+        # fp8-CB stock was measured at 5.5x the loop on Laguna-256E and is a
+        # candidate of the current 'auto' policy. fp4-CB stock remains an
+        # explicit fallback/A-B path: its BF16 transient is byte-budgeted
+        # below (42 experts / 1,184 MiB measured instead of the old 4,736 MiB
+        # whole-stack balloon on a 192-expert Hy3 band), and its packed slice
+        # no longer needs a padding copy. The unset fp4 policy remains unchanged
+        # rather than promoting a second numerical accumulation path.
         #
         #   'grouped_fused' — _apply_prefill_grouped_fused (round 1 of the MoE
         #     fused campaign, OPT-IN). Drops the stock path's HBM e4m3 expand
@@ -465,21 +446,20 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # still wedges despite non-default-stream test battery green). The
         # L2-residency hypothesis remains unmeasured; do not add it to auto
         # candidates until a live serve survives a full prefill battery.
-        # fp4-MMA fused MoE prefill (OPT-IN, default OFF — the fp4 default
-        # below stays 'loop' and is byte-identical until
-        # PRISMAQUANT_CB_FUSED_FP4_MOE is set). One tile-indexed grouped
+        # fp4-MMA fused MoE prefill. One tile-indexed grouped
         # block-scaled launch per projection stage (OMMA.SF.16864, k=64),
         # the fp8 grouped_fused_v2 mechanism with the packed-CB decode in the
         # producer/prologue. Values: "1"/"128" tile_m=128, "256" tile_m=256.
         # NOTE the activation bucket changes on this path (native NVFP4 quant,
-        # not codec.fp4_group16_act_qdq) — served-KL A/B required before any
-        # promotion; any constraint miss falls through SILENTLY to the modes
-        # below (no behaviour change when the env is unset).
+        # not codec.fp4_group16_act_qdq). An explicit PRISMAQUANT_CB_PREFILL
+        # is authoritative and bypasses this default, so stock/loop remain
+        # real bisection controls rather than being silently preempted.
         # DEFAULT-ON since 2026-07-31 (Robert's call); tile 128 is the measured
         # best (5.2-5.6x the per-expert loop). PRISMAQUANT_CB_FUSED_FP4_MOE=0
         # restores the per-expert loop. Same unvalidated-on-serving-metric
         # caveat as the dense gate in linear.py applies.
-        if self.is_fp4 and num_tokens > 16:
+        requested_mode = os.environ.get("PRISMAQUANT_CB_PREFILL")
+        if requested_mode is None and self.is_fp4 and num_tokens > 16:
             gf4 = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "1").strip()
             if gf4 in ("1", "128", "256"):
                 out = self._apply_prefill_grouped_fused_fp4(
@@ -488,8 +468,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 if out is not None:
                     return out
 
-        mode = os.environ.get("PRISMAQUANT_CB_PREFILL") or (
-            "auto" if not self.is_fp4 else "stock")
+        # Preserve current policy: fp8 uses measured auto; fp4 first tries its
+        # default fused path above and falls back to the conservative loop on a
+        # constraint miss. Stock remains explicitly selectable, now with safe
+        # byte budgeting and a zero-copy packed view.
+        mode = requested_mode or ("auto" if not self.is_fp4 else "loop")
         if mode == "auto":
             return self._apply_prefill_auto(
                 layer, x, topk_weights, topk_ids, act)
@@ -2078,7 +2061,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                   + f" other={(_tot-_acc)*1000:.0f}ms", flush=True)
         return out
 
-    def _stock_chunk_default(self, layer, dtype) -> int:
+    def _stock_chunk_default(self, layer, _dtype=None) -> int:
         """Expert-chunk count for ``_apply_prefill_stock`` (INV-1 sizing).
 
         ``PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK`` overrides everything (bisection
@@ -2104,17 +2087,45 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         (shapes and env), never a tensor value, so the trip count stays a
         constant of the captured graph.
         """
-        env = os.environ.get("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
-        if env:
-            return int(env)
         E = int(layer._cb_E)
+        if E <= 0:
+            raise ValueError("CB expert count must be a positive integer")
+
+        def _positive_env(name: str, default: int | None = None) -> int:
+            raw = os.environ.get(name)
+            if raw is None or raw.strip() == "":
+                if default is None:
+                    raise ValueError(f"{name} is required")
+                return default
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a positive integer, got "
+                                 f"{raw!r}") from exc
+            if value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got "
+                                 f"{raw!r}")
+            return value
+
+        env = os.environ.get("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
+        if env is not None and env.strip() != "":
+            return min(E, _positive_env(
+                "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK"))
         if not self.is_fp4:
             return 256
-        budget = int(os.environ.get(
-            "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES") or (1 << 30))
-        elt = torch.finfo(dtype).bits // 8 if dtype.is_floating_point else 2
+        budget = _positive_env("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES", 1 << 30)
+        # expand_fp4_v2_to_weight always emits BF16, independent of x.dtype.
+        elt = 2
         # w13 tile (2*inter x hidden) >= w2 tile (hidden x inter) always.
         per_expert = 2 * int(layer._cb_inter) * int(layer._cb_hidden) * elt
+        if (per_expert > budget
+                and not PrismaQuantCBMoEMethod._STOCK_BUDGET_WARNED):
+            print("[prismaquant-cb] WARNING: one fp4 stock-prefill expert "
+                  f"tile ({per_expert} bytes) exceeds "
+                  f"PRISMAQUANT_CB_PREFILL_CHUNK_BYTES={budget}; using chunk "
+                  "1, so the budget cannot be met.", file=sys.stderr,
+                  flush=True)
+            PrismaQuantCBMoEMethod._STOCK_BUDGET_WARNED = True
         return max(1, min(E, budget // max(1, per_expert)))
 
     @staticmethod
