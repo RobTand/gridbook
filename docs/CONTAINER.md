@@ -368,8 +368,9 @@ artifact bytes  +  KV cache  +  ~2-4 GB runtime/activation overhead
 - **`--max-model-len`** and **`--max-num-seqs`** multiply into the KV pool. The
   27B recipe above uses 32768 / 2. Reduce both first when a load OOMs.
 - **`--enforce-eager`** skips CUDA-graph capture. It costs some decode
-  throughput but removes a large capture-time memory spike; every measurement in
-  `BENCHMARKS.md` was taken with it.
+  throughput but removes capture startup and memory. Published-model rows in
+  `BENCHMARKS.md` use it; the explicitly labelled 0.6B graph canary uses
+  mode-0 `FULL_DECODE_ONLY` with capture sizes `[1,2,4,8]`.
 
 ### On unified-memory boxes (GB10 / DGX Spark)
 

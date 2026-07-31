@@ -103,11 +103,12 @@ warning rather than for a crash:
 
 Notes:
 
-- **`--enforce-eager` is the tested configuration.** The decode dispatch branches
-  on the token count on the host, which is capture-hostile; naive graph capture
-  made decode *worse*, because vLLM pads captured decode batches past the
-  prefill threshold and every graphed step then took the prefill path. Details
-  and the exceptions: [`KERNELS.md`](docs/KERNELS.md#cuda-graph-safety-rules).
+- **`--enforce-eager` remains the published 27B configuration.** The default
+  opaque dispatch now makes a mode-0 `FULL_DECODE_ONLY` graph a supported
+  optimization candidate; it improved the close-rate 0.6B canary by 20.1% and
+  replayed changed inputs exactly. Keep eager for the quickstart until the same
+  graph configuration clears the 27B streaming gate. Details and the exact
+  flags: [`KERNELS.md`](docs/KERNELS.md#cuda-graph-safety-rules).
 - **`--gpu-memory-utilization 0.85` is a deliberately conservative start**, not a
   tuned value. On a unified-memory box (GB10 / DGX Spark) that flag does not
   carve up private VRAM — it claims from the pool the host also lives in, and

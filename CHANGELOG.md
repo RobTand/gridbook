@@ -6,6 +6,9 @@
   different activation bucket awaits a served quality A/B. This also avoids
   the grouped MoE kernel's severe padding amplification immediately above its
   16-token dispatch boundary.
+- Revalidate `FULL_DECODE_ONLY` CUDA graphs with the opaque default dispatch:
+  changed inputs replay exactly against eager at capture sizes 1 and 4, and a
+  close-rate 0.6B canary narrows Gridbook decode to 5.9% of native.
 
 ## 0.3.0 — 2026-07-31
 

@@ -381,22 +381,32 @@ Work down this list:
 
 ## Do I really need `--enforce-eager`?
 
-It is what every published number used, and the honest answer is that naive
-graph capture measured **worse**, not better.
+It remains the conservative configuration used for the published 27B result,
+but it is no longer the only capture-safe choice.
 
-The decode dispatch branches on the host over the token count (small M → the
-GEMV kernel; large M → the prefill path). vLLM pads captured decode batches, and
-the padded size can land above that threshold, so every graphed decode step took
-the *prefill* path — one token at a time. Launch overhead was not the decode
-bottleneck; the kernel's own throughput was.
+The old inline dispatch let a prefill-sized trace bake the wrong arm into a
+decode graph. The default `PRISMAQUANT_CB_DISPATCH=op` now wraps each complete
+Linear/MoE dispatch in one opaque custom op. A decode-size capture therefore
+records the GEMV arm, while prefill executes eagerly and chooses its own arm.
 
-Paths with no host branching (the dense and MoE FP4-v2 grouped kernels) *are*
-capture-clean, and a `FULL_DECODE_ONLY` capture with `torch.compile` disabled
-over the plugin measured **+24% decode on the 295B artifact**. That is a
-supported configuration, not the default. The rules are in
-[KERNELS.md](KERNELS.md#cuda-graph-safety-rules).
+The validated candidate is:
 
-If you drop `--enforce-eager`, measure. Do not assume.
+```text
+--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8]}'
+```
+
+Leave `PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE` unset and do not select
+`PRISMAQUANT_CB_DISPATCH=inline`. On the close-rate 0.6B canary this improved
+Gridbook's 32+256 whole-request latency by 20.1%, to within 5.9% of native;
+changed batch-1 and batch-4 prompts matched eager text, tokens, and token
+logprobs exactly. It also adds graph-capture startup time and memory, so choose
+capture sizes that match the concurrency you actually serve. The 295B FP4-v2
+path separately measured +24% decode. The published 27B FP8-CB artifact still
+needs the full streaming gate before its quickstart changes.
+
+The rules and evidence limits are in
+[KERNELS.md](KERNELS.md#cuda-graph-safety-rules) and
+[BENCHMARKS.md](BENCHMARKS.md#2026-07-31-cuda-graph-canary--close-rate-not-formal-parity).
 
 ---
 
