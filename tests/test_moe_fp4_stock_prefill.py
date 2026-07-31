@@ -2,8 +2,9 @@
 
 Three things are decidable on CPU from shapes and config ints alone:
 
-  1. ``_apply_inline``'s mode precedence — an explicit stock/loop request must
-     bypass the default fused-FP4 path; an unset request keeps current policy.
+  1. ``_apply_inline``'s mode precedence — fused FP4 is explicitly opted in;
+     an unset request takes the conservative loop, and an explicit stock/loop
+     request remains authoritative.
   2. ``_stock_chunk_default`` — the fp4 bf16 chunk transient is 2 B/elt, so the
      fp8 lane's flat 256 holds every expert of a large MoE live at once. The
      fp4 chunk is byte-budgeted instead; fp8 keeps its 256 verbatim.
@@ -63,19 +64,28 @@ def moe(request):
     """``gridbook.moe``, importable with or without a real vLLM install."""
     import importlib
 
-    before = set(sys.modules)
+    # Preserve complete module objects, not only names. Another CPU test may
+    # have installed a deliberately smaller vLLM stub first; ``import vllm``
+    # alone would then succeed even though the MoE submodules are absent.
+    before = {
+        name: module for name, module in sys.modules.items()
+        if name.startswith("vllm") or name.startswith("gridbook")
+    }
     stubbed = False
     try:
-        import vllm  # noqa: F401
+        from vllm.model_executor.layers.fused_moe.config import (  # noqa: F401
+            FusedMoEConfig,
+        )
     except Exception:
         _install_vllm_stubs()
         stubbed = True
     mod = importlib.import_module("gridbook.moe")
     yield mod
     if stubbed:
-        for name in set(sys.modules) - before:
+        for name in list(sys.modules):
             if name.startswith("vllm") or name.startswith("gridbook"):
                 sys.modules.pop(name, None)
+        sys.modules.update(before)
 
 
 def _method(moe, *, grid, k, n_sub, type_size, is_v2=True):
@@ -144,13 +154,22 @@ def _dispatch_mode(moe, monkeypatch, m, fused_fp4="fused_fp4"):
     return m._apply_inline(lay, x, w, ids)
 
 
-def test_unset_fp4_keeps_current_fused_default(moe, monkeypatch):
+def test_unset_fp4_uses_conservative_loop(moe, monkeypatch):
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
+    monkeypatch.delenv("PRISMAQUANT_CB_FUSED_FP4_MOE", raising=False)
+    assert _dispatch_mode(moe, monkeypatch, _fp4(moe)) == "loop"
+
+
+@pytest.mark.parametrize("value", ["1", "128", "256"])
+def test_fp4_fused_prefill_is_explicitly_opted_in(moe, monkeypatch, value):
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", value)
     assert _dispatch_mode(moe, monkeypatch, _fp4(moe)) == "fused_fp4"
 
 
-def test_unset_fp4_fused_miss_falls_back_to_loop(moe, monkeypatch):
+def test_opted_in_fp4_fused_miss_falls_back_to_loop(moe, monkeypatch):
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", "1")
     assert _dispatch_mode(
         moe, monkeypatch, _fp4(moe), fused_fp4=None) == "loop"
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Restore dense and MoE fused NVFP4 prefill to explicit opt-in while its
+  different activation bucket awaits a served quality A/B. This also avoids
+  the grouped MoE kernel's severe padding amplification immediately above its
+  16-token dispatch boundary.
+
 ## 0.3.0 — 2026-07-31
 
 This release incorporates reviewed contributions from Jason Wong

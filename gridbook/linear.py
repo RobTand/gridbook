@@ -55,20 +55,18 @@ _FP4_FUSED_MODE: list = []
 
 
 def _fp4_fused_mode() -> str:
-    # DEFAULT-ON since 2026-07-31 (Robert's call). Set
-    # PRISMAQUANT_CB_FUSED_FP4=0 to restore the Triton decode path.
-    #
-    # What this changes for a served artifact: the fp4 activation bucket moves
+    # Explicit opt-in: what this changes for a served artifact is the fp4
+    # activation bucket moving
     # from the Triton path's fp32 emulation scales to the format's native
     # ue4m3 scale factors — measured ~7.5e-2 relative against Triton. The fused
     # kernel is bit-exact against the stock NVF4 collective, so this is
     # arguably the *more* faithful rendering of what NVFP4 hardware serving
     # does; but it is a change in served numerics that has NOT been validated
     # on the serving metric (no KL/PPL A/B). See
-    # docs/lanes/nvfp4-cb/fp4-fused-prefill.md.
+    # docs/KERNELS.md ("Fused decode-in-prologue").
     if not _FP4_FUSED_MODE:
         _FP4_FUSED_MODE.append(
-            os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "1").strip())
+            os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "").strip())
     return _FP4_FUSED_MODE[0]
 
 
@@ -490,7 +488,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # global x per-group-16 ue4m3 SF) instead of the Triton/transient
         # paths' fp32-group-scale QDQ — the hardware SF operand is ue4m3, an
         # fp32 group scale is unrepresentable. Promotion therefore requires a
-        # served KL A/B (docs/lanes/nvfp4-cb/fp4-fused-prefill.md), which is
+        # served KL A/B (docs/KERNELS.md), which is
         # why this lands opt-in. "1" = all prefill M; "midm" = only the fp8
         # kernel's proven 16<M<=128 niche.
         if (self.is_fp4 and bias is None and M > PREFILL_M_THRESHOLD

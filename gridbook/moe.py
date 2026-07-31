@@ -492,13 +492,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # not codec.fp4_group16_act_qdq). An explicit PRISMAQUANT_CB_PREFILL
         # is authoritative and bypasses this default, so stock/loop remain
         # real bisection controls rather than being silently preempted.
-        # DEFAULT-ON since 2026-07-31 (Robert's call); tile 128 is the measured
-        # best (5.2-5.6x the per-expert loop). PRISMAQUANT_CB_FUSED_FP4_MOE=0
-        # restores the per-expert loop. Same unvalidated-on-serving-metric
-        # caveat as the dense gate in linear.py applies.
+        # Explicit opt-in until a served quality gate and routing-shape ladder
+        # pass. Tile 128 is 5.2-5.6x faster than the per-expert loop on the
+        # measured shapes, but its padding cost has a sharp token-count cliff.
+        # The same unvalidated-on-serving-metric caveat as the dense gate in
+        # linear.py applies.
         requested_mode = os.environ.get("PRISMAQUANT_CB_PREFILL")
         if requested_mode is None and self.is_fp4 and num_tokens > 16:
-            gf4 = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "1").strip()
+            gf4 = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "").strip()
             if gf4 in ("1", "128", "256"):
                 out = self._apply_prefill_grouped_fused_fp4(
                     layer, x, topk_weights, topk_ids, act,

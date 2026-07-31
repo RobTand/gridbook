@@ -74,7 +74,27 @@ if "vllm" not in sys.modules:
 
 from gridbook import codec                                        # noqa: E402
 from gridbook.config import PrismaQuantConfig                      # noqa: E402
+from gridbook import linear as cb_linear                           # noqa: E402
 from gridbook.linear import PrismaQuantCBLinearMethod              # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_fp4_fused_mode_cache():
+    """Keep process-global dispatch policy independent between tests."""
+    cb_linear._FP4_FUSED_MODE.clear()
+    yield
+    cb_linear._FP4_FUSED_MODE.clear()
+
+
+def test_dense_fp4_fused_prefill_is_opt_in(monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_CB_FUSED_FP4", raising=False)
+    assert cb_linear._fp4_fused_mode() == ""
+
+
+@pytest.mark.parametrize("value", ["1", "midm"])
+def test_dense_fp4_fused_prefill_explicit_modes(monkeypatch, value):
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
+    assert cb_linear._fp4_fused_mode() == value
 
 
 @pytest.fixture(autouse=True)
