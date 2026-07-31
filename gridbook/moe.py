@@ -433,8 +433,12 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # not codec.fp4_group16_act_qdq) — served-KL A/B required before any
         # promotion; any constraint miss falls through SILENTLY to the modes
         # below (no behaviour change when the env is unset).
+        # DEFAULT-ON since 2026-07-31 (Robert's call); tile 128 is the measured
+        # best (5.2-5.6x the per-expert loop). PRISMAQUANT_CB_FUSED_FP4_MOE=0
+        # restores the per-expert loop. Same unvalidated-on-serving-metric
+        # caveat as the dense gate in linear.py applies.
         if self.is_fp4 and num_tokens > 16:
-            gf4 = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "").strip()
+            gf4 = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "1").strip()
             if gf4 in ("1", "128", "256"):
                 out = self._apply_prefill_grouped_fused_fp4(
                     layer, x, topk_weights, topk_ids, act,

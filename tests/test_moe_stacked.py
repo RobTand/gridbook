@@ -76,9 +76,16 @@ def test_stacked_fp8_expert_scale_slices():
 def test_moe_method_buffer_shapes():
     """vLLM-dependent: construct the CB MoE method + create_weights, assert the
     stacked w13/w2 buffer shapes. Deferred to the container (post-27B window)."""
-    pytest.importorskip("vllm")
+    # Skip on `gridbook.moe` itself, not on `vllm`. Importing `vllm` (or even
+    # `...layers.fused_moe`) can succeed while the specific submodule
+    # `gridbook.moe` needs is absent — and an earlier test in the same session
+    # can leave a partial `vllm` in sys.modules, so a narrower importorskip
+    # passes and the real import then hard-fails. Gating on the module under
+    # test is order-independent.
+    moe_mod = pytest.importorskip("gridbook.moe")
     import types
-    from gridbook.moe import PrismaQuantCBMoEMethod, _row_bytes
+    PrismaQuantCBMoEMethod = moe_mod.PrismaQuantCBMoEMethod
+    _row_bytes = moe_mod._row_bytes
 
     E, hidden, inter, k, ts = 8, 512, 1024, 44, 176   # fp8 k44 -> ts=4k=176
     scheme = {"grid": "fp8", "mode": "product", "k": k, "n_sub": 4,
