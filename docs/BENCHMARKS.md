@@ -1,5 +1,11 @@
 # Benchmarks
 
+For new native-performance work, use the reproducible streaming
+[native-parity protocol](NATIVE-PARITY.md). It fixes request shapes and seeds,
+runs independent blocks through `vllm bench serve`, and records the artifact,
+image, dispatch, software, and server provenance alongside true TTFT/TPOT/ITL/
+E2EL metrics.
+
 All results are from a **single NVIDIA GB10 / DGX Spark** (Blackwell `sm_121`,
 128 GB unified memory, ~273 GB/s). Published-model rows use vLLM with
 `--enforce-eager`; the explicitly labelled CUDA-graph canary does not. Read the
