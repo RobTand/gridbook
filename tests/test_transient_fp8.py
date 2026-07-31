@@ -91,6 +91,8 @@ def _subtables(scheme, codebooks):
 def _prep(qname):
     """Load a single-role FP8_CB layer and derive every tensor the transient
     path consumes. Returns a dict."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required for artifact-backed expansion")
     tensors, codebooks, q2s = _load()
     if qname not in q2s:
         pytest.skip(f"{qname} not a CB target in {ART}")
