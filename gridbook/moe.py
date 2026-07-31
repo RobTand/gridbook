@@ -65,7 +65,7 @@ from .moe_l2 import (
     cb_l2_plan,
 )
 from .moe_routing import cb_grouped_pad_routing
-from .ops import dispatch_via_op
+from .ops import dispatch_via_op, fp4_act_qdq_or_codec
 
 
 def _row_bytes(in_features: int, type_size: int) -> int:
@@ -120,10 +120,20 @@ def _disable_grouped_mm(exc) -> None:
     _GROUPED_MM_OK = False
 
 
+# Backward-compatible private name for the integrated follow-on patch and its
+# focused tests.  The implementation lives in codec so dense, MoE and
+# top-level-loader codebook construction all enforce the same contract.
+_assert_cast_lossless = codec.assert_cast_lossless
+
+
 class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
     """CB decode for RoutedExperts (FusedMoE) — one uniform CB format per layer."""
 
-    _STOCK_BUDGET_WARNED = False
+    # Process-wide fail-loud state (see _cb_expand_ext_ok / _cuda_moe_ok).
+    _EXPAND_EXT_OK: bool | None = None   # cached cuda_ext probe for the expander
+    _DECODE_ENGAGED_LOGGED = False       # one-time decode-path engagement line
+    _DECODE_DISABLED_LOGGED = False      # deduplicate a host-wide ext failure
+    _STOCK_BUDGET_WARNED = False         # deduplicate undersized-budget warning
 
     def __init__(self, quant_config, moe: FusedMoEConfig, scheme: dict,
                  prefix: str) -> None:
@@ -249,13 +259,18 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         ref = self.scheme["codebook_ref"]
         names = ref if isinstance(ref, list) else [ref]
         subs = [codebooks[n].to(dev) for n in names]
-        layer._cb_flat = codec.build_flat_codebook(subs)
+        layer._cb_flat = codec.build_flat_codebook(
+            subs, self.prefix, "fp4" if self.is_fp4 else "fp8")
         layer._cb_row0 = torch.zeros(1, dtype=torch.int32, device=dev)
         if self.is_v2:
             layer._cb_compose = codec.build_compose_table(
                 self._sub_table).to(dev)
         else:
             layer._cb_compose = torch.zeros(1, dtype=torch.float32, device=dev)
+            # Materialize and validate every representation while the model is
+            # loading.  A disabled grouped-decode gate must not defer this to
+            # the first stock-prefill forward (which may be under capture).
+            self._stock_cb_flat_fp8(layer)
         # Per-layer uniformity: one format for all experts (union-find at
         # export). The stacked buffer is single-format by construction; assert
         # the byte width matches the scheme so a mis-exported stack fails loudly.
@@ -1948,7 +1963,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             a1, a1s = moe_kernel_quantize_input(
                 x, None, fp8_dtype, per_act_token_quant=True)
         else:
-            a1 = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+            a1 = fp4_act_qdq_or_codec(x)
             a1s = None
         if _timing:
             torch.cuda.synchronize(); _t["qdq"] += _time.time() - _t0
@@ -2016,7 +2031,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                     ic2, None, fp8_dtype, per_act_token_quant=True)
                 b2s = layer.w2_weight_scale[c0:c1]            # [nE, hidden]
             else:
-                a2 = codec.fp4_group16_act_qdq(ic2).to(torch.bfloat16)
+                a2 = fp4_act_qdq_or_codec(ic2)
                 a2s = b2s = None
             if _timing:
                 torch.cuda.synchronize(); _t["qdq"] += _time.time() - _t0
@@ -2190,7 +2205,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # the .contiguous() copy the Triton path required — that pair
             # cost ~26 ms/layer of pure memcpy on Laguna-256E prefill.
             # PRISMAQUANT_CB_EXPAND=triton restores the old path (bisection).
-            if _expand_env == "triton":
+            # The extension probe is NOT optional: pq_ops.cb_expand_fp8 calls
+            # get_ext().cb_expand_fp8 with no None check of its own (ops.py's
+            # docstring says "Caller must check cuda_ext.get_ext()"), so on a
+            # host where the JIT build failed this branch raises AttributeError
+            # mid-prefill instead of falling back — breaking the fallback
+            # contract cuda_ext.py's own module docstring advertises.
+            if (_expand_env == "triton"
+                    or not self._cb_expand_ext_ok()):
                 qwp = codec.pad_qweight(
                     packed.reshape(nE * out_f, -1).contiguous())
                 W = expand_cb_to_fp8(
@@ -2231,14 +2253,39 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         return W.view(nE, out_f, in_f)
 
     @staticmethod
-    def _stock_cb_flat_fp8(layer) -> torch.Tensor:
+    def _cb_expand_ext_ok() -> bool:
+        """Is the JIT CUDA extension (which owns ``cb_expand_fp8``) loaded?
+
+        Probed once and cached on the class; resolves at capture time with no
+        device read. ``ops.cb_expand_fp8`` dereferences ``get_ext()``
+        unconditionally, so a caller that skips this probe gets an
+        ``AttributeError`` on a host with no usable nvcc rather than the Triton
+        fallback ``cuda_ext.get_ext`` promises."""
+        ok = PrismaQuantCBMoEMethod._EXPAND_EXT_OK
+        if ok is None:
+            from .cuda_ext import get_ext
+            ext = get_ext()
+            ok = ext is not None and hasattr(ext, "cb_expand_fp8")
+            if not ok:
+                print("[prismaquant-cb] WARNING: CUDA expand extension "
+                      "unavailable — stock prefill falls back to the padded "
+                      "Triton expander (correct, measurably slower).",
+                      file=sys.stderr, flush=True)
+            PrismaQuantCBMoEMethod._EXPAND_EXT_OK = ok
+        return ok
+
+    def _stock_cb_flat_fp8(self, layer) -> torch.Tensor:
         """The per-layer codebook re-encoded to E4M3 bytes for the fp8-direct
-        expand (every CB value is on the e4m3 grid — lossless). Cached on the
-        layer (also built by the CUDA-decode gate); built once, before capture."""
+        expand. Cached on the layer (also built by the CUDA-decode gate); built
+        once, before capture. "Every CB value is on the e4m3 grid — lossless"
+        used to be a comment here; it is now a check (see
+        ``_assert_cast_lossless``), because learned tables must satisfy the
+        same serving-grid contract as lattice tables.
+        (Was a ``@staticmethod``; every call site already went through ``self``,
+        and the check wants the layer prefix for its message.)"""
         cb = getattr(layer, "_cb_flat_fp8", None)
         if cb is None:
-            cb = layer._cb_flat.to(torch.float8_e4m3fn).view(
-                torch.uint8).contiguous()
+            cb = codec.flat_codebook_fp8(layer._cb_flat, self.prefix)
             layer._cb_flat_fp8 = cb
         return cb
 
@@ -2258,10 +2305,35 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             if ok:
                 from .cuda_ext import get_ext
                 ok = get_ext() is not None
-            if ok and not self.is_fp4 and not hasattr(layer, "_cb_flat_fp8"):
-                layer._cb_flat_fp8 = layer._cb_flat.to(
-                    torch.float8_e4m3fn).view(torch.uint8).contiguous()
+                if not ok:
+                    # This used to cache ok=False with NO log line, and apply()
+                    # then fell through to the full-E stock-prefill path AT
+                    # DECODE — numerically correct, so nothing downstream can
+                    # tell, but a different throughput class entirely. A
+                    # benchmark taken on that path looks valid and measures the
+                    # wrong thing; say so on stderr instead.
+                    cls = PrismaQuantCBMoEMethod
+                    if not cls._DECODE_DISABLED_LOGGED:
+                        print("[prismaquant-cb] WARNING: grouped CUDA decode "
+                              "extension unavailable; the grouped path is "
+                              "disabled and the configured runtime fallback "
+                              "will be used. Throughput may differ.",
+                              file=sys.stderr, flush=True)
+                        cls._DECODE_DISABLED_LOGGED = True
+            if ok and not self.is_fp4:
+                # Normally materialized during process_weights_after_loading;
+                # retain this defensive check for callers that construct a
+                # layer through an alternate/test load path.
+                self._stock_cb_flat_fp8(layer)
             layer._cb_moe_cuda_ok = ok
+            if ok and not PrismaQuantCBMoEMethod._DECODE_ENGAGED_LOGGED:
+                # Positive counterpart to the warning above: one line per
+                # process proving WHICH decode path a run actually engaged, so
+                # a log can settle it after the fact regardless of why the fast
+                # path might have disengaged (missing extension,
+                # PRISMAQUANT_CB_DECODE override, or an unsupported format).
+                print("[prismaquant-cb] decode=grouped-cuda", flush=True)
+                PrismaQuantCBMoEMethod._DECODE_ENGAGED_LOGGED = True
         return ok
 
     def _apply_grouped_decode(self, layer, x, topk_weights, topk_ids, act):
@@ -2294,7 +2366,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # bit-identical to the loop's codec.fp4_group16_act_qdq; the kernel
             # composes the two-tier weight scale in-register from the packed
             # 9-byte section + the resident (256,16) compose table.
-            xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+            xq = fp4_act_qdq_or_codec(x)
             gate_up = pq_ops.cb_moe_gemv_fp4_v2(
                 xq, layer.w13_cb_qweight.data, layer._cb_flat,
                 layer._cb_compose, pair_expert, pair_xrow,
@@ -2312,7 +2384,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         apply_moe_activation(act, a, gate_up)
 
         if self.is_fp4:
-            aq = codec.fp4_group16_act_qdq(a).to(torch.bfloat16)
+            aq = fp4_act_qdq_or_codec(a)
             y_down = pq_ops.cb_moe_gemv_fp4_v2(
                 aq, layer.w2_cb_qweight.data, layer._cb_flat,
                 layer._cb_compose, pair_expert, pair_self,

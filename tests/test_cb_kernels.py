@@ -43,6 +43,9 @@ codec = pytest.importorskip(
 kernels = pytest.importorskip("gridbook.kernels")
 cb_decode_linear = kernels.cb_decode_linear
 
+if not torch.cuda.is_available():
+    pytest.skip("CUDA device unavailable", allow_module_level=True)
+
 SERVE = Path("/home/rob/dq-runs/nvfp4-cb-phase0/serve")
 ARTIFACTS = ["fp8cb_k44", "nvfp4cb_k16"]
 # One single-role Linear per common role (single codebook -> row offset 0).

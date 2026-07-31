@@ -312,6 +312,61 @@ All **non-target tensors** (norms, embeddings, `lm_head`, BF16-assigned Linears)
 are copied verbatim (BF16 passthrough) and their module names **MUST** appear in
 the config `ignore` set (§5).
 
+### 4.1 External codebook provenance (`codebook_sha256`)
+
+Wrong codebook **values** are not detectable at decode time: a `k`-bit codeword
+indexes a `2^k`-row table (§1.1), so every index is in range by construction and
+a sidecar with the right names and shapes but the wrong numbers — a stale
+sidecar, one from a different checkpoint at the same rung, or length-preserving
+data corruption — decodes to a correctly-shaped tensor of structured garbage
+rather than raising. (Structural damage is already caught: a byte-truncated
+safetensors file fails to deserialize, and a table missing by name fails at
+lookup.)
+
+The full quant config therefore **SHOULD** carry an artifact-external digest for
+every table in `cb_codebooks.pqcb`:
+
+```json
+"provenance": {
+  "codebook_sha256": {
+    "cb_codebook.lattice.NVFP4_CB_K16.sub0": "<64 lowercase hex characters>",
+    "cb_codebook.lattice.NVFP4_CB_K16.sub1": "<64 lowercase hex characters>"
+  }
+}
+```
+
+The expected values live in `quant_config.json`, not in safetensors metadata
+inside the file they describe. A self-declared digest cannot distinguish the
+intended sidecar from a different intact sidecar carrying its own matching
+declaration.
+
+**Construction (normative, per table).** Convert the table to IEEE-754
+binary16 (`fp16`), contiguous row-major (C) order, serialize its raw
+little-endian bytes with no framing, and compute SHA-256 over those bytes. This
+is the construction used by the PrismaQuant exporters:
+
+```python
+import hashlib, torch
+def codebook_sha256(table: torch.Tensor) -> str:
+    raw = table.to(torch.float16).cpu().contiguous().numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()
+```
+
+The tensor name is the key in the mapping and is not absorbed into its digest.
+Shape and dtype are validated elsewhere by the format contract; all conforming
+sidecar tables are already `fp16` (§4). The explicit conversion is retained to
+match existing exporter output byte-for-byte.
+
+If `provenance.codebook_sha256` is present, a runtime **MUST** require it to
+cover the sidecar's tensor names exactly, verify every digest before use, and
+refuse a malformed, incomplete, or mismatched mapping. The field remains
+**OPTIONAL** for backward compatibility: a config with no mapping **MUST** load
+without this integrity check. An empty mapping is not the same as absence.
+
+This binding detects accidental corruption and a sidecar swapped independently
+of its config. It is not a signature: replacing both files with a mutually
+consistent pair is outside its scope.
+
 ---
 
 ## 5. Configuration vocabulary (`config.json`)

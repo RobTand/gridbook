@@ -27,6 +27,9 @@ import torch
 codec = pytest.importorskip("gridbook.codec")
 from gridbook.cuda_ext import _find_cutlass_include, csrc_dir, get_ext  # noqa: E402
 
+if not torch.cuda.is_available():
+    pytest.skip("CUDA device unavailable", allow_module_level=True)
+
 gemv_ext = get_ext()
 if gemv_ext is None:
     pytest.skip("CUDA extension unavailable (no nvcc?)", allow_module_level=True)
