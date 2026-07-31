@@ -559,6 +559,18 @@ def test_prefix_caching_and_server_evidence_fail_closed(tmp_path):
         bench_serve.parse_args(missing_digest)
 
 
+def test_digest_bound_inputs_are_rechecked_after_argument_parsing(
+    tmp_path, monkeypatch
+):
+    args = _parse(tmp_path)
+    Path(args.server_evidence[0]).write_text("changed after parse\n")
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
+    with pytest.raises(bench_serve.BenchmarkError, match="server evidence.*mismatch"):
+        bench_serve.collect_metadata(args, {})
+
+
 def test_cuda_version_remains_a_deprecated_accelerator_runtime_alias(tmp_path):
     argv = _argv(tmp_path)
     index = argv.index("--accelerator-runtime")
@@ -1037,6 +1049,52 @@ def test_git_state_requires_a_real_pyproject_source_root(tmp_path, monkeypatch):
     state = bench_serve._git_state(None)
     assert state["commit"] is None
     assert state["source"] == "unavailable-non-source-install"
+
+    explicit = bench_serve._git_state("d" * 40)
+    assert explicit["commit"] == "d" * 40
+    assert explicit["source"] == "argument"
+    assert explicit["dirty"] is None
+    assert explicit["release_eligible"] is False
+
+
+def test_generated_report_is_the_only_checkout_dirty_check_exclusion(
+    tmp_path, monkeypatch
+):
+    checkout = tmp_path / "checkout"
+    source = checkout / "gridbook" / "bench_serve.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("# clean source\n")
+    (checkout / "pyproject.toml").write_text("[project]\nname='gridbook'\n")
+    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=checkout,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Gridbook test"], cwd=checkout, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=checkout, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=checkout, check=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    monkeypatch.setattr(bench_serve, "__file__", str(source))
+
+    report = checkout / "results" / "report.json"
+    report.parent.mkdir()
+    report.write_text("generated evidence\n")
+    clean = bench_serve._git_state(commit, generated_paths=(report,))
+    assert clean["dirty"] is False
+    assert clean["release_eligible"] is True
+
+    source.write_text("# changed source\n")
+    with pytest.raises(bench_serve.BenchmarkError, match="checkout is dirty"):
+        bench_serve._git_state(commit, generated_paths=(report,))
 
 
 def test_urls_commands_and_server_args_never_persist_credentials(tmp_path, monkeypatch):
@@ -1609,8 +1667,46 @@ def test_run_writes_a_complete_report_without_vllm_or_server(tmp_path, monkeypat
     )
     assert all("errors" not in block["raw_result"] for block in written["blocks"])
     assert written["summary"]["completed_blocks"] == 3
+    assert written["metadata"]["measurement_provenance"] == {
+        "digest_bound_inputs_verified_before_requests": True,
+        "digest_bound_inputs_verified_after_requests": True,
+        "git_state_verified_after_requests": True,
+        "client_runtime_verified_after_requests": True,
+    }
     assert written["finished_at"].endswith("Z")
     assert os.stat(args.output).st_mode & 0o777 == 0o600
+
+
+def test_evidence_mutation_during_measurement_invalidates_the_report(
+    tmp_path, monkeypatch
+):
+    args = _parse(tmp_path)
+    calls = 0
+
+    def fake_run(command):
+        nonlocal calls
+        calls += 1
+        path = Path(_option(command, "--result-dir")) / _option(
+            command, "--result-filename"
+        )
+        path.write_text(json.dumps(_valid_result(args, offset=float(calls))))
+        if calls == args.blocks:
+            Path(args.server_evidence[0]).write_text("changed during requests\n")
+        return 0
+
+    monkeypatch.setattr(bench_serve, "_run_command", fake_run)
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
+    with pytest.raises(bench_serve.BenchmarkError, match="server evidence.*mismatch"):
+        bench_serve.run_benchmark(args)
+
+    report = json.loads(args.output.read_text())
+    assert report["status"] == "failed"
+    assert report["measurement_valid"] is False
+    provenance = report["metadata"]["measurement_provenance"]
+    assert provenance["digest_bound_inputs_verified_before_requests"] is True
+    assert provenance["digest_bound_inputs_verified_after_requests"] is False
 
 
 def test_report_omits_generated_text_and_arbitrary_server_errors():

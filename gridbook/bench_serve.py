@@ -1126,6 +1126,43 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _revalidate_bound_inputs(args: argparse.Namespace) -> None:
+    """Require every digest-bound input to match its parsed snapshot.
+
+    ``parse_args`` validates these files before a report is reserved.  They are
+    external mutable paths, however, so a long-lived caller could otherwise
+    change one after parsing while the report continued to claim the old
+    digest.  Comparing the complete normalized summaries also protects against
+    a future validator accidentally changing semantics without changing this
+    call site.
+    """
+
+    inventory = _validate_artifact_inventory(
+        args.artifact_inventory, args.artifact_inventory_sha256
+    )
+    if inventory != args.artifact_inventory_summary:
+        raise BenchmarkError(
+            "artifact inventory changed after command-line validation"
+        )
+    execution_manifest = _validate_execution_manifest(
+        args.execution_manifest,
+        args.execution_manifest_sha256,
+        inventory["sha256"],
+        args,
+    )
+    if execution_manifest != args.execution_manifest_summary:
+        raise BenchmarkError(
+            "execution manifest changed after command-line validation"
+        )
+    server_evidence = _validate_server_evidence(
+        args.server_evidence, args.server_evidence_sha256
+    )
+    if server_evidence != args.server_evidence_summary:
+        raise BenchmarkError(
+            "server evidence changed after command-line validation"
+        )
+
+
 def build_vllm_command(
     args: argparse.Namespace,
     *,
@@ -1344,7 +1381,10 @@ def redact_command(command: Sequence[str]) -> list[str]:
 
 
 def _git_state(
-    commit_override: str | None, *, allow_dirty: bool = False
+    commit_override: str | None,
+    *,
+    allow_dirty: bool = False,
+    generated_paths: Sequence[Path] = (),
 ) -> dict[str, Any]:
     if commit_override and not _GIT_COMMIT.fullmatch(commit_override):
         raise BenchmarkError("explicit Gridbook commit is not exact 40/64 hex")
@@ -1377,9 +1417,28 @@ def _git_state(
                     capture_output=True,
                     text=True,
                 ).stdout.strip()
+                status_command = [
+                    "git",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    "--",
+                    ".",
+                ]
+                for generated_path in generated_paths:
+                    normalized_path = Path(
+                        os.path.abspath(os.fspath(generated_path.expanduser()))
+                    )
+                    try:
+                        relative_path = normalized_path.relative_to(checkout)
+                    except ValueError:
+                        continue
+                    status_command.append(
+                        ":(exclude,top,literal)" + relative_path.as_posix()
+                    )
                 detected_dirty = bool(
                     subprocess.run(
-                        ["git", "status", "--porcelain"],
+                        status_command,
                         cwd=checkout,
                         check=True,
                         capture_output=True,
@@ -1414,7 +1473,15 @@ def _git_state(
             "source": (
                 "argument+checkout" if detected_commit is not None else "argument"
             ),
-            "release_eligible": not allow_dirty and detected_dirty is not True,
+            # An assertion supplied beside an installed wheel is useful
+            # research metadata, but it is not proof that the executing bytes
+            # came from that commit.  Release eligibility requires the exact
+            # clean checkout that supplied this module.
+            "release_eligible": (
+                detected_commit is not None
+                and detected_dirty is False
+                and not allow_dirty
+            ),
         }
     if detected_commit is None:
         return {
@@ -1432,14 +1499,17 @@ def _git_state(
 
 
 def _package_version() -> str | None:
+    # Prefer the package that supplied this module.  Distribution metadata can
+    # describe a different globally installed Gridbook when a source checkout
+    # is selected via PYTHONPATH or an editable test setup.
     try:
-        return importlib.metadata.version("gridbook")
-    except importlib.metadata.PackageNotFoundError:
-        try:
-            from gridbook import __version__
+        from gridbook import __version__
 
-            return __version__
-        except (ImportError, AttributeError):
+        return __version__
+    except (ImportError, AttributeError):
+        try:
+            return importlib.metadata.version("gridbook")
+        except importlib.metadata.PackageNotFoundError:
             return None
 
 
@@ -1485,7 +1555,12 @@ def collect_metadata(
             probe_errors[name] = _redact_text(f"{type(exc).__name__}: {exc}")
             return fallback
 
-    git = _git_state(args.git_commit, allow_dirty=args.allow_dirty)
+    _revalidate_bound_inputs(args)
+    git = _git_state(
+        args.git_commit,
+        allow_dirty=args.allow_dirty,
+        generated_paths=(args.output,),
+    )
     client_runtime_probe = _vllm_version(args.vllm_executable)
     if client_runtime_probe is None:
         raise BenchmarkError(
@@ -1502,6 +1577,12 @@ def collect_metadata(
     }
     metadata = {
         "git": git,
+        "measurement_provenance": {
+            "digest_bound_inputs_verified_before_requests": True,
+            "digest_bound_inputs_verified_after_requests": False,
+            "git_state_verified_after_requests": False,
+            "client_runtime_verified_after_requests": False,
+        },
         "software": {
             "gridbook_version": probe("gridbook_version", _package_version),
             "runner_vllm_cli_probe": client_runtime_probe,
@@ -2500,6 +2581,25 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 finally:
                     block["finished_at"] = _utc_now()
                     block["wall_duration_s"] = time.monotonic() - block_clock
+        _revalidate_bound_inputs(args)
+        ending_git = _git_state(
+            args.git_commit,
+            allow_dirty=args.allow_dirty,
+            generated_paths=(output_path,),
+        )
+        if ending_git != report["metadata"]["git"]:
+            raise BenchmarkError(
+                "Gridbook source provenance changed during the benchmark"
+            )
+        ending_client_runtime = _vllm_version(args.vllm_executable)
+        if ending_client_runtime != args.client_runtime_id:
+            raise BenchmarkError(
+                "vLLM client runtime identity changed during the benchmark"
+            )
+        provenance = report["metadata"]["measurement_provenance"]
+        provenance["digest_bound_inputs_verified_after_requests"] = True
+        provenance["git_state_verified_after_requests"] = True
+        provenance["client_runtime_verified_after_requests"] = True
         report["summary"] = summarize_blocks(report["blocks"])
         report["status"] = "success"
         report["measurement_valid"] = True

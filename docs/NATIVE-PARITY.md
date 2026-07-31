@@ -85,6 +85,14 @@ an exact 40- or 64-hex commit. Without it, provenance is detected only when
 wheel cannot accidentally inherit a parent repository. A dirty auto-detected
 checkout fails by default. `--allow-dirty` is explicitly research-only and
 forces `release_eligible: false` even when the measurement otherwise succeeds.
+An explicit `--git-commit` beside an installed wheel remains useful measurement
+metadata, but it cannot prove that the executing wheel was built from that
+commit and is therefore also `release_eligible: false`. Release-eligible harness
+provenance currently requires that this module execute from the exact clean
+checkout whose commit is recorded. The generated `--output` report is the sole
+path excluded from that checkout's dirty check, so the documented
+`results/...json` location does not invalidate its own run; no source,
+inventory, manifest, or server-evidence path receives that exclusion.
 
 `--server-arg` records the exact server command line; it is metadata only and
 never starts or changes a server. `--prefix-caching off` requires the recorded
@@ -95,6 +103,12 @@ paired, repeatable `--server-evidence PATH` and
 `--server-evidence-sha256 SHA256`. The runner hashes and records those external
 bytes but does not parse them or certify that a backend claim inside is true;
 reviewers must still inspect the bound log.
+Inventory, execution-manifest, and server-evidence files are re-read and
+SHA-256 checked immediately before requests and again after the final block.
+Any mutation makes the report fail, including a server log that continues to
+grow during measurement. Supply a closed startup/dispatch snapshot, retain that
+exact attachment beside the report, and publish it under the recorded digest;
+the report records the digest and path but does not embed arbitrary log bytes.
 The runner and server may be different containers or hosts, so their
 environments are never conflated.  `PRISMAQUANT_*` values visible to the
 benchmark process are labelled **runner environment**; add other runner values
@@ -432,9 +446,12 @@ TTFT/ITL gates.
 
 `measurement_valid: true` means only that every block satisfied this one-arm
 contract. `parity_acceptance` and `release_acceptance` are always false because
-the runner has no paired arm or quality evidence. `release_eligible` additionally
-requires clean/explicit Gridbook provenance and is forced false by
-`--allow-dirty`; it still is not a release decision.
+the runner has no paired arm or quality evidence. `release_eligible`
+additionally requires a clean, exact source-checkout binding for the harness and
+is forced false by `--allow-dirty` or argument-only installed-wheel provenance;
+it still is not a release decision. The clean Git state, digest-bound inputs,
+and client runtime identity are rechecked after the last request before that
+flag can become true.
 
 Detailed ITL entries are streamed **chunk** intervals, not a promise of one
 entry per generated token: one chunk can carry several regular or
