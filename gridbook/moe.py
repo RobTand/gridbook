@@ -72,6 +72,27 @@ def _row_bytes(in_features: int, type_size: int) -> int:
     return (in_features // codec.SUPERBLOCK) * type_size
 
 
+def _window_fits_superblock(k: int, type_size: int) -> bool:
+    """Does the expanders' 8-byte codeword window stay inside ONE superblock?
+
+    The expand/decode kernels build a codeword from an 8-byte window anchored at
+    ``byte_base = bitpos // 8`` with ``bitpos = v_local * k`` and
+    ``v_local <= 31`` (256 weights / VEC_DIM 8), so the highest byte they touch
+    inside a superblock is ``(31k)//8 + 7``. When that is ``<= type_size - 1``
+    the last codeword of the last superblock of the last ROW is still in the
+    tensor and ``codec.pad_qweight``'s read slack is unnecessary.
+
+    * fp8-CB (``type_size = 4k``): false at every shipped rung (needs k > 56) —
+      the pad is load-bearing on the Triton branch.
+    * fp4-CB v2 (``type_size = 4k + 9``): true for every k >= 0 — the 9-byte
+      two-tier scale plane is the tail slack (the window may spill into the
+      scale bytes, which the kernel masks off, but never past the superblock).
+
+    Pure python ints (shape/config only): capture-safe, resolves host-side.
+    """
+    return (31 * int(k)) // 8 + 7 <= int(type_size) - 1
+
+
 # torch._grouped_mm — the single-launch ragged grouped GEMM (2d×3d: mat_a
 # [P,K] × mat_b [G,K,N] with cumulative-end offsets [G] -> [P,N]) that collapses
 # the batched-prefill per-expert-segment GEMMs into ONE kernel. Opt-in
@@ -112,6 +133,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
     _EXPAND_EXT_OK: bool | None = None   # cached cuda_ext probe for the expander
     _DECODE_ENGAGED_LOGGED = False       # one-time decode-path engagement line
     _DECODE_DISABLED_LOGGED = False      # deduplicate a host-wide ext failure
+    _STOCK_BUDGET_WARNED = False         # deduplicate undersized-budget warning
 
     def __init__(self, quant_config, moe: FusedMoEConfig, scheme: dict,
                  prefix: str) -> None:
@@ -381,13 +403,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         #     codec.fp8_dynamic_act_qdq — test_stock_fp8_quant_matches_codec),
         #     fp4-v2 runs codec.fp4_group16_act_qdq explicitly on the module input
         #     AND the intermediate. Opt-in: PRISMAQUANT_CB_PREFILL=stock.
-        #     'stock' was the fp8-CB default from 2026-07-23 (vLLM's own
-        #     fused-MoE grouped kernel over CUDA-expanded e4m3 chunks — 5.5x the
-        #     loop on Laguna-256E, with the slack-gate discipline bounding the
-        #     ~1.6 GB chunk transient) until 'auto' superseded it on 2026-07-26;
-        #     it remains a candidate of 'auto' and the deterministic keep-path.
-        #     fp4-CB still defaults to 'loop' — its stock variant (bf16 expand)
-        #     has not had the same at-scale measurement.
+        # fp8-CB stock was measured at 5.5x the loop on Laguna-256E and is a
+        # candidate of the current 'auto' policy. fp4-CB stock remains an
+        # explicit fallback/A-B path: its BF16 transient is byte-budgeted
+        # below (42 experts / 1,184 MiB measured instead of the old 4,736 MiB
+        # whole-stack balloon on a 192-expert Hy3 band), and its packed slice
+        # no longer needs a padding copy. The unset fp4 policy remains unchanged
+        # rather than promoting a second numerical accumulation path.
         #
         #   'grouped_fused' — _apply_prefill_grouped_fused (round 1 of the MoE
         #     fused campaign, OPT-IN). Drops the stock path's HBM e4m3 expand
@@ -439,21 +461,20 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # still wedges despite non-default-stream test battery green). The
         # L2-residency hypothesis remains unmeasured; do not add it to auto
         # candidates until a live serve survives a full prefill battery.
-        # fp4-MMA fused MoE prefill (OPT-IN, default OFF — the fp4 default
-        # below stays 'loop' and is byte-identical until
-        # PRISMAQUANT_CB_FUSED_FP4_MOE is set). One tile-indexed grouped
+        # fp4-MMA fused MoE prefill. One tile-indexed grouped
         # block-scaled launch per projection stage (OMMA.SF.16864, k=64),
         # the fp8 grouped_fused_v2 mechanism with the packed-CB decode in the
         # producer/prologue. Values: "1"/"128" tile_m=128, "256" tile_m=256.
         # NOTE the activation bucket changes on this path (native NVFP4 quant,
-        # not codec.fp4_group16_act_qdq) — served-KL A/B required before any
-        # promotion; any constraint miss falls through SILENTLY to the modes
-        # below (no behaviour change when the env is unset).
+        # not codec.fp4_group16_act_qdq). An explicit PRISMAQUANT_CB_PREFILL
+        # is authoritative and bypasses this default, so stock/loop remain
+        # real bisection controls rather than being silently preempted.
         # DEFAULT-ON since 2026-07-31 (Robert's call); tile 128 is the measured
         # best (5.2-5.6x the per-expert loop). PRISMAQUANT_CB_FUSED_FP4_MOE=0
         # restores the per-expert loop. Same unvalidated-on-serving-metric
         # caveat as the dense gate in linear.py applies.
-        if self.is_fp4 and num_tokens > 16:
+        requested_mode = os.environ.get("PRISMAQUANT_CB_PREFILL")
+        if requested_mode is None and self.is_fp4 and num_tokens > 16:
             gf4 = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "1").strip()
             if gf4 in ("1", "128", "256"):
                 out = self._apply_prefill_grouped_fused_fp4(
@@ -462,8 +483,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 if out is not None:
                     return out
 
-        mode = os.environ.get("PRISMAQUANT_CB_PREFILL") or (
-            "auto" if not self.is_fp4 else "loop")
+        # Preserve current policy: fp8 uses measured auto; fp4 first tries its
+        # default fused path above and falls back to the conservative loop on a
+        # constraint miss. Stock remains explicitly selectable, now with safe
+        # byte budgeting and a zero-copy packed view.
+        mode = requested_mode or ("auto" if not self.is_fp4 else "loop")
         if mode == "auto":
             return self._apply_prefill_auto(
                 layer, x, topk_weights, topk_ids, act)
@@ -1872,8 +1896,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         Memory (INV-1): one projection's chunk tile is live at a time (w13 freed
         before w2 expands); Hy3 (E=192, 2i=3072, hidden=4096) at chunk=16 =>
         16*3072*4096 = 192 MiB fp8 w13 (~2x for the bf16 fp4 tile), vs the crashed
-        batched path's ~1.6 GB. The chunk env is PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK
-        (default 16)."""
+        batched path's ~1.6 GB. The chunk env is PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK;
+        with it unset the default comes from _stock_chunk_default — 256 for fp8-CB
+        (the 1 B/elt CUDA-expanded transient) and BYTE-BUDGETED for fp4-CB, whose
+        2 B/elt bf16 transient balloons to a measured 4,736 MiB at that flat 256
+        on the Hy3 CB band."""
         # vLLM fused-MoE internals imported lazily: the stable public surface is
         # at module top; these are version-fragile, and a build lacking them must
         # fail only this opt-in path, never the module import (CPU codec tests).
@@ -1894,8 +1921,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         )
 
         if chunk is None:
-            chunk = int(os.environ.get(
-                "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK") or "256")
+            chunk = self._stock_chunk_default(layer, x.dtype)
         chunk = max(1, chunk)
         is_fp8 = not self.is_fp4
         E = layer._cb_E
@@ -2050,6 +2076,73 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                   + f" other={(_tot-_acc)*1000:.0f}ms", flush=True)
         return out
 
+    def _stock_chunk_default(self, layer, _dtype=None) -> int:
+        """Expert-chunk count for ``_apply_prefill_stock`` (INV-1 sizing).
+
+        ``PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK`` overrides everything (bisection
+        / A-B parity), exactly as before. Otherwise:
+
+        * **fp8-CB — 256, unchanged.** Its transient is 1 B/elt and it rides the
+          CUDA expander; the measured default stays put.
+        * **fp4-CB-v2 — byte-budgeted.** The fp4 transient is bf16 (2 B/elt) and
+          there is no fp4 CUDA expander, so a flat 256 allocates
+          ``min(E, 256) x 2*inter x hidden x 2 B`` per stage: on the Hy3 CB band
+          (E=192, 2*inter=3072, hidden=4096) that is **4,736 MiB measured**
+          (4,608 MiB analytic) — ~3x the ~1.6 GB slack gate documented on the
+          'stock' arm above, and the same transient class that crashed a
+          1.4k-token Hy3 prefill on 2026-07-20. Size the chunk from a BYTE
+          budget (``PRISMAQUANT_CB_PREFILL_CHUNK_BYTES``, default 1 GiB) against
+          the LARGER of the two stage tiles instead, so the peak is a constant
+          of the config rather than a function of E: Hy3 -> chunk 42, 5 fixed
+          trips, 1,184 MiB measured (1.175x the 1,008 MiB analytic tile), flat
+          across layers, 0.283 s vs 0.302 s per prefill forward at M=2048. The
+          launch win over the per-expert loop is 192/42 = 4.6x, not 192x.
+
+        Capture-safety unchanged: every input here is a python/config int
+        (shapes and env), never a tensor value, so the trip count stays a
+        constant of the captured graph.
+        """
+        E = int(layer._cb_E)
+        if E <= 0:
+            raise ValueError("CB expert count must be a positive integer")
+
+        def _positive_env(name: str, default: int | None = None) -> int:
+            raw = os.environ.get(name)
+            if raw is None or raw.strip() == "":
+                if default is None:
+                    raise ValueError(f"{name} is required")
+                return default
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a positive integer, got "
+                                 f"{raw!r}") from exc
+            if value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got "
+                                 f"{raw!r}")
+            return value
+
+        env = os.environ.get("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
+        if env is not None and env.strip() != "":
+            return min(E, _positive_env(
+                "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK"))
+        if not self.is_fp4:
+            return 256
+        budget = _positive_env("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES", 1 << 30)
+        # expand_fp4_v2_to_weight always emits BF16, independent of x.dtype.
+        elt = 2
+        # w13 tile (2*inter x hidden) >= w2 tile (hidden x inter) always.
+        per_expert = 2 * int(layer._cb_inter) * int(layer._cb_hidden) * elt
+        if (per_expert > budget
+                and not PrismaQuantCBMoEMethod._STOCK_BUDGET_WARNED):
+            print("[prismaquant-cb] WARNING: one fp4 stock-prefill expert "
+                  f"tile ({per_expert} bytes) exceeds "
+                  f"PRISMAQUANT_CB_PREFILL_CHUNK_BYTES={budget}; using chunk "
+                  "1, so the budget cannot be met.", file=sys.stderr,
+                  flush=True)
+            PrismaQuantCBMoEMethod._STOCK_BUDGET_WARNED = True
+        return max(1, min(E, budget // max(1, per_expert)))
+
     @staticmethod
     def _stock_chunk_expert_map(c0: int, c1: int, E: int,
                                 dev) -> torch.Tensor:
@@ -2069,12 +2162,42 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         no advanced-index copy) so it never issues an index-tensor H2D sync under
         capture. ``to_fp8`` picks the fp8-direct byte transient (expand_cb_to_fp8,
         for the W8A8 kernel); else the bf16 transient (fp4-v2 value x composed
-        scale, or fp8 value x per-channel scale)."""
+        scale, or fp8 value x per-channel scale).
+
+        RAW-VIEW / PAD CONTRACT. ``codec.pad_qweight``'s right pad exists because
+        the expanders read an 8-byte codeword window at ``byte_base =
+        (bitpos // 8)`` with ``bitpos <= 31*k`` (256 weights, VEC_DIM 8), i.e. up
+        to byte ``(31k)//8 + 7`` inside a superblock. In-bounds inside the
+        superblock is therefore ``(31k)//8 + 7 <= type_size - 1``
+        (``_window_fits_superblock``):
+
+          * **fp8-CB, type_size = 4k** -> needs ``k > 56``; at the shipped
+            k in {36,44,48} the last superblock of the last row overruns by ~2 B,
+            so the pad IS load-bearing for the Triton branch (kept). The CUDA
+            expander stages exactly ``type_size`` bytes per superblock into smem
+            and needs neither the pad nor the ``.contiguous()`` copy.
+          * **fp4-CB v2, type_size = 4k + 9** (4k index bytes + 1 super-exponent
+            + 8 sub-nibble bytes) -> ``(31k)//8 + 7 <= 3.875k + 7 <= 4k + 8``
+            holds for EVERY k >= 0. The 9-byte scale plane IS the tail slack: the
+            window can spill into the scale bytes (masked off by the kernel's
+            ``mask_k``) but can never leave the superblock, let alone the row. So
+            the pad is dead weight for fp4 and the RAW slice view goes straight
+            to the expander — the same win as the fp8 branch, reached by
+            arithmetic rather than by a new kernel, and bit-identical because the
+            padding bytes were never read (GPU-verified: ``PRISMAQUANT_CB_EXPAND
+            =pad`` vs default gave ``torch.equal`` logits, max|delta| 0.0, on
+            both a uniform and a mixed-rung Hy3 layer). On Hy3 w13 at chunk 42
+            the dropped ``F.pad`` was a 143.7 MiB alloc + copy per stage per
+            chunk (+49 MiB of measured peak).
+
+        ``PRISMAQUANT_CB_EXPAND=triton`` (fp8) / ``=pad`` (fp4) restore the
+        padded call for bisection."""
         packed = getattr(layer, f"{which}_cb_qweight")[c0:c1]      # view [nE,o,b]
         nE = c1 - c0
         out_f = packed.shape[1]
         in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
         row0 = torch.zeros(nE * out_f, dtype=torch.int32, device=packed.device)
+        _expand_env = os.environ.get("PRISMAQUANT_CB_EXPAND")
         if to_fp8:                                                # fp8 bytes
             # CUDA expander (2.1x the Triton one, byte-identical) on the RAW
             # slice view: the kernel stages exactly type_size bytes per
@@ -2088,7 +2211,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # host where the JIT build failed this branch raises AttributeError
             # mid-prefill instead of falling back — breaking the fallback
             # contract cuda_ext.py's own module docstring advertises.
-            if (os.environ.get("PRISMAQUANT_CB_EXPAND") == "triton"
+            if (_expand_env == "triton"
                     or not self._cb_expand_ext_ok()):
                 qwp = codec.pad_qweight(
                     packed.reshape(nE * out_f, -1).contiguous())
@@ -2102,10 +2225,21 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                     self._stock_cb_flat_fp8(layer), row0, nE * out_f, in_f,
                     self.k, self.n_sub, self.type_size)
         elif self.is_fp4:                                         # fp4 two-tier v2
-            qwp = codec.pad_qweight(
-                packed.reshape(nE * out_f, -1).contiguous())
+            # RAW unpadded view — no F.pad alloc, no .contiguous() copy. The
+            # Triton expander indexes by qw.stride(0), so an unpadded row stride
+            # is legal, and type_size = 4k+9 puts the 8-byte codeword window
+            # in-bounds by construction (pad contract in the docstring). Output
+            # is bit-identical to the padded call: the pad bytes were never read.
+            # The predicate is re-checked per rung rather than assumed, so an
+            # exotic future type_size falls back to the pad instead of reading
+            # out of bounds. PRISMAQUANT_CB_EXPAND=pad forces the old copy.
+            raw = packed.reshape(nE * out_f, -1)      # view (dim-0 slice), no copy
+            qw = raw
+            if (_expand_env == "pad"
+                    or not _window_fits_superblock(self.k, self.type_size)):
+                qw = codec.pad_qweight(raw.contiguous())
             W = expand_fp4_v2_to_weight(
-                qwp, layer._cb_flat, row0, layer._cb_compose, nE * out_f, in_f,
+                qw, layer._cb_flat, row0, layer._cb_compose, nE * out_f, in_f,
                 self.k, self.n_sub, self.type_size)
         else:                                                     # fp8 -> bf16
             qwp = codec.pad_qweight(

@@ -172,6 +172,58 @@ def _report(tag, o_ref, o_new):
     return rel
 
 
+@pytest.mark.parametrize(
+    "mode,k",
+    [("product", k) for k in (13, 14, 15, 16, 17, 18, 20, 23, 24)]
+    + [("signed", k) for k in (13, 16)],
+)
+def test_fp4_raw_slice_matches_padded_bits_across_rungs(monkeypatch, mode, k):
+    """The zero-copy fp4 slice must reproduce the padded expander bit-for-bit.
+
+    Use legal producer-packed two-tier bytes, a nonzero expert slice, the final
+    row, and two superblocks.  Comparing BF16 storage bits also distinguishes
+    signed zero and avoids value-level NaN comparison semantics.
+    """
+    _require_stack()
+    fmt = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    from gridbook.moe import PrismaQuantCBMoEMethod
+
+    E, out_f, in_f = 3, 8, 512
+    n_sub = 1 if mode == "signed" else 2
+    sc = fmt.SCALE_CODING_TWO_TIER
+    ts = fmt.nvfp4_cb_type_size(k, "fp4", sc)
+    cb = fmt._resolve_codebook(k, "fp4", mode, None, torch.device(DEV))
+    torch.manual_seed(1000 + k + n_sub)
+    weight = torch.randn(E, out_f, in_f, device=DEV) * 0.05
+    packed, _ = fmt.nvfp4_cb_pack(
+        weight, k, grid="fp4", mode=mode, codebook=cb,
+        scale_coding=sc)
+
+    method = PrismaQuantCBMoEMethod.__new__(PrismaQuantCBMoEMethod)
+    method.prefix = "raw-pad-parity"
+    method.scheme = {"grid": "fp4", "mode": mode, "k": k,
+                     "n_sub": n_sub, "type_size": ts}
+    method.is_fp4 = method.is_v2 = True
+    method.k, method.n_sub, method.type_size = k, n_sub, ts
+    method._sub_table = codec.TWO_TIER_SUB_TABLE
+
+    subs = list(cb) if isinstance(cb, (tuple, list)) else [cb]
+    layer = types.SimpleNamespace(
+        _cb_hidden=in_f,
+        _cb_inter=256,
+        _cb_flat=codec.build_flat_codebook([t.to(DEV) for t in subs]),
+        _cb_compose=codec.build_compose_table(
+            codec.TWO_TIER_SUB_TABLE).to(DEV),
+        w13_cb_qweight=packed.reshape(E, out_f, -1).contiguous(),
+    )
+
+    monkeypatch.delenv("PRISMAQUANT_CB_EXPAND", raising=False)
+    raw = method._expand_stack_slice(layer, "w13", 1, E, to_fp8=False)
+    monkeypatch.setenv("PRISMAQUANT_CB_EXPAND", "pad")
+    padded = method._expand_stack_slice(layer, "w13", 1, E, to_fp8=False)
+    assert torch.equal(raw.view(torch.uint16), padded.view(torch.uint16))
+
+
 # --------------------------------------------------------------------------- #
 # 1 — the stock kernel's fp8 activation quant IS codec.fp8_dynamic_act_qdq.      #
 # --------------------------------------------------------------------------- #

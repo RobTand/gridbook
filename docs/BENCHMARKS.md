@@ -269,15 +269,18 @@ also predates the fp8-direct expander, so treat it as the pessimistic end.
 on the artifact.** `_cuda_moe_ok()` in `gridbook/moe.py` returns `False` when
 `get_ext() is None`, and the call falls through to the prefill-family paths:
 
-- **fp4-CB artifacts** (the 295B) default to `PRISMAQUANT_CB_PREFILL=loop` —
-  literally the per-expert transient loop that measured **3.52 tok/s** decoding
-  the 35B before the grouped kernel replaced it (**32.6–33.3 tok/s** after). That
-  loop costs ~10k host syncs/launches per token; it is a launch-storm, not a
-  bandwidth problem.
-- **fp8-CB artifacts** default to `auto`, a different (batched-expand) path.
-  Expect a large regression — the one-launch-per-projection grouped GEMV is gone
-  — but **its size has not been measured**, and the 3.52 figure above does *not*
-  describe it.
+- **fp8-CB** defaults to `auto`, whose candidates include chunked `stock`.
+- **fp4-CB** first tries the default fused-FP4 prefill kernel. If that kernel is
+  ineligible, it falls back to the conservative per-expert `loop`; operators can
+  explicitly select the now byte-budgeted `stock` path for a measured A/B.
+  Expect a large regression when the grouped decode kernel is gone, but its
+  exact size depends on the selected fallback and **has not been measured**.
+- The **3.52 tok/s** figure that used to be quoted here is the per-expert
+  transient loop the 35B measured before the grouped kernel replaced it
+  (**32.6–33.3 tok/s** after). It remains the right order of magnitude for what
+  the fp4 constraint-miss fallback or an explicit `PRISMAQUANT_CB_PREFILL=loop`
+  costs
+  (~10k host syncs/launches per token — a launch problem, not a bandwidth one).
 
 Prefill degrades too and is not separately quantified for the fallback.
 
