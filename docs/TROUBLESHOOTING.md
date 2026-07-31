@@ -15,6 +15,7 @@ for "gridbook" will find nothing. Search for **`[prismaquant-cb]`**.
 
 - [The CUDA extension did not load (Triton fallback)](#the-cuda-extension-did-not-load-triton-fallback)
 - [Broken install: CUDA sources missing from the package](#broken-install-cuda-sources-missing-from-the-package)
+- [Incompatible JIT extension: the module loaded but has the wrong API](#incompatible-jit-extension-the-module-loaded-but-has-the-wrong-api)
 - [Fused prefill extension unavailable](#fused-prefill-extension-unavailable)
 - [Invalid quantization method: gridbook](#invalid-quantization-method-gridbook)
 - [Missing codebook sidecar or quant config](#missing-codebook-sidecar-or-quant-config)
@@ -102,45 +103,49 @@ found` must print `True`. Do **not** work around this by copying `csrc/` into
 
 ---
 
-## Stale JIT build cache: the extension loaded but is the wrong build
+## Incompatible JIT extension: the module loaded but has the wrong API
 
 **Symptom** — on stderr:
 
 ```
-[prismaquant-cb] ERROR: stale CUDA decode-GEMV extension — the extension built
-from cb_gemv.cu loaded from /opt/gridbook/ext-cache, but does not export
-['cb_gemv_fp4_v2'] (needs [...]). The JIT build cache is persistent and shared
-by design, so the usual cause is a STALE .so left there by an older cb_gemv.cu
-— the current source was never compiled. Delete /opt/gridbook/ext-cache and
-start again ...
+[prismaquant-cb] ERROR: incompatible CUDA decode-GEMV extension — the module
+loaded for cb_gemv.cu from '<module path>' does not satisfy the current call
+contract: missing ['cb_gemv_fp4_v2']; every required symbol is [...]. requested
+build directory '/opt/gridbook/ext-cache' has mode ..., owner uid:gid ..., and
+is ... by this process. Clear this extension's build directory ...
 ```
 
-Same message shape for `stale fused prefill extension` and, as a
-`UserWarning`, `stale persistent-TC ext`.
+The persistent-TC and fused loaders report the same module path, missing
+contract, and build-directory diagnostics. They remain fail-soft and return
+`None`, so their callers take the existing correct fallback.
 
-**Cause** — the build cache is *meant* to persist across restarts
+**Cause** — this symptom proves only that a module loaded successfully but does
+not export the API the current Python code will call. A stale or corrupt build
+artifact is possible, especially when one cache is carried across upgrades or
+image versions; an unexpected module supplied by the environment is another
+possibility. The error reports both the loaded module's `__file__` and the
+requested build directory so those cases can be distinguished.
+
+The build cache is *meant* to persist across restarts
 ([persisting the cache](INSTALL.md#persisting-the-jit-build-cache); the
-reference image pins `PRISMAQUANT_CB_EXT_DIR=/opt/gridbook/ext-cache`). When
-the cached `.so` is not rebuilt, the process runs a binary from older sources.
-The two ways to get there:
+reference image pins `PRISMAQUANT_CB_EXT_DIR=/opt/gridbook/ext-cache`), but use
+one cache directory per gridbook version when mounting it from the host.
 
-* **one cache directory, two gridbook versions** — a host directory mounted
-  into images of different versions, or a package upgrade/rollback against a
-  kept cache;
-* **the cache is not writable by the serving user** — most often a directory
-  created root-owned by an earlier `docker run` without `--user`, so the
-  rebuild cannot land.
+An **unwritable cache does not by itself explain a successfully loaded old
+module**. PyTorch normally needs to acquire a lock and write build metadata or
+outputs before loading; insufficient permissions ordinarily raise during that
+lock/build phase and land in the separate *"extension could not be built"*
+warning. Check ownership when that warning contains `PermissionError`, rather
+than inferring root ownership from a missing-symbol error.
 
 **Fix** — delete the directory (or point `PRISMAQUANT_CB_EXT_DIR` at a fresh
-one) and restart; you pay one ~30 s rebuild. If it recurs, check the ownership
-and mode of the directory from *inside* the serving container:
+one) and restart; you pay one ~30 s rebuild. Compare the module path in the
+error with the requested cache path. If a build error reports permissions,
+inspect the directory from *inside* the serving container:
 
 ```bash
-docker exec <container> ls -ld "$PRISMAQUANT_CB_EXT_DIR"
-docker exec <container> id
+docker exec <container> sh -lc 'ls -ld "$PRISMAQUANT_CB_EXT_DIR"; id'
 ```
-
-Use one cache directory per gridbook version if you mount one from the host.
 
 **Why it is reported rather than tolerated** — until the loaders checked, the
 module was returned unexamined. A missing symbol then surfaced either as
