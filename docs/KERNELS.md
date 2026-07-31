@@ -127,6 +127,27 @@ GEMV that composes the two-tier scale in-register per the decode rules above.
 The **correctness-first per-expert loop is retained** as a fallback path, and its
 numerics are pinned bit-identical to the grouped kernel by a regression test.
 
+**Smem-resident dictionary (opt-in, `PRISMAQUANT_CB_GEMV=v2`).** The shipped
+grouped GEMV gathers sub-codebook entries from global/L2 per lane per
+superblock. `csrc/cb_gemv_v2.cu` instead stages the whole product dictionary in
+shared memory once per block and bursts each output row's packed bytes into
+smem before decoding it — the same insight the fused **prefill** mainloop
+already uses (`csrc/cutlass_fork/sm120_cb_fused_mma.hpp`, where it removed the
+k48 L1 cliff), applied to the M≤16 decode regime. It opts in to the sm_121a
+99 KB dynamic-smem budget, which the shipped decode GEMV does not (it caps its
+rowpack request at 48 KB), so the k20/k24 staged configurations are only
+expressible in the new kernel. The loader admits only the native Blackwell
+target capabilities (12.0/12.1) with at least 99 KiB opt-in shared memory; this
+PR's execution battery covers cc 12.1, not cc 12.0. It
+is **not** bit-exact against the default
+grouped schedule — reassociation class, same as CUDA-vs-Triton — and it is
+**not** a default: unset means `inherited`. Explicit `auto` or `v2` reaches it
+only where the hardware gate and compiled occupancy predicate both pass;
+`PRISMAQUANT_CB_GEMV=inherited` is the kill switch. The
+selection resolves once per process and is fixed per (layer, stack) at load, so
+the call-site branch is a trace-time constant and FULL-decode cudagraphs are
+unaffected.
+
 MoE **prefill** used to be that per-expert loop, whose launch storm dominated
 TTFT. It no longer is. A **CUDA chunk-expander** now expands expert chunks
 directly into vLLM's own fused-MoE grouped kernel (raw unpadded views,
@@ -215,6 +236,7 @@ serving; it is documented in [`BENCHMARKS.md`](BENCHMARKS.md) too.
 | FP8-CB decode (dense) | **Shipped**, at/above native parity |
 | FP4-CB v2 decode (dense) | **Shipped**: bit-matched CUDA GEMV (13/13 parity vs Triton + expand reference). The decode chain is compute-bound at GEMV shapes (ncu SM 71%/mem 44%) under the bit-exact contract — the measured ceiling, not a staging problem |
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
+| MoE grouped decode GEMV, smem-resident dictionary | **Opt-in** (`PRISMAQUANT_CB_GEMV=v2`), never a default. Wins 1.13–1.58× on k13/k16/k20 in a 16-cell GB10 sweep; loses on k24 at K≥2048 (occupancy wall), where a compiled predicate routes the cell back to the shipped kernel. Reassociation-class output difference vs the default schedule (9/204 synthetic cells, worst `max_rel` 5.88e-03) — **not** bit-exact. No live-serve soak yet |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
 | Fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — persistent-N is the answer |
 | Persistent-N large-M dense prefill | **Built and MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. Quarantined behind `PRISMAQUANT_ENABLE_PTC=1` as a schedule reference; do not enable it. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 
 _ext = None
 _tried = False
@@ -251,6 +252,86 @@ def get_ext():
               file=sys.stderr, flush=True)
         _ext = None
     return _ext
+
+
+_ext_v2 = None
+_tried_v2 = False
+_ext_v2_lock = threading.Lock()
+
+# Symbols cb_gemv_v2.cu must export, checked on EVERY load rather than only in
+# a build script. ``PRISMAQUANT_CB_EXT_DIR`` is normally a PERSISTENT directory
+# (that is the whole point of the env var — see the module docstring), so a .so
+# left there by an OLDER cb_gemv_v2.cu is reused silently by
+# ``torch.utils.cpp_extension.load`` and the dispatch would then call a symbol
+# that is not in it — a stale-artefact failure, mid-forward, on a JIT artefact.
+# Failing here instead routes every CB layer to the inherited kernel with a
+# loud reason.
+_V2_SYMBOLS = (
+    "cb_gemv_v2",
+    "cb_gemv_v2_prefers_inherited",
+    "cb_gemv_v2_prepare",
+    "cb_expand_v2",
+)
+
+
+def get_ext_v2():
+    """The compiled CB-GEMV-v2 extension (``gridbook/csrc/cb_gemv_v2.cu``).
+
+    A SEPARATE JIT MODULE from :func:`get_ext`, not a second source file of it:
+    both ``.cu`` files define ``PYBIND11_MODULE(TORCH_EXTENSION_NAME, ...)``
+    (cb_gemv.cu / cb_gemv_v2.cu), so compiling them into one module collides at
+    link. Separate name, separate build subdirectory, same cache root — so the
+    one-time build persists exactly as the inherited ext's does.
+
+    Fail-soft, same contract as :func:`get_ext`: any build/env failure returns
+    None and the caller (``moe_gemv_select.cb_gemv_v2_available``) routes every
+    CB layer to the INHERITED kernel — correct, unchanged serving, just without
+    the v2 delta. The warning is loud because a silent degrade would turn a
+    v2-vs-inherited A/B into two identical arms and read as "v2 buys nothing".
+    """
+    global _ext_v2, _tried_v2
+    if _tried_v2:
+        return _ext_v2
+    with _ext_v2_lock:
+        if _tried_v2:
+            return _ext_v2
+        try:
+            import torch  # noqa: F401  (must import before cpp_extension)
+            from torch.utils.cpp_extension import load
+
+            src = os.path.join(
+                _require_csrc("cb_gemv_v2.cu"), "cb_gemv_v2.cu")
+            build_dir = os.environ.get(
+                "PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+                    os.path.expanduser("~"), ".cache", "prismaquant-cb-ext")
+            build_dir = os.path.join(build_dir, "v2")
+            os.makedirs(build_dir, exist_ok=True)
+            mod = load(name="prismaquant_cb_v2_ext", sources=[src],
+                       build_directory=build_dir,
+                       extra_cuda_cflags=["-O3"], verbose=False)
+            _ext_v2 = _require_symbols(
+                mod, _V2_SYMBOLS, build_dir=build_dir,
+                source="cb_gemv_v2.cu")
+        except StaleExtensionError as exc:
+            print(f"[prismaquant-cb] ERROR: incompatible CB-GEMV-v2 "
+                  f"extension — {exc} Every CB layer decodes on the inherited "
+                  f"GEMV kernel.", file=sys.stderr, flush=True)
+            _ext_v2 = None
+        except IncompleteInstallError as exc:
+            print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
+                  f"Every CB layer decodes on the inherited GEMV kernel.",
+                  file=sys.stderr, flush=True)
+            _ext_v2 = None
+        except Exception as exc:  # noqa: BLE001 — build/env failure -> fallback
+            print(f"[prismaquant-cb] WARNING: the CB-GEMV-v2 extension could "
+                  f"not be built ({type(exc).__name__}: {exc}); every CB layer "
+                  f"decodes on the inherited GEMV kernel (this is expected on "
+                  f"non-sm_120/sm_121 GPUs and without nvcc). To get the v2 "
+                  f"path: {_NVCC_HINT}.", file=sys.stderr, flush=True)
+            _ext_v2 = None
+        finally:
+            _tried_v2 = True
+    return _ext_v2
 
 
 _fused = None
