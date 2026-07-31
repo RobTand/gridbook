@@ -1,10 +1,10 @@
 # Native-parity serving protocol
 
 This is the reproducible performance gate for work intended to bring Gridbook
-to native vLLM parity.  It compares the same model family, exact whole-artifact
-byte budget, serving image, and controlled request distribution while changing
-only the declared quantization/backend contract.  It is a protocol, not a
-performance claim.
+to native vLLM parity. It compares the same model family, exact whole-artifact
+byte budget, serving image, and controlled request distribution while recording
+the complete quantization/backend/activation contract. It is a protocol, not a
+performance or quality claim.
 
 The runner is `gridbook-bench-serve` (or
 `python -m gridbook.bench_serve` from a checkout).  It delegates every request
@@ -41,14 +41,36 @@ experiment, not another sample of the same experiment.
 | Hardware | Same GPU, power/clock policy, thermals, and no competing workload |
 | Client | Same input/output lengths, prompts, dataset seed, arrival rate, concurrency, warmups, and blocks |
 
-Use a native quantized artifact made from the same base model.  The formal size
+Use a native quantized artifact made from the same base model. The formal size
 gate is integer arithmetic: **`whole_served_artifact_bytes <= B`**.  “Whole
 served artifact” means every model shard, config, tokenizer file, codebook,
 scale/index sidecar, and other file actually shipped for serving.  Download,
 JIT/compiler, engine, and KV caches are excluded.  Target bpp, quantizable-body
 bytes, and resident VRAM remain useful diagnostics, but none substitutes for
-the whole-artifact gate.  BF16 is a useful ceiling, not the native denominator;
+the whole-artifact gate. Model-payload bytes are recorded separately with an
+explicit scope and are never used for this gate. BF16 is a useful ceiling, not
+the native denominator;
 a 27B Gridbook result cannot be compared with a differently sized native model.
+
+The runner requires a SHA-256-bound inventory document, recomputes its integer
+file-byte sum, requires that sum to equal `--artifact-bytes`, and then applies
+the budget. It accepts a standalone `gridbook.artifact-inventory.v1` (canonical
+relative `path`, non-negative integer `bytes`, and file `sha256` per entry), a
+standalone `prismaquant.cb_export_artifact_inventory.v1`, or the producer's
+`quant_config.json` containing that PrismaQuant inventory under
+`provenance.artifact_inventory`. This lets new Gridbook exports feed their
+fixed-point whole-directory inventory directly into the harness. It also binds
+legacy/native reports to a reviewable document rather than an unaudited number
+on the command line. The runner validates the document and digest, but does not
+reopen terabytes of model shards; artifact publication must separately verify
+file contents. A standalone Gridbook inventory carries per-file digests for
+that purpose, while the current embedded PrismaQuant inventory carries sizes
+and is bound as a whole by the `quant_config.json` digest.
+An embedded export inventory is admissible only while the served file set and
+sizes still match it. If publication adds a model card, `.gitattributes`, or any
+other served-directory file, generate a standalone inventory from the final
+downloaded snapshot; the pre-upload export inventory is then payload provenance,
+not the formal whole-shipped-artifact gate.
 
 The runner requires opaque `--image-id` and `--model-id` values and records them
 verbatim.  Prefer an image digest and a model repository plus immutable commit,
@@ -62,7 +84,7 @@ explicitly with repeatable `--server-env NAME=VALUE`.  Credentials, URL user
 info, sensitive URL query values, authorization headers, and secret-like
 arguments/environment keys are redacted from metadata and recorded commands.
 
-Format labels are not execution evidence.  Every report requires the
+Format labels are not execution evidence. Every report requires the
 format/rung, serialized weight layout, scale coding, full weight/activation
 contract (`W4A4`, `W8A8`, and so on), concrete kernel/backend, tensor-parallel
 size, fallback state, exact server vLLM/runtime build, GPU identifier, driver,
@@ -71,12 +93,50 @@ fields because the benchmark may run outside the serving container.  Attach
 server log lines proving the backend and fallback state; `--server-arg` and a
 filename containing “native” do not prove dispatch.
 
+Every report also requires a SHA-256-bound
+`gridbook.execution-manifest.v1`. Its `assignments` enumerate serving units and
+their format/rung, layout, scale coding, W/A contract, concrete backend, and
+fallback state, and it is bound to the artifact-inventory digest and TP size.
+It must declare `coverage: "all_serving_units"`; a sampled-layer manifest is
+not release evidence.
+Uniform runs must repeat the manifest's one value on the corresponding CLI
+identity fields. If an assignment uses more than one value, that CLI field must
+say `mixed`. The manifest is the authoritative identity for mixed menus; a
+single average bpp or headline format is not.
+
+Minimal manifests look like this (real inventories enumerate every shipped
+file, and real mixed menus enumerate every serving unit or an auditable complete
+set of non-overlapping unit groups):
+
+```json
+{"schema":"gridbook.artifact-inventory.v1","total_bytes":123,"files":[{"path":"config.json","bytes":123,"sha256":"<64 hex>"}]}
+```
+
+For a new PrismaQuant export, pass its existing `quant_config.json` instead of
+translating the embedded inventory into the standalone form.
+
+```json
+{"schema":"gridbook.execution-manifest.v1","coverage":"all_serving_units","artifact_inventory_sha256":"<inventory JSON SHA-256>","tensor_parallel_size":1,"assignments":[{"unit":"model.*","format_rung":"FP8_CB_K36","serialized_layout":"product-codebook-indices-v1","scale_coding":"e4m3-per-block","quant_contract":"W8A8","kernel_backend":"gridbook-cuda-cb-gemv-v2","fallback_state":"none-observed"}]}
+```
+
+The digest arguments are the SHA-256 of the exact JSON file bytes, not a digest
+of a reserialized in-memory object.
+
 One important delegated-NVFP4 trap is **Marlin contract drift**.  An auto/native
 MoE path may select Marlin while dropping activation scales, making the executed
 operator W4A16 rather than W4A4.  Such a run cannot be labelled W4A4 even if the
 serialized weights are NVFP4.  Record the executed W/A contract and concrete
 backend, and prove both from server logs.  A silent fallback is a different arm,
 not a slower sample of the requested arm.
+An intentional Gridbook W4A16 arm is valid when its exact packing/metadata,
+profile, loader, and delegated backend are recorded as W4A16; it must never be
+used as evidence for W4A4 merely because both reuse a native weight family.
+
+The opt-in fused native-FP4 prefill path is another contract-changing cell, not
+a transparent acceleration switch: it moves activation scaling from the
+FP32-emulated group-scale bucket to native UE4M3 factors. Keep it explicitly
+labelled and opt-in until its own same-session served KL/PPL/task and routing/
+shape gates pass; arithmetic or latency parity alone cannot promote it.
 
 ## Approximate 0.6B smoke matrix
 
@@ -84,14 +144,15 @@ Use the 0.6B pair for rapid iteration only.  The small model exposes launch and
 dispatch overhead quickly, but its currently available arms are not a formal
 native-parity pair:
 
-| 0.6B arm | Whole shipped bytes | Executed contract |
-|---|---:|---|
-| Native | 870,290,032 B | W4A4 delegated NVFP4 (only if logs prove the non-Marlin W4A4 path) |
-| Gridbook CB | 871,628,664 B | W8A8 FP8_CB_K36 |
+| 0.6B arm | Model payload scope | Exact whole directory | Executed contract |
+|---|---:|---:|---|
+| Native | 870,290,032 B | 886,191,111 B | W4A4 delegated NVFP4 (only if logs prove the non-Marlin W4A4 path) |
+| Gridbook CB | 871,628,664 B (model plus `cb_codebooks.pqcb`) | 887,531,487 B | W8A8 FP8_CB_K36 |
 
-The CB artifact is **+1,338,632 B / +0.154%**.  It misses a `<=0.1%` matching
-tolerance and fails the exact `bytes <= B` gate when `B` is the native
-870,290,032 B.  More fundamentally, W4A4 native versus W8A8 FP8_CB_K36 is a
+At payload scope CB is **+1,338,632 B / +0.154%**. At exact whole-directory
+scope it is **+1,340,376 B / +0.15125%**. Both miss a `<=0.1%` matching
+tolerance, and CB fails the exact `bytes <= B` gate when `B` is the native
+whole-directory size. More fundamentally, W4A4 native versus W8A8 FP8_CB_K36 is a
 different whole execution contract.  These runs can identify promising kernels
 and regressions; they cannot establish release parity.
 
@@ -152,10 +213,13 @@ and covers the serving scheduler, not just one batch-1 kernel point:
 | MoE routing | Per-layer/per-step routed-token histograms, expert occupancy, active experts, and grouped-operator shape |
 | Grouped MoE | Time the whole routed/grouped operator including routing, packing, launches, kernel, and combine—not an isolated inner GEMM |
 
-`vllm bench serve` supplies request timing but does not emit speculative
-acceptance or MoE routing histograms.  Attach matched server telemetry/log
-artifacts for those fields, keyed by run label, block seed, and timestamps.
-Record the production batch/routed-token `M` seen in those attachments.  Never
+The pinned `vllm bench serve` emits speculative acceptance rate and length,
+draft count, draft/accepted token counts, and per-position acceptance rates.
+The runner requires and arithmetically reconciles every field when
+`--speculative-mode=on`, and forbids those fields when the mode is `off`.
+It does not emit MoE routing histograms. Attach matched server telemetry/log
+artifacts for routing, keyed by run label, block seed, and timestamps.
+Record the production batch/routed-token `M` seen in those attachments. Never
 extrapolate an `M=1` expert microbenchmark to grouped MoE serving: routing skew,
 packing, occupancy, expert grouping, and combine overhead are part of the
 operator that must reach parity.
@@ -165,6 +229,26 @@ separate labelled cells.  They must not be averaged together.  Acceptance-rate
 differences can move effective throughput even when the underlying decode
 kernel is unchanged, so publish acceptance beside throughput for every
 speculative arm.
+
+## Performance is a constraint, not the quality objective
+
+A release assignment minimizes predicted quality loss subject to hard limits:
+exact whole-artifact bytes `<= B`, p95 TTFT, p95 ITL and/or p05 throughput,
+resident weights plus KV plus peak scratch memory, backend/shape/TP legality,
+and serving-unit coupling. Do not replace those limits with
+`quality + lambda * time`, one blended `serve_ms`, or the sum of each layer's
+independently fastest format. That synthetic reference can exceed the byte
+budget. The performance denominator is the fastest **globally feasible**
+assignment under the same whole-artifact budget and execution constraints.
+
+Kernel and per-layer timings can propose candidates; they cannot promote an
+assignment. Final selection requires every arm to be evaluated in the same
+session against the same BF16 teacher capture with served KL/PPL and the
+declared downstream task suite, then measured end to end with this workload
+matrix. This prevents cross-session KL drift, a changed activation bucket, or
+an M=1 microbenchmark from being reported as a quality-preserving native-parity
+win. If a dispatch change alters numerical association, repeat the same-session
+quality gate even when generated smoke text looks unchanged.
 
 ## Invocation template
 
@@ -183,6 +267,8 @@ gridbook-bench-serve \
   --git-commit "$GRIDBOOK_COMMIT" \
   --run-label "$ARM-$SIZE-decode" \
   --artifact-bytes "$WHOLE_ARTIFACT_BYTES" \
+  --artifact-inventory "$ARTIFACT_INVENTORY_JSON" \
+  --artifact-inventory-sha256 "$ARTIFACT_INVENTORY_SHA256" \
   --byte-budget "$BYTE_BUDGET_BYTES" \
   --format-rung "$FORMAT_RUNG" \
   --serialized-layout "$SERIALIZED_LAYOUT" \
@@ -196,6 +282,9 @@ gridbook-bench-serve \
   --gpu-id "$GPU_ID" \
   --driver-version "$NVIDIA_DRIVER_VERSION" \
   --cuda-version "$SERVER_CUDA_VERSION" \
+  --execution-manifest "$EXECUTION_MANIFEST_JSON" \
+  --execution-manifest-sha256 "$EXECUTION_MANIFEST_SHA256" \
+  --speculative-mode off \
   --server-arg=--enforce-eager \
   --server-arg="--max-model-len=$MAX_MODEL_LEN" \
   --runner-env CUDA_VISIBLE_DEVICES \
@@ -218,9 +307,17 @@ Use the same template with the prefill and mixed-online values from the table.
 identity.  They are deliberately separate because production servers often use
 a short alias for a long Hub revision.  `--git-commit` may be omitted when the
 runner is invoked from a Git checkout; an installed wheel has no repository
-metadata, so supply the exact commit used to build it.  The byte and execution
-identity arguments are required: the runner refuses an artifact larger than
-the declared budget before issuing a request.
+metadata, so supply the exact commit used to build it. The byte inventory, its
+digest, the execution manifest, and its digest are required. The runner verifies
+their bindings and refuses an artifact larger than the declared budget before
+issuing a request. For a speculative cell use `--speculative-mode on
+--speculative-config '{"method":"...","num_speculative_tokens":K,...}'`; the
+JSON must describe the exact server configuration, not merely say “enabled,”
+and the same strict-JSON object must appear in the recorded
+`--server-arg=--speculative-config=...`. A mismatch or a speculative server flag
+in an `off` cell fails before requests are issued.
+Optional payload bytes use `--payload-bytes` together with a precise
+`--payload-scope`.
 
 The benchmark does not launch a server.  Start native and Gridbook servers with
 the recorded, matched arguments, wait until model loading and JIT compilation
@@ -229,23 +326,27 @@ the same accelerator during a comparison.
 
 ## Structured report and acceptance
 
-Each JSON report has schema `gridbook.vllm-bench-serve.v1` and contains:
+Each JSON report has schema `gridbook.vllm-bench-serve.v2` and contains:
 
 - UTC start/end timestamps and wall duration;
 - Gridbook git commit/dirty state and package, vLLM, Python, platform and host
   versions;
 - supplied image, artifact, tokenizer, endpoint and served-model identities;
-- exact whole-artifact bytes, budget, headroom, and byte-scope definition;
+- exact inventory-derived whole-artifact bytes, inventory digest/reference,
+  budget, headroom, and byte-scope definition, plus separately scoped optional
+  payload bytes;
 - structured format/rung, serialized layout/scale coding, W/A contract,
   concrete backend/fallback, TP size, client/server runtimes, GPU, driver, and
-  CUDA;
+  CUDA, plus the digest-bound per-serving-unit execution manifest;
 - recorded server flags and dispatch environment;
 - runner environment and explicitly supplied server environment in separate
   fields;
-- the exact workload controls, block seeds, and full vLLM command for each block;
+- the exact workload controls, structured speculation mode/config, block seeds,
+  and full vLLM command for each block;
 - the input-length ratio, validation envelope, and observed per-request lengths;
 - raw vLLM detailed output for each block; and
-- mean, median, min, max and sample standard deviation across block metrics.
+- mean, median, min, max, NumPy-linear block p05/p95, and sample standard
+  deviation across block metrics.
 
 A nonzero client exit, failed request, missing streaming metric, early EOS, or
 length mismatch makes the report `failed`.  Required throughput and every
@@ -257,16 +358,21 @@ redacted command, return code, raw result when one exists, and validation error
 so the run cannot be mistaken for missing data.  The output name is atomically
 reserved before probes begin, preventing concurrent clients from both claiming
 it; existing reports are never overwritten unless `--overwrite` is explicit.
+The CLI enforces at least four warmups, at least three independent blocks, and a
+percentile set containing p95; a report cannot quietly weaken the minimum
+TTFT/ITL gates.
 
 Detailed ITL entries are streamed **chunk** intervals, not a promise of one
 entry per generated token: one chunk can carry several regular or
 speculatively accepted tokens.  The harness therefore never requires
-`len(itls) == output_len - 1`.  It reconciles TTFT and flattened ITL means and
-medians against the detailed arrays, reconstructs per-request E2EL as
-`ttft + sum(itls)` with a small terminal-event allowance, and checks mean TPOT
-against `(mean E2EL - mean TTFT) / (fixed output_len - 1)`.  These consistency
-checks reject contradictory summary data without inventing token arrival times
-that the client did not observe.
+`len(itls) == output_len - 1`. It reconstructs mean, median, population standard
+deviation, and every requested percentile for TTFT and flattened ITL with
+NumPy-linear percentile semantics. It reconstructs per-request E2EL as
+`ttft + sum(itls)` and TPOT as `sum(itls) / (fixed output_len - 1)`, checking the
+same complete aggregate set with a small declared terminal-event allowance.
+Request, output-token, and total-token throughput are independently recomputed
+from the finite positive raw duration and exact detailed totals. These checks
+reject contradictory summary data without inventing one ITL per token.
 
 Reports are created with mode `0600`, but treat them as **sensitive raw output**.
 `--save-detailed` includes generated model text and server error strings, which

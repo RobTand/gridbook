@@ -5,6 +5,7 @@ fixed-shape validation, provenance capture, and the report schema without a
 vLLM install, a GPU, or a listening server.
 """
 
+import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +17,40 @@ from gridbook import bench_serve
 
 
 def _argv(tmp_path):
+    inventory_path = tmp_path / "artifact-inventory.json"
+    inventory = {
+        "schema": bench_serve.ARTIFACT_INVENTORY_SCHEMA,
+        "total_bytes": 800,
+        "files": [
+            {"path": "model.safetensors", "bytes": 700, "sha256": "a" * 64},
+            {"path": "config.json", "bytes": 100, "sha256": "b" * 64},
+        ],
+    }
+    inventory_raw = json.dumps(inventory, sort_keys=True).encode()
+    inventory_path.write_bytes(inventory_raw)
+    inventory_digest = hashlib.sha256(inventory_raw).hexdigest()
+
+    execution_path = tmp_path / "execution-manifest.json"
+    execution = {
+        "schema": bench_serve.EXECUTION_MANIFEST_SCHEMA,
+        "coverage": "all_serving_units",
+        "artifact_inventory_sha256": inventory_digest,
+        "tensor_parallel_size": 1,
+        "assignments": [
+            {
+                "unit": "model.*",
+                "format_rung": "FP8_CB_K36",
+                "serialized_layout": "product-codebook-indices-v1",
+                "scale_coding": "e4m3-per-block",
+                "quant_contract": "W8A8",
+                "kernel_backend": "gridbook-cuda-cb-gemv-v2",
+                "fallback_state": "none-observed",
+            }
+        ],
+    }
+    execution_raw = json.dumps(execution, sort_keys=True).encode()
+    execution_path.write_bytes(execution_raw)
+    execution_digest = hashlib.sha256(execution_raw).hexdigest()
     return [
         "--base-url",
         "http://127.0.0.1:8000/",
@@ -33,6 +68,10 @@ def _argv(tmp_path):
         "gridbook-0.6b-decode",
         "--artifact-bytes",
         "800",
+        "--artifact-inventory",
+        str(inventory_path),
+        "--artifact-inventory-sha256",
+        inventory_digest,
         "--byte-budget",
         "900",
         "--format-rung",
@@ -59,6 +98,12 @@ def _argv(tmp_path):
         "580.00",
         "--cuda-version",
         "13.0",
+        "--execution-manifest",
+        str(execution_path),
+        "--execution-manifest-sha256",
+        execution_digest,
+        "--speculative-mode",
+        "off",
         "--input-len",
         "32",
         "--output-len",
@@ -85,6 +130,27 @@ def _without_option(argv, name):
     return [*argv[:index], *argv[index + 2 :]]
 
 
+def _replace_option(argv, name, value):
+    replaced = list(argv)
+    index = replaced.index(name)
+    replaced[index + 1] = str(value)
+    return replaced
+
+
+def _write_json_digest(path, payload):
+    raw = json.dumps(payload, sort_keys=True).encode()
+    path.write_bytes(raw)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _reconcile_throughput(result):
+    result["request_throughput"] = result["completed"] / result["duration"]
+    result["output_throughput"] = result["total_output_tokens"] / result["duration"]
+    result["total_token_throughput"] = (
+        result["total_input_tokens"] + result["total_output_tokens"]
+    ) / result["duration"]
+
+
 def _valid_result(args, *, offset=0.0):
     multi_token = args.output_len > 1
     ttft_ms = 20.0 + offset
@@ -94,22 +160,25 @@ def _valid_result(args, *, offset=0.0):
     itl_ms = 2.0 + offset if multi_token else 0.0
     e2el_ms = ttft_ms + itl_ms
     tpot_ms = itl_ms / (args.output_len - 1) if multi_token else 0.0
+    duration = 4.0
+    total_input = args.num_prompts * args.input_len
+    total_output = args.num_prompts * args.output_len
     result = {
+        "duration": duration,
         "completed": args.num_prompts,
         "failed": 0,
-        "total_input_tokens": args.num_prompts * args.input_len,
-        "total_output_tokens": args.num_prompts * args.output_len,
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
         "input_lens": [args.input_len] * args.num_prompts,
         "output_lens": [args.output_len] * args.num_prompts,
         "errors": [""] * args.num_prompts,
         "ttfts": [ttft_ms / 1000] * args.num_prompts,
         "itls": [
-            [itl_ms / 1000] if multi_token else []
-            for _ in range(args.num_prompts)
+            [itl_ms / 1000] if multi_token else [] for _ in range(args.num_prompts)
         ],
-        "request_throughput": 2.0 + offset,
-        "output_throughput": 500.0 + offset,
-        "total_token_throughput": 600.0 + offset,
+        "request_throughput": args.num_prompts / duration,
+        "output_throughput": total_output / duration,
+        "total_token_throughput": (total_input + total_output) / duration,
         "mean_ttft_ms": ttft_ms,
         "median_ttft_ms": ttft_ms,
         "std_ttft_ms": 0.0,
@@ -134,6 +203,24 @@ def _valid_result(args, *, offset=0.0):
             key = bench_serve._percentile_result_key(percentile, metric)
             result[key] = value
     return result
+
+
+def _add_valid_speculative_result(result, *, drafts=10, tokens=2):
+    accepted_by_position = [0.8, 0.4][:tokens]
+    if len(accepted_by_position) < tokens:
+        accepted_by_position.extend([0.0] * (tokens - len(accepted_by_position)))
+    accepted = round(sum(accepted_by_position) * drafts)
+    draft_tokens = drafts * tokens
+    result.update(
+        {
+            "spec_decode_acceptance_rate": accepted / draft_tokens * 100,
+            "spec_decode_acceptance_length": 1 + accepted / drafts,
+            "spec_decode_num_drafts": drafts,
+            "spec_decode_draft_tokens": draft_tokens,
+            "spec_decode_accepted_tokens": accepted,
+            "spec_decode_per_position_acceptance_rates": accepted_by_position,
+        }
+    )
 
 
 def test_command_uses_official_streaming_fixed_shape_semantics(tmp_path):
@@ -180,9 +267,13 @@ def test_dataset_seed_and_server_sampling_are_distinct_metadata(tmp_path, monkey
 
 def test_parser_rejects_ranges_that_break_a_comparable_workload(tmp_path):
     with pytest.raises(SystemExit):
-        _parse(tmp_path, "--blocks", "0")
+        _parse(tmp_path, "--blocks", "2")
+    with pytest.raises(SystemExit):
+        _parse(tmp_path, "--warmups", "3")
     with pytest.raises(SystemExit):
         _parse(tmp_path, "--percentiles", "50,100")
+    with pytest.raises(SystemExit):
+        _parse(tmp_path, "--percentiles", "50,90,99")
     with pytest.raises(SystemExit):
         _parse(tmp_path, "--request-rate", "0")
     with pytest.raises(SystemExit):
@@ -198,9 +289,17 @@ def test_parser_rejects_ranges_that_break_a_comparable_workload(tmp_path):
             _parse(tmp_path, "--input-range-ratio", ratio)
 
 
+def test_required_identity_strings_reject_whitespace(tmp_path):
+    for option in ("--model-id", "--image-id", "--run-label"):
+        with pytest.raises(SystemExit):
+            _parse(tmp_path, option, "   ")
+
+
 def test_execution_identity_and_whole_artifact_bytes_are_required(tmp_path):
     required = (
         "--artifact-bytes",
+        "--artifact-inventory",
+        "--artifact-inventory-sha256",
         "--byte-budget",
         "--format-rung",
         "--serialized-layout",
@@ -214,6 +313,12 @@ def test_execution_identity_and_whole_artifact_bytes_are_required(tmp_path):
         "--gpu-id",
         "--driver-version",
         "--cuda-version",
+        "--execution-manifest",
+        "--execution-manifest-sha256",
+        "--speculative-mode",
+        "--model-id",
+        "--image-id",
+        "--run-label",
     )
     for option in required:
         with pytest.raises(SystemExit):
@@ -224,19 +329,252 @@ def test_whole_artifact_must_fit_exact_byte_budget(tmp_path):
     with pytest.raises(SystemExit):
         _parse(
             tmp_path,
-            "--artifact-bytes",
-            "901",
             "--byte-budget",
-            "900",
+            "799",
         )
     args = _parse(
         tmp_path,
-        "--artifact-bytes",
-        "900",
         "--byte-budget",
-        "900",
+        "800",
     )
-    assert args.artifact_bytes == args.byte_budget == 900
+    assert args.artifact_bytes == args.byte_budget == 800
+
+
+def test_artifact_inventory_digest_sum_and_paths_fail_closed(tmp_path):
+    argv = _argv(tmp_path)
+    inventory_path = Path(_option(argv, "--artifact-inventory"))
+
+    inventory_path.write_text("{}")
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(argv)
+
+    bad_sum = {
+        "schema": bench_serve.ARTIFACT_INVENTORY_SCHEMA,
+        "total_bytes": 800,
+        "files": [{"path": "model", "bytes": 799, "sha256": "a" * 64}],
+    }
+    digest = _write_json_digest(inventory_path, bad_sum)
+    bad_sum_argv = _replace_option(argv, "--artifact-inventory-sha256", digest)
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(bad_sum_argv)
+
+    unsafe = {
+        "schema": bench_serve.ARTIFACT_INVENTORY_SCHEMA,
+        "total_bytes": 800,
+        "files": [{"path": "../model", "bytes": 800, "sha256": "a" * 64}],
+    }
+    digest = _write_json_digest(inventory_path, unsafe)
+    unsafe_argv = _replace_option(argv, "--artifact-inventory-sha256", digest)
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(unsafe_argv)
+
+    unsafe["files"][0]["path"] = "weights//model"
+    digest = _write_json_digest(inventory_path, unsafe)
+    noncanonical_argv = _replace_option(argv, "--artifact-inventory-sha256", digest)
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(noncanonical_argv)
+
+
+def test_prismaquant_quant_config_inventory_is_consumed_directly(tmp_path):
+    argv = _argv(tmp_path)
+    inventory_path = Path(_option(argv, "--artifact-inventory"))
+    execution_path = Path(_option(argv, "--execution-manifest"))
+    quant_config = {
+        "quant_method": "gridbook",
+        "provenance": {
+            "artifact_inventory": {
+                "schema": bench_serve.PRISMAQUANT_ARTIFACT_INVENTORY_SCHEMA,
+                "scope": "all_regular_files_recursive",
+                "file_bytes": {
+                    "config.json": 100,
+                    "model.safetensors": 700,
+                },
+                "export_directory_bytes": 800,
+            }
+        },
+    }
+    inventory_digest = _write_json_digest(inventory_path, quant_config)
+    argv = _replace_option(argv, "--artifact-inventory-sha256", inventory_digest)
+
+    execution = json.loads(execution_path.read_text())
+    execution["artifact_inventory_sha256"] = inventory_digest
+    execution_digest = _write_json_digest(execution_path, execution)
+    argv = _replace_option(argv, "--execution-manifest-sha256", execution_digest)
+    args = bench_serve.parse_args(argv)
+    assert args.artifact_inventory_summary["schema"] == (
+        bench_serve.PRISMAQUANT_ARTIFACT_INVENTORY_SCHEMA
+    )
+    assert args.artifact_inventory_summary["source"] == "quant-config-provenance"
+    assert args.artifact_inventory_summary["computed_total_bytes"] == 800
+    assert args.artifact_inventory_summary["files"] == [
+        {"path": "config.json", "bytes": 100},
+        {"path": "model.safetensors", "bytes": 700},
+    ]
+
+    quant_config["provenance"]["artifact_inventory"]["export_directory_bytes"] = 801
+    bad_digest = _write_json_digest(inventory_path, quant_config)
+    bad_argv = _replace_option(argv, "--artifact-inventory-sha256", bad_digest)
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(bad_argv)
+
+
+def test_payload_scope_is_explicit_and_never_substitutes_for_whole_bytes(tmp_path):
+    with pytest.raises(SystemExit):
+        _parse(tmp_path, "--payload-bytes", "700")
+    with pytest.raises(SystemExit):
+        _parse(tmp_path, "--payload-scope", "model shards only")
+    with pytest.raises(SystemExit):
+        _parse(
+            tmp_path,
+            "--payload-bytes",
+            "801",
+            "--payload-scope",
+            "model shards only",
+        )
+    args = _parse(
+        tmp_path,
+        "--payload-bytes",
+        "700",
+        "--payload-scope",
+        "model shards plus codebook sidecar",
+    )
+    metadata = bench_serve.collect_metadata(args, {})
+    assert metadata["artifacts"]["payload"] == {
+        "bytes": 700,
+        "scope": "model shards plus codebook sidecar",
+        "is_budget_gate": False,
+    }
+    assert metadata["artifacts"]["whole_served_artifact_bytes"] == 800
+
+
+def test_execution_manifest_binds_inventory_and_mixed_assignments(tmp_path):
+    argv = _argv(tmp_path)
+    execution_path = Path(_option(argv, "--execution-manifest"))
+    inventory_digest = _option(argv, "--artifact-inventory-sha256")
+    manifest = {
+        "schema": bench_serve.EXECUTION_MANIFEST_SCHEMA,
+        "coverage": "all_serving_units",
+        "artifact_inventory_sha256": inventory_digest,
+        "tensor_parallel_size": 1,
+        "assignments": [
+            {
+                "unit": "model.layers.0",
+                "format_rung": "FP8_CB_K36",
+                "serialized_layout": "product-codebook-indices-v1",
+                "scale_coding": "e4m3-per-block",
+                "quant_contract": "W8A8",
+                "kernel_backend": "gridbook-cuda-cb-gemv-v2",
+                "fallback_state": "none-observed",
+            },
+            {
+                "unit": "model.layers.1",
+                "format_rung": "NVFP4",
+                "serialized_layout": "compressed-tensors",
+                "scale_coding": "ue4m3",
+                "quant_contract": "W4A4",
+                "kernel_backend": "vllm-cutlass",
+                "fallback_state": "none-observed",
+            },
+        ],
+    }
+    manifest_digest = _write_json_digest(execution_path, manifest)
+    mixed_argv = _replace_option(argv, "--execution-manifest-sha256", manifest_digest)
+    for option in (
+        "--format-rung",
+        "--serialized-layout",
+        "--scale-coding",
+        "--quant-contract",
+        "--kernel-backend",
+    ):
+        mixed_argv = _replace_option(mixed_argv, option, "mixed")
+    args = bench_serve.parse_args(mixed_argv)
+    assert args.execution_manifest_summary["assignment_count"] == 2
+    assert args.execution_manifest_summary["sha256"] == manifest_digest
+
+    not_declared_mixed = _replace_option(mixed_argv, "--format-rung", "FP8_CB_K36")
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(not_declared_mixed)
+
+    incomplete_manifest = dict(manifest)
+    del incomplete_manifest["coverage"]
+    incomplete_digest = _write_json_digest(execution_path, incomplete_manifest)
+    incomplete_argv = _replace_option(
+        mixed_argv, "--execution-manifest-sha256", incomplete_digest
+    )
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(incomplete_argv)
+
+    manifest["artifact_inventory_sha256"] = "0" * 64
+    wrong_binding_digest = _write_json_digest(execution_path, manifest)
+    wrong_binding = _replace_option(
+        mixed_argv, "--execution-manifest-sha256", wrong_binding_digest
+    )
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(wrong_binding)
+
+
+def test_speculative_mode_requires_structured_configuration(tmp_path):
+    with pytest.raises(SystemExit):
+        _parse(tmp_path, "--speculative-mode", "on")
+    with pytest.raises(SystemExit):
+        _parse(
+            tmp_path,
+            "--speculative-mode",
+            "on",
+            "--speculative-config",
+            '{"method":"mtp"}',
+        )
+    with pytest.raises(SystemExit):
+        _parse(
+            tmp_path,
+            "--speculative-config",
+            '{"method":"mtp","num_speculative_tokens":2}',
+        )
+    for config in (
+        '{"num_speculative_tokens":2,"num_speculative_tokens":3}',
+        '{"num_speculative_tokens":2,"threshold":NaN}',
+    ):
+        with pytest.raises(SystemExit):
+            _parse(
+                tmp_path,
+                "--speculative-mode",
+                "on",
+                "--speculative-config",
+                config,
+            )
+
+    config = '{"method":"mtp","num_speculative_tokens":2}'
+    with pytest.raises(SystemExit):
+        _parse(
+            tmp_path,
+            "--speculative-mode",
+            "on",
+            "--speculative-config",
+            config,
+        )
+    with pytest.raises(SystemExit):
+        _parse(
+            tmp_path,
+            "--speculative-mode",
+            "on",
+            "--speculative-config",
+            config,
+            '--server-arg=--speculative-config={"method":"draft-model","num_speculative_tokens":2}',
+        )
+    args = _parse(
+        tmp_path,
+        "--speculative-mode",
+        "on",
+        "--speculative-config",
+        config,
+        f"--server-arg=--speculative-config={config}",
+    )
+    assert args.speculative_config["method"] == "mtp"
+    with pytest.raises(SystemExit):
+        _parse(
+            tmp_path,
+            '--server-arg=--speculative-config={"method":"mtp","num_speculative_tokens":2}',
+        )
 
 
 def test_dispatch_environment_is_sorted_explicit_and_secret_safe():
@@ -295,23 +633,27 @@ def test_metadata_captures_supplied_artifact_and_server_identity(tmp_path, monke
     assert metadata["artifacts"]["byte_budget_bytes"] == 900
     assert metadata["artifacts"]["budget_headroom_bytes"] == 100
     assert metadata["artifacts"]["within_byte_budget"] is True
-    assert metadata["execution_identity"] == {
-        "format_rung": "FP8_CB_K36",
-        "serialization": {
-            "layout": "product-codebook-indices-v1",
-            "scale_coding": "e4m3-per-block",
-        },
-        "quant_contract": "W8A8",
-        "kernel_backend": "gridbook-cuda-cb-gemv-v2",
-        "tensor_parallel_size": 1,
-        "fallback_state": "none-observed",
-        "client_runtime_id": "vllm-bench@g54b16d8a9",
-        "server_runtime_id": "vllm@g54b16d8a9+gridbook-0.3.0",
-        "hardware": {
-            "gpu_id": "NVIDIA-GB10:GPU-1234",
-            "driver_version": "580.00",
-            "cuda_version": "13.0",
-        },
+    identity = metadata["execution_identity"]
+    assert identity["format_rung"] == "FP8_CB_K36"
+    assert identity["serialization"] == {
+        "layout": "product-codebook-indices-v1",
+        "scale_coding": "e4m3-per-block",
+    }
+    assert identity["quant_contract"] == "W8A8"
+    assert identity["kernel_backend"] == "gridbook-cuda-cb-gemv-v2"
+    assert identity["tensor_parallel_size"] == 1
+    assert identity["fallback_state"] == "none-observed"
+    assert identity["manifest"]["assignment_count"] == 1
+    assert (
+        identity["manifest"]["artifact_inventory_sha256"]
+        == metadata["artifacts"]["inventory"]["sha256"]
+    )
+    assert identity["client_runtime_id"] == "vllm-bench@g54b16d8a9"
+    assert identity["server_runtime_id"] == "vllm@g54b16d8a9+gridbook-0.3.0"
+    assert identity["hardware"] == {
+        "gpu_id": "NVIDIA-GB10:GPU-1234",
+        "driver_version": "580.00",
+        "cuda_version": "13.0",
     }
     assert metadata["server"]["recorded_args"] == ["--enforce-eager"]
     assert metadata["dispatch"]["runner_environment"] == {
@@ -373,6 +715,60 @@ def test_urls_commands_and_server_args_never_persist_credentials(tmp_path):
     assert _option(redacted_command, "--tokenizer") == "org/tokenizer"
 
 
+def test_redaction_covers_nested_json_headers_cookies_and_url_fragments():
+    command = [
+        "client",
+        "--extra-body",
+        json.dumps(
+            {
+                "public": "visible",
+                "nested": {
+                    "authorization": "Bearer json-secret",
+                    "items": [
+                        {"api_key": "array-secret"},
+                        "https://example.test/#access_token=fragment-secret&mode=ok",
+                    ],
+                },
+            }
+        ),
+        "--header",
+        "X-Api-Key: header-secret",
+        "-H",
+        "Cookie: session=cookie-secret; Path=/",
+        '--server-config={"refresh_token":"embedded-secret","safe":1}',
+        "https://example.test/path#token=second-fragment&view=public",
+    ]
+    serialized = json.dumps(bench_serve.redact_command(command))
+    for secret in (
+        "json-secret",
+        "array-secret",
+        "fragment-secret",
+        "header-secret",
+        "cookie-secret",
+        "embedded-secret",
+        "second-fragment",
+    ):
+        assert secret not in serialized
+    assert "visible" in serialized
+    assert "mode=ok" in serialized
+    assert "view=public" in serialized
+
+
+@pytest.mark.parametrize(
+    "header",
+    (
+        "authorization: Basic lower-secret",
+        "Proxy-Authorization: Bearer proxy-secret",
+        "Set-Cookie: SID=set-cookie-secret; HttpOnly",
+        "API-Key: api-header-secret",
+    ),
+)
+def test_inline_sensitive_header_variations_are_redacted(header):
+    redacted = bench_serve._redact_text(header)
+    assert "secret" not in redacted
+    assert "<redacted>" in redacted
+
+
 def test_secret_key_detection_does_not_confuse_tokenizer_or_monkey():
     assert bench_serve._is_sensitive_key("HF_TOKEN")
     assert bench_serve._is_sensitive_key("authorization")
@@ -391,9 +787,7 @@ def test_validate_result_requires_true_streaming_metrics_and_exact_lengths(tmp_p
     with pytest.raises(bench_serve.BenchmarkError, match="required metrics"):
         bench_serve.validate_result(missing_itl, args)
 
-    short_decode = dict(
-        result, total_output_tokens=result["total_output_tokens"] - 1
-    )
+    short_decode = dict(result, total_output_tokens=result["total_output_tokens"] - 1)
     with pytest.raises(bench_serve.BenchmarkError, match="not completed exactly"):
         bench_serve.validate_result(short_decode, args)
 
@@ -453,12 +847,138 @@ def test_validate_result_reconciles_aggregate_and_detailed_timings(tmp_path):
         bench_serve.validate_result(bad_tpot, args)
 
 
+@pytest.mark.parametrize(
+    "metric",
+    (
+        "std_ttft_ms",
+        "p95_ttft_ms",
+        "std_itl_ms",
+        "p99_itl_ms",
+        "std_e2el_ms",
+        "p90_e2el_ms",
+        "std_tpot_ms",
+        "p95_tpot_ms",
+    ),
+)
+def test_every_dispersion_and_percentile_is_reconstructed(tmp_path, metric):
+    args = _parse(tmp_path)
+    result = _valid_result(args)
+    result[metric] += 10.0
+    with pytest.raises(bench_serve.BenchmarkError, match="disagrees"):
+        bench_serve.validate_result(result, args)
+
+
+@pytest.mark.parametrize(
+    "metric",
+    ("request_throughput", "output_throughput", "total_token_throughput"),
+)
+def test_throughput_is_reconstructed_from_duration_and_totals(tmp_path, metric):
+    args = _parse(tmp_path)
+    result = _valid_result(args)
+    result[metric] += 0.1
+    with pytest.raises(bench_serve.BenchmarkError, match="duration and exact totals"):
+        bench_serve.validate_result(result, args)
+
+
+@pytest.mark.parametrize("duration", (0, -1, float("inf"), "4"))
+def test_duration_must_be_finite_positive_number(tmp_path, duration):
+    args = _parse(tmp_path)
+    result = _valid_result(args)
+    result["duration"] = duration
+    if duration == float("inf"):
+        match = "NaN/Infinity"
+    else:
+        match = "duration"
+    with pytest.raises(bench_serve.BenchmarkError, match=match):
+        bench_serve.validate_result(result, args)
+
+
+def test_numpy_linear_percentile_and_population_std_are_pinned(tmp_path):
+    args = _parse(tmp_path)
+    result = _valid_result(args)
+    ttft_ms = [10.0, 11.0, 13.0, 17.0, 23.0, 31.0, 41.0, 53.0]
+    result["ttfts"] = [value / 1000 for value in ttft_ms]
+    aggregates = bench_serve._sample_aggregates(ttft_ms, args.percentiles.split(","))
+    result["mean_ttft_ms"] = aggregates["mean"]
+    result["median_ttft_ms"] = aggregates["median"]
+    result["std_ttft_ms"] = aggregates["std"]
+    for percentile in args.percentiles.split(","):
+        result[bench_serve._percentile_result_key(percentile, "ttft")] = aggregates[
+            f"p{float(percentile):g}"
+        ]
+
+    e2el_ms = [value + 2.0 for value in ttft_ms]
+    e2el = bench_serve._sample_aggregates(e2el_ms, args.percentiles.split(","))
+    result["mean_e2el_ms"] = e2el["mean"]
+    result["median_e2el_ms"] = e2el["median"]
+    result["std_e2el_ms"] = e2el["std"]
+    for percentile in args.percentiles.split(","):
+        result[bench_serve._percentile_result_key(percentile, "e2el")] = e2el[
+            f"p{float(percentile):g}"
+        ]
+    bench_serve.validate_result(result, args)
+
+    result["std_ttft_ms"] = __import__("statistics").stdev(ttft_ms)
+    with pytest.raises(bench_serve.BenchmarkError, match="std_ttft_ms disagrees"):
+        bench_serve.validate_result(result, args)
+
+
+def test_itl_chunk_count_is_not_assumed_to_equal_output_tokens(tmp_path):
+    args = _parse(tmp_path)
+    result = _valid_result(args)
+    assert all(len(intervals) == 1 for intervals in result["itls"])
+    assert args.output_len - 1 == 255
+    bench_serve.validate_result(result, args)
+
+
+def test_speculative_result_contract_is_required_and_reconciled(tmp_path):
+    args = _parse(
+        tmp_path,
+        "--speculative-mode",
+        "on",
+        "--speculative-config",
+        '{"method":"mtp","num_speculative_tokens":2}',
+        '--server-arg=--speculative-config={"method":"mtp","num_speculative_tokens":2}',
+    )
+    result = _valid_result(args)
+    with pytest.raises(bench_serve.BenchmarkError, match="lacks required"):
+        bench_serve.validate_result(result, args)
+
+    _add_valid_speculative_result(result)
+    bench_serve.validate_result(result, args)
+
+    mutations = {
+        "spec_decode_acceptance_rate": result["spec_decode_acceptance_rate"] + 1,
+        "spec_decode_acceptance_length": result["spec_decode_acceptance_length"] + 1,
+        "spec_decode_num_drafts": result["spec_decode_num_drafts"] + 1,
+        "spec_decode_draft_tokens": result["spec_decode_draft_tokens"] + 1,
+        "spec_decode_accepted_tokens": result["spec_decode_draft_tokens"] + 1,
+        "spec_decode_per_position_acceptance_rates": [0.8],
+    }
+    for key, bad_value in mutations.items():
+        bad = dict(result, **{key: bad_value})
+        with pytest.raises(bench_serve.BenchmarkError):
+            bench_serve.validate_result(bad, args)
+
+
+def test_non_speculative_cell_rejects_speculative_telemetry(tmp_path):
+    args = _parse(tmp_path)
+    result = _valid_result(args)
+    _add_valid_speculative_result(result)
+    with pytest.raises(bench_serve.BenchmarkError, match="non-speculative"):
+        bench_serve.validate_result(result, args)
+
+
 def test_single_token_prefill_explicitly_allows_empty_itl_and_zero_tpot(tmp_path):
     args = _parse(tmp_path, "--output-len", "1")
     result = _valid_result(args)
     assert all(not intervals for intervals in result["itls"])
     assert result["mean_itl_ms"] == result["mean_tpot_ms"] == 0.0
     bench_serve.validate_result(result, args)
+
+    unexpected_itl = dict(result, itls=[[0.001], *result["itls"][1:]])
+    with pytest.raises(bench_serve.BenchmarkError, match="single-token"):
+        bench_serve.validate_result(unexpected_itl, args)
 
 
 def test_input_range_ratio_is_passed_and_validated_as_input_only(tmp_path):
@@ -483,10 +1003,12 @@ def test_input_range_ratio_is_passed_and_validated_as_input_only(tmp_path):
     result = _valid_result(args)
     result["input_lens"] = input_lens
     result["total_input_tokens"] = sum(input_lens)
+    _reconcile_throughput(result)
     bench_serve.validate_result(result, args)
 
     too_long = dict(result, input_lens=[41, *input_lens[1:]])
     too_long["total_input_tokens"] = sum(too_long["input_lens"])
+    _reconcile_throughput(too_long)
     with pytest.raises(bench_serve.BenchmarkError, match=r"range \[1, 40\]"):
         bench_serve.validate_result(too_long, args)
 
@@ -494,9 +1016,7 @@ def test_input_range_ratio_is_passed_and_validated_as_input_only(tmp_path):
     with pytest.raises(bench_serve.BenchmarkError, match="unexpected input_lens"):
         bench_serve.validate_result(wrong_type, args)
 
-    wrong_output_type = dict(
-        result, output_lens=[256.0, *result["output_lens"][1:]]
-    )
+    wrong_output_type = dict(result, output_lens=[256.0, *result["output_lens"][1:]])
     with pytest.raises(bench_serve.BenchmarkError, match="unexpected output_lens"):
         bench_serve.validate_result(wrong_output_type, args)
 
@@ -542,6 +1062,8 @@ def test_summary_keeps_independent_values_and_sample_dispersion(tmp_path):
     assert ttft["values"] == [20.0, 21.0, 22.0]
     assert ttft["mean"] == pytest.approx(21.0)
     assert ttft["median"] == pytest.approx(21.0)
+    assert ttft["block_p05"] == pytest.approx(20.1)
+    assert ttft["block_p95"] == pytest.approx(21.9)
     assert ttft["sample_stdev"] == pytest.approx(1.0)
     assert summary["metrics"]["p99_itl_ms"]["values"] == [2.0, 3.0, 4.0]
 
@@ -656,9 +1178,10 @@ def test_individual_metadata_probe_failure_is_recorded_not_raised(
     monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: "vLLM")
     metadata = bench_serve.collect_metadata(args, {})
     assert metadata["software"]["gridbook_version"] is None
-    assert "package metadata unavailable" in metadata["collection_errors"][
-        "gridbook_version"
-    ]
+    assert (
+        "package metadata unavailable"
+        in metadata["collection_errors"]["gridbook_version"]
+    )
 
 
 def test_nonfinite_raw_result_is_rejected_but_preserved_as_valid_json(

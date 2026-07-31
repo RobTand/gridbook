@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import importlib.metadata
 import json
 import math
@@ -25,15 +26,20 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Mapping, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-
-SCHEMA = "gridbook.vllm-bench-serve.v1"
+SCHEMA = "gridbook.vllm-bench-serve.v2"
+ARTIFACT_INVENTORY_SCHEMA = "gridbook.artifact-inventory.v1"
+PRISMAQUANT_ARTIFACT_INVENTORY_SCHEMA = "prismaquant.cb_export_artifact_inventory.v1"
+EXECUTION_MANIFEST_SCHEMA = "gridbook.execution-manifest.v1"
 STREAMING_METRICS = "ttft,tpot,itl,e2el"
 DEFAULT_PERCENTILES = "50,90,95,99"
+MIN_WARMUPS = 4
+MIN_BLOCKS = 3
 
 # These are stable vLLM result names.  Percentile keys are added dynamically
 # below because the selected percentiles are configurable.
@@ -65,9 +71,7 @@ REQUIRED_THROUGHPUT_RESULTS = (
     "output_throughput",
     "total_token_throughput",
 )
-_PERCENTILE_RESULT = re.compile(
-    r"^p(?:\d+(?:\.\d+)?)_(?:ttft|tpot|itl|e2el)_ms$"
-)
+_PERCENTILE_RESULT = re.compile(r"^p(?:\d+(?:\.\d+)?)_(?:ttft|tpot|itl|e2el)_ms$")
 _SENSITIVE_SEGMENTS = {
     "AUTH",
     "AUTHORIZATION",
@@ -75,6 +79,7 @@ _SENSITIVE_SEGMENTS = {
     "COOKIE",
     "CREDENTIAL",
     "CREDENTIALS",
+    "HEADER",
     "KEY",
     "PASSWORD",
     "PASSWD",
@@ -85,12 +90,36 @@ _SENSITIVE_SEGMENTS = {
     "TOKEN",
 }
 _SENSITIVE_COMPOUNDS = ("APIKEY", "AUTHTOKEN", "ACCESSTOKEN", "REFRESHTOKEN")
+_SENSITIVE_OPTIONS = {
+    "-H",
+    "-b",
+    "--cookie",
+    "--extra-header",
+    "--extra-headers",
+    "--header",
+    "--headers",
+}
 _ASSIGNMENT = re.compile(r"(\b[-\w.]+\b\s*(?:=|:)\s*)([^\s,;]+)")
 _OPTION_VALUE = re.compile(r"((?:^|\s)(--?[-\w.]+)\s+)([^\s]+)")
 _AUTH_HEADER = re.compile(
     r"(?i)((?:proxy-)?authorization\s*:\s*)([^\s,;]+)(?:\s+([^\s,;]+))?"
 )
-_URL = re.compile(r"https?://[^\s]+", re.I)
+_SENSITIVE_HEADER = re.compile(
+    r"(?i)((?:(?:proxy-)?authorization|cookie|set-cookie|x-api-key|api-key)"
+    r"\s*:\s*)(.*)$"
+)
+_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+
+_EXECUTION_ASSIGNMENT_FIELDS = (
+    "unit",
+    "format_rung",
+    "serialized_layout",
+    "scale_coding",
+    "quant_contract",
+    "kernel_backend",
+    "fallback_state",
+)
 
 
 class BenchmarkError(RuntimeError):
@@ -98,8 +127,10 @@ class BenchmarkError(RuntimeError):
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
-        "+00:00", "Z"
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
     )
 
 
@@ -121,6 +152,283 @@ def _nonempty(value: str) -> str:
     if not value.strip():
         raise argparse.ArgumentTypeError("must not be empty")
     return value
+
+
+def _sha256(value: str) -> str:
+    if not _SHA256.fullmatch(value):
+        raise argparse.ArgumentTypeError("must be a 64-character SHA-256 hex digest")
+    return value.lower()
+
+
+def _strict_json_loads(value: str | bytes) -> Any:
+    def reject_constant(constant: str) -> None:
+        raise ValueError(f"non-finite JSON number {constant} is forbidden")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, child in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON object key {key!r}")
+            result[key] = child
+        return result
+
+    return json.loads(
+        value,
+        parse_constant=reject_constant,
+        object_pairs_hook=unique_object,
+    )
+
+
+def _json_object(value: str) -> dict[str, Any]:
+    try:
+        parsed = _strict_json_loads(value)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a valid JSON object") from exc
+    if not isinstance(parsed, dict) or not parsed:
+        raise argparse.ArgumentTypeError("must be a non-empty JSON object")
+    return parsed
+
+
+def _read_hashed_json(
+    path: Path, expected_digest: str, label: str
+) -> tuple[dict[str, Any], str]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise BenchmarkError(f"cannot read {label} {path}: {exc}") from exc
+    actual_digest = hashlib.sha256(raw).hexdigest()
+    if actual_digest != expected_digest:
+        raise BenchmarkError(
+            f"{label} SHA-256 mismatch: declared={expected_digest}, "
+            f"actual={actual_digest}"
+        )
+    try:
+        payload = _strict_json_loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise BenchmarkError(f"{label} is not valid UTF-8 JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise BenchmarkError(f"{label} must contain one JSON object")
+    return payload, actual_digest
+
+
+def _canonical_inventory_path(name: Any, where: str) -> str:
+    if not isinstance(name, str) or not name.strip() or "\\" in name:
+        raise BenchmarkError(f"{where} must be a POSIX relative path")
+    path = PurePosixPath(name)
+    if (
+        path.is_absolute()
+        or str(path) != name
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise BenchmarkError(f"{where} is not canonical: {name!r}")
+    return name
+
+
+def _inventory_size(value: Any, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BenchmarkError(f"{where} must be a non-negative integer")
+    return value
+
+
+def _extract_prismaquant_inventory(
+    document: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    if document.get("schema") == PRISMAQUANT_ARTIFACT_INVENTORY_SCHEMA:
+        return document
+    provenance = document.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return None
+    inventory = provenance.get("artifact_inventory")
+    if (
+        isinstance(inventory, Mapping)
+        and inventory.get("schema") == PRISMAQUANT_ARTIFACT_INVENTORY_SCHEMA
+    ):
+        return inventory
+    return None
+
+
+def _validate_artifact_inventory(path: Path, expected_digest: str) -> dict[str, Any]:
+    document, digest = _read_hashed_json(path, expected_digest, "artifact inventory")
+    normalized_files: list[dict[str, Any]] = []
+
+    if document.get("schema") == ARTIFACT_INVENTORY_SCHEMA:
+        files = document.get("files")
+        if not isinstance(files, list) or not files:
+            raise BenchmarkError("artifact inventory files must be a non-empty array")
+        seen: set[str] = set()
+        for index, entry in enumerate(files):
+            if not isinstance(entry, Mapping):
+                raise BenchmarkError(
+                    f"artifact inventory files[{index}] must be an object"
+                )
+            name = _canonical_inventory_path(
+                entry.get("path"), f"artifact inventory files[{index}].path"
+            )
+            if name in seen:
+                raise BenchmarkError(
+                    f"artifact inventory contains duplicate path {name!r}"
+                )
+            seen.add(name)
+            size = _inventory_size(
+                entry.get("bytes"), f"artifact inventory files[{index}].bytes"
+            )
+            file_digest = entry.get("sha256")
+            if not isinstance(file_digest, str) or not _SHA256.fullmatch(file_digest):
+                raise BenchmarkError(
+                    f"artifact inventory files[{index}].sha256 must be a SHA-256 digest"
+                )
+            normalized_files.append(
+                {"path": name, "bytes": size, "sha256": file_digest.lower()}
+            )
+        declared_total = _inventory_size(
+            document.get("total_bytes"), "artifact inventory total_bytes"
+        )
+        schema = ARTIFACT_INVENTORY_SCHEMA
+        source = "standalone-gridbook-inventory"
+    else:
+        inventory = _extract_prismaquant_inventory(document)
+        if inventory is None:
+            raise BenchmarkError(
+                "artifact inventory must be a gridbook.artifact-inventory.v1 "
+                "object, a prismaquant.cb_export_artifact_inventory.v1 object, "
+                "or a quant_config containing that PrismaQuant inventory"
+            )
+        if inventory.get("scope") != "all_regular_files_recursive":
+            raise BenchmarkError(
+                "PrismaQuant artifact inventory scope must be "
+                "all_regular_files_recursive"
+            )
+        file_bytes = inventory.get("file_bytes")
+        if not isinstance(file_bytes, Mapping) or not file_bytes:
+            raise BenchmarkError(
+                "PrismaQuant artifact inventory file_bytes must be a non-empty object"
+            )
+        for name_value, size_value in file_bytes.items():
+            name = _canonical_inventory_path(
+                name_value, "PrismaQuant artifact inventory file_bytes key"
+            )
+            size = _inventory_size(
+                size_value, f"PrismaQuant artifact inventory file_bytes[{name!r}]"
+            )
+            normalized_files.append({"path": name, "bytes": size})
+        normalized_files.sort(key=lambda entry: entry["path"])
+        declared_total = _inventory_size(
+            inventory.get("export_directory_bytes"),
+            "PrismaQuant artifact inventory export_directory_bytes",
+        )
+        schema = PRISMAQUANT_ARTIFACT_INVENTORY_SCHEMA
+        source = (
+            "standalone-prismaquant-inventory"
+            if document is inventory
+            else "quant-config-provenance"
+        )
+
+    computed_total = sum(entry["bytes"] for entry in normalized_files)
+    if declared_total != computed_total:
+        raise BenchmarkError(
+            "artifact inventory total disagrees with its file entries: "
+            f"declared={declared_total}, computed={computed_total}"
+        )
+    return {
+        "reference": str(path),
+        "sha256": digest,
+        "schema": schema,
+        "source": source,
+        "file_count": len(normalized_files),
+        "computed_total_bytes": computed_total,
+        "files": normalized_files,
+    }
+
+
+def _validate_execution_manifest(
+    path: Path,
+    expected_digest: str,
+    artifact_inventory_digest: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    payload, digest = _read_hashed_json(path, expected_digest, "execution manifest")
+    if payload.get("schema") != EXECUTION_MANIFEST_SCHEMA:
+        raise BenchmarkError(
+            "execution manifest schema must be " + EXECUTION_MANIFEST_SCHEMA
+        )
+    if payload.get("artifact_inventory_sha256") != artifact_inventory_digest:
+        raise BenchmarkError(
+            "execution manifest is not bound to the selected artifact inventory"
+        )
+    if payload.get("coverage") != "all_serving_units":
+        raise BenchmarkError(
+            "execution manifest coverage must declare all_serving_units"
+        )
+    if payload.get("tensor_parallel_size") != args.tensor_parallel_size:
+        raise BenchmarkError(
+            "execution manifest tensor_parallel_size disagrees with the command"
+        )
+    assignments = payload.get("assignments")
+    if not isinstance(assignments, list) or not assignments:
+        raise BenchmarkError("execution manifest assignments must be non-empty")
+
+    units: set[str] = set()
+    values: dict[str, set[str]] = {
+        field: set() for field in _EXECUTION_ASSIGNMENT_FIELDS if field != "unit"
+    }
+    for index, assignment in enumerate(assignments):
+        if not isinstance(assignment, Mapping):
+            raise BenchmarkError(
+                f"execution manifest assignments[{index}] must be an object"
+            )
+        for field in _EXECUTION_ASSIGNMENT_FIELDS:
+            value = assignment.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise BenchmarkError(
+                    f"execution manifest assignments[{index}].{field} must be non-empty"
+                )
+            if field == "unit":
+                if value in units:
+                    raise BenchmarkError(
+                        f"execution manifest contains duplicate unit {value!r}"
+                    )
+                units.add(value)
+            else:
+                values[field].add(value)
+
+    command_fields = {
+        "format_rung": args.format_rung,
+        "serialized_layout": args.serialized_layout,
+        "scale_coding": args.scale_coding,
+        "quant_contract": args.quant_contract,
+        "kernel_backend": args.kernel_backend,
+        "fallback_state": args.fallback_state,
+    }
+    for field, command_value in command_fields.items():
+        observed = values[field]
+        if len(observed) == 1:
+            only_value = next(iter(observed))
+            if command_value != only_value:
+                raise BenchmarkError(
+                    f"--{field.replace('_', '-')}={command_value!r} disagrees with "
+                    f"the uniform execution manifest value {only_value!r}"
+                )
+        elif command_value.lower() != "mixed":
+            raise BenchmarkError(
+                f"--{field.replace('_', '-')} must be 'mixed' because the execution "
+                f"manifest contains {len(observed)} values"
+            )
+
+    return {
+        "reference": str(path),
+        "sha256": digest,
+        "schema": EXECUTION_MANIFEST_SCHEMA,
+        "artifact_inventory_sha256": artifact_inventory_digest,
+        "coverage": "all_serving_units",
+        "assignment_count": len(assignments),
+        "assignments": [
+            {field: assignment[field] for field in _EXECUTION_ASSIGNMENT_FIELDS}
+            for assignment in assignments
+        ],
+        "distinct_values": {
+            field: sorted(field_values) for field, field_values in values.items()
+        },
+    }
 
 
 def _input_range_ratio(value: str) -> float:
@@ -166,6 +474,40 @@ def _server_environment(value: str) -> tuple[str, str]:
     return name, setting
 
 
+def _recorded_speculative_config(server_args: Sequence[str]) -> dict[str, Any] | None:
+    raw_configs: list[str] = []
+    index = 0
+    while index < len(server_args):
+        argument = server_args[index]
+        if argument == "--speculative-config":
+            if index + 1 >= len(server_args):
+                raise BenchmarkError("recorded --speculative-config has no JSON value")
+            raw_configs.append(server_args[index + 1])
+            index += 2
+            continue
+        match = re.fullmatch(r"--speculative-config(?:=|\s+)(.+)", argument, re.DOTALL)
+        if match:
+            raw_configs.append(match.group(1))
+        index += 1
+    if len(raw_configs) > 1:
+        raise BenchmarkError(
+            "recorded server args contain multiple speculative configs"
+        )
+    if not raw_configs:
+        return None
+    try:
+        config = _strict_json_loads(raw_configs[0])
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise BenchmarkError(
+            "recorded server --speculative-config is not strict JSON"
+        ) from exc
+    if not isinstance(config, dict) or not config:
+        raise BenchmarkError(
+            "recorded server --speculative-config must be a non-empty JSON object"
+        )
+    return config
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gridbook-bench-serve",
@@ -175,7 +517,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     server = parser.add_argument_group("online server")
-    server.add_argument("--base-url", required=True, help="OpenAI-compatible base URL")
+    server.add_argument(
+        "--base-url", type=_nonempty, required=True, help="OpenAI-compatible base URL"
+    )
     server.add_argument(
         "--backend",
         default="openai",
@@ -187,6 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     server.add_argument(
         "--served-model-name",
+        type=_nonempty,
         help="model name sent to the API (defaults to --model)",
     )
     server.add_argument(
@@ -210,29 +555,35 @@ def build_parser() -> argparse.ArgumentParser:
     artifact = parser.add_argument_group("artifact identity")
     artifact.add_argument(
         "--model",
+        type=_nonempty,
         required=True,
         help="model/tokenizer name understood by vLLM bench serve",
     )
     artifact.add_argument(
         "--tokenizer",
+        type=_nonempty,
         help="tokenizer name or revision (defaults to --model)",
     )
     artifact.add_argument(
         "--model-id",
+        type=_nonempty,
         required=True,
         help="exact served artifact identifier/revision recorded in the report",
     )
     artifact.add_argument(
         "--image-id",
+        type=_nonempty,
         required=True,
         help="exact serving image tag or digest recorded in the report",
     )
     artifact.add_argument(
         "--git-commit",
+        type=_nonempty,
         help="Gridbook commit override; otherwise detected from this checkout",
     )
     artifact.add_argument(
         "--run-label",
+        type=_nonempty,
         required=True,
         help="short arm/workload label, for example gridbook-27b-decode",
     )
@@ -241,6 +592,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         required=True,
         help="exact whole served-artifact bytes, excluding caches",
+    )
+    artifact.add_argument(
+        "--artifact-inventory",
+        type=Path,
+        required=True,
+        help=(
+            "canonical standalone inventory or PrismaQuant quant_config.json "
+            "whose file-byte sum must equal --artifact-bytes"
+        ),
+    )
+    artifact.add_argument(
+        "--artifact-inventory-sha256",
+        type=_sha256,
+        required=True,
+        help="SHA-256 of the exact artifact-inventory JSON bytes",
+    )
+    artifact.add_argument(
+        "--payload-bytes",
+        type=_positive_int,
+        help="optional model-payload bytes (a diagnostic, never the budget gate)",
+    )
+    artifact.add_argument(
+        "--payload-scope",
+        type=_nonempty,
+        help="required explicit definition when --payload-bytes is supplied",
     )
     artifact.add_argument(
         "--byte-budget",
@@ -267,6 +643,37 @@ def build_parser() -> argparse.ArgumentParser:
     identity.add_argument("--gpu-id", type=_nonempty, required=True)
     identity.add_argument("--driver-version", type=_nonempty, required=True)
     identity.add_argument("--cuda-version", type=_nonempty, required=True)
+    identity.add_argument(
+        "--execution-manifest",
+        type=Path,
+        required=True,
+        help=(
+            "gridbook.execution-manifest.v1 JSON enumerating uniform or mixed "
+            "serving-unit assignments"
+        ),
+    )
+    identity.add_argument(
+        "--execution-manifest-sha256",
+        type=_sha256,
+        required=True,
+        help="SHA-256 of the exact execution-manifest JSON bytes",
+    )
+
+    speculation = parser.add_argument_group("speculative decoding")
+    speculation.add_argument(
+        "--speculative-mode",
+        choices=("off", "on"),
+        required=True,
+        help="whether this workload cell executes speculative decoding",
+    )
+    speculation.add_argument(
+        "--speculative-config",
+        type=_json_object,
+        help=(
+            "non-empty JSON object describing the exact server speculation "
+            "configuration; required when --speculative-mode=on"
+        ),
+    )
 
     workload = parser.add_argument_group("fixed workload")
     workload.add_argument("--input-len", type=_positive_int, required=True)
@@ -277,19 +684,17 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="measured prompts in each block",
     )
-    workload.add_argument(
-        "--max-concurrency", type=_positive_int, required=True
-    )
+    workload.add_argument("--max-concurrency", type=_positive_int, required=True)
     workload.add_argument(
         "--warmups",
         type=_nonnegative_int,
-        default=2,
-        help="unmeasured warmup prompts before each block (default: 2)",
+        default=MIN_WARMUPS,
+        help=f"unmeasured warmup prompts before each block (minimum: {MIN_WARMUPS})",
     )
     workload.add_argument(
         "--blocks",
         type=_positive_int,
-        default=3,
+        default=MIN_BLOCKS,
         help=(
             "independent client blocks; distinct deterministic dataset seed per "
             "block (default: 3)"
@@ -356,9 +761,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     output = parser.add_argument_group("runner and output")
-    output.add_argument(
-        "--vllm-executable", default="vllm", help="vLLM CLI executable"
-    )
+    output.add_argument("--vllm-executable", default="vllm", help="vLLM CLI executable")
     output.add_argument(
         "--output", type=Path, required=True, help="structured JSON report path"
     )
@@ -373,6 +776,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.max_concurrency > args.num_prompts:
         parser.error("--max-concurrency cannot exceed --num-prompts")
+    if args.warmups < MIN_WARMUPS:
+        parser.error(f"--warmups must be at least {MIN_WARMUPS}")
+    if args.blocks < MIN_BLOCKS:
+        parser.error(f"--blocks must be at least {MIN_BLOCKS}")
+    if 95.0 not in {float(item) for item in args.percentiles.split(",")}:
+        parser.error("--percentiles must include 95 for the TTFT/ITL release gates")
     server_env_names = [name for name, _ in args.server_env]
     if len(server_env_names) != len(set(server_env_names)):
         parser.error("--server-env names must not be repeated")
@@ -381,6 +790,61 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             f"--artifact-bytes ({args.artifact_bytes}) exceeds --byte-budget "
             f"({args.byte_budget})"
         )
+    if (args.payload_bytes is None) != (args.payload_scope is None):
+        parser.error("--payload-bytes and --payload-scope must be supplied together")
+    if args.payload_bytes is not None and args.payload_bytes > args.artifact_bytes:
+        parser.error("--payload-bytes cannot exceed --artifact-bytes")
+    if args.speculative_mode == "on" and args.speculative_config is None:
+        parser.error("--speculative-config is required when --speculative-mode=on")
+    if args.speculative_mode == "off" and args.speculative_config is not None:
+        parser.error("--speculative-config is forbidden when --speculative-mode=off")
+    if args.speculative_mode == "on":
+        speculative_tokens = args.speculative_config.get("num_speculative_tokens")
+        if (
+            isinstance(speculative_tokens, bool)
+            or not isinstance(speculative_tokens, int)
+            or speculative_tokens <= 0
+        ):
+            parser.error(
+                "--speculative-config must contain positive integer "
+                "num_speculative_tokens"
+            )
+    try:
+        recorded_speculative_config = _recorded_speculative_config(args.server_arg)
+        if args.speculative_mode == "on":
+            if recorded_speculative_config is None:
+                raise BenchmarkError(
+                    "--speculative-mode=on requires the exact --speculative-config "
+                    "in recorded --server-arg metadata"
+                )
+            if recorded_speculative_config != args.speculative_config:
+                raise BenchmarkError(
+                    "structured --speculative-config disagrees with recorded server args"
+                )
+        elif recorded_speculative_config is not None:
+            raise BenchmarkError(
+                "--speculative-mode=off conflicts with a recorded server "
+                "--speculative-config"
+            )
+        inventory = _validate_artifact_inventory(
+            args.artifact_inventory, args.artifact_inventory_sha256
+        )
+        if inventory["computed_total_bytes"] != args.artifact_bytes:
+            raise BenchmarkError(
+                "--artifact-bytes disagrees with the canonical inventory sum: "
+                f"declared={args.artifact_bytes}, "
+                f"computed={inventory['computed_total_bytes']}"
+            )
+        execution_manifest = _validate_execution_manifest(
+            args.execution_manifest,
+            args.execution_manifest_sha256,
+            inventory["sha256"],
+            args,
+        )
+    except BenchmarkError as exc:
+        parser.error(str(exc))
+    args.artifact_inventory_summary = inventory
+    args.execution_manifest_summary = execution_manifest
     return args
 
 
@@ -486,12 +950,65 @@ def _redact_url(value: str) -> str:
             ],
             doseq=True,
         )
-        return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+        fragment = parsed.fragment
+        if fragment:
+            fragment_pairs = parse_qsl(fragment, keep_blank_values=True)
+            if "=" in fragment and fragment_pairs:
+                fragment = urlencode(
+                    [
+                        (
+                            key,
+                            "<redacted>" if _is_sensitive_key(key) else setting,
+                        )
+                        for key, setting in fragment_pairs
+                    ],
+                    doseq=True,
+                )
+            elif _is_sensitive_key(fragment):
+                fragment = "<redacted>"
+        return urlunsplit((parsed.scheme, netloc, parsed.path, query, fragment))
     except (TypeError, ValueError):
         return "<redacted-invalid-url>"
 
 
-def _redact_text(value: str) -> str:
+def _redact_structured(value: Any, *, parent_key: str | None = None) -> Any:
+    if parent_key is not None and _is_sensitive_key(parent_key):
+        return "<redacted>"
+    if isinstance(value, Mapping):
+        return {
+            str(key): _redact_structured(child, parent_key=str(key))
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_structured(child) for child in value]
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
+
+
+def _redact_embedded_json(value: str) -> str | None:
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(value):
+        if character not in "[{":
+            continue
+        try:
+            parsed, end = decoder.raw_decode(value[index:])
+        except json.JSONDecodeError:
+            continue
+        if value[index + end :].strip():
+            continue
+        redacted = json.dumps(
+            _redact_structured(parsed), separators=(",", ":"), sort_keys=True
+        )
+        return _redact_plain_text(value[:index]) + redacted
+    return None
+
+
+def _is_sensitive_option(value: str) -> bool:
+    return value in _SENSITIVE_OPTIONS or _is_sensitive_key(value)
+
+
+def _redact_plain_text(value: str) -> str:
     def redact_url(match: re.Match[str]) -> str:
         return _redact_url(match.group(0))
 
@@ -505,16 +1022,43 @@ def _redact_text(value: str) -> str:
             "<redacted>" if _is_sensitive_key(match.group(2)) else match.group(3)
         )
 
-    def redact_authorization(match: re.Match[str]) -> str:
-        scheme_or_value = match.group(2)
-        if match.group(3) is None:
-            return match.group(1) + "<redacted>"
-        return match.group(1) + scheme_or_value + " <redacted>"
-
     redacted = _URL.sub(redact_url, str(value))
+    redacted = _SENSITIVE_HEADER.sub(
+        lambda match: match.group(1) + "<redacted>", redacted
+    )
     redacted = _ASSIGNMENT.sub(redact_assignment, redacted)
     redacted = _OPTION_VALUE.sub(redact_option, redacted)
-    return _AUTH_HEADER.sub(redact_authorization, redacted)
+    return _AUTH_HEADER.sub(lambda match: match.group(1) + "<redacted>", redacted)
+
+
+def _redact_text(value: str) -> str:
+    text = str(value)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        return json.dumps(
+            _redact_structured(parsed), separators=(",", ":"), sort_keys=True
+        )
+
+    option_equals = re.match(r"^(--?[-\w.]+)=(.*)$", text, re.DOTALL)
+    if option_equals:
+        option, setting = option_equals.groups()
+        if _is_sensitive_option(option):
+            return option + "=<redacted>"
+        return option + "=" + _redact_text(setting)
+    option_space = re.match(r"^(--?[-\w.]+)(\s+)(.*)$", text, re.DOTALL)
+    if option_space:
+        option, spacing, setting = option_space.groups()
+        if _is_sensitive_option(option):
+            return option + spacing + "<redacted>"
+        return option + spacing + _redact_text(setting)
+
+    embedded = _redact_embedded_json(text)
+    if embedded is not None:
+        return embedded
+    return _redact_plain_text(text)
 
 
 def redact_command(command: Sequence[str]) -> list[str]:
@@ -528,7 +1072,7 @@ def redact_command(command: Sequence[str]) -> list[str]:
         text = _redact_text(str(item))
         redacted.append(text)
         if str(item).startswith("-") and "=" not in str(item):
-            hide_next = _is_sensitive_key(str(item))
+            hide_next = _is_sensitive_option(str(item))
     return redacted
 
 
@@ -640,10 +1184,29 @@ def collect_metadata(
             "model_id": _redact_text(args.model_id),
             "benchmark_model": _redact_text(args.model),
             "tokenizer": _redact_text(args.tokenizer or args.model),
-            "whole_served_artifact_bytes": args.artifact_bytes,
+            "whole_served_artifact_bytes": args.artifact_inventory_summary[
+                "computed_total_bytes"
+            ],
             "byte_budget_bytes": args.byte_budget,
             "budget_headroom_bytes": args.byte_budget - args.artifact_bytes,
             "within_byte_budget": args.artifact_bytes <= args.byte_budget,
+            "payload": (
+                {
+                    "bytes": args.payload_bytes,
+                    "scope": _redact_text(args.payload_scope),
+                    "is_budget_gate": False,
+                }
+                if args.payload_bytes is not None
+                else None
+            ),
+            "inventory": _redact_structured(
+                {
+                    **args.artifact_inventory_summary,
+                    "reference": _redact_text(
+                        args.artifact_inventory_summary["reference"]
+                    ),
+                }
+            ),
             "byte_scope": (
                 "shipped model shards, configs, tokenizer, and sidecars; "
                 "runtime/download/JIT caches excluded"
@@ -659,6 +1222,14 @@ def collect_metadata(
             "kernel_backend": _redact_text(args.kernel_backend),
             "tensor_parallel_size": args.tensor_parallel_size,
             "fallback_state": _redact_text(args.fallback_state),
+            "manifest": _redact_structured(
+                {
+                    **args.execution_manifest_summary,
+                    "reference": _redact_text(
+                        args.execution_manifest_summary["reference"]
+                    ),
+                }
+            ),
             "client_runtime_id": _redact_text(args.client_runtime_id),
             "server_runtime_id": _redact_text(args.server_runtime_id),
             "hardware": {
@@ -671,9 +1242,7 @@ def collect_metadata(
             "base_url": _redact_url(args.base_url.rstrip("/")),
             "backend": args.backend,
             "endpoint": _redact_text(args.endpoint),
-            "served_model_name": _redact_text(
-                args.served_model_name or args.model
-            ),
+            "served_model_name": _redact_text(args.served_model_name or args.model),
             "recorded_args": redact_command(args.server_arg),
         },
         "dispatch": {
@@ -720,13 +1289,21 @@ def collect_metadata(
                 _input_length_bounds(args.input_len, args.input_range_ratio)
             ),
             "aggregate_reconciliation": {
-                "ttft_itl": "mean/median vs detailed arrays; 0.01 ms or 1e-5 relative",
+                "throughput": (
+                    "duration and exact token/request totals; 1e-9 relative/absolute"
+                ),
+                "ttft_itl": (
+                    "mean/median/population-std/all requested percentiles vs "
+                    "detailed arrays; NumPy-linear percentile semantics; "
+                    "1e-6 ms or 1e-9 relative"
+                ),
                 "e2el": (
-                    "mean/median vs TTFT+ITL; 5 ms or 0.5% terminal-SSE allowance"
+                    "all aggregates vs per-request TTFT+sum(ITL); 5 ms or 0.5% "
+                    "terminal-SSE allowance"
                 ),
                 "tpot": (
-                    "mean vs (mean_e2el-mean_ttft)/(fixed_output_len-1); "
-                    "0.05 ms or 0.5%"
+                    "all aggregates vs per-request sum(ITL)/(fixed_output_len-1); "
+                    "terminal-SSE allowance divided by output_len-1"
                 ),
                 "itl_cardinality": (
                     "not equated to output tokens because one SSE chunk may carry "
@@ -737,6 +1314,15 @@ def collect_metadata(
             "streaming": True,
             "metrics": STREAMING_METRICS.split(","),
             "percentiles": [float(item) for item in args.percentiles.split(",")],
+            "speculative_decoding": {
+                "mode": args.speculative_mode,
+                "config": _redact_structured(args.speculative_config),
+                "result_contract": (
+                    "all vLLM spec_decode_* fields required and reconciled"
+                    if args.speculative_mode == "on"
+                    else "spec_decode_* fields forbidden"
+                ),
+            },
         },
     }
     metadata["collection_errors"] = probe_errors
@@ -803,26 +1389,64 @@ def _input_length_bounds(input_len: int, ratio: float) -> tuple[int, int]:
     return 1, math.ceil(input_len * (1 + ratio))
 
 
-def _aggregate_tolerance_ms(metric: str, expected_ms: float) -> float:
+def _numpy_linear_percentile(samples: Sequence[float], percentile: float) -> float:
+    """NumPy's default percentile method without adding a NumPy dependency."""
+
+    if not samples:
+        return 0.0
+    ordered = sorted(float(value) for value in samples)
+    position = (len(ordered) - 1) * percentile / 100.0
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _sample_aggregates(
+    samples_ms: Sequence[float], requested_percentiles: Sequence[str]
+) -> dict[str, float]:
+    samples = [float(value) for value in samples_ms]
+    aggregates = {
+        "mean": statistics.fmean(samples) if samples else 0.0,
+        "median": statistics.median(samples) if samples else 0.0,
+        "std": statistics.pstdev(samples) if samples else 0.0,
+    }
+    for percentile in requested_percentiles:
+        aggregates[f"p{float(percentile):g}"] = _numpy_linear_percentile(
+            samples, float(percentile)
+        )
+    return aggregates
+
+
+def _aggregate_tolerance_ms(metric: str, expected_ms: float, output_len: int) -> float:
     if metric == "e2el":
         # vLLM's request latency extends through the terminal SSE event, while
         # detailed ITLs stop at the final token-bearing chunk.  Permit that
         # small transport tail, but not a fabricated decode-length gap.
         return max(5.0, abs(expected_ms) * 0.005)
-    return max(0.01, abs(expected_ms) * 1e-5)
+    if metric == "tpot" and output_len > 1:
+        return max(5.0 / (output_len - 1), abs(expected_ms) * 0.005)
+    return max(0.000001, abs(expected_ms) * 1e-9)
 
 
 def _reconcile_detailed_aggregate(
-    result: Mapping[str, Any], metric: str, samples_ms: Sequence[float]
+    result: Mapping[str, Any],
+    metric: str,
+    samples_ms: Sequence[float],
+    requested_percentiles: Sequence[str],
+    output_len: int,
 ) -> None:
-    expected = {
-        "mean": statistics.fmean(samples_ms) if samples_ms else 0.0,
-        "median": statistics.median(samples_ms) if samples_ms else 0.0,
-    }
+    expected = _sample_aggregates(samples_ms, requested_percentiles)
     for statistic_name, expected_ms in expected.items():
-        key = f"{statistic_name}_{metric}_ms"
+        if statistic_name.startswith("p"):
+            percentile = statistic_name[1:]
+            key = _percentile_result_key(percentile, metric)
+        else:
+            key = f"{statistic_name}_{metric}_ms"
         actual_ms = _number(result, key)
-        tolerance_ms = _aggregate_tolerance_ms(metric, expected_ms)
+        tolerance_ms = _aggregate_tolerance_ms(metric, expected_ms, output_len)
         if actual_ms is None or abs(actual_ms - expected_ms) > tolerance_ms:
             raise BenchmarkError(
                 f"{key} disagrees with detailed streaming evidence: "
@@ -831,12 +1455,126 @@ def _reconcile_detailed_aggregate(
             )
 
 
+_SPEC_RESULT_FIELDS = (
+    "spec_decode_acceptance_rate",
+    "spec_decode_acceptance_length",
+    "spec_decode_num_drafts",
+    "spec_decode_draft_tokens",
+    "spec_decode_accepted_tokens",
+    "spec_decode_per_position_acceptance_rates",
+)
+
+
+def _exact_nonnegative_int(result: Mapping[str, Any], key: str) -> int | None:
+    value = result.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _validate_speculative_result(
+    result: Mapping[str, Any], args: argparse.Namespace
+) -> None:
+    present = [key for key in _SPEC_RESULT_FIELDS if key in result]
+    if args.speculative_mode == "off":
+        if present:
+            raise BenchmarkError(
+                "non-speculative cell contains speculative result fields: "
+                + ", ".join(present)
+            )
+        return
+
+    missing = [key for key in _SPEC_RESULT_FIELDS if key not in result]
+    if missing:
+        raise BenchmarkError(
+            "speculative cell lacks required vLLM result fields: " + ", ".join(missing)
+        )
+    drafts = _exact_nonnegative_int(result, "spec_decode_num_drafts")
+    draft_tokens = _exact_nonnegative_int(result, "spec_decode_draft_tokens")
+    accepted = _exact_nonnegative_int(result, "spec_decode_accepted_tokens")
+    if drafts is None or drafts <= 0 or draft_tokens is None or draft_tokens <= 0:
+        raise BenchmarkError("speculative draft counts must be positive integers")
+    if accepted is None or accepted > draft_tokens:
+        raise BenchmarkError(
+            "spec_decode_accepted_tokens must be a non-negative integer no larger "
+            "than spec_decode_draft_tokens"
+        )
+    rate = _number(result, "spec_decode_acceptance_rate")
+    length = _number(result, "spec_decode_acceptance_length")
+    if rate is None or not 0 <= rate <= 100:
+        raise BenchmarkError("spec_decode_acceptance_rate must be in [0, 100]")
+    if length is None or length < 1:
+        raise BenchmarkError("spec_decode_acceptance_length must be at least 1")
+    expected_rate = accepted / draft_tokens * 100
+    expected_length = 1 + accepted / drafts
+    if not math.isclose(rate, expected_rate, rel_tol=1e-9, abs_tol=1e-9):
+        raise BenchmarkError(
+            "spec_decode_acceptance_rate does not reconcile with accepted/draft tokens"
+        )
+    if not math.isclose(length, expected_length, rel_tol=1e-9, abs_tol=1e-9):
+        raise BenchmarkError(
+            "spec_decode_acceptance_length does not reconcile with accepted tokens "
+            "per draft"
+        )
+
+    per_position = result.get("spec_decode_per_position_acceptance_rates")
+    if not isinstance(per_position, list) or not per_position:
+        raise BenchmarkError(
+            "spec_decode_per_position_acceptance_rates must be a non-empty array"
+        )
+    bad_positions = [
+        index
+        for index, value in enumerate(per_position)
+        if isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not 0 <= float(value) <= 1
+    ]
+    if bad_positions:
+        raise BenchmarkError(
+            "speculative per-position acceptance rates must be finite values in [0, 1]"
+        )
+    configured_tokens = args.speculative_config.get("num_speculative_tokens")
+    if (
+        isinstance(configured_tokens, bool)
+        or not isinstance(configured_tokens, int)
+        or configured_tokens <= 0
+    ):
+        raise BenchmarkError(
+            "--speculative-config must contain positive integer num_speculative_tokens"
+        )
+    if len(per_position) != configured_tokens:
+        raise BenchmarkError(
+            "speculative per-position rate count disagrees with num_speculative_tokens"
+        )
+    if not drafts <= draft_tokens <= drafts * configured_tokens:
+        raise BenchmarkError(
+            "spec_decode_draft_tokens is outside the feasible range from "
+            "num_drafts and declared num_speculative_tokens"
+        )
+    expected_accepted_per_draft = accepted / drafts
+    if not math.isclose(
+        sum(map(float, per_position)),
+        expected_accepted_per_draft,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    ):
+        raise BenchmarkError(
+            "speculative per-position rates do not reconcile with accepted tokens"
+        )
+
+
 def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None:
     nonfinite = _nonfinite_paths(result)
     if nonfinite:
         raise BenchmarkError(
             "vLLM result contains NaN/Infinity at: " + ", ".join(nonfinite[:10])
         )
+    _validate_speculative_result(result, args)
+
+    duration = _number(result, "duration")
+    if duration is None or duration <= 0:
+        raise BenchmarkError("vLLM result duration must be finite and positive")
 
     requested_percentiles = args.percentiles.split(",")
     required_metrics = list(REQUIRED_STREAMING_RESULTS)
@@ -889,32 +1627,20 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
             "vLLM result has negative latency metrics: " + ", ".join(negative)
         )
 
-    expected: dict[str, tuple[tuple[str, ...], int]] = {
-        "completed": (("completed",), args.num_prompts),
-        "failed": (("failed",), 0),
-        "total_output_tokens": (
-            ("total_output_tokens", "total_output"),
-            args.num_prompts * args.output_len,
-        ),
+    expected_counts: dict[str, int] = {
+        "completed": args.num_prompts,
+        "failed": 0,
+        "total_output_tokens": args.num_prompts * args.output_len,
     }
     if args.input_range_ratio == 0:
-        # Current vLLM uses *_tokens.  The shorter aliases keep results from
-        # older bench-serve releases usable without weakening the fixed gate.
-        expected["total_input_tokens"] = (
-            ("total_input_tokens", "total_input"),
-            args.num_prompts * args.input_len,
-        )
+        expected_counts["total_input_tokens"] = args.num_prompts * args.input_len
     mismatches = []
-    for label, (aliases, wanted) in expected.items():
-        actual = None
-        for key in aliases:
-            actual = _number(result, key)
-            if actual is not None:
-                break
+    for label, wanted in expected_counts.items():
+        actual = _exact_nonnegative_int(result, label)
         if actual is None:
             mismatches.append(f"{label}=missing (expected {wanted})")
         elif actual != wanted:
-            mismatches.append(f"{label}={actual:g} (expected {wanted})")
+            mismatches.append(f"{label}={actual} (expected {wanted})")
     if mismatches:
         raise BenchmarkError(
             "fixed-shape block was not completed exactly: " + "; ".join(mismatches)
@@ -939,18 +1665,13 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
         raise BenchmarkError(
             f"{mode} block has unexpected input_lens at request index: {preview}"
         )
-    if args.input_range_ratio > 0:
-        total_input = None
-        for key in ("total_input_tokens", "total_input"):
-            total_input = _number(result, key)
-            if total_input is not None:
-                break
-        observed_total = sum(input_lens)
-        if total_input != observed_total:
-            raise BenchmarkError(
-                "distributed input lengths do not reconcile with total_input_tokens: "
-                f"{total_input} != {observed_total}"
-            )
+    total_input = _exact_nonnegative_int(result, "total_input_tokens")
+    observed_total_input = sum(input_lens)
+    if total_input != observed_total_input:
+        raise BenchmarkError(
+            "input lengths do not reconcile with total_input_tokens: "
+            f"{total_input} != {observed_total_input}"
+        )
 
     output_lens = result.get("output_lens")
     if not isinstance(output_lens, list) or len(output_lens) != args.num_prompts:
@@ -967,9 +1688,35 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
     if wrong_outputs:
         preview = ", ".join(str(index) for index in wrong_outputs[:5])
         raise BenchmarkError(
-            "fixed output block has unexpected output_lens at request index: "
-            + preview
+            "fixed output block has unexpected output_lens at request index: " + preview
         )
+    total_output = _exact_nonnegative_int(result, "total_output_tokens")
+    observed_total_output = sum(output_lens)
+    if total_output != observed_total_output:
+        raise BenchmarkError(
+            "output lengths do not reconcile with total_output_tokens: "
+            f"{total_output} != {observed_total_output}"
+        )
+
+    expected_throughputs = {
+        "request_throughput": args.num_prompts / duration,
+        "output_throughput": observed_total_output / duration,
+        "total_token_throughput": (observed_total_input + observed_total_output)
+        / duration,
+    }
+    for key, expected_throughput in expected_throughputs.items():
+        actual_throughput = _number(result, key)
+        if actual_throughput is None or not math.isclose(
+            actual_throughput,
+            expected_throughput,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise BenchmarkError(
+                f"{key} disagrees with duration and exact totals: "
+                f"reported={actual_throughput}, "
+                f"reconstructed={expected_throughput:.12g}"
+            )
 
     errors = result.get("errors")
     if not isinstance(errors, list) or len(errors) != args.num_prompts:
@@ -1007,6 +1754,11 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
                 "multi-token response has no inter-token latency samples at "
                 f"request index {request_index}"
             )
+        if args.output_len == 1 and request_itls:
+            raise BenchmarkError(
+                "single-token response unexpectedly contains inter-token latency "
+                f"samples at request index {request_index}"
+            )
         for interval_index, value in enumerate(request_itls):
             if (
                 isinstance(value, bool)
@@ -1024,39 +1776,47 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
     # reconstructing it also validates that each detailed request has a finite,
     # positive end-to-end latency.  output_len=1 intentionally has no ITLs.
     e2els = [
-        float(ttft) + sum(map(float, intervals))
-        for ttft, intervals in zip(ttfts, itls)
+        float(ttft) + sum(map(float, intervals)) for ttft, intervals in zip(ttfts, itls)
     ]
     if any(not math.isfinite(value) or value <= 0 for value in e2els):
         raise BenchmarkError("derived detailed E2EL contains a non-finite value")
 
     _reconcile_detailed_aggregate(
-        result, "ttft", [float(value) * 1000 for value in ttfts]
+        result,
+        "ttft",
+        [float(value) * 1000 for value in ttfts],
+        requested_percentiles,
+        args.output_len,
     )
     _reconcile_detailed_aggregate(
         result,
         "itl",
         [float(value) * 1000 for intervals in itls for value in intervals],
+        requested_percentiles,
+        args.output_len,
     )
     _reconcile_detailed_aggregate(
-        result, "e2el", [value * 1000 for value in e2els]
+        result,
+        "e2el",
+        [value * 1000 for value in e2els],
+        requested_percentiles,
+        args.output_len,
     )
-    if args.output_len > 1:
-        # All outputs are fixed length, so linearity makes this exact even
-        # though medians cannot be reconstructed from aggregate medians and an
-        # SSE chunk may carry multiple speculative tokens.
-        expected_mean_tpot = (
-            _number(result, "mean_e2el_ms") - _number(result, "mean_ttft_ms")
-        ) / (args.output_len - 1)
-        reported_mean_tpot = _number(result, "mean_tpot_ms")
-        tolerance = max(0.05, abs(expected_mean_tpot) * 0.005)
-        if abs(reported_mean_tpot - expected_mean_tpot) > tolerance:
-            raise BenchmarkError(
-                "mean_tpot_ms disagrees with mean E2EL/TTFT and fixed output "
-                f"length: reported={reported_mean_tpot}, "
-                f"reconstructed={expected_mean_tpot:.6f}, "
-                f"tolerance={tolerance:.6f} ms"
-            )
+    tpot_samples = (
+        [
+            sum(map(float, intervals)) * 1000 / (args.output_len - 1)
+            for intervals in itls
+        ]
+        if args.output_len > 1
+        else []
+    )
+    _reconcile_detailed_aggregate(
+        result,
+        "tpot",
+        tpot_samples,
+        requested_percentiles,
+        args.output_len,
+    )
 
 
 def summarize_blocks(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -1077,6 +1837,8 @@ def summarize_blocks(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "median": statistics.median(numeric),
             "min": min(numeric),
             "max": max(numeric),
+            "block_p05": _numpy_linear_percentile(numeric, 5),
+            "block_p95": _numpy_linear_percentile(numeric, 95),
             "sample_stdev": statistics.stdev(numeric) if len(numeric) > 1 else None,
         }
     return {"completed_blocks": len(blocks), "metrics": metrics}
