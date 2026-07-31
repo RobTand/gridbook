@@ -191,6 +191,67 @@ def get_persistent_ext():
     return _ptc
 
 
+_fused_fp4 = None
+_fused_fp4_tried = False
+
+
+def get_fused_fp4_ext():
+    """The NVFP4_CB fused BLOCK-SCALED prefill extension
+    (cb_fused_fp4_gemm.cu), or None. Separate module from the fp8 fused ext
+    so the SASS gate (OMMA.SF.16864 present / QMMA absent — the fp4-at-fp8-
+    rate trap, docs/lanes/nvfp4-cb/fp4-fused-prefill.md) can be run against
+    the fp4 module alone. Needs the CUTLASS headers (vLLM's bundled copy, or
+    PRISMAQUANT_CUTLASS_INCLUDE for venv builds) and the sm_121a/sm_120a
+    arch-specific target — the block-scaled MMA is an arch-'a' instruction,
+    so the build pins the current device's compute_XYa. Fail-soft: serving
+    falls back to the Triton/transient fp4 paths."""
+    global _fused_fp4, _fused_fp4_tried
+    if _fused_fp4_tried:
+        return _fused_fp4
+    _fused_fp4_tried = True
+    try:
+        import torch
+        from torch.utils.cpp_extension import load
+
+        cut_inc = os.environ.get("PRISMAQUANT_CUTLASS_INCLUDE")
+        if not cut_inc:
+            cut_inc = _find_cutlass_include()
+        # cutlass/util/packed_stride.hpp lives in the tools tree of a CUTLASS
+        # checkout (vLLM's bundled copy keeps the same shape).
+        incs = [cut_inc]
+        util_inc = os.path.join(os.path.dirname(cut_inc), "tools", "util",
+                                "include")
+        if os.path.isdir(util_inc):
+            incs.append(util_inc)
+        src_dir = _require_csrc("cb_fused_fp4_gemm.cu")
+        build_dir = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
+        build_dir = os.path.join(build_dir, "fused_fp4")
+        os.makedirs(build_dir, exist_ok=True)
+        cc = torch.cuda.get_device_capability()
+        arch = f"compute_{cc[0]}{cc[1]}a"
+        code = f"sm_{cc[0]}{cc[1]}a"
+        _fused_fp4 = load(
+            name="pq_cb_fused_fp4",
+            sources=[os.path.join(src_dir, "cb_fused_fp4_gemm.cu")],
+            extra_include_paths=incs + [src_dir],
+            extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr",
+                               f"-gencode=arch={arch},code={code}"],
+            build_directory=build_dir, verbose=False)
+    except IncompleteInstallError as exc:
+        print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
+              f"fp4 prefill stays on the Triton/transient paths.",
+              file=sys.stderr, flush=True)
+        _fused_fp4 = None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[prismaquant-cb] WARNING: fused fp4 prefill extension "
+              f"unavailable ({type(exc).__name__}: {exc}); fp4 prefill stays "
+              f"on the Triton/transient paths (expected off Blackwell or "
+              f"without nvcc).", file=sys.stderr, flush=True)
+        _fused_fp4 = None
+    return _fused_fp4
+
+
 def get_fused_ext():
     """The CUTLASS decode-in-prologue prefill extension (cb_fused_gemm.cu),
     or None. Separate module from the GEMV ext: it needs the CUTLASS headers

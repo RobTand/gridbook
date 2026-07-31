@@ -16,7 +16,7 @@ falls back to a correct-but-slow Triton path.
 # (which builds and publishes it). prismaquant's scripts/sync_gridbook.py is the
 # one-way path between them; tests/test_gridbook_sync.py is the drift gate.
 # Releasing — the tag and the PyPI upload — happens only in the release repo.
-__version__ = "0.2.0.dev0"
+__version__ = "0.2.0"
 
 
 def register() -> None:

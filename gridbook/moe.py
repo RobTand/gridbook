@@ -423,6 +423,25 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # still wedges despite non-default-stream test battery green). The
         # L2-residency hypothesis remains unmeasured; do not add it to auto
         # candidates until a live serve survives a full prefill battery.
+        # fp4-MMA fused MoE prefill (OPT-IN, default OFF — the fp4 default
+        # below stays 'loop' and is byte-identical until
+        # PRISMAQUANT_CB_FUSED_FP4_MOE is set). One tile-indexed grouped
+        # block-scaled launch per projection stage (OMMA.SF.16864, k=64),
+        # the fp8 grouped_fused_v2 mechanism with the packed-CB decode in the
+        # producer/prologue. Values: "1"/"128" tile_m=128, "256" tile_m=256.
+        # NOTE the activation bucket changes on this path (native NVFP4 quant,
+        # not codec.fp4_group16_act_qdq) — served-KL A/B required before any
+        # promotion; any constraint miss falls through SILENTLY to the modes
+        # below (no behaviour change when the env is unset).
+        if self.is_fp4 and num_tokens > 16:
+            gf4 = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "").strip()
+            if gf4 in ("1", "128", "256"):
+                out = self._apply_prefill_grouped_fused_fp4(
+                    layer, x, topk_weights, topk_ids, act,
+                    tile_m=256 if gf4 == "256" else 128)
+                if out is not None:
+                    return out
+
         mode = os.environ.get("PRISMAQUANT_CB_PREFILL") or (
             "auto" if not self.is_fp4 else "loop")
         if mode == "auto":
@@ -455,6 +474,134 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 layer, x, topk_weights, topk_ids, act)
         return self._apply_prefill_batched(
             layer, x, topk_weights, topk_ids, act)
+
+    # -- prefill: fp4 grouped FUSED (block-scaled decode-in-prologue) --------
+    def _gf4_ok(self, layer) -> bool:
+        """Eligibility for the fp4 grouped fused prefill (cached per layer).
+        Mirrors cb_fused_fp4_moe_grouped's TORCH_CHECKs so a miss is a silent
+        fall-through to the shipping fp4 modes, never a crash."""
+        ok = getattr(layer, "_cb_gf4_ok", None)
+        if ok is not None:
+            return ok
+        ok = (self.is_fp4 and self.is_v2
+              and 12 <= self.k <= 24
+              and self.n_sub in (1, 2)
+              and self.type_size == 4 * self.k + 9
+              and layer._cb_hidden % codec.SUPERBLOCK == 0
+              and layer._cb_inter % codec.SUPERBLOCK == 0)
+        if ok and self.n_sub == 2:
+            w0 = self.k - self.k // 2
+            ok = ((1 << w0) + (1 << (self.k // 2))) * 2 <= 16384
+        if ok:
+            try:
+                import vllm._custom_ops as vops
+                ok = hasattr(vops, "scaled_fp4_quant")
+            except Exception:  # noqa: BLE001
+                ok = False
+        if ok:
+            from .cuda_ext import get_fused_fp4_ext
+            fext = get_fused_fp4_ext()
+            ok = fext is not None and hasattr(fext, "cb_fused_fp4_moe_grouped")
+        layer._cb_gf4_ok = bool(ok)
+        return layer._cb_gf4_ok
+
+    def _fp4_quant(self, x2: torch.Tensor):
+        """Native NVFP4 activation quant (packed e2m1 + swizzled ue4m3 SFA +
+        the per-row fp32 residual for the EVT). Per-tensor global scale, so
+        quant-after-gather == gather-after-quant per row."""
+        import vllm._custom_ops as vops
+        amax = x2.float().abs().amax()
+        gs = ((448.0 * 6.0) / amax.clamp_min(1e-12)).to(torch.float32)
+        aq, sf = vops.scaled_fp4_quant(x2, gs)
+        recip = (1.0 / gs).reshape(1)
+        return aq, sf.view(torch.uint8).reshape(-1), recip
+
+    def _apply_prefill_grouped_fused_fp4(self, layer, x, topk_weights,
+                                         topk_ids, act, *, tile_m=128):
+        """fp4 counterpart of ``_apply_prefill_grouped_fused_v2``: identical
+        padded routing / gather / throwaway-row combine; the projection GEMMs
+        are ONE ``cb_fused_fp4_moe_grouped`` each (native NVF4 block-scaled
+        MMA, packed rows decoded in the producer/prologue, weight scales
+        applied in-MMA via SFB). Activations are quantized AFTER the gather
+        (the swizzled SFA plane is row-block-interleaved and cannot be
+        gathered), which is bit-equivalent per row at a fixed global scale.
+        Returns None on any constraint miss."""
+        if not self._gf4_ok(layer):
+            return None
+        from .cuda_ext import get_fused_fp4_ext
+        fext = get_fused_fp4_ext()
+
+        E = layer._cb_E
+        T = x.shape[0]
+        top_k = topk_ids.shape[-1]
+        dev = x.device
+        Kh = layer._cb_hidden
+        inter = layer._cb_inter
+        N1 = 2 * inter
+        d = N1 // 2
+        kb = self.k
+
+        luts = getattr(layer, "_cb_fp4_gf", None)
+        if luts is None:
+            lut = codec.build_fp4_value_lut(
+                layer._cb_flat, kb, self.n_sub).to(dev)
+            compose = codec.build_compose_u8(self._sub_table).to(dev)
+            luts = (lut, compose,
+                    torch.ones(N1, dtype=torch.float32, device=dev),
+                    torch.ones(Kh, dtype=torch.float32, device=dev))
+            layer._cb_fp4_gf = luts
+        lut, compose, ones_n1, ones_kh = luts
+        w13 = layer.w13_cb_qweight.data
+        w2 = layer.w2_cb_qweight.data
+
+        # ---- routing: identical to the fp8 grouped_fused_v2 path -----------
+        pair_expert = topk_ids.reshape(-1).to(torch.long)
+        pair_token = torch.arange(T, device=dev, dtype=torch.long) \
+            .repeat_interleave(top_k)
+        order = torch.argsort(pair_expert, stable=True)
+        ptok_sorted = pair_token[order]
+        pw_sorted = topk_weights.reshape(-1)[order].to(torch.float32)
+
+        expert_ids, row_src, is_pad, n_blocks = cb_grouped_pad_routing(
+            topk_ids, E, tile_m)
+        if os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1":
+            nb = int(n_blocks.item())                # THE one sync (optional)
+            expert_ids = expert_ids[:nb].contiguous()
+            row_src = row_src[:nb * tile_m]
+            is_pad = is_pad[:nb * tile_m]
+
+        rows = ptok_sorted.index_select(0, row_src)
+        dest = torch.where(is_pad, torch.full_like(rows, T), rows)
+        x1 = torch.cat([x, x.new_zeros((1, Kh))])
+        a_pad = x1.index_select(0, dest).contiguous()               # [Mp, Kh]
+        Mp = a_pad.shape[0]
+
+        # stage 1: gate_up = a_pad @ W13[expert_of_tile]^T
+        aq1, sfa1, recip1 = self._fp4_quant(a_pad)
+        del a_pad
+        gate_up = fext.cb_fused_fp4_moe_grouped(
+            aq1, sfa1, w13, lut, compose,
+            recip1.expand(Mp).contiguous(), ones_n1, expert_ids,
+            N1, Kh, kb, self.n_sub, self.type_size, True, tile_m)   # [Mp, N1]
+        del aq1, sfa1
+        a = torch.empty((Mp, d), dtype=gate_up.dtype, device=dev)
+        apply_moe_activation(act, a, gate_up)                       # silu(g)*u
+        del gate_up
+
+        # stage 2: y = act @ W2[expert_of_tile]^T — SAME expert_ids.
+        aq2, sfa2, recip2 = self._fp4_quant(a)
+        del a
+        y = fext.cb_fused_fp4_moe_grouped(
+            aq2, sfa2, w2, lut, compose,
+            recip2.expand(Mp).contiguous(), ones_kh, expert_ids,
+            Kh, inter, kb, self.n_sub, self.type_size, True, tile_m)
+        del aq2, sfa2
+
+        pw_pad = pw_sorted.index_select(0, row_src)
+        y = y * pw_pad[:, None].to(y.dtype)
+        out = torch.zeros((T + 1, Kh), dtype=x.dtype, device=dev)
+        out.index_add_(0, dest, y.to(out.dtype))
+        return out[:T]
 
     # -- prefill: grouped FUSED (decode-in-prologue, round 1) ---------------
     def _gf_ok(self, layer) -> bool:

@@ -45,6 +45,21 @@ from .ops import cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op
 # Triton decode path at prefill (isolates the transient-expansion lever).
 PREFILL_M_THRESHOLD = int(os.environ.get("PRISMAQUANT_PREFILL_M_THRESHOLD", "16"))
 
+# fp4-MMA fused prefill gate (OPT-IN, default OFF): "" = off (the shipping
+# fp4 dispatch is byte-identical), "1" = fused block-scaled prefill for all
+# M > PREFILL_M_THRESHOLD, "midm" = only 16 < M <= 128 (the fp8 kernel's
+# measured niche). Promotion to a default requires a served A/B per
+# docs/lanes/nvfp4-cb/STANDARDS.md — the activation bucket changes.
+_FP4_FUSED_MODE: list = []
+
+
+def _fp4_fused_mode() -> str:
+    if not _FP4_FUSED_MODE:
+        _FP4_FUSED_MODE.append(
+            os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "").strip())
+    return _FP4_FUSED_MODE[0]
+
+
 # Within the decode regime, the CUDA GEMV handles M<=this and the Triton
 # decode-GEMM the rest. 8 is measured on GB10 (bench_cuda_gemv.py): the
 # weight-stationary GEMV re-reads x per row-block, so it wins 3.2x at M=1-2,
@@ -359,6 +374,72 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         layer._cb_ptc_ok = ok
         return ok
 
+    # -- fp4-MMA fused prefill (opt-in; see the dispatch site below) ---------
+    def _fused_fp4_ok(self, layer, K: int) -> bool:
+        """Eligibility for the fused fp4 block-scaled prefill (cached per
+        layer). Mirrors the kernel's TORCH_CHECKs so a miss is a silent
+        fall-through, never a crash."""
+        ok = getattr(layer, "_cb_fp4_fused_ok", None)
+        if ok is not None:
+            return ok
+        ok = (self.is_fp4
+              and 12 <= self.k <= 24
+              and self.n_sub in (1, 2)
+              and K % 256 == 0
+              and layer._cb_N % 8 == 0
+              and self.type_size == 4 * self.k + (9 if self.is_v2 else 16))
+        if ok and self.n_sub == 2:
+            w0 = self.k - self.k // 2
+            ok = ((1 << w0) + (1 << (self.k // 2))) * 2 <= 16384
+        if ok:
+            # Single uniform codebook block (the kernel has no per-row LUT
+            # offset — same constraint as the fp8 fused entries).
+            ro = layer._cb_row_offset
+            ok = bool((ro.max() == ro.min()).item()) and int(ro[0]) == 0
+        if ok:
+            try:
+                import vllm._custom_ops as vops
+                ok = hasattr(vops, "scaled_fp4_quant")
+            except Exception:  # noqa: BLE001 - venv without vllm
+                ok = False
+        if ok:
+            from .cuda_ext import get_fused_fp4_ext
+            fext = get_fused_fp4_ext()
+            ok = (fext is not None
+                  and hasattr(fext, "cb_fused_fp4_prefill_mm_scaled"))
+        layer._cb_fp4_fused_ok = ok
+        return ok
+
+    def _try_fused_fp4(self, layer, x, N: int, K: int, M: int):
+        """One fused NVF4 block-scaled GEMM over this layer's packed rows, or
+        None if ineligible (the caller then runs the shipping path)."""
+        if not self._fused_fp4_ok(layer, K):
+            return None
+        import vllm._custom_ops as vops
+        from .cuda_ext import get_fused_fp4_ext
+        fext = get_fused_fp4_ext()
+        lut = getattr(layer, "_cb_fp4_lut", None)
+        if lut is None:
+            dev = layer._cb_flat.device
+            lut = codec.build_fp4_value_lut(
+                layer._cb_flat, self.k, self.n_sub).to(dev)
+            layer._cb_fp4_lut = lut
+            layer._cb_fp4_compose_u8 = (
+                codec.build_compose_u8(self._sub_table).to(dev) if self.is_v2
+                else torch.zeros(1, dtype=torch.uint8, device=dev))
+            layer._cb_fp4_ones = torch.ones(N, dtype=torch.float32, device=dev)
+        x2 = x.reshape(-1, K)
+        amax = x2.float().abs().amax()
+        gs = ((448.0 * 6.0) / amax.clamp_min(1e-12)).to(torch.float32)
+        aq, sfa = vops.scaled_fp4_quant(x2, gs)
+        a_scales = (1.0 / gs).reshape(1).expand(M).contiguous()
+        y = fext.cb_fused_fp4_prefill_mm_scaled(
+            aq, sfa.view(torch.uint8).reshape(-1), layer._cb_qw_padded,
+            layer._cb_fp4_lut, layer._cb_fp4_compose_u8, a_scales,
+            layer._cb_fp4_ones, N, K, self.k, self.n_sub, self.type_size,
+            self.is_v2)
+        return y.reshape(*x.shape[:-1], N)
+
     def apply(self, layer, x, bias=None):
         # M-branch hoist (compile lane): dispatch through ONE opaque custom op
         # so torch.compile never traces the M-branch (which otherwise bakes
@@ -387,6 +468,25 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
 
         N, K = layer._cb_N, layer._cb_K
         M = x.reshape(-1, K).shape[0]
+
+        # fp4-MMA fused prefill (OPT-IN, default OFF — the shipping path below
+        # is byte-identical until PRISMAQUANT_CB_FUSED_FP4 is set). Decodes the
+        # packed CB rows inside the CUTLASS block-scaled prologue and runs the
+        # native NVF4 MMA (OMMA.SF.16864, k=64). NOTE the activation bucket
+        # CHANGES on this path: native NVFP4 quantization (per-tensor fp32
+        # global x per-group-16 ue4m3 SF) instead of the Triton/transient
+        # paths' fp32-group-scale QDQ — the hardware SF operand is ue4m3, an
+        # fp32 group scale is unrepresentable. Promotion therefore requires a
+        # served KL A/B (docs/lanes/nvfp4-cb/fp4-fused-prefill.md), which is
+        # why this lands opt-in. "1" = all prefill M; "midm" = only the fp8
+        # kernel's proven 16<M<=128 niche.
+        if (self.is_fp4 and bias is None and M > PREFILL_M_THRESHOLD
+                and _fp4_fused_mode() in ("1", "midm")
+                and not (_fp4_fused_mode() == "midm" and M > 128)):
+            y = self._try_fused_fp4(layer, x, N, K, M)
+            if y is not None:
+                return y
+
         # Decode regime (M small), plus fp4-v1 which has no transient path yet
         # (its v1 e4m3 plane is not composed during expansion) — Triton decode.
         if M <= PREFILL_M_THRESHOLD or (self.is_fp4 and not self.is_v2):

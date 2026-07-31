@@ -18,9 +18,18 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from prismaquant.nvfp4_cb_formats import (
-    _bit_split, nvfp4_cb_reconstruct, nvfp4_cb_unpack,
+# `prismaquant` is the monorepo that develops this package; it does not exist
+# in the released `gridbook` distribution. A bare import here breaks COLLECTION
+# of the whole suite outside the monorepo (not just this module), so gate it the
+# same way the plugin import below is gated: report "cannot check" via a skip
+# rather than a hard error.
+_pq_fmts = pytest.importorskip(
+    "prismaquant.nvfp4_cb_formats",
+    reason="monorepo-only (prismaquant); not part of the gridbook distribution",
 )
+_bit_split = _pq_fmts._bit_split
+nvfp4_cb_reconstruct = _pq_fmts.nvfp4_cb_reconstruct
+nvfp4_cb_unpack = _pq_fmts.nvfp4_cb_unpack
 
 # The plugin package sits outside the repo's PYTHONPATH and needs triton (and,
 # transitively for the full plugin, vLLM) — present in the serving container,

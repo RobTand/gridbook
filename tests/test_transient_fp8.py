@@ -195,8 +195,10 @@ def _scale_b_candidates(ws, N):
 
 @pytest.mark.parametrize("qname", PICK)
 def test_transient_gemm_matches_fp32_dequant(qname):
-    pytest.importorskip("vllm")
-    import vllm._custom_ops as ops
+    # Skip on the module actually needed: `vllm` can resolve to a non-package
+    # shim, so importorskip("vllm") passes and the submodule import then
+    # HARD-FAILS instead of skipping (3 red tests on a bare clone).
+    ops = pytest.importorskip("vllm._custom_ops")
 
     p = _prep(qname)
     N, K = p["N"], p["K"]
@@ -235,8 +237,10 @@ def test_transient_gemm_matches_fp32_dequant(qname):
 def test_transient_gemm_memory_steady():
     """INV-1: the per-forward transient is bounded (one layer) and does not
     grow across forwards. Reports the peak transient MiB for the largest layer."""
-    pytest.importorskip("vllm")
-    import vllm._custom_ops as ops
+    # Skip on the module actually needed: `vllm` can resolve to a non-package
+    # shim, so importorskip("vllm") passes and the submodule import then
+    # HARD-FAILS instead of skipping (3 red tests on a bare clone).
+    ops = pytest.importorskip("vllm._custom_ops")
 
     p = _prep(PICK[0])                            # down_proj: largest FP8_CB rung
     N, K = p["N"], p["K"]
