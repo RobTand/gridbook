@@ -65,7 +65,7 @@ from .moe_l2 import (
     cb_l2_plan,
 )
 from .moe_routing import cb_grouped_pad_routing
-from .ops import dispatch_via_op
+from .ops import dispatch_via_op, fp4_act_qdq_or_codec
 
 
 def _row_bytes(in_features: int, type_size: int) -> int:
@@ -1921,7 +1921,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             a1, a1s = moe_kernel_quantize_input(
                 x, None, fp8_dtype, per_act_token_quant=True)
         else:
-            a1 = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+            a1 = fp4_act_qdq_or_codec(x)
             a1s = None
         if _timing:
             torch.cuda.synchronize(); _t["qdq"] += _time.time() - _t0
@@ -1989,7 +1989,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                     ic2, None, fp8_dtype, per_act_token_quant=True)
                 b2s = layer.w2_weight_scale[c0:c1]            # [nE, hidden]
             else:
-                a2 = codec.fp4_group16_act_qdq(ic2).to(torch.bfloat16)
+                a2 = fp4_act_qdq_or_codec(ic2)
                 a2s = b2s = None
             if _timing:
                 torch.cuda.synchronize(); _t["qdq"] += _time.time() - _t0
@@ -2159,7 +2159,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # bit-identical to the loop's codec.fp4_group16_act_qdq; the kernel
             # composes the two-tier weight scale in-register from the packed
             # 9-byte section + the resident (256,16) compose table.
-            xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+            xq = fp4_act_qdq_or_codec(x)
             gate_up = pq_ops.cb_moe_gemv_fp4_v2(
                 xq, layer.w13_cb_qweight.data, layer._cb_flat,
                 layer._cb_compose, pair_expert, pair_xrow,
@@ -2177,7 +2177,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         apply_moe_activation(act, a, gate_up)
 
         if self.is_fp4:
-            aq = codec.fp4_group16_act_qdq(a).to(torch.bfloat16)
+            aq = fp4_act_qdq_or_codec(a)
             y_down = pq_ops.cb_moe_gemv_fp4_v2(
                 aq, layer.w2_cb_qweight.data, layer._cb_flat,
                 layer._cb_compose, pair_expert, pair_self,
