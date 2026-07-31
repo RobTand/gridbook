@@ -8,12 +8,16 @@ vLLM install, a GPU, or a listening server.
 import hashlib
 import json
 import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from gridbook import bench_serve
+
+CLIENT_RUNTIME_ID = "vLLM 0.23.1rc1.dev764+g54b16d8a9.d20260703"
+GRIDBOOK_COMMIT = "d" * 40
 
 
 def _argv(tmp_path):
@@ -38,7 +42,7 @@ def _argv(tmp_path):
         "tensor_parallel_size": 1,
         "assignments": [
             {
-                "unit": "model.*",
+                "unit": "model.layers.0.self_attn.q_proj",
                 "format_rung": "FP8_CB_K36",
                 "serialized_layout": "product-codebook-indices-v1",
                 "scale_coding": "e4m3-per-block",
@@ -51,6 +55,11 @@ def _argv(tmp_path):
     execution_raw = json.dumps(execution, sort_keys=True).encode()
     execution_path.write_bytes(execution_raw)
     execution_digest = hashlib.sha256(execution_raw).hexdigest()
+
+    server_evidence_path = tmp_path / "server-startup.log"
+    server_evidence_raw = b"dispatch=gridbook-cuda-cb-gemv-v2 fallback=none\n"
+    server_evidence_path.write_bytes(server_evidence_raw)
+    server_evidence_digest = hashlib.sha256(server_evidence_raw).hexdigest()
     return [
         "--base-url",
         "http://127.0.0.1:8000/",
@@ -58,12 +67,19 @@ def _argv(tmp_path):
         "org/tokenizer",
         "--served-model-name",
         "served",
+        "--prefix-caching",
+        "off",
+        "--server-arg=--no-enable-prefix-caching",
+        "--server-evidence",
+        str(server_evidence_path),
+        "--server-evidence-sha256",
+        server_evidence_digest,
         "--model-id",
         "org/artifact@0123456",
         "--image-id",
         "registry/vllm@sha256:abc",
         "--git-commit",
-        "deadbeef",
+        GRIDBOOK_COMMIT,
         "--run-label",
         "gridbook-0.6b-decode",
         "--artifact-bytes",
@@ -89,7 +105,7 @@ def _argv(tmp_path):
         "--fallback-state",
         "none-observed",
         "--client-runtime-id",
-        "vllm-bench@g54b16d8a9",
+        CLIENT_RUNTIME_ID,
         "--server-runtime-id",
         "vllm@g54b16d8a9+gridbook-0.3.0",
         "--gpu-id",
@@ -145,6 +161,24 @@ def _write_json_digest(path, payload):
     return hashlib.sha256(raw).hexdigest()
 
 
+def _range_argv(tmp_path, input_lens, *, ratio="0.25", lower=24, upper=40):
+    argv = _without_option(_argv(tmp_path), "--observed-input-len")
+    digest = bench_serve._canonical_input_lens_sha256(input_lens)
+    argv.extend(
+        [
+            "--input-range-ratio",
+            ratio,
+            "--observed-input-len-min",
+            str(lower),
+            "--observed-input-len-max",
+            str(upper),
+        ]
+    )
+    for _ in range(3):
+        argv.extend(["--expected-input-lens-sha256", digest])
+    return argv
+
+
 def _reconcile_throughput(result):
     result["request_throughput"] = result["completed"] / result["duration"]
     result["output_throughput"] = result["total_output_tokens"] / result["duration"]
@@ -171,6 +205,18 @@ def _valid_result(args, *, offset=0.0):
     total_input = args.num_prompts * observed_input_len
     total_output = args.num_prompts * args.output_len
     result = {
+        "date": "20260731-120000",
+        "endpoint_type": args.backend,
+        "backend": args.backend,
+        "label": args.run_label,
+        "model_id": args.model,
+        "tokenizer_id": args.tokenizer or args.model,
+        "num_prompts": args.num_prompts,
+        "request_rate": (
+            "inf" if args.request_rate == "inf" else float(args.request_rate)
+        ),
+        "burstiness": 1.0,
+        "max_concurrency": args.max_concurrency,
         "duration": duration,
         "completed": args.num_prompts,
         "failed": 0,
@@ -179,6 +225,12 @@ def _valid_result(args, *, offset=0.0):
         "input_lens": [observed_input_len] * args.num_prompts,
         "output_lens": [args.output_len] * args.num_prompts,
         "errors": [""] * args.num_prompts,
+        "generated_texts": ["synthetic output"] * args.num_prompts,
+        "start_times": [float(index) for index in range(args.num_prompts)],
+        "request_goodput": None,
+        "max_output_tokens_per_s": total_output / duration,
+        "max_concurrent_requests": args.max_concurrency,
+        "rtfx": [1.0] * args.num_prompts,
         "ttfts": [ttft_ms / 1000] * args.num_prompts,
         "itls": [
             [itl_ms / 1000] if multi_token else [] for _ in range(args.num_prompts)
@@ -269,7 +321,9 @@ def test_requested_64_observed_63_regression_is_validated_exactly(
     )
     assert _option(command, "--random-input-len") == "64"
 
-    monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: "vLLM")
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
     metadata = bench_serve.collect_metadata(args, {})
     assert metadata["workload"]["requested_random_input_len"] == 64
     assert metadata["workload"]["observed_input_length_contract"] == {
@@ -286,7 +340,9 @@ def test_requested_64_observed_63_regression_is_validated_exactly(
 
 def test_dataset_seed_and_server_sampling_are_distinct_metadata(tmp_path, monkeypatch):
     args = _parse(tmp_path, "--dataset-seed", "900")
-    monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: "vLLM")
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
     metadata = bench_serve.collect_metadata(args, {})
     workload = metadata["workload"]
     assert workload["dataset_base_seed"] == 900
@@ -317,6 +373,11 @@ def test_parser_rejects_ranges_that_break_a_comparable_workload(tmp_path):
         _parse(tmp_path, "--server-env", "MISSING_EQUALS")
     with pytest.raises(SystemExit):
         _parse(tmp_path, "--server-env", "MODE=a", "--server-env", "MODE=b")
+    for prefix in ("", "A_", "___", "NO-DASH_"):
+        with pytest.raises(SystemExit):
+            _parse(tmp_path, "--runner-env-prefix", prefix)
+    with pytest.raises(SystemExit):
+        _parse(tmp_path, "--runner-env-prefix", "PRISMAQUANT_")
     for ratio in ("-0.01", "1", "nan", "not-a-number"):
         with pytest.raises(SystemExit):
             _parse(tmp_path, "--input-range-ratio", ratio)
@@ -327,6 +388,8 @@ def test_observed_input_contract_is_required_and_unambiguous(tmp_path):
         bench_serve.parse_args(_without_option(_argv(tmp_path), "--observed-input-len"))
     with pytest.raises(SystemExit):
         _parse(tmp_path, "--observed-input-len-min", "31")
+    with pytest.raises(SystemExit):
+        _parse(tmp_path, "--expected-input-lens-sha256", "a" * 64)
     with pytest.raises(SystemExit):
         _parse(
             tmp_path,
@@ -339,6 +402,18 @@ def test_observed_input_contract_is_required_and_unambiguous(tmp_path):
         )
 
     range_argv = _without_option(_argv(tmp_path), "--observed-input-len")
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(
+            [
+                *range_argv,
+                "--input-range-ratio",
+                "0.25",
+                "--observed-input-len-min",
+                "24",
+                "--observed-input-len-max",
+                "40",
+            ]
+        )
     with pytest.raises(SystemExit):
         bench_serve.parse_args(
             [
@@ -369,6 +444,18 @@ def test_required_identity_strings_reject_whitespace(tmp_path):
             _parse(tmp_path, option, "   ")
 
 
+def test_git_commit_and_run_label_are_safe_exact_identifiers(tmp_path):
+    for commit in ("deadbeef", "g" * 40, "a" * 39, "a" * 41, "a" * 65):
+        with pytest.raises(SystemExit):
+            _parse(tmp_path, "--git-commit", commit)
+    args = _parse(tmp_path, "--git-commit", "A" * 64)
+    assert args.git_commit == "a" * 64
+
+    for label in ("has space", "../escape", "slash/value", "line\nbreak", "x" * 129):
+        with pytest.raises(SystemExit):
+            _parse(tmp_path, "--run-label", label)
+
+
 def test_execution_identity_and_whole_artifact_bytes_are_required(tmp_path):
     required = (
         "--artifact-bytes",
@@ -387,6 +474,9 @@ def test_execution_identity_and_whole_artifact_bytes_are_required(tmp_path):
         "--gpu-id",
         "--driver-version",
         "--accelerator-runtime",
+        "--prefix-caching",
+        "--server-evidence",
+        "--server-evidence-sha256",
         "--execution-manifest",
         "--execution-manifest-sha256",
         "--speculative-mode",
@@ -397,6 +487,38 @@ def test_execution_identity_and_whole_artifact_bytes_are_required(tmp_path):
     for option in required:
         with pytest.raises(SystemExit):
             bench_serve.parse_args(_without_option(_argv(tmp_path), option))
+
+
+def test_prefix_caching_and_server_evidence_fail_closed(tmp_path):
+    with pytest.raises(SystemExit):
+        _parse(tmp_path, "--prefix-caching", "on")
+    with pytest.raises(SystemExit):
+        _parse(
+            tmp_path,
+            "--prefix-caching",
+            "on",
+            "--server-arg=--enable-prefix-caching",
+        )
+    with pytest.raises(SystemExit):
+        _parse(tmp_path, "--server-arg=--enable-prefix-caching")
+
+    on_argv = [
+        "--server-arg=--enable-prefix-caching"
+        if item == "--server-arg=--no-enable-prefix-caching"
+        else item
+        for item in _replace_option(_argv(tmp_path), "--prefix-caching", "on")
+    ]
+    assert bench_serve.parse_args(on_argv).prefix_caching == "on"
+
+    argv = _argv(tmp_path)
+    evidence_path = Path(_option(argv, "--server-evidence"))
+    evidence_path.write_text("mutated after digest declaration")
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(argv)
+
+    missing_digest = _without_option(_argv(tmp_path), "--server-evidence-sha256")
+    with pytest.raises(SystemExit):
+        bench_serve.parse_args(missing_digest)
 
 
 def test_cuda_version_remains_a_deprecated_accelerator_runtime_alias(tmp_path):
@@ -500,7 +622,9 @@ def test_prismaquant_quant_config_inventory_is_consumed_directly(tmp_path):
         bench_serve.parse_args(bad_argv)
 
 
-def test_payload_scope_is_explicit_and_never_substitutes_for_whole_bytes(tmp_path):
+def test_payload_scope_is_explicit_and_never_substitutes_for_whole_bytes(
+    tmp_path, monkeypatch
+):
     with pytest.raises(SystemExit):
         _parse(tmp_path, "--payload-bytes", "700")
     with pytest.raises(SystemExit):
@@ -519,6 +643,9 @@ def test_payload_scope_is_explicit_and_never_substitutes_for_whole_bytes(tmp_pat
         "700",
         "--payload-scope",
         "model shards plus codebook sidecar",
+    )
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
     )
     metadata = bench_serve.collect_metadata(args, {})
     assert metadata["artifacts"]["payload"] == {
@@ -593,6 +720,41 @@ def test_execution_manifest_binds_inventory_and_mixed_assignments(tmp_path):
     )
     with pytest.raises(SystemExit):
         bench_serve.parse_args(wrong_binding)
+
+
+def test_execution_manifest_requires_concrete_nonoverlapping_assignments(tmp_path):
+    argv = _argv(tmp_path)
+    execution_path = Path(_option(argv, "--execution-manifest"))
+    base = json.loads(execution_path.read_text())
+
+    invalid_manifests = []
+    bool_tp = json.loads(json.dumps(base))
+    bool_tp["tensor_parallel_size"] = True
+    invalid_manifests.append(bool_tp)
+
+    wildcard = json.loads(json.dumps(base))
+    wildcard["assignments"][0]["unit"] = "model.layers.*"
+    invalid_manifests.append(wildcard)
+
+    overlap = json.loads(json.dumps(base))
+    overlap["assignments"].append(
+        {
+            **overlap["assignments"][0],
+            "unit": overlap["assignments"][0]["unit"] + ".weight",
+        }
+    )
+    invalid_manifests.append(overlap)
+
+    for field in bench_serve._EXECUTION_ASSIGNMENT_FIELDS:
+        literal_mixed = json.loads(json.dumps(base))
+        literal_mixed["assignments"][0][field] = "mixed"
+        invalid_manifests.append(literal_mixed)
+
+    for manifest in invalid_manifests:
+        digest = _write_json_digest(execution_path, manifest)
+        candidate = _replace_option(argv, "--execution-manifest-sha256", digest)
+        with pytest.raises(SystemExit):
+            bench_serve.parse_args(candidate)
 
 
 def test_speculative_mode_requires_structured_configuration(tmp_path):
@@ -696,19 +858,22 @@ def test_metadata_captures_supplied_artifact_and_server_identity(tmp_path, monke
         "HF_TOKEN=never-record",
     )
     monkeypatch.setattr(bench_serve, "_package_version", lambda: "0.3.0")
-    monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: "vLLM 1.2")
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
     metadata = bench_serve.collect_metadata(
         args,
         {"PRISMAQUANT_CB_DECODE": "cuda", "CUDA_VISIBLE_DEVICES": "0"},
     )
 
     assert metadata["git"] == {
-        "commit": "deadbeef",
+        "commit": GRIDBOOK_COMMIT,
         "dirty": None,
         "source": "argument",
+        "release_eligible": True,
     }
     assert metadata["software"]["gridbook_version"] == "0.3.0"
-    assert metadata["software"]["runner_vllm_cli_probe"] == "vLLM 1.2"
+    assert metadata["software"]["runner_vllm_cli_probe"] == CLIENT_RUNTIME_ID
     assert metadata["artifacts"]["image_id"].endswith("sha256:abc")
     assert metadata["artifacts"]["model_id"] == "org/artifact@0123456"
     assert metadata["artifacts"]["whole_served_artifact_bytes"] == 800
@@ -730,14 +895,25 @@ def test_metadata_captures_supplied_artifact_and_server_identity(tmp_path, monke
         identity["manifest"]["artifact_inventory_sha256"]
         == metadata["artifacts"]["inventory"]["sha256"]
     )
-    assert identity["client_runtime_id"] == "vllm-bench@g54b16d8a9"
+    assert identity["client_runtime_id"] == CLIENT_RUNTIME_ID
     assert identity["server_runtime_id"] == "vllm@g54b16d8a9+gridbook-0.3.0"
     assert identity["hardware"] == {
         "gpu_id": "NVIDIA-GB10:GPU-1234",
         "driver_version": "580.00",
         "accelerator_runtime": "CUDA 13.0",
     }
-    assert metadata["server"]["recorded_args"] == ["--enforce-eager"]
+    assert metadata["server"]["recorded_args"] == [
+        "--no-enable-prefix-caching",
+        "--enforce-eager",
+    ]
+    assert metadata["server"]["prefix_caching"] == "off"
+    assert metadata["server"]["evidence"]["attachments"][0]["sha256"] == _option(
+        _argv(tmp_path), "--server-evidence-sha256"
+    )
+    assert (
+        "verifies bytes, not semantic backend claims"
+        in metadata["server"]["evidence"]["scope"]
+    )
     assert metadata["dispatch"]["runner_environment"] == {
         "source": "benchmark process",
         "values": {
@@ -765,7 +941,67 @@ def test_metadata_captures_supplied_artifact_and_server_identity(tmp_path, monke
     }
 
 
-def test_urls_commands_and_server_args_never_persist_credentials(tmp_path):
+def test_git_state_only_autodetects_the_exact_clean_source_checkout(
+    tmp_path, monkeypatch
+):
+    checkout = tmp_path / "checkout"
+    source = checkout / "gridbook" / "bench_serve.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("# source\n")
+    (checkout / "pyproject.toml").write_text("[project]\nname='gridbook'\n")
+    monkeypatch.setattr(bench_serve, "__file__", str(source))
+
+    state = {"top_level": str(checkout), "dirty": ""}
+
+    def fake_git(command, **kwargs):
+        if command[-1] == "--show-toplevel":
+            output = state["top_level"]
+        elif command[-1] == "HEAD":
+            output = "a" * 40
+        elif command[1:3] == ["status", "--porcelain"]:
+            output = state["dirty"]
+        else:  # pragma: no cover - protects the test contract itself
+            raise AssertionError(command)
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(bench_serve.subprocess, "run", fake_git)
+    assert bench_serve._git_state(None) == {
+        "commit": "a" * 40,
+        "dirty": False,
+        "source": "checkout",
+        "release_eligible": True,
+    }
+
+    state["dirty"] = " M gridbook/bench_serve.py\n"
+    with pytest.raises(bench_serve.BenchmarkError, match="checkout is dirty"):
+        bench_serve._git_state(None)
+    dirty = bench_serve._git_state(None, allow_dirty=True)
+    assert dirty["dirty"] is True
+    assert dirty["release_eligible"] is False
+
+    state["top_level"] = str(tmp_path)
+    mismatch = bench_serve._git_state(None)
+    assert mismatch["commit"] is None
+    assert mismatch["source"] == "unavailable-root-mismatch"
+
+    explicit = bench_serve._git_state(GRIDBOOK_COMMIT, allow_dirty=True)
+    assert explicit["commit"] == GRIDBOOK_COMMIT
+    assert explicit["release_eligible"] is False
+    with pytest.raises(bench_serve.BenchmarkError, match="not exact"):
+        bench_serve._git_state("deadbeef")
+
+
+def test_git_state_requires_a_real_pyproject_source_root(tmp_path, monkeypatch):
+    source = tmp_path / "site-packages" / "gridbook" / "bench_serve.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("# installed source without project root\n")
+    monkeypatch.setattr(bench_serve, "__file__", str(source))
+    state = bench_serve._git_state(None)
+    assert state["commit"] is None
+    assert state["source"] == "unavailable-non-source-install"
+
+
+def test_urls_commands_and_server_args_never_persist_credentials(tmp_path, monkeypatch):
     secret_url = (
         "https://alice:password@example.test:8443/v1?api_key=topsecret&mode=fast"
     )
@@ -779,6 +1015,9 @@ def test_urls_commands_and_server_args_never_persist_credentials(tmp_path):
         "--server-arg=--hf-token",
         "--server-arg=split-secret",
         "--server-arg=MONKEY=visible",
+    )
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
     )
     metadata = bench_serve.collect_metadata(args, {})
     command = bench_serve.build_vllm_command(
@@ -897,6 +1136,38 @@ def test_validate_result_requires_true_streaming_metrics_and_exact_lengths(tmp_p
         bench_serve.validate_result(uneven_input, args)
 
 
+def test_pinned_vllm_saved_invocation_envelope_is_reconciled_exactly(tmp_path):
+    args = _parse(tmp_path, "--request-rate", "2.5")
+    result = _valid_result(args)
+    assert result["date"] == "20260731-120000"
+    assert result["endpoint_type"] == result["backend"] == "openai"
+    assert result["model_id"] == args.model
+    assert result["tokenizer_id"] == (args.tokenizer or args.model)
+    assert result["request_rate"] == 2.5
+    assert isinstance(result["request_rate"], float)
+    bench_serve.validate_result(result, args)
+
+    mutations = {
+        "backend": "other",
+        "endpoint_type": args.endpoint,
+        "label": "other-label",
+        "model_id": args.model_id,
+        "tokenizer_id": "other/tokenizer",
+        "num_prompts": True,
+        "request_rate": "2.5",
+        "max_concurrency": 1.0,
+    }
+    for field, bad_value in mutations.items():
+        with pytest.raises(bench_serve.BenchmarkError, match=field):
+            bench_serve.validate_result({**result, field: bad_value}, args)
+
+    for field in mutations:
+        missing = dict(result)
+        del missing[field]
+        with pytest.raises(bench_serve.BenchmarkError, match=field):
+            bench_serve.validate_result(missing, args)
+
+
 def test_validate_result_requires_detailed_positive_streaming_arrays(tmp_path):
     args = _parse(tmp_path)
     result = _valid_result(args)
@@ -1001,7 +1272,7 @@ def test_numpy_linear_percentile_and_population_std_are_pinned(tmp_path):
     result["std_ttft_ms"] = aggregates["std"]
     for percentile in args.percentiles.split(","):
         result[bench_serve._percentile_result_key(percentile, "ttft")] = aggregates[
-            f"p{float(percentile):g}"
+            f"p{bench_serve._percentile_label(percentile)}"
         ]
 
     e2el_ms = [value + 2.0 for value in ttft_ms]
@@ -1011,13 +1282,40 @@ def test_numpy_linear_percentile_and_population_std_are_pinned(tmp_path):
     result["std_e2el_ms"] = e2el["std"]
     for percentile in args.percentiles.split(","):
         result[bench_serve._percentile_result_key(percentile, "e2el")] = e2el[
-            f"p{float(percentile):g}"
+            f"p{bench_serve._percentile_label(percentile)}"
         ]
     bench_serve.validate_result(result, args)
 
     result["std_ttft_ms"] = __import__("statistics").stdev(ttft_ms)
     with pytest.raises(bench_serve.BenchmarkError, match="std_ttft_ms disagrees"):
         bench_serve.validate_result(result, args)
+
+
+def test_percentile_labels_match_pinned_vllm_without_collisions(tmp_path):
+    args = _parse(
+        tmp_path,
+        "--percentiles",
+        "1e-7,50,90,95,95.00001,95.00002,99.9999999",
+    )
+    assert args.percentiles.split(",") == [
+        "1e-07",
+        "50",
+        "90",
+        "95",
+        "95.00001",
+        "95.00002",
+        "99.9999999",
+    ]
+    assert bench_serve._percentile_result_key("95.00001", "ttft") != (
+        bench_serve._percentile_result_key("95.00002", "ttft")
+    )
+    result = _valid_result(args)
+    bench_serve.validate_result(result, args)
+    summary = bench_serve.summarize_blocks(
+        [{"raw_result": dict(result)} for _ in range(3)]
+    )
+    assert "p1e-07_ttft_ms" in summary["metrics"]
+    assert "p99.9999999_e2el_ms" in summary["metrics"]
 
 
 def test_itl_chunk_count_is_not_assumed_to_equal_output_tokens(tmp_path):
@@ -1078,19 +1376,11 @@ def test_single_token_prefill_explicitly_allows_empty_itl_and_zero_tpot(tmp_path
         bench_serve.validate_result(unexpected_itl, args)
 
 
-def test_input_range_ratio_is_passed_and_validated_as_input_only(tmp_path):
-    argv = _without_option(_argv(tmp_path), "--observed-input-len")
-    args = bench_serve.parse_args(
-        [
-            *argv,
-            "--input-range-ratio",
-            "0.25",
-            "--observed-input-len-min",
-            "24",
-            "--observed-input-len-max",
-            "40",
-        ]
-    )
+def test_input_range_ratio_requires_the_exact_block_vector_digest(
+    tmp_path, monkeypatch
+):
+    input_lens = [24, 26, 28, 30, 32, 34, 36, 40]
+    args = bench_serve.parse_args(_range_argv(tmp_path, input_lens))
     command = bench_serve.build_vllm_command(
         args, block_index=0, result_dir=tmp_path, result_filename="raw.json"
     )
@@ -1099,6 +1389,9 @@ def test_input_range_ratio_is_passed_and_validated_as_input_only(tmp_path):
         "output": 0.0,
     }
     assert bench_serve._observed_input_length_bounds(args) == (24, 40)
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
     metadata = bench_serve.collect_metadata(args, {})
     assert metadata["workload"]["input_range_ratio"] == 0.25
     assert metadata["workload"]["vllm_range_ratio"] == {
@@ -1106,13 +1399,24 @@ def test_input_range_ratio_is_passed_and_validated_as_input_only(tmp_path):
         "output": 0.0,
     }
     assert metadata["workload"]["accepted_input_length_bounds"] == [24, 40]
+    assert [
+        item["sha256"]
+        for item in metadata["workload"]["expected_input_lens_sha256_by_block"]
+    ] == args.expected_input_lens_sha256
 
-    input_lens = [24, 26, 28, 30, 32, 34, 36, 40]
     result = _valid_result(args)
     result["input_lens"] = input_lens
     result["total_input_tokens"] = sum(input_lens)
     _reconcile_throughput(result)
     bench_serve.validate_result(result, args)
+
+    different_but_in_bounds = dict(result, input_lens=[25, 26, 28, 30, 32, 34, 36, 39])
+    different_but_in_bounds["total_input_tokens"] = sum(
+        different_but_in_bounds["input_lens"]
+    )
+    _reconcile_throughput(different_but_in_bounds)
+    with pytest.raises(bench_serve.BenchmarkError, match="input_lens SHA-256"):
+        bench_serve.validate_result(different_but_in_bounds, args)
 
     too_long = dict(result, input_lens=[41, *input_lens[1:]])
     too_long["total_input_tokens"] = sum(too_long["input_lens"])
@@ -1137,6 +1441,40 @@ def test_input_range_ratio_is_passed_and_validated_as_input_only(tmp_path):
     wrong_total = dict(result, total_input_tokens=sum(input_lens) + 1)
     with pytest.raises(bench_serve.BenchmarkError, match="do not reconcile"):
         bench_serve.validate_result(wrong_total, args)
+
+
+def test_range_input_vector_digests_are_bound_in_block_order(tmp_path):
+    vectors = [
+        [24, 25, 26, 27, 28, 29, 30, 31],
+        [25, 26, 27, 28, 29, 30, 31, 32],
+        [26, 27, 28, 29, 30, 31, 32, 33],
+    ]
+    argv = _without_option(_argv(tmp_path), "--observed-input-len")
+    argv.extend(
+        [
+            "--input-range-ratio",
+            "0.25",
+            "--observed-input-len-min",
+            "24",
+            "--observed-input-len-max",
+            "40",
+        ]
+    )
+    for vector in vectors:
+        argv.extend(
+            [
+                "--expected-input-lens-sha256",
+                bench_serve._canonical_input_lens_sha256(vector),
+            ]
+        )
+    args = bench_serve.parse_args(argv)
+    result = _valid_result(args)
+    result["input_lens"] = vectors[1]
+    result["total_input_tokens"] = sum(vectors[1])
+    _reconcile_throughput(result)
+    bench_serve.validate_result(result, args, block_index=1)
+    with pytest.raises(bench_serve.BenchmarkError, match="block 1"):
+        bench_serve.validate_result(result, args, block_index=0)
 
 
 def test_validate_result_requires_throughput_percentiles_and_finite_numbers(tmp_path):
@@ -1183,7 +1521,7 @@ def test_summary_keeps_independent_values_and_sample_dispersion(tmp_path):
 
 
 def test_run_writes_a_complete_report_without_vllm_or_server(tmp_path, monkeypatch):
-    args = _parse(tmp_path, "--blocks", "3")
+    args = _parse(tmp_path, "--blocks", "3", "--allow-dirty")
     calls = []
 
     def fake_run(command):
@@ -1201,7 +1539,9 @@ def test_run_writes_a_complete_report_without_vllm_or_server(tmp_path, monkeypat
         return 0
 
     monkeypatch.setattr(bench_serve, "_run_command", fake_run)
-    monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: None)
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
     report = bench_serve.run_benchmark(args)
     written = json.loads(args.output.read_text())
 
@@ -1209,6 +1549,11 @@ def test_run_writes_a_complete_report_without_vllm_or_server(tmp_path, monkeypat
     assert report["status"] == "success"
     assert written["schema"] == bench_serve.SCHEMA
     assert written["status"] == "success"
+    assert written["evidence_scope"] == "single-arm-serving-measurement"
+    assert written["measurement_valid"] is True
+    assert written["parity_acceptance"] is False
+    assert written["release_acceptance"] is False
+    assert written["release_eligible"] is False
     assert [block["dataset_seed"] for block in written["blocks"]] == [
         1234,
         1235,
@@ -1216,6 +1561,14 @@ def test_run_writes_a_complete_report_without_vllm_or_server(tmp_path, monkeypat
     ]
     assert all(block["status"] == "success" for block in written["blocks"])
     assert all(block["returncode"] == 0 for block in written["blocks"])
+    assert all(
+        block["expected_input_lens_sha256"] is None for block in written["blocks"]
+    )
+    assert all(block["observed_input_lens_sha256"] for block in written["blocks"])
+    assert all(
+        "generated_texts" not in block["raw_result"] for block in written["blocks"]
+    )
+    assert all("errors" not in block["raw_result"] for block in written["blocks"])
     assert written["summary"]["completed_blocks"] == 3
     assert written["finished_at"].endswith("Z")
     assert os.stat(args.output).st_mode & 0o777 == 0o600
@@ -1234,23 +1587,42 @@ def test_report_omits_generated_text_and_arbitrary_server_errors():
 
     assert "generated_texts" not in sanitized
     assert sanitized["generated_texts_omitted"]["count"] == 2
-    assert sanitized["errors"] == [None, "<redacted-server-error>"]
+    assert "errors" not in sanitized
+    assert sanitized["errors_omitted"]["count"] == 2
     assert "private completion" not in serialized
     assert "unstructured-secret" not in serialized
     assert "raw-secret" not in serialized
     assert "fragment-secret" not in serialized
     assert "password" not in serialized
 
+    for malformed_errors in (
+        "Authorization: Bearer scalar-secret",
+        {"message": "mapping-secret"},
+        17,
+    ):
+        malformed = bench_serve._sanitize_result_for_report(
+            {"errors": malformed_errors}
+        )
+        assert "errors" not in malformed
+        assert malformed["errors_omitted"]["count"] is None
+        assert "secret" not in json.dumps(malformed)
+
 
 def test_failed_block_leaves_a_structured_failure_report(tmp_path, monkeypatch):
     args = _parse(tmp_path)
     monkeypatch.setattr(bench_serve, "_run_command", lambda command: 7)
-    monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: None)
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
 
     with pytest.raises(bench_serve.BenchmarkError, match="exit code 7"):
         bench_serve.run_benchmark(args)
     report = json.loads(args.output.read_text())
     assert report["status"] == "failed"
+    assert report["measurement_valid"] is False
+    assert report["parity_acceptance"] is False
+    assert report["release_acceptance"] is False
+    assert report["release_eligible"] is False
     assert len(report["blocks"]) == 1
     block = report["blocks"][0]
     assert block["status"] == "failed"
@@ -1274,7 +1646,9 @@ def test_validation_failure_retains_raw_result_and_error(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(bench_serve, "_run_command", fake_run)
-    monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: None)
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
     with pytest.raises(bench_serve.BenchmarkError, match="not completed exactly"):
         bench_serve.run_benchmark(args)
 
@@ -1310,13 +1684,37 @@ def test_individual_metadata_probe_failure_is_recorded_not_raised(
         raise RuntimeError("package metadata unavailable")
 
     monkeypatch.setattr(bench_serve, "_package_version", fail_version)
-    monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: "vLLM")
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
     metadata = bench_serve.collect_metadata(args, {})
     assert metadata["software"]["gridbook_version"] is None
     assert (
         "package metadata unavailable"
         in metadata["collection_errors"]["gridbook_version"]
     )
+
+
+def test_client_runtime_probe_must_succeed_and_match_exactly(tmp_path, monkeypatch):
+    args = _parse(tmp_path)
+    monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: None)
+    with pytest.raises(bench_serve.BenchmarkError, match="version probe failed"):
+        bench_serve.collect_metadata(args, {})
+
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID + "-other"
+    )
+    with pytest.raises(bench_serve.BenchmarkError, match="disagrees"):
+        bench_serve.collect_metadata(args, {})
+
+
+def test_allow_dirty_marks_report_provenance_release_ineligible(tmp_path, monkeypatch):
+    args = _parse(tmp_path, "--allow-dirty")
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
+    metadata = bench_serve.collect_metadata(args, {})
+    assert metadata["git"]["release_eligible"] is False
 
 
 def test_nonfinite_raw_result_is_rejected_at_strict_json_boundary(
@@ -1334,7 +1732,9 @@ def test_nonfinite_raw_result_is_rejected_at_strict_json_boundary(
         return 0
 
     monkeypatch.setattr(bench_serve, "_run_command", fake_run)
-    monkeypatch.setattr(bench_serve, "_vllm_version", lambda executable: None)
+    monkeypatch.setattr(
+        bench_serve, "_vllm_version", lambda executable: CLIENT_RUNTIME_ID
+    )
     with pytest.raises(bench_serve.BenchmarkError, match="not strict JSON"):
         bench_serve.run_benchmark(args)
     report = json.loads(args.output.read_text())

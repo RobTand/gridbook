@@ -71,7 +71,9 @@ REQUIRED_THROUGHPUT_RESULTS = (
     "output_throughput",
     "total_token_throughput",
 )
-_PERCENTILE_RESULT = re.compile(r"^p(?:\d+(?:\.\d+)?)_(?:ttft|tpot|itl|e2el)_ms$")
+_PERCENTILE_RESULT = re.compile(
+    r"^p(?:\d+(?:\.\d+)?(?:e[+-]?\d+)?)_(?:ttft|tpot|itl|e2el)_ms$"
+)
 _SENSITIVE_SEGMENTS = {
     "AUTH",
     "AUTHORIZATION",
@@ -110,6 +112,11 @@ _SENSITIVE_HEADER = re.compile(
 )
 _URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+_GIT_COMMIT = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+_RUN_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9_]+_$")
+_CONCRETE_UNIT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 
 _EXECUTION_ASSIGNMENT_FIELDS = (
     "unit",
@@ -158,6 +165,34 @@ def _sha256(value: str) -> str:
     if not _SHA256.fullmatch(value):
         raise argparse.ArgumentTypeError("must be a 64-character SHA-256 hex digest")
     return value.lower()
+
+
+def _git_commit(value: str) -> str:
+    if not _GIT_COMMIT.fullmatch(value):
+        raise argparse.ArgumentTypeError("must be an exact 40- or 64-hex commit")
+    return value.lower()
+
+
+def _run_label(value: str) -> str:
+    if not _RUN_LABEL.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            "must be 1-128 characters using only letters, digits, '.', '_', or '-'"
+        )
+    return value
+
+
+def _environment_name(value: str) -> str:
+    if not _ENV_NAME.fullmatch(value):
+        raise argparse.ArgumentTypeError("must be an environment variable name")
+    return value
+
+
+def _environment_prefix(value: str) -> str:
+    if not _ENV_PREFIX.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            "must be at least three characters, start with a letter, and end in '_'"
+        )
+    return value
 
 
 def _strict_json_loads(value: str | bytes) -> Any:
@@ -209,6 +244,52 @@ def _read_hashed_json(
     if not isinstance(payload, dict):
         raise BenchmarkError(f"{label} must contain one JSON object")
     return payload, actual_digest
+
+
+def _validate_server_evidence(
+    paths: Sequence[Path], expected_digests: Sequence[str]
+) -> list[dict[str, Any]]:
+    if not paths or len(paths) != len(expected_digests):
+        raise BenchmarkError(
+            "server evidence requires one --server-evidence-sha256 per "
+            "--server-evidence attachment"
+        )
+    attachments: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, (path, expected_digest) in enumerate(zip(paths, expected_digests)):
+        normalized = os.path.abspath(os.fspath(path.expanduser()))
+        if normalized in seen:
+            raise BenchmarkError(f"duplicate server evidence attachment: {path}")
+        seen.add(normalized)
+        if not path.expanduser().is_file():
+            raise BenchmarkError(
+                f"server evidence attachment {index + 1} is not a regular file"
+            )
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with path.expanduser().open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+        except OSError as exc:
+            raise BenchmarkError(
+                f"cannot read server evidence attachment {index + 1} {path}: {exc}"
+            ) from exc
+        actual_digest = digest.hexdigest()
+        if actual_digest != expected_digest:
+            raise BenchmarkError(
+                f"server evidence attachment {index + 1} SHA-256 mismatch: "
+                f"declared={expected_digest}, actual={actual_digest}"
+            )
+        attachments.append(
+            {
+                "reference": str(path),
+                "sha256": actual_digest,
+                "bytes": size,
+            }
+        )
+    return attachments
 
 
 def _canonical_inventory_path(name: Any, where: str) -> str:
@@ -359,7 +440,16 @@ def _validate_execution_manifest(
         raise BenchmarkError(
             "execution manifest coverage must declare all_serving_units"
         )
-    if payload.get("tensor_parallel_size") != args.tensor_parallel_size:
+    manifest_tp = payload.get("tensor_parallel_size")
+    if (
+        isinstance(manifest_tp, bool)
+        or not isinstance(manifest_tp, int)
+        or manifest_tp <= 0
+    ):
+        raise BenchmarkError(
+            "execution manifest tensor_parallel_size must be a positive integer"
+        )
+    if manifest_tp != args.tensor_parallel_size:
         raise BenchmarkError(
             "execution manifest tensor_parallel_size disagrees with the command"
         )
@@ -382,10 +472,37 @@ def _validate_execution_manifest(
                 raise BenchmarkError(
                     f"execution manifest assignments[{index}].{field} must be non-empty"
                 )
+            if value.strip().lower() == "mixed":
+                raise BenchmarkError(
+                    f"execution manifest assignments[{index}].{field} must be "
+                    "concrete, not 'mixed'"
+                )
             if field == "unit":
+                if not _CONCRETE_UNIT.fullmatch(value) or ".." in value:
+                    raise BenchmarkError(
+                        f"execution manifest assignments[{index}].unit must be a "
+                        "concrete serving-unit identifier without wildcards"
+                    )
                 if value in units:
                     raise BenchmarkError(
                         f"execution manifest contains duplicate unit {value!r}"
+                    )
+                overlap = next(
+                    (
+                        existing
+                        for existing in units
+                        if any(
+                            value.startswith(existing + separator)
+                            or existing.startswith(value + separator)
+                            for separator in (".", "/", ":")
+                        )
+                    ),
+                    None,
+                )
+                if overlap is not None:
+                    raise BenchmarkError(
+                        "execution manifest contains overlapping unit identifiers: "
+                        f"{overlap!r} and {value!r}"
                     )
                 units.add(value)
             else:
@@ -453,6 +570,11 @@ def _request_rate(value: str) -> str:
     return value
 
 
+def _percentile_label(value: str | float) -> str:
+    number = float(value)
+    return str(int(number)) if number.is_integer() else str(number)
+
+
 def _percentiles(value: str) -> str:
     try:
         parsed = [float(item) for item in value.split(",")]
@@ -464,7 +586,12 @@ def _percentiles(value: str) -> str:
         raise argparse.ArgumentTypeError("every percentile must be between 0 and 100")
     if len(set(parsed)) != len(parsed):
         raise argparse.ArgumentTypeError("percentiles must not contain duplicates")
-    return ",".join(f"{item:g}" for item in parsed)
+    labels = [_percentile_label(item) for item in parsed]
+    if len(set(labels)) != len(labels):
+        raise argparse.ArgumentTypeError(
+            "percentiles collide after pinned-vLLM float normalization"
+        )
+    return ",".join(labels)
 
 
 def _server_environment(value: str) -> tuple[str, str]:
@@ -508,6 +635,32 @@ def _recorded_speculative_config(server_args: Sequence[str]) -> dict[str, Any] |
     return config
 
 
+def _validate_recorded_prefix_caching(
+    declared_state: str, server_args: Sequence[str]
+) -> None:
+    enable_flag = "--enable-prefix-caching"
+    disable_flag = "--no-enable-prefix-caching"
+    recorded = {argument.strip() for argument in server_args}
+    enabled = enable_flag in recorded
+    disabled = disable_flag in recorded
+    if enabled and disabled:
+        raise BenchmarkError(
+            "recorded server args contain conflicting prefix-caching flags"
+        )
+    required_flag = enable_flag if declared_state == "on" else disable_flag
+    conflicting_flag = disable_flag if declared_state == "on" else enable_flag
+    if conflicting_flag in recorded:
+        raise BenchmarkError(
+            f"--prefix-caching={declared_state} conflicts with recorded "
+            f"{conflicting_flag}"
+        )
+    if required_flag not in recorded:
+        raise BenchmarkError(
+            f"--prefix-caching={declared_state} requires recorded server arg "
+            f"{required_flag}"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gridbook-bench-serve",
@@ -545,6 +698,28 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     server.add_argument(
+        "--prefix-caching",
+        choices=("off", "on"),
+        required=True,
+        help="explicit server prefix-caching state, reconciled with --server-arg",
+    )
+    server.add_argument(
+        "--server-evidence",
+        action="append",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="dispatch/startup log attachment to hash and record; repeatable",
+    )
+    server.add_argument(
+        "--server-evidence-sha256",
+        action="append",
+        type=_sha256,
+        required=True,
+        metavar="SHA256",
+        help="SHA-256 paired by order with each --server-evidence path",
+    )
+    server.add_argument(
         "--ready-timeout",
         type=_nonnegative_int,
         default=600,
@@ -578,12 +753,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     artifact.add_argument(
         "--git-commit",
-        type=_nonempty,
+        type=_git_commit,
         help="Gridbook commit override; otherwise detected from this checkout",
     )
     artifact.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="permit a dirty source checkout for research-only evidence",
+    )
+    artifact.add_argument(
         "--run-label",
-        type=_nonempty,
+        type=_run_label,
         required=True,
         help="short arm/workload label, for example gridbook-27b-decode",
     )
@@ -770,12 +950,24 @@ def build_parser() -> argparse.ArgumentParser:
             "remains fixed (default: 0)"
         ),
     )
+    workload.add_argument(
+        "--expected-input-lens-sha256",
+        action="append",
+        default=[],
+        type=_sha256,
+        metavar="SHA256",
+        help=(
+            "canonical detailed input_lens JSON-array digest for one block; "
+            "repeat in block order for nonzero --input-range-ratio"
+        ),
+    )
 
     dispatch = parser.add_argument_group("dispatch provenance")
     dispatch.add_argument(
         "--runner-env",
         action="append",
         default=[],
+        type=_environment_name,
         metavar="NAME",
         help="benchmark-runner environment variable to record; repeat as needed",
     )
@@ -783,6 +975,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--runner-env-prefix",
         action="append",
         default=["PRISMAQUANT_"],
+        type=_environment_prefix,
         metavar="PREFIX",
         help=(
             "record runner variables matching this prefix; repeat to add prefixes "
@@ -832,6 +1025,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 "--observed-input-len-min/--observed-input-len-max are forbidden "
                 "when --input-range-ratio=0"
             )
+        if args.expected_input_lens_sha256:
+            parser.error(
+                "--expected-input-lens-sha256 is forbidden when --input-range-ratio=0"
+            )
     else:
         if args.observed_input_len is not None:
             parser.error(
@@ -846,11 +1043,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error(
                 "--observed-input-len-min cannot exceed --observed-input-len-max"
             )
+        if len(args.expected_input_lens_sha256) != args.blocks:
+            parser.error(
+                "nonzero --input-range-ratio requires exactly one "
+                "--expected-input-lens-sha256 per block"
+            )
     if 95.0 not in {float(item) for item in args.percentiles.split(",")}:
-        parser.error("--percentiles must include 95 for the TTFT/ITL release gates")
+        parser.error("--percentiles must include 95 for the TTFT/ITL measurement gates")
     server_env_names = [name for name, _ in args.server_env]
     if len(server_env_names) != len(set(server_env_names)):
         parser.error("--server-env names must not be repeated")
+    if len(args.runner_env) != len(set(args.runner_env)):
+        parser.error("--runner-env names must not be repeated")
+    if len(args.runner_env_prefix) != len(set(args.runner_env_prefix)):
+        parser.error("--runner-env-prefix values must not be repeated")
     if args.artifact_bytes > args.byte_budget:
         parser.error(
             f"--artifact-bytes ({args.artifact_bytes}) exceeds --byte-budget "
@@ -876,6 +1082,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 "num_speculative_tokens"
             )
     try:
+        _validate_recorded_prefix_caching(args.prefix_caching, args.server_arg)
         recorded_speculative_config = _recorded_speculative_config(args.server_arg)
         if args.speculative_mode == "on":
             if recorded_speculative_config is None:
@@ -907,10 +1114,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             inventory["sha256"],
             args,
         )
+        server_evidence = _validate_server_evidence(
+            args.server_evidence, args.server_evidence_sha256
+        )
     except BenchmarkError as exc:
         parser.error(str(exc))
     args.artifact_inventory_summary = inventory
     args.execution_manifest_summary = execution_manifest
+    args.server_evidence_summary = server_evidence
     return args
 
 
@@ -1129,31 +1340,83 @@ def redact_command(command: Sequence[str]) -> list[str]:
     return redacted
 
 
-def _git_state(commit_override: str | None) -> dict[str, Any]:
-    if commit_override:
-        return {"commit": commit_override, "dirty": None, "source": "argument"}
+def _git_state(
+    commit_override: str | None, *, allow_dirty: bool = False
+) -> dict[str, Any]:
+    if commit_override and not _GIT_COMMIT.fullmatch(commit_override):
+        raise BenchmarkError("explicit Gridbook commit is not exact 40/64 hex")
 
-    checkout = Path(__file__).resolve().parents[1]
-    try:
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=checkout,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        dirty = bool(
-            subprocess.run(
-                ["git", "status", "--porcelain"],
+    detected_commit: str | None = None
+    detected_dirty: bool | None = None
+    unavailable_source = "unavailable-non-source-install"
+    source_file = Path(__file__).resolve()
+    checkout = source_file.parents[1]
+    expected_source = checkout / "gridbook" / "bench_serve.py"
+    if (checkout / "pyproject.toml").is_file() and expected_source.is_file():
+        unavailable_source = "unavailable"
+        try:
+            if not source_file.samefile(expected_source):
+                raise OSError("source file is not rooted at the candidate checkout")
+            top_level = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
                 cwd=checkout,
                 check=True,
                 capture_output=True,
                 text=True,
             ).stdout.strip()
+            if Path(top_level).resolve() != checkout:
+                unavailable_source = "unavailable-root-mismatch"
+            else:
+                detected_commit = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=checkout,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                detected_dirty = bool(
+                    subprocess.run(
+                        ["git", "status", "--porcelain"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                )
+                if not _GIT_COMMIT.fullmatch(detected_commit):
+                    detected_commit = None
+                    unavailable_source = "unavailable-invalid-commit"
+        except (OSError, subprocess.CalledProcessError):
+            detected_commit = None
+            detected_dirty = None
+
+    if detected_dirty and not allow_dirty:
+        raise BenchmarkError(
+            "Gridbook checkout is dirty; commit the changes or pass --allow-dirty "
+            "for research-only evidence"
         )
-    except (OSError, subprocess.CalledProcessError):
-        return {"commit": None, "dirty": None, "source": "unavailable"}
-    return {"commit": commit, "dirty": dirty, "source": "checkout"}
+    if commit_override:
+        return {
+            "commit": commit_override.lower(),
+            "dirty": detected_dirty,
+            "source": (
+                "argument+checkout" if detected_commit is not None else "argument"
+            ),
+            "release_eligible": not allow_dirty and detected_dirty is not True,
+        }
+    if detected_commit is None:
+        return {
+            "commit": None,
+            "dirty": detected_dirty,
+            "source": unavailable_source,
+            "release_eligible": False,
+        }
+    return {
+        "commit": detected_commit.lower(),
+        "dirty": detected_dirty,
+        "source": "checkout",
+        "release_eligible": not allow_dirty and not detected_dirty,
+    }
 
 
 def _package_version() -> str | None:
@@ -1210,11 +1473,16 @@ def collect_metadata(
             probe_errors[name] = _redact_text(f"{type(exc).__name__}: {exc}")
             return fallback
 
-    git = probe(
-        "git",
-        lambda: _git_state(args.git_commit),
-        {"commit": None, "dirty": None, "source": "probe-error"},
-    )
+    git = _git_state(args.git_commit, allow_dirty=args.allow_dirty)
+    client_runtime_probe = _vllm_version(args.vllm_executable)
+    if client_runtime_probe is None:
+        raise BenchmarkError(
+            "vLLM client version probe failed; --client-runtime-id cannot be verified"
+        )
+    if client_runtime_probe != args.client_runtime_id:
+        raise BenchmarkError(
+            "--client-runtime-id disagrees with the successful vLLM --version probe"
+        )
     runner_env = os.environ if env is None else env
     explicit_server_env = {
         key: "<redacted>" if _is_sensitive_key(key) else _redact_text(value)
@@ -1224,9 +1492,7 @@ def collect_metadata(
         "git": git,
         "software": {
             "gridbook_version": probe("gridbook_version", _package_version),
-            "runner_vllm_cli_probe": probe(
-                "vllm_cli_version", lambda: _vllm_version(args.vllm_executable)
-            ),
+            "runner_vllm_cli_probe": client_runtime_probe,
             "python": probe("python", platform.python_version),
             "platform": probe("platform", platform.platform),
             "machine": probe("machine", platform.machine),
@@ -1297,6 +1563,20 @@ def collect_metadata(
             "endpoint": _redact_text(args.endpoint),
             "served_model_name": _redact_text(args.served_model_name or args.model),
             "recorded_args": redact_command(args.server_arg),
+            "prefix_caching": args.prefix_caching,
+            "evidence": {
+                "scope": (
+                    "digest-bound external dispatch/startup attachments; the "
+                    "harness verifies bytes, not semantic backend claims"
+                ),
+                "attachments": [
+                    {
+                        **attachment,
+                        "reference": _redact_text(attachment["reference"]),
+                    }
+                    for attachment in args.server_evidence_summary
+                ],
+            },
         },
         "dispatch": {
             "runner_environment": {
@@ -1351,6 +1631,14 @@ def collect_metadata(
                 "declared-exact" if args.input_range_ratio == 0 else "declared-range"
             ),
             "accepted_input_length_bounds": list(_observed_input_length_bounds(args)),
+            "expected_input_lens_sha256_by_block": [
+                {
+                    "block": index + 1,
+                    "dataset_seed": args.dataset_seed + index,
+                    "sha256": digest,
+                }
+                for index, digest in enumerate(args.expected_input_lens_sha256)
+            ],
             "aggregate_reconciliation": {
                 "throughput": (
                     "duration and exact token/request totals; 1e-9 relative/absolute"
@@ -1435,15 +1723,68 @@ def _nonfinite_paths(value: Any, path: str = "$") -> list[str]:
 
 
 def _percentile_result_key(percentile: str, metric: str) -> str:
-    number = float(percentile)
-    label = str(int(number)) if number.is_integer() else f"{number:g}"
-    return f"p{label}_{metric}_ms"
+    return f"p{_percentile_label(percentile)}_{metric}_ms"
 
 
 def _observed_input_length_bounds(args: argparse.Namespace) -> tuple[int, int]:
     if args.input_range_ratio == 0:
         return args.observed_input_len, args.observed_input_len
     return args.observed_input_len_min, args.observed_input_len_max
+
+
+def _canonical_input_lens_sha256(input_lens: Sequence[int]) -> str:
+    canonical = json.dumps(
+        list(input_lens),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_result_invocation(
+    result: Mapping[str, Any], args: argparse.Namespace
+) -> None:
+    mismatches: list[str] = []
+    exact_strings = {
+        "backend": args.backend,
+        "endpoint_type": args.backend,
+        "label": args.run_label,
+        "model_id": args.model,
+        "tokenizer_id": args.tokenizer or args.model,
+    }
+    for field, expected in exact_strings.items():
+        value = result.get(field)
+        if not isinstance(value, str) or value != expected:
+            mismatches.append(field)
+
+    exact_integers = {
+        "num_prompts": args.num_prompts,
+        "max_concurrency": args.max_concurrency,
+    }
+    for field, expected in exact_integers.items():
+        value = result.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            mismatches.append(field)
+
+    request_rate = result.get("request_rate")
+    if args.request_rate == "inf":
+        request_rate_matches = request_rate == "inf"
+    else:
+        request_rate_matches = (
+            not isinstance(request_rate, bool)
+            and isinstance(request_rate, (int, float))
+            and math.isfinite(float(request_rate))
+            and float(request_rate) == float(args.request_rate)
+        )
+    if not request_rate_matches:
+        mismatches.append("request_rate")
+
+    if mismatches:
+        raise BenchmarkError(
+            "vLLM result invocation fields disagree with the pinned client command: "
+            + ", ".join(mismatches)
+        )
 
 
 def _numpy_linear_percentile(samples: Sequence[float], percentile: float) -> float:
@@ -1471,7 +1812,7 @@ def _sample_aggregates(
         "std": statistics.pstdev(samples) if samples else 0.0,
     }
     for percentile in requested_percentiles:
-        aggregates[f"p{float(percentile):g}"] = _numpy_linear_percentile(
+        aggregates[f"p{_percentile_label(percentile)}"] = _numpy_linear_percentile(
             samples, float(percentile)
         )
     return aggregates
@@ -1621,12 +1962,15 @@ def _validate_speculative_result(
         )
 
 
-def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None:
+def validate_result(
+    result: Mapping[str, Any], args: argparse.Namespace, *, block_index: int = 0
+) -> None:
     nonfinite = _nonfinite_paths(result)
     if nonfinite:
         raise BenchmarkError(
             "vLLM result contains NaN/Infinity at: " + ", ".join(nonfinite[:10])
         )
+    _validate_result_invocation(result, args)
     _validate_speculative_result(result, args)
 
     duration = _number(result, "duration")
@@ -1724,6 +2068,19 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
         raise BenchmarkError(
             f"{mode} block has unexpected input_lens at request index: {preview}"
         )
+    observed_input_lens_digest = _canonical_input_lens_sha256(input_lens)
+    if args.input_range_ratio != 0:
+        try:
+            expected_input_lens_digest = args.expected_input_lens_sha256[block_index]
+        except IndexError as exc:
+            raise BenchmarkError(
+                f"no expected input_lens digest is bound to block {block_index + 1}"
+            ) from exc
+        if observed_input_lens_digest != expected_input_lens_digest:
+            raise BenchmarkError(
+                f"block {block_index + 1} input_lens SHA-256 disagrees with the "
+                "declared canonical vector digest"
+            )
     total_input = _exact_nonnegative_int(result, "total_input_tokens")
     observed_total_input = sum(input_lens)
     if total_input != observed_total_input:
@@ -2003,12 +2360,12 @@ def _sanitize_result_for_report(result: Mapping[str, Any]) -> dict[str, Any]:
             "reason": "arbitrary model output is not performance evidence",
         }
 
-    errors = sanitized.get("errors")
-    if isinstance(errors, list):
-        sanitized["errors"] = [
-            value if value is None or value == "" else "<redacted-server-error>"
-            for value in errors
-        ]
+    if "errors" in sanitized:
+        errors = sanitized.pop("errors")
+        sanitized["errors_omitted"] = {
+            "count": len(errors) if isinstance(errors, list) else None,
+            "reason": "arbitrary server error text is not performance evidence",
+        }
 
     return _json_safe(_redact_structured(sanitized))
 
@@ -2033,7 +2390,12 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     report: dict[str, Any] = {
         "schema": SCHEMA,
         "status": "running",
-        "run_label": args.run_label,
+        "run_label": _redact_text(args.run_label),
+        "evidence_scope": "single-arm-serving-measurement",
+        "measurement_valid": False,
+        "parity_acceptance": False,
+        "release_acceptance": False,
+        "release_eligible": False,
         "started_at": started_at,
         "finished_at": None,
         "duration_s": None,
@@ -2073,6 +2435,12 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     "returncode": None,
                     "raw_result": None,
                     "validation_error": None,
+                    "expected_input_lens_sha256": (
+                        args.expected_input_lens_sha256[block_index]
+                        if args.input_range_ratio != 0
+                        else None
+                    ),
+                    "observed_input_lens_sha256": None,
                 }
                 report["blocks"].append(block)
                 # A durable checkpoint makes the in-flight command available
@@ -2096,7 +2464,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                         result = _load_result(result_dir / filename)
                         block["raw_result"] = _sanitize_result_for_report(result)
                         _atomic_write_json(output_path, report)
-                        validate_result(result, args)
+                        validate_result(result, args, block_index=block_index)
+                        block["observed_input_lens_sha256"] = (
+                            _canonical_input_lens_sha256(result["input_lens"])
+                        )
                     except BenchmarkError as exc:
                         block["validation_error"] = _redact_text(str(exc))
                         raise
@@ -2109,6 +2480,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     block["wall_duration_s"] = time.monotonic() - block_clock
         report["summary"] = summarize_blocks(report["blocks"])
         report["status"] = "success"
+        report["measurement_valid"] = True
+        report["release_eligible"] = report["metadata"]["git"]["release_eligible"]
     except BaseException as exc:
         report["status"] = "failed"
         report["error"] = _redact_text(f"{type(exc).__name__}: {exc}")
