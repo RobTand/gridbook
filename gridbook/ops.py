@@ -204,7 +204,19 @@ def fp4_act_qdq(x: torch.Tensor) -> torch.Tensor:
 
 @fp4_act_qdq.register_fake
 def _fp4_act_qdq_fake(x):
-    return torch.empty_like(x)
+    if not x.is_cuda or x.dtype is not torch.bfloat16:
+        raise RuntimeError("fp4_act_qdq wants a CUDA bf16 tensor")
+    if x.dim() < 1:
+        raise RuntimeError("fp4_act_qdq needs at least one dimension")
+    torch._check(x.shape[-1] > 0,
+                 lambda: "fp4_act_qdq needs a positive last dimension")
+    torch._check(
+        x.shape[-1] % 16 == 0,
+        lambda: "fp4_act_qdq needs a last dim that is a multiple of the fp4 "
+                "group (16)")
+    # Native calls x.contiguous() before allocating its output. FakeTensor
+    # stride metadata must describe that same contiguous result.
+    return torch.empty_like(x, memory_format=torch.contiguous_format)
 
 
 # One-shot resolution of the fp4 act-QDQ implementation.

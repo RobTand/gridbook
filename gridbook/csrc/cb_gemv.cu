@@ -459,7 +459,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
 // grid is sorted({+/-x for x in (0,.5,1,1.5,2,3,4,6)}) = 15 entries (+0 and -0
 // collapse to one), i.e. codec._fp4_qdq_grid.  Any deviation here is a numerics
 // change, not an optimisation — tests/test_fp4_act_qdq.py compares against the
-// codec element-wise with torch.equal, never a tolerance.
+// codec element-wise through the raw bf16 bits, never a tolerance.
 //
 // THE SCALE IS A **MULTIPLY BY THE RECIPROCAL**, NOT A DIVIDE.  This is the
 // single most load-bearing line in the file.
@@ -555,10 +555,14 @@ torch::Tensor fp8_act_qdq(torch::Tensor x) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16,
               "fp8_act_qdq wants a CUDA bf16 tensor");
   auto x2 = x.contiguous();
+  TORCH_CHECK(x2.dim() >= 1,
+              "fp8_act_qdq needs at least one dimension");
   const int64_t K = x2.size(-1);
+  TORCH_CHECK(K > 0,
+              "fp8_act_qdq needs a positive last dimension");
   const int64_t M = x2.numel() / K;
   auto out = torch::empty_like(x2);
-  if (M == 0 || K == 0) return out;
+  if (M == 0) return out;
   const c10::cuda::OptionalCUDAGuard guard(x2.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   fp8_act_qdq_kernel<<<(unsigned)M, kThreads, 0, stream>>>(
