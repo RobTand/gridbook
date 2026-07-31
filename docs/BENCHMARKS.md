@@ -1,9 +1,47 @@
 # Benchmarks
 
 All results are from a **single NVIDIA GB10 / DGX Spark** (Blackwell `sm_121`,
-128 GB unified memory, ~273 GB/s), serving through vLLM with `--enforce-eager`.
-Read the [caveats](#caveats--read-these) — these are single-box, single-seed
+128 GB unified memory, ~273 GB/s). Published-model rows use vLLM with
+`--enforce-eager`; the explicitly labelled CUDA-graph canary does not. Read the
+[caveats](#caveats--read-these) — these are single-box, single-seed
 measurements, and the 295B result carries **no quality-vs-teacher claim**.
+
+## 2026-07-31 CUDA-graph canary — close-rate, not formal parity
+
+The current opaque per-layer dispatch (`PRISMAQUANT_CB_DISPATCH=op`) fixes the
+historical graph-capture failure described below. On a Qwen3 0.6B iteration
+pair, vLLM `FULL_DECODE_ONLY` with compilation mode 0 and capture sizes
+`[1,2,4,8]` measured:
+
+Execution identity: GB10 `sm_121`, driver 595.84, TP=1, Gridbook 0.3.0 at
+`aea57dcb`, vLLM `0.23.1rc1.dev764+g54b16d8a9` / Torch 2.11.0 / CUDA 13.0 in
+image digest `sha256:d0840ff0e0ba1899a51bf4cb473f43d0c765288b8de708080ad9d95768615141`.
+The Gridbook arm is `FP8_CB_K36` (W8A8), default opaque dispatch, with no CUDA
+extension-build warning; the native arm is compressed-tensors NVFP4 (W4A4).
+The concrete native Linear backend and per-kernel fallback trace were not
+retained, another reason this row is a canary rather than release evidence.
+
+| Workload | Gridbook | native | Gridbook / native |
+|---|---:|---:|---:|
+| 1400 input + 1 output, eager | 29.289 ms | 24.777 ms | 1.182× latency |
+| 32 input + 256 output, eager | 1.4443 s | 2.8883 s | 0.500× latency |
+| 32 input + 256 output, full-decode graph | 1.1534 s | 1.0895 s | **1.059× latency** |
+
+The graph removes **20.1%** from Gridbook's end-to-end 32+256 latency and puts
+it within **5.9%** of native in this canary. Four changed batch-1 prompts and a
+four-request batch produced exactly equal text, token sequences, and per-token
+logprobs between eager and graph replay (maximum absolute logprob difference
+0). Capture took about 30 seconds and reported 2.64 GiB for sizes 1/2/4/8 in
+the validation process.
+
+This is deliberately **not** an exact-rate parity claim. The native model
+payload is 870,290,032 bytes; the Gridbook model plus codebook sidecar is
+871,628,664 bytes, **1,338,632 bytes (0.154%) larger**. It also compares the
+whole execution contracts: native NVFP4 is W4A4, while `FP8_CB_K36` is W8A8.
+Use this small pair for iteration; a release claim still requires exact
+whole-artifact accounting, the same-session streaming protocol, and the 27B
+gate. The timings above are offline whole-request latency with three warmups
+and ten measured repetitions, not TTFT/TPOT measurements.
 
 ## What is being compared, and how
 

@@ -49,8 +49,10 @@ but several times slower and not a serving target.
   W4A16 group. **Consequence:** an artifact's hardware requirements are the union
   of gridbook's and those of its delegated groups.
 - **Single-GPU (`tp=1`) only** — there is no tensor-parallel handling for CB
-  weights. `--enforce-eager` is the tested serving configuration
-  ([why](TROUBLESHOOTING.md#do-i-really-need---enforce-eager)).
+  weights. `--enforce-eager` is the published-model configuration; mode-0
+  `FULL_DECODE_ONLY` is also capture-correct with the default opaque dispatch
+  and is being promoted through the model-size performance gates
+  ([details](TROUBLESHOOTING.md#do-i-really-need---enforce-eager)).
 
 ## Layout / registration
 

@@ -205,18 +205,23 @@ data-dependent control flow. The kernels follow these rules:
    caught: an activation-QDQ kernel built its FP4/E2M1 grid on the CPU and
    H2D-copied it *every call* — a hidden sync in eager mode and a hard error under
    capture. The grid is now cached per device.
-4. **The M-gated decode dispatch is a host branch, so it is capture-hostile.** Two
-   consequences, both learned the hard way:
-   - Naively serving without `--enforce-eager` made decode **worse**, not better:
-     the server pads captured decode batches above the prefill-M threshold, so every
-     graphed decode step takes the *expand* path per token. Launch overhead was not
-     the decode bottleneck — the kernel's own throughput was. Keep `--enforce-eager`
-     for the M-gated path.
-   - Where a path has **no** host branching (e.g. the dense/MoE FP4-v2 grouped
-     kernels), a `FULL_DECODE_ONLY` graph capture with `torch.compile` disabled over
-     the plugin is safe and helped (+24% decode on the 295B artifact). A production
-     decode kernel should key off the true token count, not a padded batch size, to
-     be capture-clean.
+4. **Hoist the whole M-gated dispatch behind one opaque op.** The historical
+   inline branch was capture-hostile: a prefill-sized trace could bake the
+   expand arm into decode. With the default `PRISMAQUANT_CB_DISPATCH=op`, each
+   Linear/MoE call is one opaque `cb_*_forward` op whose eager implementation
+   resolves M at capture time. A `FULL_DECODE_ONLY` capture records the GEMV arm
+   at each fixed decode size; prefill stays outside that graph and resolves the
+   large-M arm independently. `PRISMAQUANT_CB_DISPATCH=inline` is an A/B escape,
+   not the graph configuration.
+5. **Use full-decode graphs without compilation over the plugin.** The validated
+   shape is `mode=0`, `cudagraph_mode=FULL_DECODE_ONLY`, capture sizes
+   `[1,2,4,8]`, and `PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE` unset. On a close-rate
+   0.6B canary, changed inputs at capture sizes 1 and 4 matched eager text,
+   tokens, and per-token logprobs exactly; 32+256 latency improved 20.1% and was
+   5.9% behind native. This is directional A8-vs-W4A4 execution-contract
+   evidence, not an exact-byte 27B claim. The FP4-v2 295B path separately
+   measured +24% decode. Capture only the batch sizes the deployment needs:
+   the 0.6B validation reported ~30 s startup and 2.64 GiB for four sizes.
 
 ## A measurement side-effect worth knowing
 
