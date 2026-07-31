@@ -49,6 +49,28 @@ _FUSED_FALLBACK = {
 }
 
 
+def _initialized_tensor_parallel_world_size() -> int | None:
+    """Return vLLM's TP size once model parallelism exists.
+
+    Config/resolver unit tests intentionally run without a distributed vLLM
+    process.  Production calls ``get_quant_method`` while constructing the
+    worker model, after vLLM initializes its model-parallel groups; that is the
+    first point where the documented TP=1 restriction can be enforced against
+    the real serving state instead of an argument string.
+    """
+
+    try:
+        from vllm.distributed import (
+            get_tensor_model_parallel_world_size,
+            model_parallel_is_initialized,
+        )
+    except (ImportError, AttributeError):  # pragma: no cover - minimal stubs
+        return None
+    if not model_parallel_is_initialized():
+        return None
+    return int(get_tensor_model_parallel_world_size())
+
+
 def _canonical_prefix(prefix: str) -> str:
     """vLLM serving prefix -> canonical target namespace. Some model classes
     wrap the LM (`language_model.model.layers.*` on Qwen3.5-class VL) while
@@ -132,6 +154,42 @@ class PrismaQuantConfig(QuantizationConfig):
         self._cb_targets: set[str] = set()
         self.ct_config = None                        # stock CompressedTensorsConfig
         self._codebooks: dict[str, torch.Tensor] | None = None
+        self._tp_world_size: int | None = None
+
+    def _require_supported_tensor_parallel(self) -> None:
+        if self._tp_world_size == 1:
+            return
+        world_size = _initialized_tensor_parallel_world_size()
+        if world_size is None:
+            return
+        if world_size != 1:
+            raise ValueError(
+                "Gridbook currently supports tensor-parallel size 1 only; "
+                f"the live vLLM worker reports TP={world_size}"
+            )
+        self._tp_world_size = world_size
+
+    @staticmethod
+    def _require_cb_device_capability(scheme: dict, prefix: str) -> None:
+        """Reject an FP8-CB artifact before its first illegal prefill.
+
+        FP8-CB's shipping large-M path uses vLLM's native FP8 quantizer and
+        CUTLASS scaled GEMM, whose hardware floor is sm_89.  The main decode
+        extension itself can compile for sm_80, so a global capability floor
+        would otherwise let an A100 load successfully and fail only when the
+        first prompt crosses the 16-token decode boundary.  FP4-CB retains the
+        broader BF16 transient fallback and is not rejected here.
+        """
+
+        if scheme.get("grid") != "fp8" or not torch.cuda.is_available():
+            return
+        capability = tuple(torch.cuda.get_device_capability())
+        if capability < (8, 9):
+            raise ValueError(
+                f"FP8-CB target {prefix!r} requires compute capability sm_89+ "
+                "for its shipping prefill path; "
+                f"the current device reports sm_{capability[0]}{capability[1]}"
+            )
 
     # -- lazy resolution of the (possibly pointer) quant config --------------
     def _ensure_resolved(self) -> None:
@@ -222,7 +280,10 @@ class PrismaQuantConfig(QuantizationConfig):
         return "gridbook"
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
-        return [torch.bfloat16, torch.float16]
+        # Shipping CUDA decode and grouped-MoE bindings require BF16 inputs.
+        # Advertising FP16 lets vLLM accept a model dtype that later fails at
+        # the native boundary (or changes dtype at a fallback/crossover).
+        return [torch.bfloat16]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -363,6 +424,7 @@ class PrismaQuantConfig(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> "QuantizeMethodBase | None":
+        self._require_supported_tensor_parallel()
         self._ensure_resolved()
         from .linear import PrismaQuantCBLinearMethod
 
@@ -381,6 +443,7 @@ class PrismaQuantConfig(QuantizationConfig):
                       f"{'CB' if scheme is not None else 'no-scheme'}",
                       file=sys.stderr, flush=True)
             if scheme is not None:
+                self._require_cb_device_capability(scheme, prefix)
                 return PrismaQuantCBLinearMethod(self, scheme, prefix)
             # 2) explicitly-ignored -> BF16 passthrough.
             if self._is_ignored(prefix):
@@ -404,6 +467,7 @@ class PrismaQuantConfig(QuantizationConfig):
         if RoutedExperts is not None and isinstance(layer, RoutedExperts):
             scheme = self._moe_scheme_for_prefix(prefix)
             if scheme is not None:
+                self._require_cb_device_capability(scheme, prefix)
                 from .moe import PrismaQuantCBMoEMethod
                 return PrismaQuantCBMoEMethod(
                     self, layer.moe_config, scheme, prefix)

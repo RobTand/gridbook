@@ -412,19 +412,18 @@ The rules and evidence limits are in
 
 ## Non-Blackwell GPU: what breaks
 
-The plugin declares a compute-capability floor of **8.0**, so it will start on
-an A100 — but that floor is more permissive than the shipped paths. See the
-[hardware matrix](INSTALL.md#hardware-matrix) for the per-path breakdown.
+The base FP4-CB path declares compute capability **8.0**, while FP8-CB's native
+prefill path requires **8.9** and is now checked during model construction. See
+the [hardware matrix](INSTALL.md#hardware-matrix) for the per-path breakdown.
 
 - **`sm_89` / `sm_90` (RTX 4090, L40S, H100)** — decode and dense prefill are
   *expected* to work (the decode kernel has no architecture guards); the mid-M
   fused kernel fails soft with the warning above. **Inferred from code, untested
   by the author.**
-- **`sm_80` (A100)** — expected to fail on the first prompt longer than 16
-  tokens. The dense FP8-CB prefill calls a CUTLASS fp8 GEMM that requires
-  `sm_89+`, with no capability guard and no fallback; the symptom is an error
-  from `cutlass_scaled_mm` or `scaled_fp8_quant` at the first prefill, after a
-  successful load and short decodes. **Not recommended.**
+- **`sm_80` (A100)** — an FP8-CB artifact is rejected early with a clear
+  `sm_89+` error. The former behavior loaded successfully and then failed at
+  `cutlass_scaled_mm` / `scaled_fp8_quant` on the first prompt longer than 16
+  tokens. FP4-CB retains its BF16 fallback, but is untested on this card.
 - Per-artifact groups matter too. The 27B's vision tower is stock NVFP4 W4A16 and
   needs a vLLM NVFP4 backend independently of gridbook.
 
@@ -435,10 +434,10 @@ your versions and numbers is genuinely useful — that table is how it gets wide
 
 ## Tensor parallel (`tp > 1`)
 
-Unsupported. The plugin contains no tensor-parallel handling at all — there is no
-sharding logic for the packed index stream, per-role codebook offsets or scale
-planes. Serve with `tp=1`. Multi-GPU support is not currently on the roadmap;
-if you need it, say so on an issue.
+Unsupported and rejected during model construction. The plugin contains no
+tensor-parallel handling for the packed index stream, per-role codebook offsets
+or scale planes. Serve with `tp=1`. Multi-GPU support is not currently on the
+roadmap; if you need it, say so on an issue.
 
 ---
 

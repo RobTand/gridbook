@@ -88,6 +88,13 @@ def moe(request):
         sys.modules.update(before)
 
 
+@pytest.fixture(autouse=True)
+def _reset_prefill_mode_state(moe):
+    moe._PREFILL_MODE_STATE.clear()
+    yield
+    moe._PREFILL_MODE_STATE.clear()
+
+
 def _method(moe, *, grid, k, n_sub, type_size, is_v2=True):
     """A ``PrismaQuantCBMoEMethod`` with ``__init__`` bypassed (the fixture
     pattern the other MoE test files use) carrying just the format fields the
@@ -193,6 +200,22 @@ def test_explicit_fp4_mode_bypasses_fused_default(moe, monkeypatch, mode):
 def test_fp8_explicit_mode_still_overrides_auto(moe, monkeypatch):
     monkeypatch.setenv("PRISMAQUANT_CB_PREFILL", "loop")
     assert _dispatch_mode(moe, monkeypatch, _fp8(moe)) == "loop"
+
+
+@pytest.mark.parametrize("value", ["", "stok", "AUTO", "unknown"])
+def test_invalid_prefill_mode_fails_instead_of_selecting_batched(
+        moe, monkeypatch, value):
+    monkeypatch.setenv("PRISMAQUANT_CB_PREFILL", value)
+    with pytest.raises(ValueError, match="invalid PRISMAQUANT_CB_PREFILL"):
+        _dispatch_mode(moe, monkeypatch, _fp8(moe))
+
+
+def test_prefill_mode_cannot_change_mid_process(moe, monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_CB_PREFILL", "loop")
+    assert _dispatch_mode(moe, monkeypatch, _fp8(moe)) == "loop"
+    monkeypatch.setenv("PRISMAQUANT_CB_PREFILL", "stock")
+    with pytest.raises(RuntimeError, match="changed after Gridbook dispatch"):
+        _dispatch_mode(moe, monkeypatch, _fp8(moe))
 
 
 # --------------------------------------------------------------------------- #

@@ -107,6 +107,41 @@ def _window_fits_superblock(k: int, type_size: int) -> bool:
 # reject degrades to segmented once, not per forward.
 _GROUPED_MM_OK: bool | None = None
 
+# Every accepted public/diagnostic prefill selector. Historically every unknown
+# spelling fell through to ``batched`` -- the high-transient experimental path
+# that has crashed a large serve. Pin the environment once per process and fail
+# on typos or mid-serve mutation so one model cannot split its layers across
+# different execution contracts.
+_PREFILL_MODES = frozenset({
+    "auto",
+    "batched",
+    "grouped_fused",
+    "grouped_fused_r1",
+    "l2_pipeline",
+    "loop",
+    "stock",
+})
+_PREFILL_MODE_STATE: list[str | None] = []
+
+
+def _requested_prefill_mode() -> str | None:
+    raw = os.environ.get("PRISMAQUANT_CB_PREFILL")
+    current = raw.strip() if raw is not None else None
+    if current == "" or (current is not None and current not in _PREFILL_MODES):
+        allowed = ", ".join(sorted(_PREFILL_MODES))
+        raise ValueError(
+            "invalid PRISMAQUANT_CB_PREFILL="
+            f"{raw!r}; expected one of: {allowed}, or leave it unset"
+        )
+    if not _PREFILL_MODE_STATE:
+        _PREFILL_MODE_STATE.append(current)
+    elif current != _PREFILL_MODE_STATE[0]:
+        raise RuntimeError(
+            "PRISMAQUANT_CB_PREFILL changed after Gridbook dispatch was fixed; "
+            "restart the process instead of mixing prefill contracts"
+        )
+    return _PREFILL_MODE_STATE[0]
+
 
 def _grouped_mm_available() -> bool:
     global _GROUPED_MM_OK
@@ -501,7 +536,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # measured shapes, but its padding cost has a sharp token-count cliff.
         # The same unvalidated-on-serving-metric caveat as the dense gate in
         # linear.py applies.
-        requested_mode = os.environ.get("PRISMAQUANT_CB_PREFILL")
+        requested_mode = _requested_prefill_mode()
         if requested_mode is None and self.is_fp4 and num_tokens > 16:
             gf4 = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "").strip()
             if gf4 in ("1", "128", "256"):
@@ -544,8 +579,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if mode == "stock":
             return self._apply_prefill_stock(
                 layer, x, topk_weights, topk_ids, act)
-        return self._apply_prefill_batched(
-            layer, x, topk_weights, topk_ids, act)
+        if mode == "batched":
+            return self._apply_prefill_batched(
+                layer, x, topk_weights, topk_ids, act)
+        raise AssertionError(f"unhandled validated CB prefill mode: {mode}")
 
     # -- prefill: fp4 grouped FUSED (block-scaled decode-in-prologue) --------
     def _gf4_ok(self, layer) -> bool:
