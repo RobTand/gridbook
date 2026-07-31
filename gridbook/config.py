@@ -439,7 +439,12 @@ class PrismaQuantConfig(QuantizationConfig):
             if name.split(".")[-1] not in _MOE_LEAVES:
                 continue
             variants = _candidate_bases(name)
-            if any(v.startswith(b) for v in variants for b in bases):
+            # A target must be a dotted child of this exact expert prefix.
+            # Raw ``startswith`` also accepts neighbouring module names such
+            # as ``experts2`` and ``experts_backup``, silently assigning their
+            # scheme to the live ``experts`` stack.
+            if any(v.startswith(b.rstrip(".") + ".")
+                   for v in variants for b in bases):
                 return sch
         return None
 

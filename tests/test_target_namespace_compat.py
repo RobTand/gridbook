@@ -271,6 +271,19 @@ def test_moe_scheme_does_not_overmatch():
         "language_model.model.layers.1.mlp.shared_expert") is None
 
 
+@pytest.mark.parametrize("neighbour", ["experts2", "experts_backup"])
+@pytest.mark.parametrize("prefix", _MOE_EXPERT_PREFIXES)
+def test_moe_scheme_requires_a_dotted_prefix_boundary(neighbour, prefix):
+    """A sibling whose name merely starts with ``experts`` is not that stack."""
+    cfg = PrismaQuantConfig.from_config(_moe_config([
+        f"model.layers.1.mlp.{neighbour}.gate_up_proj",
+        f"model.layers.1.mlp.{neighbour}.down_proj",
+    ]))
+    cfg._ensure_resolved()
+
+    assert cfg._moe_scheme_for_prefix(prefix) is None
+
+
 # ---------------------------------------------------------------------------
 # The FOURTH namespace vintage: post-``apply_vllm_mapper`` (issue #1,
 # RobTand/gridbook, 2026-07-25).
