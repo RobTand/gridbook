@@ -13,6 +13,7 @@ makes the command builder/unit tests independent of a live server.
 from __future__ import annotations
 
 import argparse
+import errno
 import importlib.metadata
 import json
 import math
@@ -87,7 +88,7 @@ _SENSITIVE_COMPOUNDS = ("APIKEY", "AUTHTOKEN", "ACCESSTOKEN", "REFRESHTOKEN")
 _ASSIGNMENT = re.compile(r"(\b[-\w.]+\b\s*(?:=|:)\s*)([^\s,;]+)")
 _OPTION_VALUE = re.compile(r"((?:^|\s)(--?[-\w.]+)\s+)([^\s]+)")
 _AUTH_HEADER = re.compile(
-    r"(?i)(authorization\s*:\s*(?:basic|bearer)\s+)([^\s,;]+)"
+    r"(?i)((?:proxy-)?authorization\s*:\s*)([^\s,;]+)(?:\s+([^\s,;]+))?"
 )
 _URL = re.compile(r"https?://[^\s]+", re.I)
 
@@ -114,6 +115,22 @@ def _nonnegative_int(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be zero or greater")
     return parsed
+
+
+def _nonempty(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must not be empty")
+    return value
+
+
+def _input_range_ratio(value: str) -> float:
+    try:
+        ratio = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number in [0, 1)") from exc
+    if not math.isfinite(ratio) or not 0 <= ratio < 1:
+        raise argparse.ArgumentTypeError("must be a finite number in [0, 1)")
+    return ratio
 
 
 def _request_rate(value: str) -> str:
@@ -219,6 +236,37 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="short arm/workload label, for example gridbook-27b-decode",
     )
+    artifact.add_argument(
+        "--artifact-bytes",
+        type=_positive_int,
+        required=True,
+        help="exact whole served-artifact bytes, excluding caches",
+    )
+    artifact.add_argument(
+        "--byte-budget",
+        type=_positive_int,
+        required=True,
+        help="maximum allowed whole served-artifact bytes",
+    )
+
+    identity = parser.add_argument_group("delegated execution identity")
+    identity.add_argument("--format-rung", type=_nonempty, required=True)
+    identity.add_argument("--serialized-layout", type=_nonempty, required=True)
+    identity.add_argument("--scale-coding", type=_nonempty, required=True)
+    identity.add_argument(
+        "--quant-contract",
+        type=_nonempty,
+        required=True,
+        help="weight/activation contract, for example W4A4 or W8A8",
+    )
+    identity.add_argument("--kernel-backend", type=_nonempty, required=True)
+    identity.add_argument("--tensor-parallel-size", type=_positive_int, required=True)
+    identity.add_argument("--fallback-state", type=_nonempty, required=True)
+    identity.add_argument("--client-runtime-id", type=_nonempty, required=True)
+    identity.add_argument("--server-runtime-id", type=_nonempty, required=True)
+    identity.add_argument("--gpu-id", type=_nonempty, required=True)
+    identity.add_argument("--driver-version", type=_nonempty, required=True)
+    identity.add_argument("--cuda-version", type=_nonempty, required=True)
 
     workload = parser.add_argument_group("fixed workload")
     workload.add_argument("--input-len", type=_positive_int, required=True)
@@ -266,6 +314,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=_percentiles,
         default=DEFAULT_PERCENTILES,
         help=f"reported metric percentiles (default: {DEFAULT_PERCENTILES})",
+    )
+    workload.add_argument(
+        "--input-range-ratio",
+        type=_input_range_ratio,
+        default=0.0,
+        help=(
+            "uniform random input-length range ratio in [0,1); output length "
+            "remains fixed (default: 0)"
+        ),
     )
 
     dispatch = parser.add_argument_group("dispatch provenance")
@@ -319,6 +376,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     server_env_names = [name for name, _ in args.server_env]
     if len(server_env_names) != len(set(server_env_names)):
         parser.error("--server-env names must not be repeated")
+    if args.artifact_bytes > args.byte_budget:
+        parser.error(
+            f"--artifact-bytes ({args.artifact_bytes}) exceeds --byte-budget "
+            f"({args.byte_budget})"
+        )
     return args
 
 
@@ -355,7 +417,11 @@ def build_vllm_command(
         "--random-output-len",
         str(args.output_len),
         "--random-range-ratio",
-        "0",
+        json.dumps(
+            {"input": args.input_range_ratio, "output": 0.0},
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
         "--num-prompts",
         str(args.num_prompts),
         "--num-warmups",
@@ -439,10 +505,16 @@ def _redact_text(value: str) -> str:
             "<redacted>" if _is_sensitive_key(match.group(2)) else match.group(3)
         )
 
+    def redact_authorization(match: re.Match[str]) -> str:
+        scheme_or_value = match.group(2)
+        if match.group(3) is None:
+            return match.group(1) + "<redacted>"
+        return match.group(1) + scheme_or_value + " <redacted>"
+
     redacted = _URL.sub(redact_url, str(value))
-    redacted = _AUTH_HEADER.sub(r"\1<redacted>", redacted)
     redacted = _ASSIGNMENT.sub(redact_assignment, redacted)
-    return _OPTION_VALUE.sub(redact_option, redacted)
+    redacted = _OPTION_VALUE.sub(redact_option, redacted)
+    return _AUTH_HEADER.sub(redact_authorization, redacted)
 
 
 def redact_command(command: Sequence[str]) -> list[str]:
@@ -555,7 +627,7 @@ def collect_metadata(
         "git": git,
         "software": {
             "gridbook_version": probe("gridbook_version", _package_version),
-            "vllm_cli_version": probe(
+            "runner_vllm_cli_probe": probe(
                 "vllm_cli_version", lambda: _vllm_version(args.vllm_executable)
             ),
             "python": probe("python", platform.python_version),
@@ -568,6 +640,32 @@ def collect_metadata(
             "model_id": _redact_text(args.model_id),
             "benchmark_model": _redact_text(args.model),
             "tokenizer": _redact_text(args.tokenizer or args.model),
+            "whole_served_artifact_bytes": args.artifact_bytes,
+            "byte_budget_bytes": args.byte_budget,
+            "budget_headroom_bytes": args.byte_budget - args.artifact_bytes,
+            "within_byte_budget": args.artifact_bytes <= args.byte_budget,
+            "byte_scope": (
+                "shipped model shards, configs, tokenizer, and sidecars; "
+                "runtime/download/JIT caches excluded"
+            ),
+        },
+        "execution_identity": {
+            "format_rung": _redact_text(args.format_rung),
+            "serialization": {
+                "layout": _redact_text(args.serialized_layout),
+                "scale_coding": _redact_text(args.scale_coding),
+            },
+            "quant_contract": _redact_text(args.quant_contract),
+            "kernel_backend": _redact_text(args.kernel_backend),
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "fallback_state": _redact_text(args.fallback_state),
+            "client_runtime_id": _redact_text(args.client_runtime_id),
+            "server_runtime_id": _redact_text(args.server_runtime_id),
+            "hardware": {
+                "gpu_id": _redact_text(args.gpu_id),
+                "driver_version": _redact_text(args.driver_version),
+                "cuda_version": _redact_text(args.cuda_version),
+            },
         },
         "server": {
             "base_url": _redact_url(args.base_url.rstrip("/")),
@@ -576,7 +674,7 @@ def collect_metadata(
             "served_model_name": _redact_text(
                 args.served_model_name or args.model
             ),
-            "recorded_args": [_redact_text(value) for value in args.server_arg],
+            "recorded_args": redact_command(args.server_arg),
         },
         "dispatch": {
             "runner_environment": {
@@ -610,7 +708,31 @@ def collect_metadata(
                 "sampling_seed": None,
             },
             "request_rate": args.request_rate,
-            "random_range_ratio": 0,
+            "input_range_ratio": args.input_range_ratio,
+            "vllm_range_ratio": {
+                "input": args.input_range_ratio,
+                "output": 0.0,
+            },
+            "input_length_validation": (
+                "exact" if args.input_range_ratio == 0 else "conservative-range"
+            ),
+            "accepted_input_length_bounds": list(
+                _input_length_bounds(args.input_len, args.input_range_ratio)
+            ),
+            "aggregate_reconciliation": {
+                "ttft_itl": "mean/median vs detailed arrays; 0.01 ms or 1e-5 relative",
+                "e2el": (
+                    "mean/median vs TTFT+ITL; 5 ms or 0.5% terminal-SSE allowance"
+                ),
+                "tpot": (
+                    "mean vs (mean_e2el-mean_ttft)/(fixed_output_len-1); "
+                    "0.05 ms or 0.5%"
+                ),
+                "itl_cardinality": (
+                    "not equated to output tokens because one SSE chunk may carry "
+                    "multiple tokens"
+                ),
+            },
             "ignore_eos": True,
             "streaming": True,
             "metrics": STREAMING_METRICS.split(","),
@@ -667,6 +789,46 @@ def _percentile_result_key(percentile: str, metric: str) -> str:
     number = float(percentile)
     label = str(int(number)) if number.is_integer() else f"{number:g}"
     return f"p{label}_{metric}_ms"
+
+
+def _input_length_bounds(input_len: int, ratio: float) -> tuple[int, int]:
+    if ratio == 0:
+        return input_len, input_len
+    # Pinned vLLM 0.23 samples through ceil(input_len * (1 + ratio)), but its
+    # lower endpoint is computed after subtracting tokenizer-added special
+    # tokens and its decode/re-encode correction can shorten a prompt.  That
+    # special-token count is not exposed in bench-serve JSON.  One token is
+    # therefore the only universally safe lower bound; the upper bound remains
+    # exact and useful, and totals/per-request types are checked independently.
+    return 1, math.ceil(input_len * (1 + ratio))
+
+
+def _aggregate_tolerance_ms(metric: str, expected_ms: float) -> float:
+    if metric == "e2el":
+        # vLLM's request latency extends through the terminal SSE event, while
+        # detailed ITLs stop at the final token-bearing chunk.  Permit that
+        # small transport tail, but not a fabricated decode-length gap.
+        return max(5.0, abs(expected_ms) * 0.005)
+    return max(0.01, abs(expected_ms) * 1e-5)
+
+
+def _reconcile_detailed_aggregate(
+    result: Mapping[str, Any], metric: str, samples_ms: Sequence[float]
+) -> None:
+    expected = {
+        "mean": statistics.fmean(samples_ms) if samples_ms else 0.0,
+        "median": statistics.median(samples_ms) if samples_ms else 0.0,
+    }
+    for statistic_name, expected_ms in expected.items():
+        key = f"{statistic_name}_{metric}_ms"
+        actual_ms = _number(result, key)
+        tolerance_ms = _aggregate_tolerance_ms(metric, expected_ms)
+        if actual_ms is None or abs(actual_ms - expected_ms) > tolerance_ms:
+            raise BenchmarkError(
+                f"{key} disagrees with detailed streaming evidence: "
+                f"reported={actual_ms}, reconstructed={expected_ms:.6f}, "
+                f"tolerance={tolerance_ms:.6f} ms"
+            )
 
 
 def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None:
@@ -727,27 +889,28 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
             "vLLM result has negative latency metrics: " + ", ".join(negative)
         )
 
-    expected = {
+    expected: dict[str, tuple[tuple[str, ...], int]] = {
         "completed": (("completed",), args.num_prompts),
         "failed": (("failed",), 0),
-        # Current vLLM uses *_tokens.  The shorter aliases keep reports made by
-        # older bench-serve releases usable without weakening the exact-length
-        # gate.
-        "total_input_tokens": (
-            ("total_input_tokens", "total_input"),
-            args.num_prompts * args.input_len,
-        ),
         "total_output_tokens": (
             ("total_output_tokens", "total_output"),
             args.num_prompts * args.output_len,
         ),
     }
+    if args.input_range_ratio == 0:
+        # Current vLLM uses *_tokens.  The shorter aliases keep results from
+        # older bench-serve releases usable without weakening the fixed gate.
+        expected["total_input_tokens"] = (
+            ("total_input_tokens", "total_input"),
+            args.num_prompts * args.input_len,
+        )
     mismatches = []
     for label, (aliases, wanted) in expected.items():
-        actual = next(
-            (_number(result, key) for key in aliases if _number(result, key) is not None),
-            None,
-        )
+        actual = None
+        for key in aliases:
+            actual = _number(result, key)
+            if actual is not None:
+                break
         if actual is None:
             mismatches.append(f"{label}=missing (expected {wanted})")
         elif actual != wanted:
@@ -757,18 +920,56 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
             "fixed-shape block was not completed exactly: " + "; ".join(mismatches)
         )
 
-    for key, wanted in (("input_lens", args.input_len), ("output_lens", args.output_len)):
-        lengths = result.get(key)
-        if not isinstance(lengths, list) or len(lengths) != args.num_prompts:
+    input_lens = result.get("input_lens")
+    if not isinstance(input_lens, list) or len(input_lens) != args.num_prompts:
+        raise BenchmarkError(
+            "vLLM detailed result input_lens must contain one value per prompt"
+        )
+    lower, upper = _input_length_bounds(args.input_len, args.input_range_ratio)
+    wrong_inputs = [
+        index
+        for index, value in enumerate(input_lens)
+        if isinstance(value, bool)
+        or not isinstance(value, int)
+        or not lower <= value <= upper
+    ]
+    if wrong_inputs:
+        preview = ", ".join(str(index) for index in wrong_inputs[:5])
+        mode = "fixed" if args.input_range_ratio == 0 else f"range [{lower}, {upper}]"
+        raise BenchmarkError(
+            f"{mode} block has unexpected input_lens at request index: {preview}"
+        )
+    if args.input_range_ratio > 0:
+        total_input = None
+        for key in ("total_input_tokens", "total_input"):
+            total_input = _number(result, key)
+            if total_input is not None:
+                break
+        observed_total = sum(input_lens)
+        if total_input != observed_total:
             raise BenchmarkError(
-                f"vLLM detailed result {key} must contain one value per prompt"
+                "distributed input lengths do not reconcile with total_input_tokens: "
+                f"{total_input} != {observed_total}"
             )
-        wrong = [index for index, value in enumerate(lengths) if value != wanted]
-        if wrong:
-            preview = ", ".join(str(index) for index in wrong[:5])
-            raise BenchmarkError(
-                f"fixed-shape block has unexpected {key} at request index: {preview}"
-            )
+
+    output_lens = result.get("output_lens")
+    if not isinstance(output_lens, list) or len(output_lens) != args.num_prompts:
+        raise BenchmarkError(
+            "vLLM detailed result output_lens must contain one value per prompt"
+        )
+    wrong_outputs = [
+        index
+        for index, value in enumerate(output_lens)
+        if isinstance(value, bool)
+        or not isinstance(value, int)
+        or value != args.output_len
+    ]
+    if wrong_outputs:
+        preview = ", ".join(str(index) for index in wrong_outputs[:5])
+        raise BenchmarkError(
+            "fixed output block has unexpected output_lens at request index: "
+            + preview
+        )
 
     errors = result.get("errors")
     if not isinstance(errors, list) or len(errors) != args.num_prompts:
@@ -829,6 +1030,34 @@ def validate_result(result: Mapping[str, Any], args: argparse.Namespace) -> None
     if any(not math.isfinite(value) or value <= 0 for value in e2els):
         raise BenchmarkError("derived detailed E2EL contains a non-finite value")
 
+    _reconcile_detailed_aggregate(
+        result, "ttft", [float(value) * 1000 for value in ttfts]
+    )
+    _reconcile_detailed_aggregate(
+        result,
+        "itl",
+        [float(value) * 1000 for intervals in itls for value in intervals],
+    )
+    _reconcile_detailed_aggregate(
+        result, "e2el", [value * 1000 for value in e2els]
+    )
+    if args.output_len > 1:
+        # All outputs are fixed length, so linearity makes this exact even
+        # though medians cannot be reconstructed from aggregate medians and an
+        # SSE chunk may carry multiple speculative tokens.
+        expected_mean_tpot = (
+            _number(result, "mean_e2el_ms") - _number(result, "mean_ttft_ms")
+        ) / (args.output_len - 1)
+        reported_mean_tpot = _number(result, "mean_tpot_ms")
+        tolerance = max(0.05, abs(expected_mean_tpot) * 0.005)
+        if abs(reported_mean_tpot - expected_mean_tpot) > tolerance:
+            raise BenchmarkError(
+                "mean_tpot_ms disagrees with mean E2EL/TTFT and fixed output "
+                f"length: reported={reported_mean_tpot}, "
+                f"reconstructed={expected_mean_tpot:.6f}, "
+                f"tolerance={tolerance:.6f} ms"
+            )
+
 
 def summarize_blocks(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     results = [block["raw_result"] for block in blocks]
@@ -862,13 +1091,25 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         with os.fdopen(fd, "w") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     except BaseException:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
         raise
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _reserve_output(path: Path, *, overwrite: bool) -> None:
@@ -880,14 +1121,21 @@ def _reserve_output(path: Path, *, overwrite: bool) -> None:
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise BenchmarkError(f"refusing to reserve symlink output: {path}")
     flags = os.O_WRONLY | os.O_CREAT
     flags |= os.O_TRUNC if overwrite else os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags, 0o600)
     except FileExistsError as exc:
         raise BenchmarkError(
             f"output already exists: {path} (pass --overwrite to replace it)"
         ) from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP or path.is_symlink():
+            raise BenchmarkError(f"refusing to reserve symlink output: {path}") from exc
+        raise
     with os.fdopen(descriptor, "w") as handle:
         os.fchmod(handle.fileno(), 0o600)
         json.dump(
@@ -896,6 +1144,9 @@ def _reserve_output(path: Path, *, overwrite: bool) -> None:
             allow_nan=False,
         )
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(path.parent)
 
 
 def _json_safe(value: Any) -> Any:
@@ -920,7 +1171,11 @@ def _run_command(command: Sequence[str]) -> int:
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
-    output_path = args.output.expanduser().resolve()
+    # ``resolve()`` follows the final component and would turn an explicitly
+    # rejected output symlink into its target before _reserve_output sees it.
+    # abspath-style normalization preserves that final component for the
+    # O_NOFOLLOW/symlink gate while still making report paths deterministic.
+    output_path = Path(os.path.abspath(os.fspath(args.output.expanduser())))
     _reserve_output(output_path, overwrite=args.overwrite)
 
     started_at = _utc_now()

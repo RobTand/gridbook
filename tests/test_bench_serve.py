@@ -15,8 +15,8 @@ import pytest
 from gridbook import bench_serve
 
 
-def _parse(tmp_path, *extra):
-    argv = [
+def _argv(tmp_path):
+    return [
         "--base-url",
         "http://127.0.0.1:8000/",
         "--model",
@@ -31,6 +31,34 @@ def _parse(tmp_path, *extra):
         "deadbeef",
         "--run-label",
         "gridbook-0.6b-decode",
+        "--artifact-bytes",
+        "800",
+        "--byte-budget",
+        "900",
+        "--format-rung",
+        "FP8_CB_K36",
+        "--serialized-layout",
+        "product-codebook-indices-v1",
+        "--scale-coding",
+        "e4m3-per-block",
+        "--quant-contract",
+        "W8A8",
+        "--kernel-backend",
+        "gridbook-cuda-cb-gemv-v2",
+        "--tensor-parallel-size",
+        "1",
+        "--fallback-state",
+        "none-observed",
+        "--client-runtime-id",
+        "vllm-bench@g54b16d8a9",
+        "--server-runtime-id",
+        "vllm@g54b16d8a9+gridbook-0.3.0",
+        "--gpu-id",
+        "NVIDIA-GB10:GPU-1234",
+        "--driver-version",
+        "580.00",
+        "--cuda-version",
+        "13.0",
         "--input-len",
         "32",
         "--output-len",
@@ -41,17 +69,31 @@ def _parse(tmp_path, *extra):
         "1",
         "--output",
         str(tmp_path / "report.json"),
-        *extra,
     ]
-    return bench_serve.parse_args(argv)
+
+
+def _parse(tmp_path, *extra):
+    return bench_serve.parse_args([*_argv(tmp_path), *extra])
 
 
 def _option(command, name):
     return command[command.index(name) + 1]
 
 
+def _without_option(argv, name):
+    index = argv.index(name)
+    return [*argv[:index], *argv[index + 2 :]]
+
+
 def _valid_result(args, *, offset=0.0):
     multi_token = args.output_len > 1
+    ttft_ms = 20.0 + offset
+    # Detailed ITLs describe streamed chunk arrivals, not token cardinality.
+    # Keeping one interval for a 256-token response protects compatibility with
+    # bundled/speculatively accepted token chunks.
+    itl_ms = 2.0 + offset if multi_token else 0.0
+    e2el_ms = ttft_ms + itl_ms
+    tpot_ms = itl_ms / (args.output_len - 1) if multi_token else 0.0
     result = {
         "completed": args.num_prompts,
         "failed": 0,
@@ -60,31 +102,32 @@ def _valid_result(args, *, offset=0.0):
         "input_lens": [args.input_len] * args.num_prompts,
         "output_lens": [args.output_len] * args.num_prompts,
         "errors": [""] * args.num_prompts,
-        "ttfts": [0.020 + offset / 1000] * args.num_prompts,
-        "itls": [[0.002 + offset / 1000] if multi_token else []
-                 for _ in range(args.num_prompts)],
+        "ttfts": [ttft_ms / 1000] * args.num_prompts,
+        "itls": [
+            [itl_ms / 1000] if multi_token else []
+            for _ in range(args.num_prompts)
+        ],
         "request_throughput": 2.0 + offset,
         "output_throughput": 500.0 + offset,
         "total_token_throughput": 600.0 + offset,
-        "mean_ttft_ms": 20.0 + offset,
-        "median_ttft_ms": 19.0 + offset,
-        "std_ttft_ms": 1.0,
-        "p99_ttft_ms": 22.0 + offset,
-        "mean_tpot_ms": 2.0 + offset if multi_token else 0.0,
-        "median_tpot_ms": 1.9 + offset if multi_token else 0.0,
-        "std_tpot_ms": 0.1,
-        "mean_itl_ms": 2.1 + offset if multi_token else 0.0,
-        "median_itl_ms": 2.0 + offset if multi_token else 0.0,
-        "std_itl_ms": 0.2,
-        "mean_e2el_ms": 530.0 + offset,
-        "median_e2el_ms": 525.0 + offset,
-        "std_e2el_ms": 5.0,
+        "mean_ttft_ms": ttft_ms,
+        "median_ttft_ms": ttft_ms,
+        "std_ttft_ms": 0.0,
+        "mean_tpot_ms": tpot_ms,
+        "median_tpot_ms": tpot_ms,
+        "std_tpot_ms": 0.0,
+        "mean_itl_ms": itl_ms,
+        "median_itl_ms": itl_ms,
+        "std_itl_ms": 0.0,
+        "mean_e2el_ms": e2el_ms,
+        "median_e2el_ms": e2el_ms,
+        "std_e2el_ms": 0.0,
     }
     percentile_values = {
-        "ttft": 22.0 + offset,
-        "tpot": 2.2 + offset if multi_token else 0.0,
-        "itl": 2.5 + offset if multi_token else 0.0,
-        "e2el": 540.0 + offset,
+        "ttft": ttft_ms,
+        "tpot": tpot_ms,
+        "itl": itl_ms,
+        "e2el": e2el_ms,
     }
     for percentile in args.percentiles.split(","):
         for metric, value in percentile_values.items():
@@ -108,7 +151,10 @@ def test_command_uses_official_streaming_fixed_shape_semantics(tmp_path):
     assert _option(command, "--dataset-name") == "random"
     assert _option(command, "--random-input-len") == "32"
     assert _option(command, "--random-output-len") == "256"
-    assert _option(command, "--random-range-ratio") == "0"
+    assert json.loads(_option(command, "--random-range-ratio")) == {
+        "input": 0.0,
+        "output": 0.0,
+    }
     assert _option(command, "--num-warmups") == "4"
     assert _option(command, "--seed") == "902"
     assert _option(command, "--temperature") == "0"
@@ -147,6 +193,50 @@ def test_parser_rejects_ranges_that_break_a_comparable_workload(tmp_path):
         _parse(tmp_path, "--server-env", "MISSING_EQUALS")
     with pytest.raises(SystemExit):
         _parse(tmp_path, "--server-env", "MODE=a", "--server-env", "MODE=b")
+    for ratio in ("-0.01", "1", "nan", "not-a-number"):
+        with pytest.raises(SystemExit):
+            _parse(tmp_path, "--input-range-ratio", ratio)
+
+
+def test_execution_identity_and_whole_artifact_bytes_are_required(tmp_path):
+    required = (
+        "--artifact-bytes",
+        "--byte-budget",
+        "--format-rung",
+        "--serialized-layout",
+        "--scale-coding",
+        "--quant-contract",
+        "--kernel-backend",
+        "--tensor-parallel-size",
+        "--fallback-state",
+        "--client-runtime-id",
+        "--server-runtime-id",
+        "--gpu-id",
+        "--driver-version",
+        "--cuda-version",
+    )
+    for option in required:
+        with pytest.raises(SystemExit):
+            bench_serve.parse_args(_without_option(_argv(tmp_path), option))
+
+
+def test_whole_artifact_must_fit_exact_byte_budget(tmp_path):
+    with pytest.raises(SystemExit):
+        _parse(
+            tmp_path,
+            "--artifact-bytes",
+            "901",
+            "--byte-budget",
+            "900",
+        )
+    args = _parse(
+        tmp_path,
+        "--artifact-bytes",
+        "900",
+        "--byte-budget",
+        "900",
+    )
+    assert args.artifact_bytes == args.byte_budget == 900
 
 
 def test_dispatch_environment_is_sorted_explicit_and_secret_safe():
@@ -198,9 +288,31 @@ def test_metadata_captures_supplied_artifact_and_server_identity(tmp_path, monke
         "source": "argument",
     }
     assert metadata["software"]["gridbook_version"] == "0.3.0"
-    assert metadata["software"]["vllm_cli_version"] == "vLLM 1.2"
+    assert metadata["software"]["runner_vllm_cli_probe"] == "vLLM 1.2"
     assert metadata["artifacts"]["image_id"].endswith("sha256:abc")
     assert metadata["artifacts"]["model_id"] == "org/artifact@0123456"
+    assert metadata["artifacts"]["whole_served_artifact_bytes"] == 800
+    assert metadata["artifacts"]["byte_budget_bytes"] == 900
+    assert metadata["artifacts"]["budget_headroom_bytes"] == 100
+    assert metadata["artifacts"]["within_byte_budget"] is True
+    assert metadata["execution_identity"] == {
+        "format_rung": "FP8_CB_K36",
+        "serialization": {
+            "layout": "product-codebook-indices-v1",
+            "scale_coding": "e4m3-per-block",
+        },
+        "quant_contract": "W8A8",
+        "kernel_backend": "gridbook-cuda-cb-gemv-v2",
+        "tensor_parallel_size": 1,
+        "fallback_state": "none-observed",
+        "client_runtime_id": "vllm-bench@g54b16d8a9",
+        "server_runtime_id": "vllm@g54b16d8a9+gridbook-0.3.0",
+        "hardware": {
+            "gpu_id": "NVIDIA-GB10:GPU-1234",
+            "driver_version": "580.00",
+            "cuda_version": "13.0",
+        },
+    }
     assert metadata["server"]["recorded_args"] == ["--enforce-eager"]
     assert metadata["dispatch"]["runner_environment"] == {
         "source": "benchmark process",
@@ -234,6 +346,9 @@ def test_urls_commands_and_server_args_never_persist_credentials(tmp_path):
         secret_url,
         "--server-arg=--hf-token supersecret",
         "--server-arg=Authorization: Bearer abc123",
+        "--server-arg=Authorization: Token token-secret",
+        "--server-arg=--hf-token",
+        "--server-arg=split-secret",
         "--server-arg=MONKEY=visible",
     )
     metadata = bench_serve.collect_metadata(args, {})
@@ -243,7 +358,15 @@ def test_urls_commands_and_server_args_never_persist_credentials(tmp_path):
     redacted_command = bench_serve.redact_command(command)
     serialized = json.dumps({"metadata": metadata, "command": redacted_command})
 
-    for secret in ("alice", "password", "topsecret", "supersecret", "abc123"):
+    for secret in (
+        "alice",
+        "password",
+        "topsecret",
+        "supersecret",
+        "abc123",
+        "token-secret",
+        "split-secret",
+    ):
         assert secret not in serialized
     assert "mode=fast" in metadata["server"]["base_url"]
     assert "MONKEY=visible" in serialized
@@ -278,6 +401,10 @@ def test_validate_result_requires_true_streaming_metrics_and_exact_lengths(tmp_p
     with pytest.raises(bench_serve.BenchmarkError, match="unexpected output_lens"):
         bench_serve.validate_result(uneven, args)
 
+    uneven_input = dict(result, input_lens=[31, 33] + [32] * 6)
+    with pytest.raises(bench_serve.BenchmarkError, match="unexpected input_lens"):
+        bench_serve.validate_result(uneven_input, args)
+
 
 def test_validate_result_requires_detailed_positive_streaming_arrays(tmp_path):
     args = _parse(tmp_path)
@@ -305,12 +432,77 @@ def test_validate_result_requires_detailed_positive_streaming_arrays(tmp_path):
         bench_serve.validate_result(zero_itl, args)
 
 
+def test_validate_result_reconciles_aggregate_and_detailed_timings(tmp_path):
+    args = _parse(tmp_path)
+    result = _valid_result(args)
+
+    bad_ttft = dict(result, mean_ttft_ms=result["mean_ttft_ms"] + 1.0)
+    with pytest.raises(bench_serve.BenchmarkError, match="mean_ttft_ms disagrees"):
+        bench_serve.validate_result(bad_ttft, args)
+
+    bad_itl = dict(result, median_itl_ms=result["median_itl_ms"] + 1.0)
+    with pytest.raises(bench_serve.BenchmarkError, match="median_itl_ms disagrees"):
+        bench_serve.validate_result(bad_itl, args)
+
+    bad_e2el = dict(result, mean_e2el_ms=result["mean_e2el_ms"] + 10.0)
+    with pytest.raises(bench_serve.BenchmarkError, match="mean_e2el_ms disagrees"):
+        bench_serve.validate_result(bad_e2el, args)
+
+    bad_tpot = dict(result, mean_tpot_ms=result["mean_tpot_ms"] + 1.0)
+    with pytest.raises(bench_serve.BenchmarkError, match="mean_tpot_ms disagrees"):
+        bench_serve.validate_result(bad_tpot, args)
+
+
 def test_single_token_prefill_explicitly_allows_empty_itl_and_zero_tpot(tmp_path):
     args = _parse(tmp_path, "--output-len", "1")
     result = _valid_result(args)
     assert all(not intervals for intervals in result["itls"])
     assert result["mean_itl_ms"] == result["mean_tpot_ms"] == 0.0
     bench_serve.validate_result(result, args)
+
+
+def test_input_range_ratio_is_passed_and_validated_as_input_only(tmp_path):
+    args = _parse(tmp_path, "--input-range-ratio", "0.25")
+    command = bench_serve.build_vllm_command(
+        args, block_index=0, result_dir=tmp_path, result_filename="raw.json"
+    )
+    assert json.loads(_option(command, "--random-range-ratio")) == {
+        "input": 0.25,
+        "output": 0.0,
+    }
+    assert bench_serve._input_length_bounds(32, 0.25) == (1, 40)
+    metadata = bench_serve.collect_metadata(args, {})
+    assert metadata["workload"]["input_range_ratio"] == 0.25
+    assert metadata["workload"]["vllm_range_ratio"] == {
+        "input": 0.25,
+        "output": 0.0,
+    }
+    assert metadata["workload"]["accepted_input_length_bounds"] == [1, 40]
+
+    input_lens = [24, 26, 28, 30, 32, 34, 36, 40]
+    result = _valid_result(args)
+    result["input_lens"] = input_lens
+    result["total_input_tokens"] = sum(input_lens)
+    bench_serve.validate_result(result, args)
+
+    too_long = dict(result, input_lens=[41, *input_lens[1:]])
+    too_long["total_input_tokens"] = sum(too_long["input_lens"])
+    with pytest.raises(bench_serve.BenchmarkError, match=r"range \[1, 40\]"):
+        bench_serve.validate_result(too_long, args)
+
+    wrong_type = dict(result, input_lens=[24.0, *input_lens[1:]])
+    with pytest.raises(bench_serve.BenchmarkError, match="unexpected input_lens"):
+        bench_serve.validate_result(wrong_type, args)
+
+    wrong_output_type = dict(
+        result, output_lens=[256.0, *result["output_lens"][1:]]
+    )
+    with pytest.raises(bench_serve.BenchmarkError, match="unexpected output_lens"):
+        bench_serve.validate_result(wrong_output_type, args)
+
+    wrong_total = dict(result, total_input_tokens=sum(input_lens) + 1)
+    with pytest.raises(bench_serve.BenchmarkError, match="do not reconcile"):
+        bench_serve.validate_result(wrong_total, args)
 
 
 def test_validate_result_requires_throughput_percentiles_and_finite_numbers(tmp_path):
@@ -351,7 +543,7 @@ def test_summary_keeps_independent_values_and_sample_dispersion(tmp_path):
     assert ttft["mean"] == pytest.approx(21.0)
     assert ttft["median"] == pytest.approx(21.0)
     assert ttft["sample_stdev"] == pytest.approx(1.0)
-    assert summary["metrics"]["p99_itl_ms"]["values"] == [2.5, 3.5, 4.5]
+    assert summary["metrics"]["p99_itl_ms"]["values"] == [2.0, 3.0, 4.0]
 
 
 def test_run_writes_a_complete_report_without_vllm_or_server(tmp_path, monkeypatch):
@@ -504,6 +696,23 @@ def test_existing_report_is_never_replaced_without_opt_in(tmp_path, monkeypatch)
     with pytest.raises(bench_serve.BenchmarkError, match="already exists"):
         bench_serve.run_benchmark(args)
     assert args.output.read_text() == "keep me"
+
+
+def test_overwrite_fails_closed_on_symlink_output(tmp_path, monkeypatch):
+    target = tmp_path / "target.json"
+    target.write_text("keep target")
+    link = tmp_path / "report.json"
+    link.symlink_to(target)
+    args = _parse(tmp_path, "--overwrite")
+    monkeypatch.setattr(
+        bench_serve,
+        "_run_command",
+        lambda command: pytest.fail("benchmark must not start"),
+    )
+    with pytest.raises(bench_serve.BenchmarkError, match="symlink"):
+        bench_serve.run_benchmark(args)
+    assert link.is_symlink()
+    assert target.read_text() == "keep target"
 
 
 def test_output_reservation_has_exactly_one_concurrent_winner(tmp_path):
