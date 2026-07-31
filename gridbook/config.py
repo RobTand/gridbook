@@ -251,11 +251,34 @@ class PrismaQuantConfig(QuantizationConfig):
     # -- codebook sidecar (loaded once, shared across all layers) ------------
     def get_codebooks(self) -> dict[str, torch.Tensor]:
         if self._codebooks is None:
-            from safetensors.torch import load_file
             from vllm.config import get_current_vllm_config
+
+            from .cb_digest import load_codebooks
+
+            # Resolve the full quant config before opening the sidecar: the
+            # expected per-table hashes live outside the .pqcb in
+            # quant_config.json.  A digest carried only by the sidecar would
+            # attest to the wrong file just as readily as the right one.
+            self._ensure_resolved()
+            provenance = self._full_config.get("provenance")
+            if provenance is None:
+                expected_sha256 = None       # legacy, intentionally optional
+            elif not isinstance(provenance, dict):
+                raise ValueError(
+                    "provenance must be an object when it is present")
+            elif ("codebook_sha256" in provenance
+                  and provenance["codebook_sha256"] is None):
+                raise ValueError(
+                    "provenance.codebook_sha256 must be an object when "
+                    "declared; omit the field for a legacy artifact")
+            else:
+                expected_sha256 = provenance.get("codebook_sha256")
             model_dir = get_current_vllm_config().model_config.model
-            self._codebooks = load_file(
-                _resolve_model_file(model_dir, self.codebook_file))
+            # This is the single choke point used by linear.py, moe.py, and
+            # moe_toplevel_loader.py, and it is memoized after verification.
+            self._codebooks = load_codebooks(
+                _resolve_model_file(model_dir, self.codebook_file),
+                expected_sha256=expected_sha256)
         return self._codebooks
 
     # -- per-prefix scheme resolution (handles vLLM fused qkv/gate_up) -------
