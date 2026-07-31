@@ -269,17 +269,29 @@ PY
 A healthy install prints `BUILD : CUDA extension LOADED`, four symbols,
 `CB_DECODE : cuda`, and `RESULT : CUDA decode path`.
 
-Three distinct failures are reported differently, on purpose:
+The `symbols:` line above is informational. The loader itself asserts the
+symbols its callers dereference unconditionally, so `BUILD : CUDA extension
+LOADED` already means those are present; a build that lacks one reports
+*"incompatible CUDA decode-GEMV extension"* and returns `UNAVAILABLE` instead of
+loading. Symbols listed there but **not** required — `cb_expand_fp8_into` is
+one — are optional bindings that older extensions may not have; their absence
+costs a fast path, not correctness.
+
+Four distinct failures are reported differently, on purpose:
 
 - **`cb_gemv.cu found: False`** plus an *"installed without its CUDA sources"*
   error — a **packaging** problem with your install (reinstall gridbook).
 - **`BUILD : CUDA extension UNAVAILABLE`** preceded by a compiler error — a
   **toolchain** problem on your machine (usually no `nvcc`).
+- **`BUILD : CUDA extension UNAVAILABLE`** preceded by an *"incompatible ...
+  extension"* error naming missing symbols — the loaded binary does not match
+  the current Python call contract. Use the named cache diagnostics and see
+  [TROUBLESHOOTING.md](TROUBLESHOOTING.md#incompatible-jit-extension-the-module-loaded-but-has-the-wrong-api).
 - **`BUILD : ... LOADED` but `RESULT : FALLBACK path`** — nothing is broken; an
   environment variable is forcing the slow path. `PRISMAQUANT_CB_DECODE=triton`
   is a bisection switch that some scripts and model cards set. Unset it.
 
-All three are covered in [TROUBLESHOOTING](TROUBLESHOOTING.md).
+All four are covered in [TROUBLESHOOTING](TROUBLESHOOTING.md).
 
 ---
 
