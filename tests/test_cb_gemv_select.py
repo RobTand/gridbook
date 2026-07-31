@@ -175,8 +175,13 @@ def test_v2_loader_contract_requires_prepare_symbol():
 def test_decode_contract_is_resolved_in_cpp_per_call():
     """Do not regress to a Python/load-time cached contract while inherited
     resolves the same env switch in its C++ launcher on every call."""
-    source = (pathlib.Path(__file__).resolve().parents[1] / "gridbook" /
-              "csrc" / "cb_gemv_v2.cu").read_text()
+    # The CPU matrix runs a copied test directory against the installed wheel,
+    # not against a checkout. Resolve the shipped source through the same
+    # package-resource API the JIT loader uses so this pins both the contract
+    # and wheel completeness without assuming a repo-relative path.
+    cuda_ext = pytest.importorskip("gridbook.cuda_ext")
+    source = (pathlib.Path(cuda_ext.csrc_dir()) /
+              "cb_gemv_v2.cu").read_text()
     assert ('pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2")'
             in source)
     assert "decode_contract_v2_arg" not in source
