@@ -152,13 +152,13 @@ tooling and model cards — see the README's naming section.)
 |---|---|---|
 | `PRISMAQUANT_CB_EXT_DIR` | `~/.cache/prismaquant-cb-ext` | Where the JIT extensions are built and cached. Point it at a persistent, writable directory in containers to avoid a ~30 s rebuild per start. |
 | `PRISMAQUANT_CB_DECODE` | `cuda` | `triton` forces the Triton decode path (much slower; bisection only). |
-| `PRISMAQUANT_CB_PREFILL` | `auto` (fp8-CB) / `loop` (fp4-CB) | MoE prefill path: `auto` \| `stock` \| `grouped_fused` \| `loop`. `auto` measures the candidates per layer on the first prefill and caches the choice. `l2_pipeline` exists but is **diagnostic-only** — it wedged live serving three times. |
+| `PRISMAQUANT_CB_PREFILL` | `auto` (fp8-CB) / unset (fp4 fused-default policy) | MoE prefill path: `auto` \| `stock` \| `grouped_fused` \| `loop`. For fp4-CB, any explicitly set mode bypasses the default fused-FP4 attempt; an unset mode uses fused-FP4 first and `loop` on a constraint miss. `l2_pipeline` exists but is **diagnostic-only** — it wedged live serving three times. |
 | `PRISMAQUANT_CB_FUSED_MIDM` | `1` | `0` skips the CUTLASS mid-M fused prefill kernel — including its JIT build, which is worth doing on non-`sm_120` GPUs where the build is doomed anyway. |
 | `PRISMAQUANT_PREFILL_M_THRESHOLD` | `16` | Token count above which a dense Linear takes the prefill path instead of the decode GEMV. |
 | `PRISMAQUANT_CB_CUDA_M_MAX` | `8` | Within the decode regime, the largest M handled by the CUDA GEMV before the Triton decode-GEMM takes over (measured crossover on GB10). |
 | `PRISMAQUANT_CB_DISPATCH` | `op` | `inline` restores in-graph host branching instead of the opaque custom-op dispatch (A/B only; less CUDA-graph-safe). |
 | `PRISMAQUANT_CB_DECODE_CONTRACT` | `v1` | `v2` selects the scale-epilogue-hoist decode contract. Measured **null** on the served 27B; kept for reproducibility. |
-| `PRISMAQUANT_CB_EXPAND` | CUDA | `triton` restores the previous Triton expander (bisection). |
+| `PRISMAQUANT_CB_EXPAND` | CUDA (fp8-CB) / raw view (fp4-CB) | `triton` restores the previous padded Triton expander on the fp8-CB branch; `pad` restores the padded copy on the fp4-CB branch. Both are bisection escapes — the default and the padded call produce bit-identical weights. |
 | `PRISMAQUANT_DEBUG_PREFIXES` | off | `1` prints, per Linear, whether it resolved to a CB scheme or fell through — the first tool to reach for when memory use is higher than expected (silent BF16 fallback). |
 | `PRISMAQUANT_CB_PREFILL_TIMING` | off | `1` emits per-stage prefill timers. |
 | `PRISMAQUANT_PRELOAD_FUSED` | off | `1` force-builds the fused extension at registration so both arms of a served A/B carry identical extension residency (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |
@@ -192,7 +192,8 @@ serve-slack budget is the sizing authority, not throughput.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK` | `64` | Experts expanded per chunk in the batched path (~1.6 GB transient at Hy3's shapes). Lower it if the transient does not fit. |
+| `PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK` | `64` (batched) / `256` (fp8-CB stock) / byte-budgeted (fp4-CB stock) | Experts expanded per chunk (~1.6 GB transient at Hy3's shapes in the batched path). Lower it if the transient does not fit. Set, it overrides the byte budget below. |
+| `PRISMAQUANT_CB_PREFILL_CHUNK_BYTES` | `1073741824` (1 GiB) | Byte budget the **fp4-CB** stock chunk is sized against (largest chunk whose one-stage BF16 weight tile fits; activations, routing, and allocator overhead are additional). If one expert exceeds the budget, chunk 1 is used with a warning. fp4's transient is 2 B/elt with no CUDA expander, so a flat chunk of 256 holds every expert of a large MoE live — 4,736 MiB measured on the 192-expert Hy3 CB band vs 1,184 MiB at this budget. fp8-CB ignores it. |
 | `PRISMAQUANT_CB_PREFILL_GROUPED_MM` | `0` | `1` collapses the per-expert segment GEMMs into one grouped call. Off by default: its ragged-offset/B-layout requirements are not met by every artifact. |
 | `PRISMAQUANT_CB_PREFILL_OVERLAP` | `0` | `1` runs the `w2` expand on a side stream to hide it under stage 1. **Measured null** on 35B-A3B (17 ms/layer, both arms identical, 2026-07-26); stays opt-in until a positive exists at any scale. |
 | `PRISMAQUANT_CB_PREFILL_AUTO_FORCE` | unset | Pins one `auto` candidate as the winner with no timing pass — reproduces a documented experiment. |

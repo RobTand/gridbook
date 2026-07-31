@@ -293,7 +293,8 @@ def _decode_cb_linear_to_bf16(scheme: dict, cb_qweight, weight_scale,
     ref = scheme["codebook_ref"]
     names = ref if isinstance(ref, list) else [ref]
     subs = [codebooks[n].to(dev) for n in names]
-    cb_flat = codec.build_flat_codebook(subs)
+    cb_flat = codec.build_flat_codebook(
+        subs, "shared-CB expert loader", "fp4" if is_fp4 else "fp8")
     qwp = codec.pad_qweight(cb_qweight.to(dev).contiguous())
     row0 = torch.zeros(out, dtype=torch.int32, device=dev)
 
