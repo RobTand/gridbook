@@ -57,7 +57,7 @@ def assert_cast_lossless(raw, cast, what: str, prefix: str) -> None:
     msg = (f"[prismaquant] {prefix}: the {what} codebook cast is LOSSY — "
            f"{n} of {a.numel()} table values do not survive it "
            f"(max abs {worst:.3e}, max rel {rel:.3e}). The cast is exact only "
-           f"for on-grid (lattice) tables; a learned codebook must be emitted "
+           f"for target-grid values; a learned codebook must be emitted "
            f"on the target grid, or every CB weight decodes against a silently-"
            f"rounded table. PRISMAQUANT_SKIP_CB_CAST_CHECK=1 overrides "
            f"(debug only).")
@@ -67,8 +67,49 @@ def assert_cast_lossless(raw, cast, what: str, prefix: str) -> None:
         raise ValueError(msg)
 
 
+def validate_codebook_grid(raw: torch.Tensor, grid: str,
+                           prefix: str = "codebook") -> None:
+    """Reject a sidecar table that is not on its declared serving grid.
+
+    This is a format check, not merely a dtype-cast check.  In particular,
+    values such as 0.53125 survive bf16 exactly but are not valid E2M1 values
+    and would otherwise fail only when the fused FP4 LUT is first built.
+    """
+    values = raw.reshape(-1).to(torch.float64)
+    finite = torch.isfinite(values)
+    if not bool(finite.all()):
+        count = int((~finite).sum())
+        raise ValueError(
+            f"[prismaquant] {prefix}: {count} of {values.numel()} codebook "
+            f"values are non-finite; {grid} codebooks must be finite and "
+            "grid-valued")
+
+    if grid == "fp8":
+        encoded = values.to(torch.float8_e4m3fn)
+        if torch.equal(values, encoded.to(torch.float64)):
+            return
+        bad = int((values != encoded.to(torch.float64)).sum())
+        raise ValueError(
+            f"[prismaquant] {prefix}: {bad} of {values.numel()} codebook "
+            "values are off the E4M3 grid declared by the fp8 format")
+
+    if grid == "fp4":
+        magnitudes = torch.tensor(_E2M1, dtype=torch.float64,
+                                  device=values.device)
+        on_grid = (values.abs().unsqueeze(-1) == magnitudes).any(dim=-1)
+        if bool(on_grid.all()):
+            return
+        bad = int((~on_grid).sum())
+        raise ValueError(
+            f"[prismaquant] {prefix}: {bad} of {values.numel()} codebook "
+            "values are off the E2M1 grid declared by the fp4 format")
+
+    raise ValueError(f"[prismaquant] {prefix}: unknown codebook grid {grid!r}")
+
+
 def build_flat_codebook(sub_tables: list[torch.Tensor],
-                        prefix: str = "codebook") -> torch.Tensor:
+                        prefix: str = "codebook",
+                        grid: str | None = None) -> torch.Tensor:
     """Concatenate product sub-tables (each (2^w, sub_dim)) into the flat layout
     the kernel gathers from: block ``s`` = ``sub_tables[s].reshape(-1)`` (row
     major, so entry (idx, local) sits at idx*sub_dim + local)."""
@@ -76,6 +117,8 @@ def build_flat_codebook(sub_tables: list[torch.Tensor],
                       for t in sub_tables]).contiguous()
     raw = torch.cat([t.reshape(-1).to(torch.float64)
                      for t in sub_tables]).contiguous()
+    if grid is not None:
+        validate_codebook_grid(raw, grid, prefix)
     assert_cast_lossless(raw, flat, "bf16 flat", prefix)
     return flat
 

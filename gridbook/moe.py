@@ -111,6 +111,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
     # Process-wide fail-loud state (see _cb_expand_ext_ok / _cuda_moe_ok).
     _EXPAND_EXT_OK: bool | None = None   # cached cuda_ext probe for the expander
     _DECODE_ENGAGED_LOGGED = False       # one-time decode-path engagement line
+    _DECODE_DISABLED_LOGGED = False      # deduplicate a host-wide ext failure
 
     def __init__(self, quant_config, moe: FusedMoEConfig, scheme: dict,
                  prefix: str) -> None:
@@ -236,13 +237,18 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         ref = self.scheme["codebook_ref"]
         names = ref if isinstance(ref, list) else [ref]
         subs = [codebooks[n].to(dev) for n in names]
-        layer._cb_flat = codec.build_flat_codebook(subs, self.prefix)
+        layer._cb_flat = codec.build_flat_codebook(
+            subs, self.prefix, "fp4" if self.is_fp4 else "fp8")
         layer._cb_row0 = torch.zeros(1, dtype=torch.int32, device=dev)
         if self.is_v2:
             layer._cb_compose = codec.build_compose_table(
                 self._sub_table).to(dev)
         else:
             layer._cb_compose = torch.zeros(1, dtype=torch.float32, device=dev)
+            # Materialize and validate every representation while the model is
+            # loading.  A disabled grouped-decode gate must not defer this to
+            # the first stock-prefill forward (which may be under capture).
+            self._stock_cb_flat_fp8(layer)
         # Per-layer uniformity: one format for all experts (union-find at
         # export). The stacked buffer is single-format by construction; assert
         # the byte width matches the scheme so a mis-exported stack fails loudly.
@@ -2139,7 +2145,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         expand. Cached on the layer (also built by the CUDA-decode gate); built
         once, before capture. "Every CB value is on the e4m3 grid — lossless"
         used to be a comment here; it is now a check (see
-        ``_assert_cast_lossless``), because it holds only for lattice tables.
+        ``_assert_cast_lossless``), because learned tables must satisfy the
+        same serving-grid contract as lattice tables.
         (Was a ``@staticmethod``; every call site already went through ``self``,
         and the check wants the layer prefix for its message.)"""
         cb = getattr(layer, "_cb_flat_fp8", None)
@@ -2171,15 +2178,18 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                     # tell, but a different throughput class entirely. A
                     # benchmark taken on that path looks valid and measures the
                     # wrong thing; say so on stderr instead.
-                    print("[prismaquant-cb] WARNING: grouped CUDA decode "
-                          "extension unavailable — CB decode falls back to the "
-                          "full-E stock-prefill path. Numerics are unchanged, "
-                          "but this is NOT the served decode path: do not take "
-                          "throughput numbers from this process.",
-                          file=sys.stderr, flush=True)
+                    cls = PrismaQuantCBMoEMethod
+                    if not cls._DECODE_DISABLED_LOGGED:
+                        print("[prismaquant-cb] WARNING: grouped CUDA decode "
+                              "extension unavailable; the grouped path is "
+                              "disabled and the configured runtime fallback "
+                              "will be used. Throughput may differ.",
+                              file=sys.stderr, flush=True)
+                        cls._DECODE_DISABLED_LOGGED = True
             if ok and not self.is_fp4:
-                # Single source of truth for the e4m3 cast (and its
-                # losslessness check) — this used to duplicate the cast.
+                # Normally materialized during process_weights_after_loading;
+                # retain this defensive check for callers that construct a
+                # layer through an alternate/test load path.
                 self._stock_cb_flat_fp8(layer)
             layer._cb_moe_cuda_ok = ok
             if ok and not PrismaQuantCBMoEMethod._DECODE_ENGAGED_LOGGED:

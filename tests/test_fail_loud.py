@@ -80,6 +80,8 @@ def _reset_process_state(monkeypatch):
     monkeypatch.setattr(moe.PrismaQuantCBMoEMethod, "_EXPAND_EXT_OK", None)
     monkeypatch.setattr(moe.PrismaQuantCBMoEMethod,
                         "_DECODE_ENGAGED_LOGGED", False)
+    monkeypatch.setattr(moe.PrismaQuantCBMoEMethod,
+                        "_DECODE_DISABLED_LOGGED", False)
     monkeypatch.delenv("PRISMAQUANT_SKIP_CB_CAST_CHECK", raising=False)
     monkeypatch.delenv("PRISMAQUANT_CB_EXPAND", raising=False)
     monkeypatch.delenv("PRISMAQUANT_CB_DECODE", raising=False)
@@ -129,8 +131,8 @@ def test_cast_check_accepts_an_on_grid_table():
 
 
 def test_cast_check_rejects_off_grid_values_with_diagnostics():
-    """A LEARNED table can carry values between e4m3 grid points. Rounding
-    them at load is invisible downstream -- the packed weight bytes are
+    """A malformed learned table can carry values between e4m3 grid points.
+    Rounding them at load is invisible downstream -- the packed weight bytes are
     untouched and every shape/uniformity assert still passes -- so the cast has
     to refuse, and say how bad it is."""
     flat = _on_grid_flat(8).float()
@@ -217,6 +219,30 @@ def test_shared_fp8_reencode_helper_checks_dense_and_moe_callers():
     flat = torch.tensor([0.53125], dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="e4m3 flat"):
         codec.flat_codebook_fp8(flat, "dense.layer")
+
+
+@pytest.mark.parametrize("value", [0.53125, float("nan"), float("inf")])
+def test_fp4_grid_validation_rejects_malformed_tables_at_load(value):
+    with pytest.raises(ValueError, match="E2M1 grid|non-finite"):
+        codec.build_flat_codebook(
+            [torch.tensor([0.0, -6.0, value], dtype=torch.float32)],
+            "fp4.layer", "fp4")
+
+
+def test_fp4_grid_validation_accepts_learned_but_grid_valued_table():
+    # A learned table is valid; it need not equal the deterministic lattice.
+    flat = codec.build_flat_codebook(
+        [torch.tensor([-6.0, -1.5, -0.0, 0.5, 3.0])],
+        "fp4.learned", "fp4")
+    assert flat.dtype is torch.bfloat16
+
+
+@pytest.mark.parametrize("value", [0.53125, float("nan"), float("inf")])
+def test_fp8_grid_validation_rejects_malformed_tables_at_load(value):
+    with pytest.raises(ValueError, match="E4M3 grid|non-finite"):
+        codec.build_flat_codebook(
+            [torch.tensor([0.0, -0.5, value], dtype=torch.float32)],
+            "fp8.layer", "fp8")
 
 
 # ------------------------------------------------- (1) the expand fail-soft
@@ -328,9 +354,7 @@ def test_expand_env_override_still_forces_triton(monkeypatch):
 
 # --------------------------------------------- (3) decode-path disengagement
 def test_decode_disengagement_is_loud(monkeypatch, capsys):
-    """No extension -> CB decode silently ran the full-E stock-prefill path.
-    Numerics are fine, which is exactly why it needs a log line: a benchmark
-    on that path looks valid and measures the wrong throughput class."""
+    """No extension must identify disengagement without claiming a fallback."""
     monkeypatch.setattr(cuda_ext, "get_ext", lambda: None)
     m = _method()
     lay = _layer()
@@ -338,6 +362,16 @@ def test_decode_disengagement_is_loud(monkeypatch, capsys):
     out = capsys.readouterr()
     assert "grouped CUDA decode" in out.err and "WARNING" in out.err
     assert "decode=grouped-cuda" not in out.out       # never claim engagement
+
+
+def test_decode_disengagement_warning_is_process_deduplicated(monkeypatch,
+                                                               capsys):
+    monkeypatch.setattr(cuda_ext, "get_ext", lambda: None)
+    assert _method()._cuda_moe_ok(_layer()) is False
+    assert "WARNING" in capsys.readouterr().err
+    assert _method(prefix="model.layers.1.mlp.experts")._cuda_moe_ok(
+        _layer()) is False
+    assert capsys.readouterr().err == ""
 
 
 def test_decode_engagement_line_is_printed_once(monkeypatch, capsys):

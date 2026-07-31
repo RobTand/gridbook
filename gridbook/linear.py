@@ -263,7 +263,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             ref = self.quant_config.target_scheme[sp]["codebook_ref"]
             names = ref if isinstance(ref, list) else [ref]
             subs = [codebooks[n].to(dev) for n in names]
-            flat = codec.build_flat_codebook(subs, self.prefix)
+            flat = codec.build_flat_codebook(
+                subs, self.prefix, "fp4" if self.is_fp4 else "fp8")
             blocks.append(flat)
             w = shard_widths[i]
             # cumulative base (not i*cb_total): correct even if per-shard
