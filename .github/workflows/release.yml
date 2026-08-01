@@ -162,7 +162,7 @@ jobs:
       # Publishes every file in dist/ and, by default, PEP 740 attestations.
       # `skip-existing` is deliberately NOT set: re-publishing an existing
       # version is a mistake, and PyPI must refuse it loudly.
-      - uses: pypa/gh-action-pypi-publish@v1.14.1
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
         with:
           repository-url: ${{ needs.build.outputs.repository_url }}
           print-hash: true
