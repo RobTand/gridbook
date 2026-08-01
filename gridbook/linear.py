@@ -576,7 +576,10 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         if not ranges:
             # Defensive compatibility for manually constructed single-LUT
             # layers. Production loaders always provide exact ranges.
-            ranges = ((0, layer._cb_flat.numel()),)
+            # If the LUT was injected directly (as in compatibility callers
+            # and tests), the packed sidecar need not be present at all.
+            ranges = ((0, (layer._cb_flat.numel() if lut is None
+                           else lut.numel())),)
         if lut is None:
             dev = layer._cb_flat.device
             lut_bytes = codec.fp4_value_lut_nbytes(self.k, self.n_sub)
