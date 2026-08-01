@@ -187,9 +187,9 @@ def test_scoped_selector_restores_missing_env_and_cache_on_error():
     assert attestations[0]["pass"] is True
 
 
-def test_moe_selector_refuses_legacy_prefill_override():
+def test_moe_selector_refuses_removed_legacy_prefill_selector():
     environ = {three.v5.PREFILL_ENV: "loop"}
-    with pytest.raises(RuntimeError, match="must remain unset"):
+    with pytest.raises(RuntimeError, match="removed legacy selector"):
         with three.scoped_three_arm_selector(
             "static",
             execution_mode="moe128",
@@ -420,7 +420,10 @@ def test_report_records_requested_and_resolved_chunked_prefill(tmp_path):
     assert settings["chunked_prefill_contract"] == contract
 
 
-def _dispatch(*, success=3, fallback=0, opportunities=3, attempts=3):
+def _dispatch(
+    *, success=3, fallback=0, opportunities=3, attempts=3,
+    native_bf16_calls=0, native_bf16_errors=0,
+):
     return {
         "fused_successes": success,
         "fused_fallbacks": fallback,
@@ -429,8 +432,8 @@ def _dispatch(*, success=3, fallback=0, opportunities=3, attempts=3):
         "candidate_gate_opportunities": opportunities,
         "fused_success_fraction": success / attempts if attempts else None,
         "probe_errors": 0,
-        "loop_calls": 0,
-        "loop_errors": 0,
+        "native_bf16_calls": native_bf16_calls,
+        "native_bf16_errors": native_bf16_errors,
         "pids": [os.getpid()],
     }
 
@@ -487,6 +490,36 @@ def test_unsupported_chunked_prefill_override_invalidates_measurement():
     assert contract["would_trigger_vllm_warning"] is True
     assert contract["pass"] is False
     assert three._all_gate_leaves_pass(gates) is False
+
+
+def test_moe_integrity_requires_native_bf16_only_for_quality_baseline():
+    dispatch = {
+        "baseline": _dispatch(
+            success=0, opportunities=0, attempts=0, native_bf16_calls=3
+        ),
+        "static": _dispatch(),
+        "rowwise": _dispatch(),
+    }
+    gates = three.core_integrity_gates(
+        dispatch=dispatch,
+        execution_mode="moe128",
+        selector_attestations=[{"label": "one", "pass": True}],
+        permutation_attestations={
+            "quality": {"pass": True},
+            "warmup": {"pass": True},
+        },
+        expected_measurements=1,
+        chunked_prefill_contract={"promotion_compatible": True},
+    )
+    assert gates["baseline_positive_native_bf16_dispatch"]["pass"] is True
+    assert gates["baseline_native_bf16_no_errors"]["pass"] is True
+    assert gates["static_dispatch"][
+        "never_entered_native_bf16_baseline"
+    ]["pass"] is True
+    assert gates["rowwise_dispatch"][
+        "never_entered_native_bf16_baseline"
+    ]["pass"] is True
+    assert three._all_gate_leaves_pass(gates) is True
 
 
 def test_configured_quality_gate_is_applied_to_both_candidates():

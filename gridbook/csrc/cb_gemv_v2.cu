@@ -85,7 +85,8 @@ DEVINL uint16_t f32_to_bf16_rn(float v) {
   return __bfloat16_as_ushort(__float2bfloat16_rn(v));
 }
 
-// Ceil-first bit split (== encoder _bit_split(k,2)): sub0 = ceil(k/2) bits in
+// Ceil-first bit split (== producer cb_layout.bit_split(k, 2)): sub0 =
+// ceil(k/2) bits in
 // the LOW bits, sub1 = floor(k/2). elt base of sub1 = 4 << w0 (sub_dim=4).
 struct Split2 {
   int w0, w1;

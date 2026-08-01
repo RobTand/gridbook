@@ -1,402 +1,190 @@
-"""Transient CB->value expander (docs/lanes/nvfp4-cb/serving-kernel.md §1a,
-prototype ii+ / M-gated prefill dispatch).
+"""Native transient expansion wrappers for Gridbook codebook weights.
 
-``expand_cb_to_value`` is the existing decode-GEMM kernel MINUS the matmul MINUS
-the per-channel/group scale: it decodes the codebook VALUE for every ``(n, j)``
-into a bounded ``[N, K]`` tile. Because an FP8_CB codebook value already lives on
-the e4m3 grid (‖·‖<=448), that tile is a *standard per-output-channel FP8
-weight* — the caller casts it to ``float8_e4m3fn`` (lossless) and feeds vLLM's
-stock W8A8 fp8 GEMM with the layer's existing ``weight_scale``. That is the whole
-trick: an expanded FP8_CB weight IS a plain fp8 checkpoint, so prefill reaches
-the native tensor cores instead of re-decoding per M-tile in a bf16-MMA kernel.
+The public function signatures are retained for serving and loader callers,
+but every decode is now performed by a packaged CUDA extension. Unsupported
+format contracts fail explicitly; this module has no Triton implementation or
+runtime fallback.
 
-**INV-1 (docs §0), honored precisely.** The ``[N, K]`` tile is a per-LAYER
-TRANSIENT: the caller expands ONE layer, GEMMs, and frees it before the next.
-This is *not* the NVINT2 trap — that died from a RESIDENT, model-wide dense
-expansion (92.9 GB artifact -> 115.7 GiB resident, OOM). Here the resident weight
-stays the packed k-bit index stream + the tiny flat codebook + the per-channel
-fp32 scale; only a single layer's decoded tile is ever live (peak ~9 MiB for the
-0.6B MLP rung), and it is released each forward. The bounded transient is the
-point, not a compromise.
-
-Self-contained: imports only ``torch`` + ``triton`` (no vLLM, no ``prismaquant``,
-no ``.kernels``), so the build-venv correctness gate imports it directly. The
-codeword byte-window extraction + product sub-index gather below is copied from
-``kernels._cb_decode_gemm_kernel`` (kept in lockstep on purpose — the two must
-decode bit-identically). **Even-split product only** (FP8_CB_K44: k=44, n_sub=4,
-sub_dim=2), matching the decode prototype's scope.
-
-FP8_CB only. NVFP4_CB stays on the Triton decode path: a *transient* NVFP4 tile
-would still need the Blackwell FP4-MMA plumbing (prototype (iii), INV-2) to be
-worth expanding, and a decoded fp4 value is not a standalone tensor without its
-group-16 scale plane — so this expander refuses ``is_fp4``.
+FP8-CB expands directly to an E4M3 ``[N, K]`` tile through
+``cb_gemv.cu::cb_expand_fp8``. FP4-CB v2 product mode expands to a composed BF16
+tile through ``cb_gemv_v2.cu::cb_expand_v2``. Both outputs remain bounded,
+per-layer transients rather than model-resident expanded weights.
 """
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
 
 
-@triton.jit
-def _cb_expand_value_kernel(
-    qw_ptr, cb_ptr, cboff_ptr, w_ptr,
-    N, K,
-    stride_qn,                 # padded row stride (bytes) of qw
-    stride_wn, stride_wk,      # output [N, K] strides
-    K_BITS: tl.constexpr,
-    SUB_DIM: tl.constexpr,
-    SUB_W0: tl.constexpr, SUB_W1: tl.constexpr,
-    SUB_W2: tl.constexpr, SUB_W3: tl.constexpr,
-    SUB_OFF1: tl.constexpr, SUB_OFF2: tl.constexpr, SUB_OFF3: tl.constexpr,
-    SUB_BASE1: tl.constexpr, SUB_BASE2: tl.constexpr, SUB_BASE3: tl.constexpr,
-    TYPE_SIZE: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    pid_n = tl.program_id(0)
-    pid_s = tl.program_id(1)                    # one 256-weight superblock
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_n = offs_n < N
-    offs_n_i = offs_n.to(tl.int64)
-
-    # --- per-column (within one 256-superblock) decode constants ------------
-    # (identical to kernels._cb_decode_gemm_kernel; must stay bit-for-bit).
-    kcol = tl.arange(0, 256)
-    v_local = kcol // 8                         # which of the 32 codewords
-    coord = kcol % 8                            # coord inside the 8-dim vector
-    sub = coord // SUB_DIM                       # which sub-codebook
-    local = coord % SUB_DIM                      # coord inside the sub-vector
-    bitpos = v_local * K_BITS
-    byte_base = (bitpos // 8).to(tl.int64)       # first byte of the codeword
-    bit_in_byte = bitpos % 8
-    mask_k = (1 << K_BITS) - 1
-    # Ceil-first per-sub split (encoder _bit_split); even k reduces to the
-    # historical uniform layout.
-    shift_sub = tl.where(
-        sub == 0, 0, tl.where(sub == 1, SUB_OFF1,
-                              tl.where(sub == 2, SUB_OFF2, SUB_OFF3)))
-    mask_sub = tl.where(
-        sub == 0, (1 << SUB_W0) - 1,
-        tl.where(sub == 1, (1 << SUB_W1) - 1,
-                 tl.where(sub == 2, (1 << SUB_W2) - 1, (1 << SUB_W3) - 1)))
-    cb_base = tl.where(
-        sub == 0, 0, tl.where(sub == 1, SUB_BASE1,
-                              tl.where(sub == 2, SUB_BASE2, SUB_BASE3)))     # flat-codebook block base
-
-    # Per-output-row codebook base offset (0 for a single-codebook Linear; a
-    # fused qkv/gate_up module points each shard's rows at that role's block of
-    # the concatenated flat codebook — same fusion mechanism as the decode
-    # kernel, so the transient path is fusion-correct too).
-    cb_off = tl.load(cboff_ptr + offs_n_i, mask=mask_n, other=0).to(tl.int64)
-
-    s = pid_s
-    col_byte = s * TYPE_SIZE + byte_base                       # [256] int64
-    # 8-byte little-endian window; masked to K_BITS so the extra bytes (next
-    # superblock / row pad) fall away. INV-1: no dense weight materialized here,
-    # only this one [BLOCK_N, 256] tile in registers.
-    code = tl.zeros((BLOCK_N, 256), dtype=tl.int64)
-    base_ptr = offs_n_i[:, None] * stride_qn + col_byte[None, :]
-    for i in range(0, 8):
-        b = tl.load(qw_ptr + base_ptr + i, mask=mask_n[:, None],
-                    other=0).to(tl.int64)
-        code = code | (b << (8 * i))
-    code = (code >> bit_in_byte[None, :]) & mask_k
-    sub_idx = (code >> shift_sub[None, :]) & mask_sub          # [BN, 256]
-    gather = (cb_off[:, None] + cb_base[None, :]
-              + sub_idx * SUB_DIM + local[None, :])
-    # The raw codebook VALUE (bf16), NOT * scale — this is the decode kernel
-    # minus the `* scale` and minus the `tl.dot`.
-    val = tl.load(cb_ptr + gather)                             # [BN, 256] bf16
-
-    xcols = (s * 256 + kcol).to(tl.int64)
-    w_out = w_ptr + offs_n_i[:, None] * stride_wn + xcols[None, :] * stride_wk
-    tl.store(w_out, val, mask=mask_n[:, None])
+def _validate_packed_rows(cb_qweight: torch.Tensor, N: int, K: int,
+                          type_size: int) -> int:
+    """Validate the common superblock layout and return raw bytes per row."""
+    if N < 0:
+        raise ValueError(f"N={N} must be non-negative")
+    if K <= 0 or K % 256 != 0:
+        raise ValueError(
+            f"K={K} must be a positive multiple of the 256-weight superblock")
+    if type_size <= 0:
+        raise ValueError(f"type_size={type_size} must be positive")
+    if cb_qweight.dtype is not torch.uint8:
+        raise TypeError("packed CB weights must be uint8")
+    if cb_qweight.dim() != 2 or cb_qweight.shape[0] != N:
+        raise ValueError(
+            f"packed CB weights must have shape [N, row_bytes], got "
+            f"{tuple(cb_qweight.shape)} for N={N}")
+    if cb_qweight.stride(1) != 1:
+        raise ValueError("packed CB weight rows must be contiguous in bytes")
+    row_bytes = (K // 256) * type_size
+    if cb_qweight.shape[1] < row_bytes:
+        raise ValueError(
+            f"packed CB row has {cb_qweight.shape[1]} bytes, needs at least "
+            f"{row_bytes} for K={K} and type_size={type_size}")
+    return row_bytes
 
 
-@triton.jit
-def _cb_expand_fp8_kernel(
-    qw_ptr, cb_ptr, cboff_ptr, w_ptr,
-    N, K,
-    stride_qn,                 # padded row stride (bytes) of qw
-    stride_wn, stride_wk,      # output [N, K] strides
-    K_BITS: tl.constexpr,
-    SUB_DIM: tl.constexpr,
-    SUB_W0: tl.constexpr, SUB_W1: tl.constexpr,
-    SUB_W2: tl.constexpr, SUB_W3: tl.constexpr,
-    SUB_OFF1: tl.constexpr, SUB_OFF2: tl.constexpr, SUB_OFF3: tl.constexpr,
-    SUB_BASE1: tl.constexpr, SUB_BASE2: tl.constexpr, SUB_BASE3: tl.constexpr,
-    TYPE_SIZE: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """FP8-direct variant of ``_cb_expand_value_kernel`` (same codeword
-    extraction, kept in lockstep): the codebook is pre-converted to E4M3 BYTES
-    (uint8), so the expand is a pure byte gather -> byte store. No bf16
-    intermediate, no cast pass — the [N,K] transient is written once as fp8,
-    halving the expand-side HBM traffic (the cutlass-kernel-notes stopgap)."""
-    pid_n = tl.program_id(0)
-    pid_s = tl.program_id(1)                    # one 256-weight superblock
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_n = offs_n < N
-    offs_n_i = offs_n.to(tl.int64)
-
-    kcol = tl.arange(0, 256)
-    v_local = kcol // 8
-    coord = kcol % 8
-    sub = coord // SUB_DIM
-    local = coord % SUB_DIM
-    bitpos = v_local * K_BITS
-    byte_base = (bitpos // 8).to(tl.int64)
-    bit_in_byte = bitpos % 8
-    mask_k = (1 << K_BITS) - 1
-    # Ceil-first per-sub split (encoder _bit_split); even k reduces to the
-    # historical uniform layout.
-    shift_sub = tl.where(
-        sub == 0, 0, tl.where(sub == 1, SUB_OFF1,
-                              tl.where(sub == 2, SUB_OFF2, SUB_OFF3)))
-    mask_sub = tl.where(
-        sub == 0, (1 << SUB_W0) - 1,
-        tl.where(sub == 1, (1 << SUB_W1) - 1,
-                 tl.where(sub == 2, (1 << SUB_W2) - 1, (1 << SUB_W3) - 1)))
-    cb_base = tl.where(
-        sub == 0, 0, tl.where(sub == 1, SUB_BASE1,
-                              tl.where(sub == 2, SUB_BASE2, SUB_BASE3)))
-
-    cb_off = tl.load(cboff_ptr + offs_n_i, mask=mask_n, other=0).to(tl.int64)
-
-    s = pid_s
-    col_byte = s * TYPE_SIZE + byte_base
-    code = tl.zeros((BLOCK_N, 256), dtype=tl.int64)
-    base_ptr = offs_n_i[:, None] * stride_qn + col_byte[None, :]
-    for i in range(0, 8):
-        b = tl.load(qw_ptr + base_ptr + i, mask=mask_n[:, None],
-                    other=0).to(tl.int64)
-        code = code | (b << (8 * i))
-    code = (code >> bit_in_byte[None, :]) & mask_k
-    sub_idx = (code >> shift_sub[None, :]) & mask_sub
-    gather = (cb_off[:, None] + cb_base[None, :]
-              + sub_idx * SUB_DIM + local[None, :])
-    val = tl.load(cb_ptr + gather)                             # [BN, 256] uint8
-
-    xcols = (s * 256 + kcol).to(tl.int64)
-    w_out = w_ptr + offs_n_i[:, None] * stride_wn + xcols[None, :] * stride_wk
-    tl.store(w_out, val, mask=mask_n[:, None])
-
-
-@triton.jit
-def _cb_expand_weight_v2_kernel(
-    qw_ptr, cb_ptr, cboff_ptr, compose_ptr, w_ptr,
-    N, K,
-    stride_qn, stride_wn, stride_wk,
-    K_BITS: tl.constexpr, SUB_DIM: tl.constexpr,
-    SUB_W0: tl.constexpr, SUB_W1: tl.constexpr,
-    SUB_W2: tl.constexpr, SUB_W3: tl.constexpr,
-    SUB_OFF1: tl.constexpr, SUB_OFF2: tl.constexpr, SUB_OFF3: tl.constexpr,
-    SUB_BASE1: tl.constexpr, SUB_BASE2: tl.constexpr, SUB_BASE3: tl.constexpr,
-    SIGNED: tl.constexpr,
-    TYPE_SIZE: tl.constexpr, BLOCK_N: tl.constexpr,
-):
-    """fp4 two-tier v2 weight expander (spec §4b): decode the codebook value AND
-    compose the E4M3 group scale in-register from the packed 9-byte plane, write
-    the full ``value × scale`` bf16 weight tile into the transient ``[N,K]``
-    buffer. Same in-kernel compose as the decode kernel (bit-exact); the plane
-    is composed during expansion so the transient carries a ready E4M3-scaled
-    weight (a future CUTLASS block-scaled prefill would instead stage the
-    swizzled SF plane here — zero CUTLASS surgery). INV-1: bounded per layer."""
-    pid_n = tl.program_id(0)
-    pid_s = tl.program_id(1)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_n = offs_n < N
-    offs_n_i = offs_n.to(tl.int64)
-
-    kcol = tl.arange(0, 256)
-    v_local = kcol // 8
-    coord = kcol % 8
-    sub = coord // SUB_DIM
-    local = coord % SUB_DIM
-    bitpos = v_local * K_BITS
-    byte_base = (bitpos // 8).to(tl.int64)
-    bit_in_byte = bitpos % 8
-    mask_k = (1 << K_BITS) - 1
-    # Ceil-first per-sub split (encoder _bit_split); even k reduces to the
-    # historical uniform layout.
-    shift_sub = tl.where(
-        sub == 0, 0, tl.where(sub == 1, SUB_OFF1,
-                              tl.where(sub == 2, SUB_OFF2, SUB_OFF3)))
-    mask_sub = tl.where(
-        sub == 0, (1 << SUB_W0) - 1,
-        tl.where(sub == 1, (1 << SUB_W1) - 1,
-                 tl.where(sub == 2, (1 << SUB_W2) - 1, (1 << SUB_W3) - 1)))
-    cb_base = tl.where(
-        sub == 0, 0, tl.where(sub == 1, SUB_BASE1,
-                              tl.where(sub == 2, SUB_BASE2, SUB_BASE3)))
-    grp16v = tl.arange(0, 16)
-    cb_off = tl.load(cboff_ptr + offs_n_i, mask=mask_n, other=0).to(tl.int64)
-
-    s = pid_s
-    col_byte = s * TYPE_SIZE + byte_base
-    code = tl.zeros((BLOCK_N, 256), dtype=tl.int64)
-    base_ptr = offs_n_i[:, None] * stride_qn + col_byte[None, :]
-    for i in range(0, 8):
-        b = tl.load(qw_ptr + base_ptr + i, mask=mask_n[:, None],
-                    other=0).to(tl.int64)
-        code = code | (b << (8 * i))
-    code = (code >> bit_in_byte[None, :]) & mask_k
-    if SIGNED:
-        sub_idx = code >> 8
-        gather = cb_off[:, None] + sub_idx * SUB_DIM + local[None, :]
-        val = tl.load(cb_ptr + gather).to(tl.float32)             # [BN,256]
-        neg = ((code >> local[None, :]) & 1) == 1
-        val = tl.where(neg, -val, val)
-    else:
-        sub_idx = (code >> shift_sub[None, :]) & mask_sub
-        gather = (cb_off[:, None] + cb_base[None, :] + sub_idx * SUB_DIM
-                  + local[None, :])
-        val = tl.load(cb_ptr + gather).to(tl.float32)             # [BN,256]
-
-    # v2 compose (bit-exact to the decode kernel / reconstruct).
-    super_off = s * TYPE_SIZE + 4 * K_BITS
-    super_e = tl.load(qw_ptr + offs_n_i * stride_qn + super_off,
-                      mask=mask_n, other=0).to(tl.int64)
-    sub_off = s * TYPE_SIZE + 4 * K_BITS + 1 + (grp16v // 2)
-    nib = (grp16v % 2) * 4
-    sub_byte = tl.load(
-        qw_ptr + offs_n_i[:, None] * stride_qn + sub_off[None, :],
-        mask=mask_n[:, None], other=0).to(tl.int64)
-    code16 = (sub_byte >> nib[None, :]) & 0xF
-    sc16 = tl.load(compose_ptr + super_e[:, None] * 16 + code16)   # [BN,16]
-    sc = tl.reshape(tl.broadcast_to(sc16[:, :, None], (BLOCK_N, 16, 16)),
-                    (BLOCK_N, 256))
-    w = (val * sc).to(tl.bfloat16)
-
-    xcols = (s * 256 + kcol).to(tl.int64)
-    tl.store(w_ptr + offs_n_i[:, None] * stride_wn + xcols[None, :] * stride_wk,
-             w, mask=mask_n[:, None])
-
-
-def _ceil_first_split(k_bits: int, n_sub: int, sub_dim: int):
-    """Per-sub widths/offsets/table bases (ceil-first, = encoder _bit_split),
-    padded to 4 subs for the constexpr plumbing."""
-    base, extra = divmod(k_bits, n_sub)
-    ws = [base + (1 if i < extra else 0) for i in range(n_sub)] \
-        + [0] * (4 - n_sub)
-    offs = [sum(ws[:i]) for i in range(4)]
-    bases = [sum(sub_dim << w for w in ws[:i] if w) for i in range(4)]
-    return ws, offs, bases
-
-
-def expand_fp4_v2_to_weight(cb_qweight_padded, cb_flat, cb_row_offset, compose,
-                            N, K, k_bits, n_sub, type_size):
-    """Transient [N,K] bf16 weight (value × composed E4M3 scale) for a fp4 v2
-    layer — the prefill counterpart of the decode kernel, amortising the decode
-    over M via one cuBLAS bf16 GEMM. Bounded per-layer transient (INV-1)."""
-    sub_dim = 8 // n_sub
-    ws, offs, bases = _ceil_first_split(k_bits, n_sub, sub_dim)
-    dev = cb_qweight_padded.device
-    W = torch.empty((N, K), dtype=torch.bfloat16, device=dev)
-    n_sb = K // 256
-    block_n = 64
-    grid = (triton.cdiv(N, block_n), n_sb)
-    _cb_expand_weight_v2_kernel[grid](
-        cb_qweight_padded, cb_flat, cb_row_offset, compose, W, N, K,
-        cb_qweight_padded.stride(0), W.stride(0), W.stride(1),
-        K_BITS=k_bits, SUB_DIM=sub_dim,
-        SUB_W0=ws[0], SUB_W1=ws[1], SUB_W2=ws[2], SUB_W3=ws[3],
-        SUB_OFF1=offs[1], SUB_OFF2=offs[2], SUB_OFF3=offs[3],
-        SUB_BASE1=bases[1], SUB_BASE2=bases[2], SUB_BASE3=bases[3],
-        SIGNED=(n_sub == 1),
-        TYPE_SIZE=type_size,
-        BLOCK_N=block_n, num_warps=4)
-    return W
+def _validate_row_offsets(cb_row_offset: torch.Tensor, N: int,
+                          device: torch.device) -> None:
+    if cb_row_offset.dtype is not torch.int32:
+        raise TypeError("cb_row_offset must be int32")
+    if cb_row_offset.dim() != 1 or cb_row_offset.numel() != N:
+        raise ValueError(f"cb_row_offset must contain exactly N={N} elements")
+    if cb_row_offset.device != device:
+        raise ValueError("cb_row_offset and packed weights must share a device")
 
 
 def expand_cb_to_fp8(
-    cb_qweight_padded: torch.Tensor,   # (N, row_bytes + PAD) uint8 (codec.PAD_BYTES)
-    cb_flat_fp8: torch.Tensor,         # (cb_total,) uint8 E4M3-byte codebook(s)
-    cb_row_offset: torch.Tensor,       # (N,) int32 per-row base into cb_flat
-    N: int, K: int,
-    k_bits: int, n_sub: int, type_size: int,
+    cb_qweight_padded: torch.Tensor,
+    cb_flat_fp8: torch.Tensor,
+    cb_row_offset: torch.Tensor,
+    N: int,
+    K: int,
+    k_bits: int,
+    n_sub: int,
+    type_size: int,
 ) -> torch.Tensor:
-    """FP8-direct transient expand: decode the codebook VALUE for every
-    ``(n, j)`` straight into a fresh ``[N, K]`` **float8_e4m3fn** tile.
+    """Expand FP8-CB values to a native E4M3 ``[N, K]`` transient.
 
-    Byte-identical to ``expand_cb_to_value(...).to(torch.float8_e4m3fn)`` (the
-    codebook is e4m3-grid-valued, so the byte gather IS the lossless cast) but
-    writes 1 B/elt once instead of a 2 B/elt bf16 tile plus a separate cast
-    pass — the cheap prefill-traffic win from cutlass-kernel-notes.md. INV-1:
-    the returned tile is a bounded per-layer transient the caller frees.
+    The native kernel currently implements the shipping four-subcodebook
+    product layout. Other layouts are rejected rather than routed to an
+    interpreted implementation.
     """
-    if cb_flat_fp8.dtype != torch.uint8:
-        raise TypeError("expand_cb_to_fp8 wants the E4M3-byte (uint8) codebook")
-    if K % 256 != 0:
-        raise ValueError(f"K={K} must be a multiple of the 256-weight superblock")
-    sub_dim = 8 // n_sub
-    ws, offs, bases = _ceil_first_split(k_bits, n_sub, sub_dim)
-    dev = cb_qweight_padded.device
-    W = torch.empty((N, K), dtype=torch.uint8, device=dev)
-    n_sb = K // 256
-    block_n = 64
-    grid = (triton.cdiv(N, block_n), n_sb)
-    _cb_expand_fp8_kernel[grid](
-        cb_qweight_padded, cb_flat_fp8, cb_row_offset, W,
-        N, K,
-        cb_qweight_padded.stride(0),
-        W.stride(0), W.stride(1),
-        K_BITS=k_bits, SUB_DIM=sub_dim,
-        SUB_W0=ws[0], SUB_W1=ws[1], SUB_W2=ws[2], SUB_W3=ws[3],
-        SUB_OFF1=offs[1], SUB_OFF2=offs[2], SUB_OFF3=offs[3],
-        SUB_BASE1=bases[1], SUB_BASE2=bases[2], SUB_BASE3=bases[3],
-        TYPE_SIZE=type_size,
-        BLOCK_N=block_n,
-        num_warps=4,
-    )
-    return W.view(torch.float8_e4m3fn)
+    _validate_packed_rows(cb_qweight_padded, N, K, type_size)
+    _validate_row_offsets(cb_row_offset, N, cb_qweight_padded.device)
+    if n_sub != 4:
+        raise NotImplementedError(
+            f"native cb_expand_fp8 supports n_sub=4, got {n_sub}")
+    if k_bits <= 0 or type_size != 4 * k_bits or type_size > 192:
+        raise NotImplementedError(
+            "native cb_expand_fp8 requires k_bits>0, type_size=4*k_bits, "
+            f"and type_size<=192; got k_bits={k_bits}, type_size={type_size}")
+    if cb_flat_fp8.dtype is not torch.uint8:
+        raise TypeError("expand_cb_to_fp8 wants an E4M3-byte uint8 codebook")
+    if cb_flat_fp8.dim() != 1 or not cb_flat_fp8.is_contiguous():
+        raise ValueError("the E4M3-byte codebook must be a contiguous vector")
+    if cb_flat_fp8.device != cb_qweight_padded.device:
+        raise ValueError("codebook and packed weights must share a device")
+
+    # Custom-op indirection keeps the native pybind call opaque to Dynamo and
+    # CUDA-graph tracing. The op itself uses cuda_ext.require_ext(), so a
+    # missing build is a clear NativeKernelUnavailableError.
+    from .ops import cb_expand_fp8
+    return cb_expand_fp8(cb_qweight_padded, cb_flat_fp8, cb_row_offset,
+                         N, K, k_bits, n_sub, type_size)
 
 
 def expand_cb_to_value(
-    cb_qweight_padded: torch.Tensor,   # (N, row_bytes + PAD) uint8 (codec.PAD_BYTES)
-    cb_flat: torch.Tensor,             # (cb_total,) bf16 flat codebook(s)
-    cb_row_offset: torch.Tensor,       # (N,) int32 per-row base into cb_flat
-    N: int, K: int,
-    k_bits: int, n_sub: int, type_size: int, is_fp4: bool,
+    cb_qweight_padded: torch.Tensor,
+    cb_flat: torch.Tensor,
+    cb_row_offset: torch.Tensor,
+    N: int,
+    K: int,
+    k_bits: int,
+    n_sub: int,
+    type_size: int,
+    is_fp4: bool,
 ) -> torch.Tensor:
-    """Decode the codebook VALUE for every ``(n, j)`` into a fresh ``[N, K]``
-    bf16 transient (no per-channel/group scale applied).
+    """Expand FP8-CB values to a BF16 ``[N, K]`` transient.
 
-    The result is the FP8_CB weight's decoded e4m3-grid values; the caller pairs
-    it with the layer's per-output ``weight_scale`` to run a stock fp8 W8A8 GEMM.
-    Every value is exactly representable in e4m3 (the codebook is e4m3-valued),
-    so ``result.to(torch.float8_e4m3fn)`` is lossless.
-
-    INV-1: the returned tile is a bounded per-layer transient; the caller frees
-    it after the GEMM. It is never resident/model-wide.
+    FP8-CB codebooks are format-constrained to the E4M3 grid. Converting their
+    BF16 storage to raw E4M3 bytes and invoking the native direct expander is
+    therefore exact; the final E4M3-to-BF16 conversion is exact as well.
     """
     if is_fp4:
         raise NotImplementedError(
-            "expand_cb_to_value is FP8_CB-only (prototype ii+). NVFP4_CB stays "
-            "on the Triton decode path: a transient FP4 tile still needs the "
-            "Blackwell FP4-MMA to be worth expanding (prototype iii / INV-2), "
-            "and a decoded fp4 value is not a standalone tensor without its "
-            "group-16 scale plane. See docs/lanes/nvfp4-cb/serving-kernel.md.")
-    if K % 256 != 0:
-        raise ValueError(f"K={K} must be a multiple of the 256-weight superblock")
-    sub_dim = 8 // n_sub
-    ws, offs, bases = _ceil_first_split(k_bits, n_sub, sub_dim)
-    dev = cb_qweight_padded.device
-    W = torch.empty((N, K), dtype=torch.bfloat16, device=dev)
-    n_sb = K // 256
-    block_n = 64
-    grid = (triton.cdiv(N, block_n), n_sb)
-    _cb_expand_value_kernel[grid](
-        cb_qweight_padded, cb_flat, cb_row_offset, W,
-        N, K,
-        cb_qweight_padded.stride(0),
-        W.stride(0), W.stride(1),
-        K_BITS=k_bits, SUB_DIM=sub_dim,
-        SUB_W0=ws[0], SUB_W1=ws[1], SUB_W2=ws[2], SUB_W3=ws[3],
-        SUB_OFF1=offs[1], SUB_OFF2=offs[2], SUB_OFF3=offs[3],
-        SUB_BASE1=bases[1], SUB_BASE2=bases[2], SUB_BASE3=bases[3],
-        TYPE_SIZE=type_size,
-        BLOCK_N=block_n,
-        num_warps=4,
-    )
-    return W
+            "expand_cb_to_value has no native FP4 contract; use "
+            "expand_fp4_v2_to_weight for FP4-v2 product codebooks")
+    if cb_flat.dtype is not torch.bfloat16:
+        raise TypeError("expand_cb_to_value wants a BF16 FP8-CB codebook")
+    if cb_flat.dim() != 1 or not cb_flat.is_contiguous():
+        raise ValueError("the BF16 codebook must be a contiguous vector")
+    cb_flat_fp8 = cb_flat.to(torch.float8_e4m3fn).view(torch.uint8).contiguous()
+    return expand_cb_to_fp8(
+        cb_qweight_padded, cb_flat_fp8, cb_row_offset,
+        N, K, k_bits, n_sub, type_size).to(torch.bfloat16)
+
+
+def expand_fp4_v2_to_weight(
+    cb_qweight_padded: torch.Tensor,
+    cb_flat: torch.Tensor,
+    cb_row_offset: torch.Tensor,
+    compose: torch.Tensor,
+    N: int,
+    K: int,
+    k_bits: int,
+    n_sub: int,
+    type_size: int,
+) -> torch.Tensor:
+    """Expand native FP4-v2 product mode to a composed BF16 transient.
+
+    One invocation of ``cb_expand_v2`` implements one zero-based physical
+    two-subcodebook product dictionary. The dense loader handles fused modules
+    with multiple dictionaries by invoking this wrapper once per contiguous
+    role segment and concatenating the native BF16 results. Passing a raw
+    concatenation to one invocation, and signed ``n_sub=1`` encoding, remain
+    unsupported and are rejected. A padded row input is compacted to the raw
+    byte plane expected by the existing extension.
+    """
+    row_bytes = _validate_packed_rows(
+        cb_qweight_padded, N, K, type_size)
+    _validate_row_offsets(cb_row_offset, N, cb_qweight_padded.device)
+    if not (0 < k_bits <= 24) or type_size != 4 * k_bits + 9:
+        raise NotImplementedError(
+            "native cb_expand_v2 requires k_bits in [1,24] and "
+            f"type_size=4*k_bits+9; got {k_bits=} and {type_size=}")
+    if n_sub != 2:
+        raise NotImplementedError(
+            "native cb_expand_v2 currently supports only the two-subcodebook "
+            f"product layout, got n_sub={n_sub}")
+    if cb_flat.dtype is not torch.bfloat16 or cb_flat.dim() != 1 \
+            or not cb_flat.is_contiguous():
+        raise TypeError("native cb_expand_v2 needs a contiguous BF16 codebook")
+    expected_cb_elems = ((4 << ((k_bits + 1) // 2))
+                         + (4 << (k_bits // 2)))
+    if cb_flat.numel() != expected_cb_elems:
+        raise NotImplementedError(
+            "native cb_expand_v2 supports one global product codebook; "
+            f"expected {expected_cb_elems} elements for k={k_bits}, got "
+            f"{cb_flat.numel()} (concatenated per-role codebooks are not "
+            "supported)")
+    if compose.dtype is not torch.float32 or compose.numel() != 256 * 16 \
+            or not compose.is_contiguous():
+        raise TypeError(
+            "native cb_expand_v2 needs a contiguous float32 compose table "
+            "with 4096 elements")
+    if cb_flat.device != cb_qweight_padded.device \
+            or compose.device != cb_qweight_padded.device:
+        raise ValueError(
+            "packed weights, codebook, offsets, and compose table must share "
+            "a device")
+
+    # The selected one-block codebook is zero-based for this invocation. A
+    # larger concatenated codebook is rejected above. Offset *values* are not
+    # consumed by cb_expand_v2; the tensor remains in this wrapper's signature
+    # to validate that the loader supplied exactly one routing entry per row.
+    # This also lets the segmented dense caller reuse its resident offset slice
+    # without allocating a zero vector or synchronizing CUDA back to the host.
+    raw_rows = cb_qweight_padded[:, :row_bytes]
+    qw_flat = raw_rows.contiguous().view(-1)
+
+    from .ops import cb_expand_fp4_v2
+    return cb_expand_fp4_v2(qw_flat, cb_flat, compose, 0, N, K,
+                            k_bits, type_size)

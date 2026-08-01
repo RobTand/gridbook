@@ -35,30 +35,19 @@ intercepts exactly those stacked-CB expert tensors, copies each into its
 registered fused param, and delegates *every other* tensor (dense CB,
 router.gate, expert_bias, norms, embeddings, lm_head, attention) unchanged to
 the original loader. One line per arch registers it
-(``install_toplevel_cb_expert_loader(SomeForCausalLM)``); DSv4 and any other
-top-level-expert-mapping MoE arch reuse it as-is.
+(``install_toplevel_cb_expert_loader(SomeForCausalLM)``). A future architecture
+with the same top-level expert mapping can reuse the wrapper, but it is not
+supported until its model class is explicitly registered and tested. In
+particular, the paused DSv4 lane is not registered in Gridbook 0.5.
 
-**Shared-expert (``shared_mlp``) CB tensors — the second interception.** HunYuan
-V3 passes ``shared_experts=self.shared_mlp`` into ``FusedMoE``; the shared MLP is
-an ordinary ``HYV3FeedForward`` (fused ``gate_up_proj`` + ``down_proj`` Linears).
-Its Linears are built with the arch's ``prefix`` argument, which for the shared
-MLP is ``…layers.N.mlp`` **without** the ``.shared_mlp`` segment — so
-``get_quant_method`` is handed ``…mlp.gate_up_proj`` / ``…mlp.down_proj``, matches
-no CB target (the schemes are keyed ``…mlp.shared_mlp.gate_proj`` etc.), and vLLM
-builds PLAIN bf16 Linears. But the *module path* (attribute nesting) is still
-``…mlp.shared_mlp.gate_up_proj.weight``, and the exporter QUANTIZED the shared MLP
-to CB, so the checkpoint carries ``…shared_mlp.{gate_proj,up_proj,down_proj}.
-cb_qweight`` (+ fp8 ``weight_scale``) with no matching cb_qweight param — the
-original loader ``KeyError``s. The wrapper additionally intercepts these,
-DECODES each to a bf16 ``[out, in]`` weight (reusing the tested CB expanders),
-fuses ``gate_proj``/``up_proj`` (cat along dim0, gate first) to fill the merged
-``gate_up_proj.weight``, and copies ``down_proj`` directly — leaving the shared
-MLP served as a plain bf16 Linear (WxA16: its activation is *not* re-quantized at
-serve time, so it runs strictly at/above the emulated fidelity). Detection is
-structural, not name-based: a checkpoint ``…cb_qweight`` / ``…weight_scale`` is
-intercepted only when vLLM built NO CB param for that module (fused or direct) but
-DID build a bf16 ``.weight`` — so genuine dense-CB and fused-attention tensors
-(which have registered cb_qweight params) always defer to the original loader.
+**Shared-expert (``shared_mlp``) CB tensors.** ``config.py`` aliases the
+architecture's collapsed parent prefix (and its MTP ``.mtp_block`` form) so a
+shared expert is constructed as a native CB Linear. The wrapper still detects
+the structural failure mode where the checkpoint carries ``cb_qweight`` but
+vLLM constructed only a plain bf16 ``.weight``. That condition now FAILS AT
+LOAD. The former compatibility behavior decoded CB into that plain Linear;
+upstream unquantized dispatch could then select cuBLAS or a Triton override,
+which violates Gridbook's native-only serving contract.
 
 Prefix note: we wrap the OUTERMOST class (e.g. ``HYV3ForCausalLM``), whose
 incoming weight names and ``named_parameters()`` BOTH carry the ``model.``
@@ -81,9 +70,8 @@ model's own ``_rewrite_spec_layer_name`` (``enorm``/``hnorm``/``eh_proj``/
 ``"__skip__"``-ped, vLLM reusing the main model's embedding + lm_head). Our
 stacked-CB expert tensors arrive WITHOUT the ``.mtp_block.`` infix (checkpoint
 convention) while the registered params carry it (``…mtp_block.mlp.experts.
-routed_experts.w13_cb_qweight``), so the ``.experts.`` anchor here — and the
-fused-target lookup in ``resolve_shared_cb_target`` — miss unless we apply the
-SAME rename to the incoming name first. When the wrapped class exposes
+routed_experts.w13_cb_qweight``), so the ``.experts.`` anchor here misses unless
+we apply the SAME rename to the incoming name first. When the wrapped class exposes
 ``_rewrite_spec_layer_name`` (+ a ``config`` with ``num_hidden_layers``) we build
 that rename once and apply it before resolution; a ``"__skip__"`` is delegated
 so the original drops it exactly as it would, and body tensors (index <
@@ -171,8 +159,8 @@ def map_cb_expert_name(name: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Shared-expert (shared_mlp) CB interception: decode CB -> bf16, inject into the
-# plain bf16 Linear vLLM built (see the module docstring for the why).
+# Shared-expert (shared_mlp) native-ownership assertion. A plain-BF16 target is
+# detected only to fail closed; it is never populated from a CB checkpoint.
 # ---------------------------------------------------------------------------
 
 _CB_QWEIGHT_SUFFIX = ".cb_qweight"
@@ -253,177 +241,6 @@ def resolve_shared_cb_target(name: str, params_dict,
     if base + ".weight" in params_dict:
         return base + ".weight", 0
     return None                               # target absent on this rank
-
-
-def _scheme_for_base(quant_config, base: str) -> dict:
-    """The CB scheme for a checkpoint module ``base`` (e.g.
-    ``…shared_mlp.gate_proj``). Exact key first; else a nesting-invariant suffix
-    match (from ``.layers.`` on), requiring a unique hit so a mis-mapped name
-    fails loudly rather than silently decoding with the wrong codebook."""
-    ts = quant_config.target_scheme
-    if base in ts:
-        return ts[base]
-    cut = base.rfind(".layers.")
-    tail = base[cut:] if cut >= 0 else "." + base.rpartition(".")[2]
-    hits = [s for k, s in ts.items() if k.endswith(tail)]
-    if len(hits) == 1:
-        return hits[0]
-    raise KeyError(
-        f"prismaquant shared-CB: no unique scheme for '{base}' "
-        f"(suffix '{tail}' matched {len(hits)} target_scheme entries)")
-
-
-def _decode_cb_linear_to_bf16(scheme: dict, cb_qweight, weight_scale,
-                              codebooks, dev):
-    """Decode ONE CB Linear's packed weight to a full ``[out, in]`` bf16 tile,
-    reusing the plugin's tested expanders — the SAME ``codec`` + ``expand`` calls
-    ``moe.py._decode_expert`` makes per routed expert (no bit-unpacking is
-    reimplemented here). fp8: ``value × per-output-channel weight_scale``; fp4
-    two-tier v2: ``value × composed group scale`` (scale packed in the bytes, no
-    separate tensor). Imports are lazy so this module stays torch-only at import.
-
-    ``in_features`` is recovered from the packed row width
-    (``row_bytes // type_size × 256``); ``cb_qweight`` is moved to ``dev`` (the
-    target param's CUDA device) for the Triton expander."""
-    from . import codec
-    from .expand import expand_cb_to_value, expand_fp4_v2_to_weight
-
-    is_fp4 = scheme["grid"] == "fp4"
-    k = int(scheme["k"])
-    n_sub = int(scheme["n_sub"])
-    type_size = int(scheme["type_size"])
-    out = int(cb_qweight.shape[0])
-    row_bytes = int(cb_qweight.shape[1])
-    if row_bytes % type_size != 0:
-        raise ValueError(
-            f"CB row_bytes {row_bytes} not a multiple of type_size {type_size}")
-    in_f = (row_bytes // type_size) * codec.SUPERBLOCK
-
-    ref = scheme["codebook_ref"]
-    names = ref if isinstance(ref, list) else [ref]
-    subs = [codebooks[n].to(dev) for n in names]
-    cb_flat = codec.build_flat_codebook(
-        subs, "shared-CB expert loader", "fp4" if is_fp4 else "fp8")
-    qwp = codec.pad_qweight(cb_qweight.to(dev).contiguous())
-    row0 = torch.zeros(out, dtype=torch.int32, device=dev)
-
-    if is_fp4:
-        sc = scheme.get("scale_coding")
-        if isinstance(sc, dict):
-            is_v2 = sc.get("kind") == codec.SCALE_CODING_TWO_TIER
-            sub_table = sc.get("table") or codec.TWO_TIER_SUB_TABLE
-        elif isinstance(sc, str):
-            is_v2 = sc == codec.SCALE_CODING_TWO_TIER
-            sub_table = codec.TWO_TIER_SUB_TABLE
-        else:
-            is_v2, sub_table = False, None
-        if not is_v2:
-            raise NotImplementedError(
-                "shared-CB fp4 requires two-tier v2 scale coding "
-                "(fp4-v1 has no compose-during-expand path)")
-        compose = codec.build_compose_table(sub_table).to(dev)
-        return expand_fp4_v2_to_weight(qwp, cb_flat, row0, compose,
-                                       out, in_f, k, n_sub, type_size)
-
-    if weight_scale is None:
-        raise ValueError("fp8 shared-CB requires a weight_scale tensor")
-    val = expand_cb_to_value(qwp, cb_flat, row0, out, in_f, k, n_sub,
-                             type_size, is_fp4=False)
-    ws = weight_scale.to(dev).to(torch.float32)
-    W = (val.float() * ws[:, None]).to(torch.bfloat16)
-    del val
-    return W
-
-
-def _find_prismaquant_config(model):
-    """The resolved ``PrismaQuantConfig`` the model's CB methods hold (preferred),
-    else the active vLLM config's ``quant_config``. Both point at the one
-    instance; ``target_scheme`` distinguishes it from any other quant config."""
-    for m in model.modules():
-        qc = getattr(getattr(m, "quant_method", None), "quant_config", None)
-        if qc is not None and hasattr(qc, "target_scheme"):
-            if hasattr(qc, "_ensure_resolved"):
-                qc._ensure_resolved()
-            return qc
-    try:
-        from vllm.config import get_current_vllm_config
-        qc = getattr(get_current_vllm_config(), "quant_config", None)
-    except Exception:  # noqa: BLE001 — no active config -> the error below
-        qc = None
-    if qc is not None and hasattr(qc, "target_scheme"):
-        if hasattr(qc, "_ensure_resolved"):
-            qc._ensure_resolved()
-        return qc
-    raise RuntimeError(
-        "prismaquant: shared-CB decode could not locate the PrismaQuantConfig "
-        "(no CB quant_method on the model and no active vLLM config)")
-
-
-def _load_shared_cb(model, buf: dict, params_dict, reverse_fusion,
-                    quant_config, rename=None) -> set:
-    """Decode buffered shared-expert CB tensors to bf16 and copy them into the
-    plain bf16 ``.weight`` params vLLM built. Grouped by target so a merged
-    ``gate_up_proj.weight`` is filled in one ``copy_`` (gate rows then up rows);
-    decode is per-tensor with the packed source freed immediately (INV-1: one
-    ``[out, in]`` transient live at a time). Returns the set of filled params.
-
-    ``buf`` is keyed by the ORIGINAL (checkpoint-convention) tensor name so the
-    per-module CB scheme lookup matches the config's ``target_scheme`` keys. For
-    a spec-layer (MTP) drafter the bf16 target PARAM carries a ``.mtp_block.``
-    infix the checkpoint name lacks, so ``rename`` (the spec-layer rewrite, or
-    identity for a body model) is applied when resolving the target param but NOT
-    when resolving the scheme — decoupling the two namings."""
-    if rename is None:
-        rename = lambda n: n                       # noqa: E731 — identity
-    # Group the two per-module tensors (cb_qweight + fp8 weight_scale) by base.
-    bases: dict[str, dict] = {}
-    for nm, w in buf.items():
-        if nm.endswith(_CB_QWEIGHT_SUFFIX):
-            b, key = nm[: -len(_CB_QWEIGHT_SUFFIX)], "qw"
-        elif nm.endswith(_INPUT_GLOBAL_SCALE_SUFFIX):
-            b, key = nm[: -len(_INPUT_GLOBAL_SCALE_SUFFIX)], "input_scale"
-        else:
-            b, key = nm[: -len(_WEIGHT_SCALE_SUFFIX)], "scale"
-        bases.setdefault(b, {})[key] = w
-
-    # Group bases by the bf16 target param they fill (merged gate_up -> 2 bases).
-    # The target is resolved on the RENAMED base (matches the built param);
-    # the scheme (below) stays on the original base ``b``.
-    groups: dict[str, list] = {}
-    for b, parts in bases.items():
-        tgt = resolve_shared_cb_target(rename(b) + _CB_QWEIGHT_SUFFIX,
-                                       params_dict, reverse_fusion)
-        if tgt is None:
-            raise ValueError(
-                f"prismaquant shared-CB '{b}': buffered but no bf16 target "
-                ".weight resolved at decode time")
-        target_name, shard = tgt
-        groups.setdefault(target_name, []).append((shard, b, parts))
-
-    codebooks = quant_config.get_codebooks()
-    loaded: set = set()
-    for target_name, items in groups.items():
-        param = params_dict[target_name]
-        dev = param.device
-        items.sort(key=lambda t: t[0])           # gate (0) before up (1)
-        decoded = []
-        for _shard, b, parts in items:
-            qw = parts.get("qw")
-            if qw is None:
-                raise ValueError(f"prismaquant shared-CB '{b}': missing cb_qweight")
-            scheme = _scheme_for_base(quant_config, b)
-            decoded.append(_decode_cb_linear_to_bf16(
-                scheme, qw, parts.get("scale"), codebooks, dev))
-            parts.clear()                        # free the packed source now
-        full = decoded[0] if len(decoded) == 1 else torch.cat(decoded, dim=0)
-        if tuple(full.shape) != tuple(param.shape):
-            raise ValueError(
-                f"prismaquant shared-CB -> '{target_name}': decoded shape "
-                f"{tuple(full.shape)} != param shape {tuple(param.shape)}")
-        param.data.copy_(full.to(param.dtype))
-        loaded.add(target_name)
-        del decoded, full
-    return loaded
 
 
 # ---------------------------------------------------------------------------
@@ -559,13 +376,6 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
         rename = _compose_renames(_hf_mapper_rename(self),
                                   _spec_layer_rename(self))
         loaded: set[str] = set()
-        # Shared-expert CB tensors (…shared_mlp.*.cb_qweight / .weight_scale):
-        # vLLM built bf16 Linears for these (no cb_qweight param). Buffer them
-        # (~0.58 GB total — held owned CPU tensors; safetensors yields copies),
-        # yield NOTHING (so the original loader never KeyErrors on them), then
-        # decode + inject after it runs.
-        shared_cb_buf: dict[str, "torch.Tensor"] = {}
-
         def _passthrough():
             # A generator (not a materialized list): only one checkpoint tensor
             # is live at a time, preserving the streaming/mmap semantics the
@@ -596,16 +406,20 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                         mark_filled(param)
                     loaded.add(mapped)
                     continue
-                # Shared-expert CB tensor whose module vLLM built as plain bf16
-                # (no cb_qweight param): buffer for post-decode, don't leak it to
-                # the original loader. Genuine dense-CB / fused-attention tensors
-                # (registered cb_qweight) resolve to None here and pass through.
-                # Buffer under the ORIGINAL name (scheme lookup keys on it);
-                # ``_load_shared_cb`` re-applies ``rename`` for the target param.
-                if resolve_shared_cb_target(
-                        res_name, params_dict, reverse_fusion) is not None:
-                    shared_cb_buf[name] = w
-                    continue
+                # A CB tensor targeting a plain bf16 Linear proves that config
+                # prefix resolution failed. The former compatibility path
+                # decoded the weight into that Linear, whose upstream serving
+                # dispatch could select cuBLAS or Triton. Fail during load so a
+                # nominal Gridbook serve can never change kernel family.
+                orphan = resolve_shared_cb_target(
+                    res_name, params_dict, reverse_fusion)
+                if orphan is not None:
+                    raise RuntimeError(
+                        f"prismaquant CB tensor '{name}' resolved to plain "
+                        f"bf16 parameter '{orphan[0]}'. Gridbook requires a "
+                        "native CB Linear for every quantized shared expert; "
+                        "fix the architecture prefix alias/loader wiring. "
+                        "Decode-to-bf16 serving fallback is forbidden.")
                 # Not a stacked-CB expert tensor (or the target param is absent
                 # on this rank: PP/EP-missing, or an MTP/spec layer the
                 # original's own filter drops). Delegate to the original loader.
@@ -617,11 +431,6 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
         ret = orig_load_weights(self, _passthrough())
         if ret:
             loaded |= set(ret)
-        if shared_cb_buf:
-            quant_config = _find_prismaquant_config(self)
-            loaded |= _load_shared_cb(self, shared_cb_buf, params_dict,
-                                      reverse_fusion, quant_config,
-                                      rename=rename)
         return loaded
 
     load_weights._pq_cb_wrapper = True

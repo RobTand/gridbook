@@ -18,14 +18,13 @@ Contracts pinned:
     overlap serving-safe with OUR kernel only.
 """
 import json
-import os
 from pathlib import Path
 
 import pytest
 import torch
 
 codec = pytest.importorskip("gridbook.codec")
-from gridbook.cuda_ext import _find_cutlass_include, csrc_dir, get_ext  # noqa: E402
+from gridbook.cuda_ext import get_ext, get_fused_ext  # noqa: E402
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA device unavailable", allow_module_level=True)
@@ -35,26 +34,9 @@ if gemv_ext is None:
     pytest.skip("CUDA extension unavailable (no nvcc?)", allow_module_level=True)
 
 
-def _build_fused():
-    from torch.utils.cpp_extension import load
-    build = os.path.join(os.path.expanduser("~"), ".cache", "pq-fused-build")
-    os.makedirs(build, exist_ok=True)
-    inc = _find_cutlass_include()          # same discovery the plugin uses
-    cut = os.path.dirname(inc)
-    src_dir = csrc_dir()
-    return load(name="pq_cb_fused",
-                sources=[os.path.join(src_dir, "cb_fused_gemm.cu")],
-                extra_include_paths=[inc,
-                                     os.path.join(cut, "tools", "util",
-                                                  "include"), src_dir],
-                extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
-                build_directory=build, verbose=False)
-
-
-try:
-    fused = _build_fused()
-except Exception as exc:  # pragma: no cover - env dependent
-    pytest.skip(f"fused ext build failed: {exc}", allow_module_level=True)
+fused = get_fused_ext()
+if fused is None:
+    pytest.skip("fused ext unavailable", allow_module_level=True)
 
 DEV = "cuda"
 

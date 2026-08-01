@@ -1,99 +1,51 @@
-"""Correctness gate for the GROUPED-FUSED MoE PREFILL path
-(``moe.PrismaQuantCBMoEMethod._apply_prefill_grouped_fused``, round 1 of the
-MoE fused campaign; ``PRISMAQUANT_CB_PREFILL=grouped_fused``).
+"""Correctness gates for the active FP8-CB fused CUTLASS MoE kernels.
 
-The grouped-fused path removes the stock path's HBM e4m3 expand round-trip by
-decoding each expert's packed CB rows inside the CUTLASS prologue
-(``cb_fused_prefill_mm_scaled``). Weights decode bit-exactly and the activation
-QDQ is the stock path's own per-token fp8 dynamic, so the two differ only by
-GEMM accumulation + cross-expert combine reassociation — the suite's
-REASSOCIATION-CLASS 2e-2 contract (same bound as loop-vs-batched).
+Round 1 decodes CB weights in each CUTLASS GEMM prologue. Round 2 replaces
+Round 1's expert launch loop with one padded grouped launch per projection.
+Both are production candidates only for quality-green FP8-CB shapes; every
+miss uses Gridbook's exact-QDQ, exact-weight-expansion, grouped-BF16 CUTLASS
+bridge. There is no stock, loop, batched, L2, or runtime-autoselector oracle.
 
-Run scopes:
-
-Round 2 (``_apply_prefill_grouped_fused_v2``) replaces R1's host loop over
-experts with ONE ``cb_fused_moe_grouped`` launch per projection stage over a
-TileM-padded, expert-sorted row collective. Its parity reference is R1, not
-stock: the two share the routing order and the QDQ, differing only in how the
-padded/segment GEMMs and the combine reassociate.
-
-Run scopes:
-
-Round 3 adds ``PRISMAQUANT_CB_PREFILL=auto``: MEASURED per-layer selection
-between stock and grouped_fused at each COMPILED TileM, because the grouped path
-wins on small-expert MoEs and loses on large-expert ones. Its policy lives in
-``gridbook.moe_autotune`` (torch-only) and is tested here on CPU with an injected
-timer — no vLLM, no GPU, no real kernel.
-
-Run scopes:
-
-* ``-k "routing or auto"`` (build venv, NO vLLM/CUDA needed): the sort/boundary
-  property the one-sync R1 routing rests on, the R2 padded-routing construction
-  at every TileM (``gridbook.moe_routing`` is torch-only for exactly this
-  reason), and the auto-selection policy.
-* everything else (serving container: vLLM + CUDA + the fused extension):
-    docker run --rm --gpus all -v /home/rob/gridbook:/gridbook \\
-      -v /home/rob/prismaquant:/prismaquant \\
-      --entrypoint bash vllm-node-tf5-cu132-lfm:latest -c 'pip install -q pytest; \\
-      PYTHONPATH=/gridbook:/prismaquant python3 -m pytest \\
-      /gridbook/tests/test_moe_grouped_fused.py -v'
+The routing tests are CPU-only. Forward tests require the serving vLLM/CUDA
+stack plus Gridbook's fused and grouped-BF16 extensions.
 """
+from __future__ import annotations
+
 import sys
+import types
 
 import pytest
 import torch
 
-pytest.importorskip("gridbook.codec")
-# Torch-only by design (see gridbook/moe_routing.py) so the ROUND-2 padded
-# routing — all of R2's index arithmetic — is exercised in the build venv.
+codec = pytest.importorskip("gridbook.codec")
 from gridbook.moe_routing import cb_grouped_pad_routing  # noqa: E402
-from gridbook.moe_autotune import (  # noqa: E402
-    STOCK,
-    cb_autotune_prefill,
-    cb_prefill_auto,
-    resolve_candidate,
-)
-
-from test_moe_batched_prefill import (  # noqa: E402
-    DEV,
-    _REL,
-    _build,
-    _report,
-    _require_stack,
-    _routing,
-    _silu_act,
-)
 
 
 @pytest.fixture(autouse=True)
 def _isolate_process_stable_moe_selectors():
     """Give every selector test the equivalent of a fresh serving process.
 
-    The production selectors deliberately reject changing an execution
-    contract after their first read.  Several tests below select different
-    contracts, so retaining that cache across pytest cases makes the module
-    depend on collection/execution order instead of testing one process
-    contract at a time.  Preserve any state owned by an outer test suite,
-    clear both selectors for this case, and restore it exactly afterward.
+    The fused-FP4 selector deliberately rejects changing an execution contract
+    after its first read. Several tests below select different contracts, so
+    retaining that cache across pytest cases makes the module depend on
+    collection/execution order instead of testing one process contract at a
+    time. Preserve any state owned by an outer test suite, clear the selector
+    for this case, and restore it exactly afterward.
     """
 
     moe = sys.modules.get("gridbook.moe")
-    prefill_before = list(moe._PREFILL_MODE_STATE) if moe is not None else None
     fused_before = list(moe._FUSED_FP4_MOE_STATE) if moe is not None else None
     if moe is not None:
-        moe._PREFILL_MODE_STATE.clear()
         moe._FUSED_FP4_MOE_STATE.clear()
     try:
         yield
     finally:
         active = sys.modules.get("gridbook.moe")
         if active is moe and moe is not None:
-            moe._PREFILL_MODE_STATE[:] = prefill_before
             moe._FUSED_FP4_MOE_STATE[:] = fused_before
         elif moe is None and active is not None:
             # The test imported Gridbook's MoE module after fixture setup.
             # Its selector cache belongs to that simulated process only.
-            active._PREFILL_MODE_STATE.clear()
             active._FUSED_FP4_MOE_STATE.clear()
 
 
@@ -101,631 +53,399 @@ def _isolate_process_stable_moe_selectors():
 # Routing property (CPU ok): stable expert-sort + cumsum boundaries reproduce   #
 # exactly the loop path's per-expert row selection, in the loop's order.        #
 # --------------------------------------------------------------------------- #
+DEV = "cuda"
+# GB10/CUDA 13.0 measured 2.015–2.040e-2 on the four fixed routing cases.
+# Keep a narrow 2.1e-2 reassociation envelope: the fused path and native BF16
+# bridge quantize the same values, but accumulate them in different tensor-core
+# types/orders. This is a regression bound, not a claim of bit equivalence.
+_REL = 2.1e-2
+
+
+def _require_stack():
+    # Probe a real vLLM submodule because another compatibility test may have
+    # installed lightweight ``vllm`` stubs into sys.modules.
+    pytest.importorskip("vllm")
+    pytest.importorskip("vllm.model_executor.layers.fused_moe.config")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for grouped-fused forward tests")
+
+
+def _build(*, experts=8, hidden=512, inter=768, seed=0):
+    """Build a synthetic FP8-CB MoE layer without invoking vLLM loading."""
+    _require_stack()
+    fmt = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    from gridbook.moe import PrismaQuantCBMoEMethod
+
+    k, n_sub = 44, 4
+    type_size = fmt.nvfp4_cb_type_size(k, "fp8")
+    codebook = fmt._resolve_codebook(
+        k, "fp8", "product", None, torch.device(DEV))
+
+    torch.manual_seed(seed)
+    w13 = torch.randn(
+        experts, 2 * inter, hidden, device=DEV) * 0.05
+    w2 = torch.randn(experts, hidden, inter, device=DEV) * 0.05
+    p13, f13 = fmt.nvfp4_cb_pack(
+        w13, k, grid="fp8", mode="product", codebook=codebook)
+    p2, f2 = fmt.nvfp4_cb_pack(
+        w2, k, grid="fp8", mode="product", codebook=codebook)
+
+    method = PrismaQuantCBMoEMethod.__new__(PrismaQuantCBMoEMethod)
+    method.quant_config = None
+    method.scheme = {
+        "grid": "fp8",
+        "mode": "product",
+        "k": k,
+        "n_sub": n_sub,
+        "type_size": type_size,
+    }
+    method.prefix = "test.grouped_fused"
+    method.is_fp4 = False
+    method.is_v2 = False
+    method.k = k
+    method.n_sub = n_sub
+    method.type_size = type_size
+    method._sub_table = None
+
+    layer = types.SimpleNamespace(
+        _cb_E=experts,
+        _cb_hidden=hidden,
+        _cb_inter=inter,
+        w13_cb_qweight=p13.reshape(
+            experts, 2 * inter, -1).contiguous(),
+        w2_cb_qweight=p2.reshape(experts, hidden, -1).contiguous(),
+        w13_weight_scale=f13["scales"].reshape(
+            experts, 2 * inter).to(DEV).float(),
+        w2_weight_scale=f2["scales"].reshape(
+            experts, hidden).to(DEV).float(),
+        _cb_flat=codec.build_flat_codebook([t.to(DEV) for t in codebook]),
+        _cb_compose=torch.zeros(1, device=DEV),
+        apply_router_weight_on_input=False,
+        activation=types.SimpleNamespace(value="silu"),
+    )
+    return method, layer, {
+        "E": experts,
+        "hidden": hidden,
+        "inter": inter,
+    }
+
+
+def _silu_act():
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    try:
+        return MoEActivation.from_str("silu")
+    except Exception:  # noqa: BLE001 - enum spelling differs across vLLM
+        return MoEActivation.SILU
+
+
+def _routing(tokens, experts, topk, distribution, seed):
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    if distribution == "uniform":
+        ids = torch.stack([
+            torch.randperm(experts, generator=generator)[:topk]
+            for _ in range(tokens)
+        ])
+    elif distribution == "subset":
+        pool = max(topk, experts // 2)
+        ids = torch.stack([
+            torch.randperm(pool, generator=generator)[:topk]
+            for _ in range(tokens)
+        ])
+    elif distribution == "one_expert":
+        assert topk == 1
+        ids = torch.full((tokens, 1), 3, dtype=torch.long)
+    else:
+        raise ValueError(distribution)
+    weights = torch.rand(tokens, topk, generator=generator) + 0.1
+    return ids.to(torch.int32).to(DEV), weights.float().to(DEV)
+
+
+def _report(tag, reference, candidate):
+    rel = ((candidate.float() - reference.float()).norm()
+           / reference.float().norm().clamp_min(1e-6)).item()
+    exact = (candidate == reference).float().mean().item()
+    maxabs = (candidate.float() - reference.float()).abs().max().item()
+    print(f"{tag}: rel={rel:.3e} exact={exact:.3f} maxabs={maxabs:.3e}")
+    return rel
+
+
+# ---------------------------------------------------------------------------
+# Padded routing construction (CPU)
+# ---------------------------------------------------------------------------
+def _reference_segments(topk_ids, experts):
+    return [torch.where(topk_ids == expert)[0] for expert in range(experts)]
+
+
+def _check_routing(topk_ids, experts, tile_m):
+    tokens, topk = topk_ids.shape
+    pairs = tokens * topk
+    capacity = pairs // tile_m + experts
+    expert_ids, row_src, is_pad, n_blocks = cb_grouped_pad_routing(
+        topk_ids, experts, tile_m)
+    assert expert_ids.shape == (capacity,)
+    assert row_src.shape == (capacity * tile_m,)
+    assert is_pad.shape == (capacity * tile_m,)
+
+    live_blocks = int(n_blocks)
+    assert live_blocks <= capacity
+    pair_expert = topk_ids.reshape(-1).to(torch.long)
+    pair_token = torch.arange(tokens).repeat_interleave(topk)
+    order = torch.argsort(pair_expert, stable=True)
+    sorted_tokens = pair_token[order]
+    counts = torch.bincount(pair_expert, minlength=experts)
+
+    assert torch.equal(
+        expert_ids[live_blocks:],
+        torch.full((capacity - live_blocks,), -1, dtype=torch.int32),
+    )
+    assert bool(is_pad[live_blocks * tile_m:].all())
+    seen = {expert: [] for expert in range(experts)}
+    for block in range(live_blocks):
+        expert = int(expert_ids[block])
+        sl = slice(block * tile_m, (block + 1) * tile_m)
+        block_pad = is_pad[sl]
+        assert not bool(
+            block_pad[:-1].bitwise_and(~block_pad[1:]).any())
+        seen[expert].extend(int(value) for value in row_src[sl][~block_pad])
+
+    references = _reference_segments(topk_ids, experts)
+    for expert in range(experts):
+        assert len(seen[expert]) == int(counts[expert])
+        actual = (sorted_tokens[torch.tensor(seen[expert], dtype=torch.long)]
+                  if seen[expert] else torch.empty(0, dtype=torch.long))
+        assert torch.equal(actual, references[expert])
+        assert sum(
+            int(expert_ids[block]) == expert
+            for block in range(live_blocks)
+        ) == -(-int(counts[expert]) // tile_m)
+    return live_blocks, capacity
+
+
 @pytest.mark.parametrize("topk", [1, 2, 4])
-def test_routing_boundaries_match_loop_selection(topk):
+def test_routing_boundaries_match_stable_reference(topk):
     torch.manual_seed(0)
-    T, E = 37, 11
-    topk_ids = torch.stack([torch.randperm(E)[:topk] for _ in range(T)])
-    pair_expert = topk_ids.reshape(-1).to(torch.long)
-    pair_token = torch.arange(T).repeat_interleave(topk)
-    order = torch.argsort(pair_expert, stable=True)
-    ptok_sorted = pair_token[order]
-    counts = torch.bincount(pair_expert, minlength=E)
-    bounds = torch.cat([counts.new_zeros(1), torch.cumsum(counts, 0)]).tolist()
-
-    assert bounds[-1] == T * topk
-    for e in range(E):
-        p0, p1 = bounds[e], bounds[e + 1]
-        tok_idx, _slot = torch.where(topk_ids == e)     # the loop's selection
-        assert torch.equal(ptok_sorted[p0:p1], tok_idx), (
-            f"expert {e}: segment != loop selection (order or bounds wrong)")
-
-
-def test_zero_row_experts_are_skippable_without_extra_syncs():
-    """Empty experts show up as p1 == p0 on the ALREADY-fetched boundaries, so
-    skipping them costs no additional device read."""
-    E, topk = 8, 1
-    topk_ids = torch.full((16, topk), 3, dtype=torch.long)
-    counts = torch.bincount(topk_ids.reshape(-1), minlength=E)
-    bounds = torch.cat([counts.new_zeros(1), torch.cumsum(counts, 0)]).tolist()
-    hit = [e for e in range(E) if bounds[e + 1] > bounds[e]]
-    assert hit == [3]
-
-
-# --------------------------------------------------------------------------- #
-# ROUND 2 padded routing (CPU ok) — the construction the grouped kernel's        #
-# per-tile expert selection rests on.                                           #
-# --------------------------------------------------------------------------- #
-def _ref_segments(topk_ids, E):
-    """The loop path's per-expert row selection, in the loop's order."""
-    return [torch.where(topk_ids == e)[0] for e in range(E)]
-
-
-def _check_routing(topk_ids, E, tile_m):
-    T, topk = topk_ids.shape
-    P = T * topk
-    cap = P // tile_m + E                       # the static capacity bound
-    eids, row_src, is_pad, n_blocks = cb_grouped_pad_routing(
-        topk_ids, E, tile_m)
-    assert eids.shape == (cap,) and eids.dtype == torch.int32
-    assert row_src.shape == (cap * tile_m,) and is_pad.shape == (cap * tile_m,)
-
-    nb = int(n_blocks)
-    assert nb <= cap, f"capacity bound violated: {nb} > {cap}"
-
-    pair_expert = topk_ids.reshape(-1).to(torch.long)
-    pair_token = torch.arange(T).repeat_interleave(topk)
-    order = torch.argsort(pair_expert, stable=True)
-    ptok_sorted = pair_token[order]
-    counts = torch.bincount(pair_expert, minlength=E)
-
-    # Live blocks carry a real expert; capacity past the total is flagged -1
-    # and every one of its rows is padding.
-    assert torch.equal(eids[nb:], torch.full((cap - nb,), -1,
-                                             dtype=torch.int32))
-    assert bool(is_pad[nb * tile_m:].all())
-    assert bool((eids[:nb] >= 0).all())
-
-    seen = {e: [] for e in range(E)}
-    for b in range(nb):
-        e = int(eids[b])
-        sl = slice(b * tile_m, (b + 1) * tile_m)
-        pad_b = is_pad[sl]
-        # Padding only ever occupies the TAIL of an expert's LAST block.
-        assert not bool(pad_b[:-1].bitwise_and(~pad_b[1:]).any()), \
-            "padding is not contiguous at the tail of the block"
-        seen[e].extend(int(v) for v in row_src[sl][~pad_b])
-
-    for e in range(E):
-        assert len(seen[e]) == int(counts[e])
-        # Each expert's rows appear in STABLE token order, i.e. exactly the
-        # loop's torch.where(topk_ids == e) selection.
-        assert torch.equal(ptok_sorted[torch.tensor(seen[e], dtype=torch.long)]
-                           if seen[e] else torch.empty(0, dtype=torch.long),
-                           _ref_segments(topk_ids, E)[e])
-        # ... and start on a block boundary: blocks per expert is exact.
-        assert sum(1 for b in range(nb) if int(eids[b]) == e) == \
-            -(-int(counts[e]) // tile_m)
-    return nb, cap
+    tokens, experts = 37, 11
+    ids = torch.stack([
+        torch.randperm(experts)[:topk] for _ in range(tokens)
+    ]).to(torch.int32)
+    _check_routing(ids, experts, 8)
 
 
 @pytest.mark.parametrize("tile_m", [4, 8, 128, 256])
 @pytest.mark.parametrize("topk", [1, 2, 4])
-def test_padded_routing_matches_loop_selection(tile_m, topk):
+def test_padded_routing_matches_stable_reference(tile_m, topk):
     torch.manual_seed(0)
-    T, E = 37, 11
-    topk_ids = torch.stack([torch.randperm(E)[:topk] for _ in range(T)])
-    _check_routing(topk_ids.to(torch.int32), E, tile_m)
+    tokens, experts = 37, 11
+    ids = torch.stack([
+        torch.randperm(experts)[:topk] for _ in range(tokens)
+    ]).to(torch.int32)
+    _check_routing(ids, experts, tile_m)
 
 
-@pytest.mark.parametrize("tile_m,exp_blocks", [(4, 4), (8, 2), (128, 1),
-                                               (256, 1)])
-def test_padded_routing_zero_row_experts_consume_no_blocks(tile_m, exp_blocks):
-    """E-1 empty experts must cost zero tiles — otherwise a 256-expert layer
-    launches 256 tiles for a one-expert prefill. Holds at every TileM the
-    'auto' path may pick, including one where the whole segment is a single
-    mostly-padded tile (tile_m=256 over 16 rows)."""
-    E = 8
-    topk_ids = torch.full((16, 1), 3, dtype=torch.int32)
-    eids, _row_src, _pad, n_blocks = cb_grouped_pad_routing(topk_ids, E, tile_m)
-    assert int(n_blocks) == exp_blocks
-    assert torch.equal(eids[:exp_blocks],
-                       torch.full((exp_blocks,), 3, dtype=torch.int32))
-
-
-@pytest.mark.parametrize("tile_m", [128, 256])
-def test_padded_routing_ragged_at_serving_tiles(tile_m):
-    """The TileM values the kernel actually compiles, on a ragged 8k-ish
-    prefill: capacity, block starts, pad flags and stable order all hold
-    unchanged — the tile size is a free parameter of the construction, which is
-    what lets 'auto' sweep it."""
-    g = torch.Generator().manual_seed(5)
-    E, T, topk = 64, 1024, 4
-    ids = torch.randint(0, E, (T, topk), generator=g, dtype=torch.int32)
-    ids[:, 0] = 7                       # a hot expert -> many full tiles
-    _check_routing(ids, E, tile_m)
+@pytest.mark.parametrize(
+    "tile_m,expected_blocks", [(4, 4), (8, 2), (128, 1), (256, 1)])
+def test_zero_row_experts_consume_no_blocks(tile_m, expected_blocks):
+    ids = torch.full((16, 1), 3, dtype=torch.int32)
+    expert_ids, _rows, _pads, blocks = cb_grouped_pad_routing(ids, 8, tile_m)
+    assert int(blocks) == expected_blocks
+    assert torch.equal(
+        expert_ids[:expected_blocks],
+        torch.full((expected_blocks,), 3, dtype=torch.int32),
+    )
 
 
 @pytest.mark.parametrize("seed", list(range(24)))
 def test_padded_routing_capacity_bound_randomized(seed):
-    """The static bound cap = P//tile_m + E is what makes the whole path
-    host-read-free at build time; fuzz it over ragged/skewed routings."""
-    g = torch.Generator().manual_seed(seed)
-    E = int(torch.randint(1, 17, (1,), generator=g))
-    topk = int(torch.randint(1, min(E, 6) + 1, (1,), generator=g))
-    T = int(torch.randint(1, 40, (1,), generator=g))
-    tile_m = int([1, 2, 4, 8, 128, 256][seed % 6])
-    # Skewed (with replacement) routing: the worst case for ragged block counts.
-    ids = torch.randint(0, E, (T, topk), generator=g, dtype=torch.int32)
-    nb, cap = _check_routing(ids, E, tile_m)
-    assert nb <= cap
+    generator = torch.Generator().manual_seed(seed)
+    experts = int(torch.randint(1, 17, (1,), generator=generator))
+    topk = int(torch.randint(
+        1, min(experts, 6) + 1, (1,), generator=generator))
+    tokens = int(torch.randint(1, 40, (1,), generator=generator))
+    tile_m = [1, 2, 4, 8, 128, 256][seed % 6]
+    ids = torch.randint(
+        0, experts, (tokens, topk), generator=generator, dtype=torch.int32)
+    live, capacity = _check_routing(ids, experts, tile_m)
+    assert live <= capacity
 
 
-# --------------------------------------------------------------------------- #
-# ROUND 3 auto-selection policy (CPU ok) — the timer is injected, so this is     #
-# the real dispatch/caching/determinism logic with no vLLM, GPU or kernel.       #
-# --------------------------------------------------------------------------- #
-class _FakeLayer:
-    """Stands in for the FusedMoE layer: the policy only ever touches
-    ``_cb_prefill_choice`` on it (per-LAYER caching, not global)."""
-
-
-def _auto_fixture(ms):
-    """Candidates named by ``ms`` (name -> fake milliseconds) with tensor
-    outputs tagged by name, plus a spy timer counting how often it is called."""
-    tags = {name: torch.full((2,), float(i))
-            for i, name in enumerate(sorted(ms))}
-    calls = {"timed": 0, "ran": []}
-
-    def build():
-        out = []
-        for name in ms:                    # deliberately NOT sorted: tie-break
-            def fn(n=name):                # must not depend on this order
-                calls["ran"].append(n)
-                return tags[n]
-            out.append((name, fn))
-        return out
-
-    def timer(fn):
-        calls["timed"] += 1
-        out = fn()
-        # The candidate's identity is its output tag; map back to its ms.
-        name = next(n for n, t in tags.items() if torch.equal(t, out))
-        return out, ms[name]
-
-    return tags, build, timer, calls
-
-
-def _run_auto(layer, build, timer, calls, num_tokens, **kw):
-    return cb_prefill_auto(
-        layer, num_tokens, build,
-        lambda: (calls["ran"].append("stock:direct"), build()[0][1]())[1],
-        timer=timer, **kw)
-
-
-def test_auto_caches_the_measured_winner_on_the_layer():
-    """The argmin is cached on the LAYER and later calls dispatch straight to it
-    with NO further timing — the tuning cost is once per layer per process."""
-    ms = {STOCK: 9.0, "grouped_fused:tile_m=128": 4.0,
-          "grouped_fused:tile_m=256": 7.0}
-    tags, build, timer, calls = _auto_fixture(ms)
-    layer = _FakeLayer()
-
-    out = _run_auto(layer, build, timer, calls, 4096)
-    assert layer._cb_prefill_choice == "grouped_fused:tile_m=128"
-    assert calls["timed"] == 3, "every candidate must be timed exactly once"
-    # DETERMINISM: the tuning call returns the STOCK output, not the winner's.
-    assert torch.equal(out, tags[STOCK])
-
-    calls["timed"] = 0
-    calls["ran"].clear()
-    out2 = _run_auto(layer, build, timer, calls, 4096)
-    assert calls["timed"] == 0, "re-timed a layer that already has a winner"
-    assert calls["ran"] == ["grouped_fused:tile_m=128"]
-    assert torch.equal(out2, tags["grouped_fused:tile_m=128"])
-
-
-def test_auto_below_min_m_uses_stock_and_caches_nothing():
-    """A short prefill is not the steady-state shape, so it must not tune AND
-    must not cache — the first qualifying call still gets to measure."""
-    ms = {STOCK: 9.0, "grouped_fused:tile_m=128": 4.0}
-    tags, build, timer, calls = _auto_fixture(ms)
-    layer = _FakeLayer()
-    out = _run_auto(layer, build, timer, calls, 512, min_m=1024)
-    assert calls["timed"] == 0
-    assert getattr(layer, "_cb_prefill_choice", None) is None
-    assert torch.equal(out, tags[STOCK])
-
-    out = _run_auto(layer, build, timer, calls, 1024, min_m=1024)
-    assert calls["timed"] == 2 and layer._cb_prefill_choice == \
-        "grouped_fused:tile_m=128"
-    assert torch.equal(out, tags[STOCK])
-
-
-def test_auto_stock_can_win():
-    """The large-expert regression case: stock must be selectable, or 'auto'
-    would just be grouped_fused with extra steps."""
-    ms = {STOCK: 3.0, "grouped_fused:tile_m=128": 8.0}
-    tags, build, timer, calls = _auto_fixture(ms)
-    layer = _FakeLayer()
-    _run_auto(layer, build, timer, calls, 2048)
-    assert layer._cb_prefill_choice == STOCK
-    calls["ran"].clear()
-    assert torch.equal(_run_auto(layer, build, timer, calls, 2048), tags[STOCK])
-    assert calls["ran"] == [STOCK]
-
-
-def test_auto_force_pins_without_timing():
-    """PRISMAQUANT_CB_PREFILL_AUTO_FORCE bisection: pin a path, measure nothing.
-    A bare family name resolves to that family's first (smallest-TileM)
-    candidate."""
-    ms = {STOCK: 1.0, "grouped_fused:tile_m=128": 9.0,
-          "grouped_fused:tile_m=256": 9.5}
-    tags, build, timer, calls = _auto_fixture(ms)
-    layer = _FakeLayer()
-    out = _run_auto(layer, build, timer, calls, 4096, forced="grouped_fused")
-    assert calls["timed"] == 0
-    assert layer._cb_prefill_choice == "grouped_fused"
-    assert torch.equal(out, tags["grouped_fused:tile_m=128"])
-
-    layer2 = _FakeLayer()
-    out2 = _run_auto(layer2, build, timer, calls, 4096,
-                     forced="grouped_fused:tile_m=256")
-    assert torch.equal(out2, tags["grouped_fused:tile_m=256"])
-
-
-def test_auto_disqualified_candidates_are_skipped():
-    """A (TileM, k_bits) pair the build could not compile raises or returns
-    None; it must be dropped, not crash the serve, and stock must still win the
-    argmin over the survivors."""
-    calls = {"n": 0}
-
-    def build():
-        return [(STOCK, lambda: torch.zeros(2)),
-                ("grouped_fused:tile_m=128", lambda: None),
-                ("grouped_fused:tile_m=256",
-                 lambda: (_ for _ in ()).throw(RuntimeError("no smem")))]
-
-    def timer(fn):
-        calls["n"] += 1
-        try:
-            out = fn()
-        except Exception:
-            return None
-        return None if out is None else (out, 1.0)
-
-    best, timings, kept = cb_autotune_prefill(build(), timer=timer)
-    assert best == STOCK and list(timings) == [STOCK] and kept is not None
-    assert calls["n"] == 3
-
-
-def test_auto_all_candidates_disqualified_falls_back_to_stock():
-    """If nothing can be timed the policy must still serve the request."""
-    layer = _FakeLayer()
-    out = cb_prefill_auto(
-        layer, 4096, lambda: [(STOCK, lambda: None)],
-        lambda: torch.ones(2), timer=lambda fn: None)
-    assert torch.equal(out, torch.ones(2))
-    assert getattr(layer, "_cb_prefill_choice", None) is None
-
-
-def test_auto_stale_choice_falls_back_to_stock():
-    """A cached/forced name that resolves to nothing (or whose path became
-    unavailable) serves from the default rather than failing the request."""
-    layer = _FakeLayer()
-    layer._cb_prefill_choice = "grouped_fused:tile_m=512"
-    out = cb_prefill_auto(
-        layer, 4096, lambda: [(STOCK, lambda: torch.zeros(2))],
-        lambda: torch.ones(2))
-    assert torch.equal(out, torch.ones(2))
-
-
-def test_auto_tie_breaks_on_name_not_iteration_order():
-    """Equal timings must resolve to the same winner regardless of the order the
-    candidates happened to be enumerated in — otherwise the served path is a
-    race outcome."""
-    cands = [("grouped_fused:tile_m=256", lambda: torch.zeros(1)),
-             (STOCK, lambda: torch.zeros(1)),
-             ("grouped_fused:tile_m=128", lambda: torch.zeros(1))]
-    timer = lambda fn: (fn(), 5.0)                             # noqa: E731
-    best_a, _, _ = cb_autotune_prefill(cands, timer=timer)
-    best_b, _, _ = cb_autotune_prefill(list(reversed(cands)), timer=timer)
-    assert best_a == best_b == "grouped_fused:tile_m=128"
-
-
-def test_resolve_candidate_precedence():
-    cands = [(STOCK, "s"), ("grouped_fused:tile_m=128", "g128"),
-             ("grouped_fused:tile_m=256", "g256")]
-    assert resolve_candidate(STOCK, cands) == "s"
-    assert resolve_candidate("grouped_fused:tile_m=256", cands) == "g256"
-    assert resolve_candidate("grouped_fused", cands) == "g128"
-    assert resolve_candidate("nonsense", cands) is None
-
-
-# --------------------------------------------------------------------------- #
-# GPU parity: grouped_fused vs stock (the path it replaces).                    #
-# --------------------------------------------------------------------------- #
-def _require_fused(m, layer):
+# ---------------------------------------------------------------------------
+# CUDA quality and dispatch gates
+# ---------------------------------------------------------------------------
+def _require_r1(method, layer):
     _require_stack()
-    if not m._gf_ok(layer):
-        pytest.skip("fused CB extension / rung constraints unmet")
+    if not method._gf_ok(layer):
+        pytest.skip("FP8-CB fused CUTLASS Round 1 unavailable")
+    from gridbook.cuda_ext import get_bf16_grouped_ext
+    if get_bf16_grouped_ext() is None:
+        pytest.skip("owned grouped-BF16 CUTLASS reference unavailable")
 
 
-@pytest.mark.parametrize("dist", ["uniform", "subset"])
+def _require_r2(method, layer):
+    _require_r1(method, layer)
+    if not method._gf2_ok(layer):
+        pytest.skip("FP8-CB fused CUTLASS Round 2 unavailable")
+
+
+@pytest.mark.parametrize("distribution", ["uniform", "subset"])
 @pytest.mark.parametrize("topk", [2, 4])
-def test_grouped_fused_vs_stock_parity(dist, topk):
-    _require_stack()
-    m, layer, d = _build("fp8", seed=1)
-    _require_fused(m, layer)
+def test_round1_matches_native_quality_bridge(distribution, topk):
+    method, layer, dims = _build(seed=1)
+    _require_r1(method, layer)
     act = _silu_act()
-    T = 48
-    ti, tw = _routing(T, d["E"], topk, dist, seed=7)
+    tokens = 48
+    ids, weights = _routing(
+        tokens, dims["E"], topk, distribution, seed=7)
     torch.manual_seed(2)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    x = torch.randn(
+        tokens, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    reference = method._apply_prefill_native_bf16(
+        layer, x, weights, ids, act)
+    candidate = method._apply_prefill_grouped_fused(
+        layer, x, weights, ids, act)
+    assert candidate is not None
+    rel = _report(
+        f"r1-vs-native[{distribution},topk={topk}]", reference, candidate)
+    assert rel <= _REL
 
-    o_stock = m._apply_prefill_stock(layer, x, tw, ti, act)
-    o_gf = m._apply_prefill_grouped_fused(layer, x, tw, ti, act)
-    assert o_gf is not None, "grouped_fused returned None despite _gf_ok"
-    assert o_gf.shape == o_stock.shape == (T, d["hidden"])
-    rel = _report(f"gf-vs-stock[{dist},topk={topk}]", o_stock, o_gf)
-    assert rel <= _REL, f"{dist}/topk={topk}: rel {rel:.3e} > {_REL}"
 
-
-@pytest.mark.parametrize("T", [1, 3, 17, 129])
-def test_grouped_fused_small_and_partial_tile_m(T):
-    """No minimum M: an expert with a handful of rows must run through one
-    partial CUTLASS tile, not crash and not need padding."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=3)
-    _require_fused(m, layer)
+@pytest.mark.parametrize("tokens", [17, 33, 129])
+def test_round1_partial_tiles_match_native_quality_bridge(tokens):
+    method, layer, dims = _build(seed=3)
+    _require_r1(method, layer)
     act = _silu_act()
-    ti, tw = _routing(T, d["E"], 2, "uniform", seed=5)
+    ids, weights = _routing(
+        tokens, dims["E"], 2, "uniform", seed=5)
     torch.manual_seed(4)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o_stock = m._apply_prefill_stock(layer, x, tw, ti, act)
-    o_gf = m._apply_prefill_grouped_fused(layer, x, tw, ti, act)
-    rel = _report(f"gf-vs-stock[M={T}]", o_stock, o_gf)
-    assert rel <= _REL
+    x = torch.randn(
+        tokens, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    reference = method._apply_prefill_native_bf16(
+        layer, x, weights, ids, act)
+    candidate = method._apply_prefill_grouped_fused(
+        layer, x, weights, ids, act)
+    assert _report(f"r1-vs-native[M={tokens}]", reference, candidate) <= _REL
 
 
-def test_grouped_fused_all_tokens_one_expert():
-    """Ragged extreme: E-1 zero-row experts + one full segment."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=6)
-    _require_fused(m, layer)
-    act = _silu_act()
-    T = 40
-    ti, tw = _routing(T, d["E"], 1, "one_expert", seed=1)
-    torch.manual_seed(8)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o_stock = m._apply_prefill_stock(layer, x, tw, ti, act)
-    o_gf = m._apply_prefill_grouped_fused(layer, x, tw, ti, act)
-    rel = _report("gf-vs-stock[one_expert]", o_stock, o_gf)
-    assert rel <= _REL
-
-
-def test_fp4_falls_through():
-    """fp4-CB is not eligible (the prologue can't compose a two-tier scale):
-    _gf_ok must be False and the path must return None, not raise."""
-    _require_stack()
-    m, layer, d = _build("fp4v2")
-    assert m._gf_ok(layer) is False
-    act = _silu_act()
-    ti, tw = _routing(8, d["E"], 2, "uniform", seed=0)
-    x = torch.randn(8, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    assert m._apply_prefill_grouped_fused(layer, x, tw, ti, act) is None
-
-
-# --------------------------------------------------------------------------- #
-# ROUND 2 GPU parity: v2 (one launch per stage) vs R1 (the bisection reference). #
-# --------------------------------------------------------------------------- #
-def _require_fused2(m, layer):
-    _require_stack()
-    if not m._gf2_ok(layer):
-        pytest.skip("grouped cb_fused_moe_grouped binding / rung constraints "
-                    "unmet")
-
-
-@pytest.mark.parametrize("dist", ["uniform", "subset"])
+@pytest.mark.parametrize("distribution", ["uniform", "subset"])
 @pytest.mark.parametrize("topk", [2, 4])
-def test_grouped_fused_v2_vs_r1_parity(dist, topk):
-    _require_stack()
-    m, layer, d = _build("fp8", seed=1)
-    _require_fused2(m, layer)
+def test_round2_matches_round1(distribution, topk):
+    method, layer, dims = _build(seed=1)
+    _require_r2(method, layer)
     act = _silu_act()
-    T = 48
-    ti, tw = _routing(T, d["E"], topk, dist, seed=7)
+    tokens = 48
+    ids, weights = _routing(
+        tokens, dims["E"], topk, distribution, seed=7)
     torch.manual_seed(2)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o_r1 = m._apply_prefill_grouped_fused(layer, x, tw, ti, act)
-    o_v2 = m._apply_prefill_grouped_fused_v2(layer, x, tw, ti, act)
-    assert o_v2 is not None, "v2 returned None despite _gf2_ok"
-    assert o_v2.shape == o_r1.shape == (T, d["hidden"])
-    rel = _report(f"v2-vs-r1[{dist},topk={topk}]", o_r1, o_v2)
-    assert rel <= _REL, f"{dist}/topk={topk}: rel {rel:.3e} > {_REL}"
+    x = torch.randn(
+        tokens, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    round1 = method._apply_prefill_grouped_fused(
+        layer, x, weights, ids, act)
+    round2 = method._apply_prefill_grouped_fused_v2(
+        layer, x, weights, ids, act)
+    assert round2 is not None
+    assert _report(
+        f"r2-vs-r1[{distribution},topk={topk}]", round1, round2) <= _REL
 
 
-@pytest.mark.parametrize("T", [1, 3, 17, 129])
-def test_grouped_fused_v2_small_m(T):
-    """Sub-TileM M: the padded layout must still produce exactly one tile per
-    short expert, with the pad rows inert."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=3)
-    _require_fused2(m, layer)
+def test_round2_padding_trim_is_bit_identical(monkeypatch):
+    method, layer, dims = _build(seed=11)
+    _require_r2(method, layer)
     act = _silu_act()
-    ti, tw = _routing(T, d["E"], 2, "uniform", seed=5)
-    torch.manual_seed(4)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o_r1 = m._apply_prefill_grouped_fused(layer, x, tw, ti, act)
-    o_v2 = m._apply_prefill_grouped_fused_v2(layer, x, tw, ti, act)
-    rel = _report(f"v2-vs-r1[M={T}]", o_r1, o_v2)
-    assert rel <= _REL
-
-
-def test_grouped_fused_v2_all_tokens_one_expert():
-    """Ragged extreme: E-1 zero-row experts (zero tiles) + one full segment."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=6)
-    _require_fused2(m, layer)
-    act = _silu_act()
-    T = 40
-    ti, tw = _routing(T, d["E"], 1, "one_expert", seed=1)
-    torch.manual_seed(8)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o_r1 = m._apply_prefill_grouped_fused(layer, x, tw, ti, act)
-    o_v2 = m._apply_prefill_grouped_fused_v2(layer, x, tw, ti, act)
-    rel = _report("v2-vs-r1[one_expert]", o_r1, o_v2)
-    assert rel <= _REL
-
-
-def test_grouped_fused_v2_trim_is_bit_identical(monkeypatch):
-    """TRIM=0 launches up to E extra all-padding tiles. If padding is truly
-    inert the two outputs are BIT-identical — not merely close."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=11)
-    _require_fused2(m, layer)
-    act = _silu_act()
-    T = 33
-    ti, tw = _routing(T, d["E"], 2, "uniform", seed=3)
+    ids, weights = _routing(33, dims["E"], 2, "uniform", seed=3)
     torch.manual_seed(12)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    x = torch.randn(
+        33, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
     monkeypatch.setenv("PRISMAQUANT_CB_GROUPED_TRIM", "1")
-    o_trim = m._apply_prefill_grouped_fused_v2(layer, x, tw, ti, act)
+    trimmed = method._apply_prefill_grouped_fused_v2(
+        layer, x, weights, ids, act)
     monkeypatch.setenv("PRISMAQUANT_CB_GROUPED_TRIM", "0")
-    o_full = m._apply_prefill_grouped_fused_v2(layer, x, tw, ti, act)
-    assert torch.equal(o_trim, o_full), "padding tiles are not inert"
+    full = method._apply_prefill_grouped_fused_v2(
+        layer, x, weights, ids, act)
+    assert torch.equal(trimmed, full)
 
 
-def test_grouped_fused_v2_falls_back_to_r1_without_binding(monkeypatch):
-    """An extension build predating cb_fused_moe_grouped must fall back to R1,
-    never crash — the gate is the only thing standing between them."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=13)
-    _require_fused(m, layer)
-    layer._cb_gf2_ok = False                      # simulate the missing binding
-    act = _silu_act()
-    ti0, tw0 = _routing(8, d["E"], 2, "uniform", seed=0)
-    x0 = torch.randn(8, d["hidden"], dtype=torch.bfloat16, device=DEV)
-    assert m._apply_prefill_grouped_fused_v2(layer, x0, tw0, ti0, act) is None
-
-    monkeypatch.setenv("PRISMAQUANT_CB_PREFILL", "grouped_fused")
+def test_native_dispatch_prefers_round2():
+    method, layer, dims = _build(seed=14)
+    _require_r2(method, layer)
     seen = {}
-    orig = m._apply_prefill_grouped_fused
-    m._apply_prefill_grouped_fused = lambda *a, **kw: (
-        seen.setdefault("hit", True), orig(*a, **kw))[1]
-    T = 32
-    ti, tw = _routing(T, d["E"], 2, "uniform", seed=2)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o = m._apply_inline(layer, x, tw, ti)
-    assert seen.get("hit"), "dispatch did not fall back to R1"
-    assert o.shape == (T, d["hidden"])
+    original = method._apply_prefill_grouped_fused_v2
 
-
-def test_mode_dispatch_prefers_v2(monkeypatch):
-    """With the binding present, 'grouped_fused' means ROUND 2."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=14)
-    _require_fused2(m, layer)
-    monkeypatch.setenv("PRISMAQUANT_CB_PREFILL", "grouped_fused")
-    seen = {}
-    orig = m._apply_prefill_grouped_fused_v2
-    m._apply_prefill_grouped_fused_v2 = lambda *a, **kw: (
-        seen.setdefault("hit", True), orig(*a, **kw))[1]
-    T = 32
-    ti, tw = _routing(T, d["E"], 2, "uniform", seed=2)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o = m._apply_inline(layer, x, tw, ti)
-    assert seen.get("hit"), "mode dispatch did not reach v2"
-    assert o.shape == (T, d["hidden"])
-
-
-# --------------------------------------------------------------------------- #
-# ROUND 3 GPU: every COMPILED TileM must be a correct candidate.                 #
-# --------------------------------------------------------------------------- #
-def _tile_sizes(m, layer):
-    tiles = m._gf2_tile_sizes(layer)
-    if not tiles:
-        pytest.skip("extension exposes no grouped TileM")
-    return tiles
-
-
-def test_grouped_fused_v2_parity_at_every_compiled_tile_m():
-    """'auto' may pick any TileM the build compiled, so each one must hit the
-    same R1 reassociation bound — a tile is a performance knob, never a
-    numerics knob."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=1)
-    _require_fused2(m, layer)
-    act = _silu_act()
-    T = 48
-    ti, tw = _routing(T, d["E"], 2, "uniform", seed=7)
-    torch.manual_seed(2)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o_r1 = m._apply_prefill_grouped_fused(layer, x, tw, ti, act)
-    for tm in _tile_sizes(m, layer):
-        o = m._apply_prefill_grouped_fused_v2(layer, x, tw, ti, act, tile_m=tm)
-        assert o is not None, f"tile_m={tm} advertised but returned None"
-        rel = _report(f"v2[tile_m={tm}]-vs-r1", o_r1, o)
-        assert rel <= _REL, f"tile_m={tm}: rel {rel:.3e} > {_REL}"
-
-
-@pytest.mark.parametrize("dist,T", [("one_expert", 40), ("subset", 17),
-                                    ("uniform", 3)])
-def test_grouped_fused_v2_ragged_at_tile_m_256(dist, T):
-    """Ragged / zero-row cases at the LARGE tile, where padding dominates: a
-    handful of rows must still be one mostly-padded, inert tile."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=6)
-    _require_fused2(m, layer)
-    if 256 not in m._gf2_tile_sizes(layer):
-        pytest.skip("tile_m=256 not compiled in this extension build")
-    act = _silu_act()
-    topk = 1 if dist == "one_expert" else 2
-    ti, tw = _routing(T, d["E"], topk, dist, seed=1)
-    torch.manual_seed(8)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o_r1 = m._apply_prefill_grouped_fused(layer, x, tw, ti, act)
-    o = m._apply_prefill_grouped_fused_v2(layer, x, tw, ti, act, tile_m=256)
-    rel = _report(f"v2[tile_m=256,{dist},M={T}]-vs-r1", o_r1, o)
-    assert rel <= _REL
-
-
-def test_auto_mode_end_to_end(monkeypatch):
-    """PRISMAQUANT_CB_PREFILL=auto on a real layer: it tunes once, caches a
-    choice, and the tuning call's output matches the stock path bit-for-bit."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=17)
-    _require_fused(m, layer)
-    act = _silu_act()
-    T = 64
-    monkeypatch.setenv("PRISMAQUANT_CB_PREFILL", "auto")
-    monkeypatch.setenv("PRISMAQUANT_CB_AUTOTUNE_MIN_M", str(T))
-    ti, tw = _routing(T, d["E"], 2, "uniform", seed=2)
-    torch.manual_seed(5)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o_stock = m._apply_prefill_stock(layer, x, tw, ti, act)
-    o_auto = m._apply_inline(layer, x, tw, ti)
-    assert getattr(layer, "_cb_prefill_choice", None) is not None
-    assert torch.equal(o_auto, o_stock), "tuning call is not deterministic"
-    o_next = m._apply_inline(layer, x, tw, ti)
-    assert o_next.shape == (T, d["hidden"])
-
-
-def test_auto_mode_below_min_m_is_stock(monkeypatch):
-    """Under the threshold: no tuning, no cached choice, stock output."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=19)
-    _require_fused(m, layer)
-    act = _silu_act()
-    T = 32
-    monkeypatch.setenv("PRISMAQUANT_CB_PREFILL", "auto")
-    monkeypatch.setenv("PRISMAQUANT_CB_AUTOTUNE_MIN_M", "1024")
-    ti, tw = _routing(T, d["E"], 2, "uniform", seed=2)
-    torch.manual_seed(6)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o = m._apply_inline(layer, x, tw, ti)
-    assert getattr(layer, "_cb_prefill_choice", None) is None
-    assert torch.equal(o, m._apply_prefill_stock(layer, x, tw, ti, act))
-
-
-def test_mode_dispatch_selects_grouped_fused(monkeypatch):
-    """PRISMAQUANT_CB_PREFILL=grouped_fused_r1 pins the ROUND-1 path (the
-    bisection reference) regardless of the grouped binding's presence."""
-    _require_stack()
-    m, layer, d = _build("fp8", seed=9)
-    _require_fused(m, layer)
-    monkeypatch.setenv("PRISMAQUANT_CB_PREFILL", "grouped_fused_r1")
-    seen = {}
-    orig = m._apply_prefill_grouped_fused
-
-    def _spy(*a, **kw):
+    def spy(*args, **kwargs):
         seen["hit"] = True
-        return orig(*a, **kw)
+        return original(*args, **kwargs)
 
-    m._apply_prefill_grouped_fused = _spy
-    T = 32
-    ti, tw = _routing(T, d["E"], 2, "uniform", seed=2)
-    x = torch.randn(T, d["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    o = m._apply_inline(layer, x, tw, ti)
-    assert seen.get("hit"), "mode dispatch did not reach grouped_fused"
-    assert o.shape == (T, d["hidden"])
+    method._apply_prefill_grouped_fused_v2 = spy
+    ids, weights = _routing(32, dims["E"], 2, "uniform", seed=2)
+    x = torch.randn(
+        32, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    out = method._apply_inline(layer, x, weights, ids)
+    assert seen.get("hit")
+    assert out.shape == (32, dims["hidden"])
+
+
+def test_native_dispatch_falls_from_round2_to_round1():
+    method, layer, dims = _build(seed=13)
+    _require_r1(method, layer)
+    layer._cb_gf2_ok = False
+    seen = {}
+    original = method._apply_prefill_grouped_fused
+
+    def spy(*args, **kwargs):
+        seen["hit"] = True
+        return original(*args, **kwargs)
+
+    method._apply_prefill_grouped_fused = spy
+    ids, weights = _routing(32, dims["E"], 2, "uniform", seed=2)
+    x = torch.randn(
+        32, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    out = method._apply_inline(layer, x, weights, ids)
+    assert seen.get("hit")
+    assert out.shape == (32, dims["hidden"])
+
+
+def _tile_sizes(method, layer):
+    sizes = method._gf2_tile_sizes(layer)
+    if not sizes:
+        pytest.skip("extension exposes no grouped TileM")
+    return sizes
+
+
+def test_round2_quality_at_every_compiled_tile():
+    method, layer, dims = _build(seed=1)
+    _require_r2(method, layer)
+    act = _silu_act()
+    ids, weights = _routing(48, dims["E"], 2, "uniform", seed=7)
+    torch.manual_seed(2)
+    x = torch.randn(
+        48, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    round1 = method._apply_prefill_grouped_fused(
+        layer, x, weights, ids, act)
+    for tile_m in _tile_sizes(method, layer):
+        candidate = method._apply_prefill_grouped_fused_v2(
+            layer, x, weights, ids, act, tile_m=tile_m)
+        assert candidate is not None
+        assert _report(
+            f"r2[tile={tile_m}]-vs-r1", round1, candidate) <= _REL
+
+
+@pytest.mark.parametrize(
+    "distribution,tokens", [("one_expert", 40), ("subset", 17),
+                             ("uniform", 33)])
+def test_round2_ragged_at_tile_256(distribution, tokens):
+    method, layer, dims = _build(seed=6)
+    _require_r2(method, layer)
+    if 256 not in method._gf2_tile_sizes(layer):
+        pytest.skip("tile_m=256 not compiled")
+    act = _silu_act()
+    topk = 1 if distribution == "one_expert" else 2
+    ids, weights = _routing(
+        tokens, dims["E"], topk, distribution, seed=1)
+    torch.manual_seed(8)
+    x = torch.randn(
+        tokens, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    round1 = method._apply_prefill_grouped_fused(
+        layer, x, weights, ids, act)
+    round2 = method._apply_prefill_grouped_fused_v2(
+        layer, x, weights, ids, act, tile_m=256)
+    assert _report(
+        f"r2[tile=256,{distribution},M={tokens}]-vs-r1",
+        round1, round2) <= _REL

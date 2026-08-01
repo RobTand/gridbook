@@ -13,8 +13,8 @@ because the pad is 16 bytes wide: the fp8 CUTLASS prefill entries still read
 of that contract are pinned here.
 
 CPU-only; vLLM symbols are stubbed when unavailable (same idiom as
-``test_target_namespace_compat``). No CUDA is touched: ``PRISMAQUANT_CB_DECODE``
-is forced off the ``cuda`` default so the load-time JIT warm never fires.
+``test_target_namespace_compat``). Required native-kernel attestation is stubbed
+explicitly so no CUDA build is touched.
 """
 import json
 import struct
@@ -75,7 +75,6 @@ def _runtime_modules(isolated_gridbook_runtime_imports):
     """Import Gridbook against a private real-or-stubbed vLLM graph."""
     del isolated_gridbook_runtime_imports
     env = pytest.MonkeyPatch()
-    env.setenv("PRISMAQUANT_CB_DECODE", "triton")
     try:
         try:
             from vllm.model_executor.parameter import ModelWeightParameter  # noqa: F401
@@ -248,6 +247,7 @@ def test_dense_fp4_sm_count_is_cached_without_synchronizing(monkeypatch):
 def test_dense_fp4_tile_route_reaches_binding_and_telemetry(
         monkeypatch, M, N, expected_tile):
     method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.prefix = "test.dense"
     method.k = 16
     method.n_sub = 2
     method.type_size = 73
@@ -295,6 +295,7 @@ def test_dense_rowwise_modes_reach_only_the_rowwise_activation_family(
 ):
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
     method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.prefix = "test.dense"
     method.is_fp4 = True
     observed = []
 
@@ -317,6 +318,7 @@ def test_dense_static_lsq_modes_reach_only_the_lsq_activation_family(
 ):
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
     method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.prefix = "test.dense"
     method.is_fp4 = True
     observed = []
 
@@ -351,6 +353,7 @@ def test_dense_fused_fp4_selector_enforces_lut_smem_limit(
     """
 
     method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.prefix = "test.dense"
     method.is_fp4 = True
     method.is_v2 = True
     method.has_static_fp4_activation = True
@@ -363,11 +366,6 @@ def test_dense_fused_fp4_selector_enforces_lut_smem_limit(
         _cb_fp4_input_global_scale=torch.ones(1, dtype=torch.float32),
     )
 
-    vops = types.ModuleType("vllm._custom_ops")
-    vops.scaled_fp4_quant = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
-    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
-                        raising=False)
     from gridbook import cuda_ext
 
     class FusedExt:
@@ -379,6 +377,7 @@ def test_dense_fused_fp4_selector_enforces_lut_smem_limit(
 
 def test_dense_static_and_rowwise_eligibility_are_isolated(monkeypatch):
     method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.prefix = "test.dense"
     method.is_fp4 = True
     method.is_v2 = True
     method.has_static_fp4_activation = False
@@ -390,11 +389,6 @@ def test_dense_static_and_rowwise_eligibility_are_isolated(monkeypatch):
         _cb_row_offset=torch.zeros(8, dtype=torch.int32),
     )
 
-    vops = types.ModuleType("vllm._custom_ops")
-    vops.scaled_fp4_quant = object()
-    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
-    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
-                        raising=False)
     from gridbook import cuda_ext
 
     class FusedExt:
@@ -412,6 +406,7 @@ def test_dense_static_and_rowwise_eligibility_are_isolated(monkeypatch):
 
 def test_dense_rowwise_eligibility_requires_quantizer_and_gemm(monkeypatch):
     method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.prefix = "test.dense"
     method.is_fp4 = True
     method.is_v2 = True
     method.has_static_fp4_activation = True
@@ -425,11 +420,6 @@ def test_dense_rowwise_eligibility_requires_quantizer_and_gemm(monkeypatch):
         _cb_fp4_input_global_scale_f32=2.0,
     )
 
-    vops = types.ModuleType("vllm._custom_ops")
-    vops.scaled_fp4_quant = object()
-    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
-    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
-                        raising=False)
     from gridbook import cuda_ext
 
     class StaticOnlyExt:
@@ -447,6 +437,7 @@ def test_dense_static_lsq_eligibility_requires_contract_and_matching_symbol(
     monkeypatch,
 ):
     method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.prefix = "test.dense"
     method.is_fp4 = True
     method.is_v2 = True
     method.has_static_fp4_activation = True
@@ -479,6 +470,7 @@ def test_dense_static_lsq_eligibility_requires_contract_and_matching_symbol(
     ) is False
 
     legacy = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    legacy.prefix = "test.legacy_dense"
     legacy.is_fp4 = True
     legacy.is_v2 = True
     legacy.has_static_fp4_activation = False
@@ -516,6 +508,31 @@ def _single_process_tp(monkeypatch):
         return
     monkeypatch.setattr(par, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(par, "get_tensor_model_parallel_world_size", lambda: 1)
+
+
+@pytest.fixture(autouse=True)
+def _attest_native_loader_without_building_cuda(monkeypatch):
+    """Unit tests exercise load-time layout on CPU, not the JIT itself.
+
+    Production now attests the required main extension during model load. Stub
+    only that attestation here; fail-closed loader behavior has dedicated tests
+    in ``test_fail_loud.py`` and CUDA extension tests.
+    """
+    from gridbook import cuda_ext
+    native = types.SimpleNamespace()
+    monkeypatch.setattr(cuda_ext, "require_ext", lambda operation: native)
+    monkeypatch.setattr(cuda_ext, "require_ext_v2", lambda operation: native)
+    monkeypatch.setattr(
+        cuda_ext, "require_fp4_v2_expander",
+        lambda operation, **kwargs: native)
+    monkeypatch.setattr(
+        cuda_ext, "require_bf16_grouped_ext", lambda operation: native)
+    monkeypatch.setattr(cuda_ext, "get_ext", lambda: native)
+    monkeypatch.setattr(cuda_ext, "get_fused_ext", lambda: None)
+    monkeypatch.setattr(
+        cb_linear, "require_native_fp8_cutlass", lambda operation: None)
+    monkeypatch.setattr(
+        cb_linear, "require_native_fp4_quant", lambda operation: None)
 
 
 # The real shipped fp8 rungs. type_size == 4*k, all 16-byte multiples — the
@@ -622,7 +639,7 @@ def test_layer_no_longer_references_the_original_storage():
 
 def test_repointed_cb_qweight_still_satisfies_the_fp8_kernel_checks():
     """``layer.cb_qweight.data`` is still passed to cb_fused_prefill_mm_scaled
-    (mid-M, default-on) and the persistent-TC path. Mirror their TORCH_CHECKs."""
+    (mid-M, default-on). Mirror its TORCH_CHECKs."""
     layer, _ = _loaded_layer()
     qw = layer.cb_qweight.data
     row_bytes = (_K // codec.SUPERBLOCK) * _SCHEME["type_size"]
@@ -648,6 +665,28 @@ def test_weight_scale_is_not_duplicated():
             == layer.weight_scale.data.untyped_storage().data_ptr())
 
 
+def test_public_apply_requires_opaque_registered_dispatch():
+    """Production cannot expose the Python body to Inductor/Triton."""
+    from gridbook.cuda_ext import NativeKernelUnavailableError
+
+    layer, _ = _loaded_layer()
+    method = PrismaQuantCBLinearMethod(
+        types.SimpleNamespace(), dict(_SCHEME), _TARGET)
+    del layer._cb_layer_id
+    with pytest.raises(NativeKernelUnavailableError, match="not registered"):
+        method.apply(layer, torch.zeros(1, _K, dtype=torch.bfloat16))
+
+
+def test_public_apply_rejects_bias_without_native_operator():
+    from gridbook.cuda_ext import NativeKernelUnavailableError
+
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+    with pytest.raises(NativeKernelUnavailableError, match="biased CB Linear"):
+        method.apply(
+            layer, torch.zeros(1, _K, dtype=torch.bfloat16),
+            torch.zeros(layer._cb_N, dtype=torch.bfloat16))
+
+
 # ---------------------------------------------------------------------------
 # 3. fused roles: exact codebook references share one LUT block safely
 # ---------------------------------------------------------------------------
@@ -667,7 +706,9 @@ _FUSED_ROLES = [
 ]
 _REF_A = tuple(f"cb.a.sub{i}" for i in range(4))
 _REF_B = tuple(f"cb.b.sub{i}" for i in range(4))
-_FUSED_WIDTHS = (3, 5, 4)
+# Preserve deliberately uneven role boundaries while keeping the fused output
+# dimension inside the native FP8 CUTLASS contract (N % 16 == 0).
+_FUSED_WIDTHS = (3, 5, 8)
 _FUSED_BLOCK_VALUES = 4 * (2 ** (_FUSED_K // 4)) * 2
 
 
@@ -791,22 +832,23 @@ def test_dedup_preserves_every_rows_addressed_lut(role_refs):
 
 
 def _mock_fp8_ops(monkeypatch, N):
-    vops = types.ModuleType("vllm._custom_ops")
-    vops.scaled_fp8_quant = lambda x, **kw: (
-        x, torch.ones(x.shape[0], 1, dtype=torch.float32))
-    vops.cutlass_scaled_mm = lambda xq, wt, sa, ws, dtype, bias: torch.full(
-        (xq.shape[0], N), 7.0, dtype=torch.bfloat16)
-    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
-    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
-                        raising=False)
-    return vops
+    monkeypatch.setattr(
+        cb_linear, "native_fp8_quant",
+        lambda x: (x, torch.ones(x.shape[0], 1, dtype=torch.float32)))
+    monkeypatch.setattr(
+        cb_linear, "native_cutlass_scaled_mm",
+        lambda xq, wt, sa, ws, dtype: torch.full(
+            (xq.shape[0], N), 7.0, dtype=torch.bfloat16))
 
 
-def test_same_ref_fused_roles_enter_midm_kernel(monkeypatch):
+@pytest.mark.parametrize("M", [9, 16, 32])
+def test_same_ref_fused_roles_enter_native_fused_kernel(monkeypatch, M):
+    """FP8-CB M=9..128 reaches fused CUTLASS, never legacy cb_gemm."""
     from gridbook import cuda_ext
+    from gridbook import ops as cb_ops
 
     method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
-    N, K, M = layer._cb_N, layer._cb_K, 32
+    N, K = layer._cb_N, layer._cb_K
     _mock_fp8_ops(monkeypatch, N)
     calls = []
 
@@ -818,7 +860,7 @@ def test_same_ref_fused_roles_enter_midm_kernel(monkeypatch):
 
     monkeypatch.setattr(cuda_ext, "get_fused_ext", lambda: _FusedExt())
     monkeypatch.setattr(
-        sys.modules["gridbook.linear"], "expand_cb_to_fp8",
+        cb_ops, "cb_expand_fp8",
         lambda *a, **kw: pytest.fail("eligible shared LUT fell back"),
     )
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "1")
@@ -828,12 +870,16 @@ def test_same_ref_fused_roles_enter_midm_kernel(monkeypatch):
     assert torch.equal(out, torch.full_like(out, 11.0))
 
 
-def test_distinct_ref_fused_roles_fall_back_before_extension(monkeypatch):
+@pytest.mark.parametrize("M", [9, 16])
+def test_distinct_ref_roles_use_native_expand_before_fused_ext(monkeypatch, M):
+    """An offset-bearing LUT is fused-ineligible and stays native-only."""
     from gridbook import cuda_ext
+    from gridbook import ops as cb_ops
 
     method, layer, _ = _fused_loaded_layer([_REF_A, _REF_B, _REF_A])
-    N, K, M = layer._cb_N, layer._cb_K, 32
+    N, K = layer._cb_N, layer._cb_K
     _mock_fp8_ops(monkeypatch, N)
+    monkeypatch.setattr(method, "_cuda_gemv_ok", lambda: True)
     monkeypatch.setattr(
         cuda_ext, "get_fused_ext",
         lambda: pytest.fail("offset-unsafe fused extension was queried"),
@@ -844,12 +890,71 @@ def test_distinct_ref_fused_roles_fall_back_before_extension(monkeypatch):
         fallback_calls.append((args, kwargs))
         return torch.zeros(N, K, dtype=torch.float32)
 
-    monkeypatch.setattr(
-        sys.modules["gridbook.linear"], "expand_cb_to_fp8", _expand)
+    monkeypatch.setattr(cb_ops, "cb_expand_fp8", _expand)
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "1")
     out = method._apply_inline(layer, torch.zeros(M, K, dtype=torch.bfloat16))
     assert len(fallback_calls) == 1
     assert torch.equal(out, torch.full_like(out, 7.0))
+
+
+@pytest.mark.parametrize("M", [9, 16])
+def test_missing_fused_ext_falls_back_to_native_expand(monkeypatch, M):
+    """The optional fused module may miss; the required CUDA expander may not."""
+    from gridbook import cuda_ext
+    from gridbook import ops as cb_ops
+
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+    N, K = layer._cb_N, layer._cb_K
+    _mock_fp8_ops(monkeypatch, N)
+    monkeypatch.setattr(method, "_cuda_gemv_ok", lambda: True)
+    monkeypatch.setattr(cuda_ext, "get_fused_ext", lambda: None)
+    calls = []
+
+    def _expand(*args, **kwargs):
+        calls.append((args, kwargs))
+        return torch.zeros(N, K, dtype=torch.float32)
+
+    monkeypatch.setattr(cb_ops, "cb_expand_fp8", _expand)
+    out = method._apply_inline(layer, torch.zeros(M, K, dtype=torch.bfloat16))
+    assert len(calls) == 1
+    assert torch.equal(out, torch.full_like(out, 7.0))
+
+
+@pytest.mark.parametrize("M", [9, 16])
+def test_missing_required_cuda_ext_fails_closed(monkeypatch, M):
+    """No fused kernel and no CUDA expander is fatal, never a Triton fallback."""
+    from gridbook import cuda_ext
+    from gridbook import ops as cb_ops
+
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+    N, K = layer._cb_N, layer._cb_K
+    _mock_fp8_ops(monkeypatch, N)
+    monkeypatch.setattr(method, "_cuda_gemv_ok", lambda: False)
+    monkeypatch.setattr(cuda_ext, "get_fused_ext", lambda: None)
+    monkeypatch.setattr(
+        cb_ops, "cb_expand_fp8",
+        lambda *a, **kw: pytest.fail("unavailable CUDA expander was called"),
+    )
+    with pytest.raises(RuntimeError, match="alternate fallback is forbidden"):
+        method._apply_inline(layer, torch.zeros(M, K, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize("M", [1, 8])
+def test_fp8_decode_uses_native_cuda_gemv(monkeypatch, M):
+    """The lower FP8-CB boundary remains the existing native CUDA GEMV."""
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+    N, K = layer._cb_N, layer._cb_K
+    calls = []
+    monkeypatch.setattr(method, "_cuda_gemv_ok", lambda: True)
+
+    def _gemv(x, *args):
+        calls.append(x.shape)
+        return torch.full((M, N), 13.0, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(sys.modules["gridbook.linear"], "cb_gemv_fp8", _gemv)
+    out = method._apply_inline(layer, torch.zeros(M, K, dtype=torch.bfloat16))
+    assert calls == [torch.Size([M, K])]
+    assert torch.equal(out, torch.full_like(out, 13.0))
 
 
 def test_fused_lut_guard_rejects_uniform_nonzero_base():
@@ -937,6 +1042,117 @@ def _fp4_fused_loaded_layer(role_refs, widths):
     return method, layer
 
 
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("1", (False, False)),
+        ("static_lsq", (False, True)),
+        ("rowwise", (True, False)),
+    ],
+)
+def test_explicit_dense_fp4_mode_is_attested_and_cached_at_model_load(
+    monkeypatch, mode, expected,
+):
+    calls = []
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", mode)
+
+    def eligible(self, layer, K, *, rowwise=False, static_lsq=False):
+        calls.append((K, rowwise, static_lsq))
+        return True
+
+    monkeypatch.setattr(
+        PrismaQuantCBLinearMethod, "_fused_fp4_ok", eligible
+    )
+    _method, layer = _fp4_fused_loaded_layer(
+        (_FP4_REF_A, _FP4_REF_A, _FP4_REF_A), (128, 128, 128)
+    )
+    assert layer._cb_fused_fp4_mode == mode
+    assert calls == [(_K, *expected)]
+
+
+def test_explicit_dense_fp4_mode_fails_at_model_load_when_unavailable(
+    monkeypatch,
+):
+    from gridbook.cuda_ext import NativeKernelUnavailableError
+
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", "rowwise")
+    monkeypatch.setattr(
+        PrismaQuantCBLinearMethod,
+        "_fused_fp4_ok",
+        lambda *args, **kwargs: False,
+    )
+    with pytest.raises(
+        NativeKernelUnavailableError,
+        match="requested native fused dense FP4 mode 'rowwise'",
+    ):
+        _fp4_fused_loaded_layer(
+            (_FP4_REF_A, _FP4_REF_A, _FP4_REF_A), (128, 128, 128)
+        )
+
+
+def test_default_dense_fp4_mode_does_not_resolve_optional_fused_extension(
+    monkeypatch,
+):
+    from gridbook import cuda_ext
+
+    monkeypatch.delenv("PRISMAQUANT_CB_FUSED_FP4", raising=False)
+    monkeypatch.setattr(
+        cuda_ext,
+        "get_fused_fp4_ext",
+        lambda: pytest.fail("default FP4 mode built optional fused extension"),
+    )
+    _method, layer = _fp4_fused_loaded_layer(
+        (_FP4_REF_A, _FP4_REF_A, _FP4_REF_A), (128, 128, 128)
+    )
+    assert layer._cb_fused_fp4_mode == ""
+
+
+def test_fp8_fused_midm_optout_skips_model_load_jit(monkeypatch):
+    from gridbook import cuda_ext
+
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "0")
+    monkeypatch.setattr(
+        cuda_ext,
+        "get_fused_ext",
+        lambda: pytest.fail("FP8 fused opt-out built optional extension"),
+    )
+    _loaded_layer()
+
+
+def test_fp8_fused_midm_optout_cannot_enable_jit_after_model_load(
+        monkeypatch):
+    from gridbook import cuda_ext
+
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "0")
+    method, layer, _ = _fused_loaded_layer(
+        [_REF_A, _REF_A, _REF_A])
+    _mock_fp8_ops(monkeypatch, layer._cb_N)
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "1")
+    monkeypatch.setattr(
+        cuda_ext,
+        "get_fused_ext",
+        lambda: pytest.fail("mid-serve opt-in triggered a fused JIT"),
+    )
+    with pytest.raises(
+        RuntimeError, match="FUSED_MIDM changed after this CB layer was loaded"
+    ):
+        method._apply_inline(
+            layer, torch.zeros(16, layer._cb_K, dtype=torch.bfloat16))
+
+
+def test_fp8_native_quality_shape_rejects_unaligned_fused_output_at_load(
+        monkeypatch):
+    from gridbook.cuda_ext import NativeKernelUnavailableError
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "_FUSED_WIDTHS", (3, 5, 4))
+    with pytest.raises(
+        NativeKernelUnavailableError,
+        match="FP8 CUTLASS quality prefill requires N divisible by 16",
+    ):
+        _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+
+
 def test_distinct_fp4_refs_emit_tile_identity_map_without_role_lut_copies():
     method, layer = _fp4_fused_loaded_layer(
         (_FP4_REF_A, _FP4_REF_B, _FP4_REF_A), (128, 256, 128))
@@ -953,6 +1169,52 @@ def test_distinct_fp4_refs_emit_tile_identity_map_without_role_lut_copies():
     assert layer._cb_flat.numel() == 2 * _FP4_BLOCK_VALUES
 
 
+def test_fp4_quality_expansion_routes_each_role_segment_to_its_lut(
+        monkeypatch):
+    method, layer = _fp4_fused_loaded_layer(
+        (_FP4_REF_A, _FP4_REF_B, _FP4_REF_A), (128, 256, 128))
+    calls = []
+
+    def expand_segment(qw, cb, offsets, compose, nrows, K, *format_args):
+        del offsets, compose, format_args
+        calls.append((nrows, cb.data_ptr(), qw.shape[0]))
+        return torch.full(
+            (nrows, K), float(len(calls)), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        cb_linear, "expand_fp4_v2_to_weight", expand_segment)
+    weight = method._expand_fp4_quality_weight(
+        layer, layer._cb_N, layer._cb_K)
+
+    a_start, _ = layer._cb_fp4_lut_ranges[0]
+    b_start, _ = layer._cb_fp4_lut_ranges[1]
+    a_ptr = layer._cb_flat.narrow(0, a_start, 1).data_ptr()
+    b_ptr = layer._cb_flat.narrow(0, b_start, 1).data_ptr()
+    assert layer._cb_fp4_quality_segments == (
+        (0, 128, 0), (128, 256, 1), (384, 128, 0))
+    assert calls == [(128, a_ptr, 128), (256, b_ptr, 256),
+                     (128, a_ptr, 128)]
+    assert weight.shape == (512, _K)
+    assert torch.all(weight[:128] == 1)
+    assert torch.all(weight[128:384] == 2)
+    assert torch.all(weight[384:] == 3)
+
+
+def test_fp4_expander_device_attestation_failure_is_a_load_error(monkeypatch):
+    from gridbook import cuda_ext
+    from gridbook.cuda_ext import NativeKernelUnavailableError
+
+    def reject(_operation, **_kwargs):
+        raise NativeKernelUnavailableError("unsupported FP4 expander device")
+
+    monkeypatch.setattr(cuda_ext, "require_fp4_v2_expander", reject)
+    with pytest.raises(
+        NativeKernelUnavailableError, match="unsupported FP4 expander device"
+    ):
+        _fp4_fused_loaded_layer(
+            (_FP4_REF_A, _FP4_REF_A, _FP4_REF_A), (128, 128, 128))
+
+
 def test_fp4_tile_map_fails_closed_when_distinct_role_boundary_is_unaligned(
         monkeypatch):
     method, layer = _fp4_fused_loaded_layer(
@@ -960,11 +1222,6 @@ def test_fp4_tile_map_fails_closed_when_distinct_role_boundary_is_unaligned(
     assert layer._cb_fp4_fused_lut_ok is False
     assert layer._cb_fp4_lut_tile_ids is None
 
-    vops = types.ModuleType("vllm._custom_ops")
-    vops.scaled_fp4_quant = object()
-    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
-    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
-                        raising=False)
     from gridbook import cuda_ext
     monkeypatch.setattr(
         cuda_ext, "get_fused_fp4_ext",
@@ -977,16 +1234,11 @@ def test_fp4_multilut_dispatch_builds_unique_blocks_and_passes_tile_ids(
     method, layer = _fp4_fused_loaded_layer(
         (_FP4_REF_A, _FP4_REF_B, _FP4_REF_A), (128, 256, 128))
     M, N, K = 32, layer._cb_N, layer._cb_K
-    vops = types.ModuleType("vllm._custom_ops")
-
     def _quant(x, _global_scale):
         return (torch.zeros(x.shape[0], x.shape[1] // 2, dtype=torch.uint8),
                 torch.zeros(1, dtype=torch.uint8))
 
-    vops.scaled_fp4_quant = _quant
-    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
-    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
-                        raising=False)
+    monkeypatch.setattr(cb_linear, "native_fp4_quant", _quant)
     calls = []
 
     class _FusedExt:
@@ -1016,14 +1268,14 @@ def test_fp4_single_lut_dispatch_keeps_offset_free_binding(monkeypatch):
     method, layer = _fp4_fused_loaded_layer(
         (_FP4_REF_A, _FP4_REF_A, _FP4_REF_A), (128, 128, 128))
     M, N, K = 32, layer._cb_N, layer._cb_K
-    vops = types.ModuleType("vllm._custom_ops")
-    vops.scaled_fp4_quant = lambda x, _scale: (
-        torch.zeros(x.shape[0], x.shape[1] // 2, dtype=torch.uint8),
-        torch.zeros(1, dtype=torch.uint8),
+    monkeypatch.setattr(
+        cb_linear,
+        "native_fp4_quant",
+        lambda x, _scale: (
+            torch.zeros(x.shape[0], x.shape[1] // 2, dtype=torch.uint8),
+            torch.zeros(1, dtype=torch.uint8),
+        ),
     )
-    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
-    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
-                        raising=False)
     tile_maps = []
 
     class _FusedExt:

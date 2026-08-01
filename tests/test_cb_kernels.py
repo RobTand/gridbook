@@ -1,5 +1,4 @@
-"""Correctness gate for the CB Triton decode-GEMM, on the REAL exported 0.6B
-tensors (docs/lanes/nvfp4-cb/serving-kernel.md prototype (i)).
+"""Format-reference gates on the REAL exported 0.6B CB tensors.
 
 Run:
   PYTHONPATH=/home/rob/prismaquant:/home/rob/gridbook \
@@ -7,9 +6,10 @@ Run:
     /home/rob/gridbook/tests/test_cb_kernels.py -v
 
 Two checks per artifact/Linear:
-  * exact-match unpack — the kernel's byte-window codeword extraction is
+  * exact-match unpack — Gridbook's byte-window codeword extraction is
     bit-identical to `nvfp4_cb_unpack`;
-  * decode-GEMM matches `nvfp4_cb_reconstruct @ x` to <=1e-2 rel (bf16 accum).
+  * the independent pure-Torch decode reference matches
+    `nvfp4_cb_reconstruct @ x` to <=1e-2 rel (BF16 weight rounding).
 """
 import json
 from pathlib import Path
@@ -27,21 +27,23 @@ _pq_fmts = pytest.importorskip(
     "prismaquant.nvfp4_cb_formats",
     reason="monorepo-only (prismaquant); not part of the gridbook distribution",
 )
-_bit_split = _pq_fmts._bit_split
+_pq_layout = pytest.importorskip(
+    "prismaquant.cb_layout",
+    reason="monorepo-only producer layout contract is unavailable",
+)
+bit_split = _pq_layout.bit_split
 nvfp4_cb_reconstruct = _pq_fmts.nvfp4_cb_reconstruct
 nvfp4_cb_unpack = _pq_fmts.nvfp4_cb_unpack
 
-# Gridbook needs triton (and, transitively for full registration, vLLM), which
-# is present in the serving container but not necessarily in the build venv.
-# Skip cleanly instead of breaking
-# collection of the main suite.
+# Skip cleanly instead of breaking collection of the main suite when the
+# independently packaged plugin is not on PYTHONPATH.
 codec = pytest.importorskip(
     "gridbook.codec",
     reason="gridbook plugin not importable in this environment "
            "(run inside the serving container / with plugins on PYTHONPATH)",
 )
-kernels = pytest.importorskip("gridbook.kernels")
-cb_decode_linear = kernels.cb_decode_linear
+
+from cb_torch_reference import cb_linear_reference  # noqa: E402
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA device unavailable", allow_module_level=True)
@@ -117,7 +119,7 @@ def test_unpack_bitexact(art, qname):
     fields = nvfp4_cb_unpack(packed, k, grid, mode, (N, in_f),
                              codebook=subs, scales=ws)
     idx = fields["indices"].to(torch.int64)              # (N, nvec, n_sub)
-    widths = _bit_split(k, n_sub)
+    widths = bit_split(k, n_sub)
     off, code_ref = 0, torch.zeros_like(idx[..., 0])
     for i in range(n_sub):
         code_ref |= idx[..., i] << off
@@ -162,9 +164,10 @@ def test_gemm_matches_reconstruct(art, qname, M):
     qwp = codec.pad_qweight(packed)
     scale = (codec.decode_fp4_scale_plane(packed, k) if is_fp4
              else ws.reshape(-1))
-    y = cb_decode_linear(x, qwp, cb_flat, cb_row_offset, scale,
-                         torch.zeros(1, device=DEV), N=N, K=K,
-                         k_bits=k, n_sub=n_sub, type_size=ts, is_fp4=is_fp4)
+    y = cb_linear_reference(
+        x, qwp, cb_flat, cb_row_offset, scale,
+        torch.zeros(1, device=DEV), N=N, K=K, k_bits=k, n_sub=n_sub,
+        type_size=ts, is_fp4=is_fp4)
 
     rel = (y.float() - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
     assert rel <= 1e-2, f"{art}/{qname} M={M}: rel err {rel:.4e} > 1e-2"
@@ -206,9 +209,10 @@ def test_fused_row_offset():
     scale = codec.decode_fp4_scale_plane(packed, k)
     torch.manual_seed(1)
     x = torch.randn(8, K, dtype=torch.bfloat16, device=DEV)
-    y = cb_decode_linear(x, qwp, cb_flat, off, scale,
-                         torch.zeros(1, device=DEV), N=Na + Nb, K=K,
-                         k_bits=k, n_sub=n_sub, type_size=ts, is_fp4=is_fp4)
+    y = cb_linear_reference(
+        x, qwp, cb_flat, off, scale, torch.zeros(1, device=DEV),
+        N=Na + Nb, K=K, k_bits=k, n_sub=n_sub, type_size=ts,
+        is_fp4=is_fp4)
     y_ref = x.float() @ w_ref.float().t()
     rel = (y.float() - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
     assert rel <= 1e-2, f"fused rel err {rel:.4e} > 1e-2"

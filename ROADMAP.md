@@ -22,15 +22,25 @@ still describe some of them as future work.
   tok/s).
 - **MoE decode.** Grouped `(token, expert)` GEMV plus a deterministic combine,
   DEFAULT. Took 35B-MoE decode from 3.52 → ~33 tok/s (faster than BF16's 28.4).
-- **MoE prefill.** A CUDA chunk-expander feeding vLLM's own fused-MoE grouped
-  kernel. Measured on Laguna-S-2.1 (117B MoE): 293 → **1,821 tok/s** at 8k and
-  207 → **1,822 tok/s** at 63k (commit `8829c16`). The current default is
-  `auto`: a measured per-layer selection over the candidate paths, promoted after
-  a two-model gate showed it at or above the best fixed path on both models.
-- **Mid-M fused prefill** (16 < M ≤ 128): a CUTLASS decode-in-prologue GEMM with
+- **MoE prefill.** Native CUDA expansion plus a Gridbook-owned CUTLASS grouped
+  GEMM is the quality-preserving production lane. Its predecessor CUDA
+  chunk-expander path measured 293 → **1,821 tok/s** at 8k and 207 → **1,822
+  tok/s** at 63k on Laguna-S-2.1 (commit `8829c16`); those historical numbers
+  are not measurements of the new owned grouped bridge. The bridge's current
+  generic SM80-compatible schedule is not Blackwell-optimized and measured
+  **6–17% slower** than segmented BF16 matmuls on warm synthetic DSV4 shapes.
+- **Native FP8 operator ownership.** FP8 activation quantization and CUTLASS
+  scaled GEMM call vLLM's registered native CUDA operators directly after ABI
+  and shape attestation; the fallback-capable `vllm._custom_ops` wrapper is not
+  in Gridbook's serving path.
+- **Native shared-CB ownership.** HunYuan-V3 shared-expert prefixes, including
+  nested/collapsed MTP forms, resolve to native CB Linears. A CB tensor that can
+  resolve only to a plain BF16 Linear now stops model load.
+- **Mid-M fused prefill** (FP8-CB dispatch band 9 ≤ M ≤ 128): a CUTLASS decode-in-prologue GEMM with
   an fp32 epilogue, promoted to DEFAULT after measuring **1.40× in its niche**
   at the promotion gate (1.04–1.45× across M = 32/64/128 on GB10) with the
-  quality gate preserved. `sm_120`-family only; fails soft elsewhere.
+  quality gate preserved. `sm_120`-family only; other devices use native CUDA
+  expansion + CUTLASS.
 - **Quantized MTP draft head.** The 295B artifact ships an FP8-CB K44 draft
   block; speculative decode at k=1 measured 14.6 → **16.1 tok/s** on prose. (The
   remaining upside needs vLLM to capture drafter CUDA graphs — upstream work, see
@@ -39,7 +49,8 @@ still describe some of them as future work.
   with ceil-first uneven index splits, encoder-anchored and frozen.
 - **Packaging.** The CUDA sources ship inside the Python package, so a
   non-editable `pip install` produces a working CUDA path. Previously any
-  non-editable install silently degraded to the Triton fallback.
+  non-editable install silently degraded to the Triton fallback in retired
+  releases.
 - **FP8-CB hardware floor.** An FP8-CB artifact now fails early with a clear
   `sm_89+` requirement rather than loading on `sm_80` and failing at its first
   large-M prefill.
@@ -64,9 +75,9 @@ resident weight copy, decoder, or matmul merely to create another route.
 #### P0 — decide fused NVFP4 safely
 
 - [ ] **K0.1 — Align the producer and consumer releases.** In PrismaQuant, bump
-  the immutable Gridbook runtime pin from 0.4.1 (`59cebf9`) to 0.4.2
-  (`1634210`), rerun cross-repository contract/provenance CI, and publish the
-  resulting patch release. Do not copy the Gridbook runtime back into the
+  the immutable Gridbook runtime pin from 0.4.1 (`59cebf9`) to the final
+  Gridbook 0.5.0 release commit, rerun cross-repository contract/provenance CI,
+  and publish PrismaQuant 0.5.2. Do not copy the Gridbook runtime back into the
   producer.
 - [ ] **K0.2 — Produce a valid routed-MoE validation artifact.** Re-export a
   manageable representative model with producer-attested, stage-specific
@@ -208,10 +219,26 @@ practice rather than in principle.
   [`docs/CONTAINER.md`](docs/CONTAINER.md); no image is published to a registry
   yet.
 
+### Widening measured hardware coverage
+
+Every published number is from one GB10 / DGX Spark (`sm_121`, arm64). The
+decode kernel is architecture-generic by construction and *should* run from
+`sm_80` up, but that is inferred, not measured — see the
+[hardware matrix](docs/INSTALL.md#hardware-matrix). Two concrete code items would
+make the wider claim safe:
+
+- **Wider execution validation for the dense FP8-CB capability guard.** The
+  native FP8 prefill lane requires `sm_89+` and Gridbook rejects FP8-CB early on
+  A100 rather than selecting a different kernel family. H100/Ada execution is
+  still inferred rather than measured.
+- **An architecture precheck before the fused CUTLASS build**, so a non-Blackwell
+  GPU skips a doomed multi-minute compile inside the user's first request and
+  selects the qualified native expand + CUTLASS route directly.
+
 ### vLLM compatibility preflight
 
-The plugin imports vLLM internals (fused-MoE classes, `_custom_ops`, the
-quantization registry) that carry no stability promise, and vLLM
+The plugin imports vLLM internals (fused-MoE classes, the quantization registry,
+the registered `vllm._C` CUDA operator ABI) that carry no stability promise, and vLLM
 logs-and-continues when a plugin fails to load — so drift surfaces as an
 unrelated "invalid quantization method" at model load. A symbol canary that fails
 with one actionable sentence naming the missing symbol and the tested vLLM
@@ -255,10 +282,10 @@ than silence.
 
 | Item | Verdict |
 |---|---|
-| **Persistent-N large-M dense prefill** | Built, parity-green, and **2–5.7× slower** than expand-then-GEMM at 27B shapes: the CUDA expander had already shrunk the dense expand tax to ~10%, removing the opportunity that motivated it. The kernel is retained, quarantined behind `PRISMAQUANT_ENABLE_PTC=1`, as a schedule reference. Do not enable it. |
-| **`grouped_fused` MoE prefill as default** | Wins on small-expert MoE (35B class), loses on large-expert (Laguna class). Reverted to OPT-IN; the measured per-layer `auto` selection is the end state. |
+| **Persistent-N large-M dense prefill** | Built, parity-green, and **2–5.7× slower** than expand-then-GEMM at 27B shapes: the CUDA expander had already shrunk the dense expand tax to ~10%, removing the opportunity that motivated it. The serving selector, custom op, loader, and switch are deleted; only the `.cu` and an explicitly opted-in direct research test remain. |
+| **Legacy `grouped_fused` / per-layer `auto` MoE selection** | The predecessor fused path won on small-expert MoE (35B class) and lost on large-expert Laguna. Those selectors are removed from production; the native quality contract is grouped CUDA GEMV at M≤16 and exact expansion + owned CUTLASS grouped GEMM above it. |
 | **w2 rowpack decode schedule** | Measured negative; stays behind an environment switch as a recorded result. |
 | **Decode contract v2** (scale-epilogue hoist) | Measured **null** on the served 27B (10.10 vs 10.13 tok/s, quality-neutral) — decode is bandwidth-bound at per-byte parity, so there was nothing for the hoist to recover. Default stays v1; v2 remains available. |
-| **L2-pinned per-expert scratch pipeline** | Wedged live serving three times, including the serial variant. DIAGNOSTIC-ONLY, excluded from the `auto` candidate set; the underlying L2-residency hypothesis is still unmeasured. |
+| **L2-pinned per-expert scratch pipeline** | Wedged live serving three times, including the serial variant. Removed from production dispatch and its selector surface; the underlying L2-residency hypothesis remains a historical unmeasured idea. |
 | **Signed "S-rung" formats** | Serving correctness proven bit-exact end to end, but in a matched-rate head-to-head over 776 per-(Linear, rung) comparisons the unsigned rungs won 79% of the time and the allocator placed 6 signed units against 147 unsigned. Closed as research-only; the spec keeps them for exotic weight geometries. |
-| **Naive inline CUDA-graph capture of the decode path** | Measured *worse*: a prefill-sized trace baked the expand arm into decode. This specific design remains rejected. The later opaque whole-dispatch op fixed the mechanism; mode-0 `FULL_DECODE_ONLY` is now a validated candidate (20.1% faster on the close-rate 0.6B canary), pending the 27B streaming gate. |
+| **Retired host-branch CUDA-graph capture of the decode path** | Historical measurement, *worse*: a prefill-sized trace baked the expand arm into decode. That branch and its switch are removed. The later opaque whole-dispatch op fixed the mechanism; mode-0 `FULL_DECODE_ONLY` measured 20.1% faster on the dated close-rate 0.6B canary, pending a fresh 27B streaming gate on the current operator stack. |

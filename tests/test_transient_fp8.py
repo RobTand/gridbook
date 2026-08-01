@@ -31,12 +31,11 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-# The plugin sits outside the repo PYTHONPATH and needs triton (present in both
-# the build venv and the serving container). Skip cleanly if unavailable.
+# The plugin can sit outside the repo PYTHONPATH. Skip cleanly if unavailable;
+# Gridbook itself has no Triton dependency.
 codec = pytest.importorskip(
     "gridbook.codec",
-    reason="gridbook plugin not importable (needs the plugin on "
-           "PYTHONPATH + triton)")
+    reason="gridbook plugin not importable (put the plugin on PYTHONPATH)")
 _expand = pytest.importorskip("gridbook.expand")
 expand_cb_to_value = _expand.expand_cb_to_value
 
@@ -163,8 +162,10 @@ def test_fp8_direct_expand_bitexact(qname):
 
 
 def test_value_expand_rejects_fp4():
-    """NVFP4_CB must stay on the Triton decode path -- the expander refuses it
-    rather than silently producing a scale-less fp4 tile.
+    """The FP8 value expander must reject FP4-CB.
+
+    FP4-CB uses its dedicated native scale-composing expander; this helper
+    refuses FP4 rather than silently producing a scale-less tile.
 
     CPU tensors on purpose: ``expand_cb_to_value`` rejects ``is_fp4`` on its
     first line, before it touches the device, so the argument-validation

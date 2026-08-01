@@ -127,40 +127,79 @@ docker run --rm --gpus all -v "$PWD/dist:/dist" \
   --entrypoint bash <your-vllm-image> -c '
   pip install --no-deps -q /dist/gridbook-*.whl
   cd /                      # never run this from the repo: it would shadow the install
-  TORCH_CUDA_ARCH_LIST=12.1 python -c "
-from gridbook.cuda_ext import get_ext, get_fused_fp4_ext, csrc_dir
+  TORCH_CUDA_ARCH_LIST=12.1a python -c "
+from gridbook.cuda_ext import (
+    csrc_dir, get_bf16_grouped_ext, get_ext, get_ext_v2,
+    get_fused_ext, get_fused_fp4_ext,
+)
+from gridbook.native_cutlass import (
+    require_native_fp8_cutlass, require_native_moe_activation,
+)
 print(\"csrc:\", csrc_dir())
 m = get_ext()
-assert m is not None, \"extension failed to build\"
+assert m is not None, \"main extension failed to build\"
 assert hasattr(m, \"cb_gemv_fp8\"), \"built module is missing cb_gemv_fp8\"
-f = get_fused_fp4_ext()
-assert f is not None, \"fused NVFP4 extension failed to build\"
+v2 = get_ext_v2()
+assert v2 is not None, \"FP4-v2 extension failed to build\"
+for symbol in (\"cb_gemv_v2\", \"cb_expand_v2\"):
+    assert hasattr(v2, symbol), f\"built v2 module is missing {symbol}\"
+v2.cb_gemv_v2_prepare()  # actual cc12.0/12.1 + 99 KiB device attestation
+grouped = get_bf16_grouped_ext()
+assert grouped is not None, \"grouped BF16 CUTLASS extension failed to build\"
+for symbol in (\"cb_bf16_grouped_mm\", \"cb_bf16_grouped_mm_out\"):
+    assert hasattr(grouped, symbol), f\"built grouped module is missing {symbol}\"
+fp8_fused = get_fused_ext()
+assert fp8_fused is not None, \"fused FP8-CB extension failed to build\"
+for symbol in (\"cb_fused_prefill_mm_scaled\", \"cb_fused_moe_grouped\"):
+    assert hasattr(fp8_fused, symbol), f\"built FP8 fused module is missing {symbol}\"
+fp4_fused = get_fused_fp4_ext()
+assert fp4_fused is not None, \"fused NVFP4-CB extension failed to build\"
 for symbol in (\"cb_fused_fp4_prefill_mm_scaled\",
                \"cb_fused_fp4_moe_grouped\",
                \"cb_fused_fp4_moe_tile_sizes\"):
-    assert hasattr(f, symbol), f\"built fused module is missing {symbol}\"
-assert list(f.cb_fused_fp4_moe_tile_sizes()) == [128, 256]
-print(\"ok:\", m, f)"'
+    assert hasattr(fp4_fused, symbol), f\"built FP4 fused module is missing {symbol}\"
+assert list(fp4_fused.cb_fused_fp4_moe_tile_sizes()) == [128, 256]
+require_native_fp8_cutlass(\"release native-op gate\")
+require_native_moe_activation(\"silu\", \"release native-op gate\")
+print(\"ok:\", m, v2, grouped, fp8_fused, fp4_fused)"'
 ```
 
-The fused extension also requires the GPU operator/SASS suite from an installed
-wheel. Stage `tests/test_fused_fp4_prefill.py` outside the checkout, install the
-matching PrismaQuant producer only as a test fixture, and run it on the release
-GPU image. The release gate is 0 failures, 0 skips, `OMMA.SF.16864` present in
-both fused symbols, and no `QMMA` in either symbol. Both fused runtime flags
-remain default-off unless the served quality gate separately promotes them.
+This command compiles every serving-reachable packaged extension: the main and
+v2 decode/expansion modules, the required exact grouped BF16 CUTLASS quality
+bridge, and both optional fused specializations. It also attests the direct
+compiled vLLM FP8/CUTLASS and activation ABI that Gridbook invokes without a
+Python fallback helper. The retained `cb_persistent_tc.cu` source is not part
+of this gate: its serving selector, custom op, and package loader were deleted,
+and it remains available only to the explicitly opted-in research test.
 
-If the compile prints both modules, the packaging is genuinely sound. Two ways
-it can fail, and they mean different things:
+The fused FP4 extension also requires the GPU operator/SASS suite from an
+installed wheel. Stage `tests/test_fused_fp4_prefill.py` outside the checkout,
+install the matching PrismaQuant producer only as a test fixture, and run it on
+the release GPU image. The release gate is 0 failures, 0 skips,
+`OMMA.SF.16864` present in both fused symbols, and no `QMMA` in either symbol.
+Both fused runtime flags remain default-off unless the served quality gate
+separately promotes them.
+
+The SASS assertion needs matching `cuobjdump` and `nvdisasm` executables. CUDA's
+split-toolkit images may contain only `cuda-cuobjdump`; install the matching
+`cuda-nvdisasm-<major>-<minor>` package or mount that toolkit's `nvdisasm` into
+the validation container. A missing or older disassembler is a failed release
+environment, not a skipped kernel gate.
+
+If the command prints all five extension modules and passes the native-op
+attestation, the installed wheel's native serving floor is genuinely sound.
+Two ways it can fail, and they mean different things:
 
 - `[prismaquant-cb] ERROR: broken gridbook install — …` → the packaged sources
   are missing. **Do not tag.** This is a packaging defect.
 - `[prismaquant-cb] WARNING: … extension unavailable …` → no usable `nvcc` in
   that image. Fix the image and re-run; this gate has not been passed.
 
-Either way `get_ext()` returns `None`, and a release cut in that state installs,
-imports, registers and serves *correct* output on the slow Triton path, with one
-stderr line as the only clue.
+For a required module, either failure means a release cut cannot serve the
+corresponding Gridbook format: the call fails closed with a native-extension
+diagnostic. Gridbook has no Triton dependency or Triton fallback for CB
+operators; vLLM may still ship or use Triton for components Gridbook does not
+own. Do not tag.
 
 The full serve smoke (real artifact, decode throughput vs `docs/BENCHMARKS.md`)
 is the other GPU-only gate — see [`DISTRIBUTION.md` §3.4](DISTRIBUTION.md).
@@ -215,19 +254,23 @@ Order of operations for a first launch:
 | `install` (3.10 / 3.11 / 3.12 / 3.13) | the wheel installed **`--no-deps`** still imports, exposes `__version__` matching the dist metadata, exposes a loadable `vllm.general_plugins` entry point, and resolves `gridbook/csrc/*` from site-packages |
 | `cpu-tests` (3.10 / 3.11 / 3.12 / 3.13) | the GPU-free part of the suite, run against the **installed wheel** from outside the checkout |
 
-`check_dist.py` is the packaging gate. It asserts a literal floor of
-runtime-required sources is in *both* artifacts, that **nothing** under
-`gridbook/csrc` in the checkout is missing from either (so a new kernel file that
-nobody added to the `package-data` globs fails CI), and that the **checkout** has
-no stale repo-root `csrc/` left over from before the packaging fix. That last one
-is checked against the checkout and not the artifacts on purpose: `MANIFEST.in`
-never grafts a root `csrc/`, so a two-copy tree is invisible in the built
-wheel/sdist and an artifact-only scan would pass vacuously.
+`check_dist.py` is the packaging gate. It asserts a literal floor of current
+serving-reachable sources is in *both* artifacts: main and v2 decode/expansion,
+the grouped BF16 CUTLASS bridge, both fused specializations, and their owned
+headers. The retired persistent-TC source is deliberately outside that runtime
+floor. The gate separately asserts that **nothing** under `gridbook/csrc` in
+the checkout is missing from either artifact (so retained research sources and
+any new kernel still cannot disappear because a `package-data` glob drifted),
+and that the **checkout** has no stale repo-root `csrc/` left over from before
+the packaging fix. That last one is checked against the checkout and not the
+artifacts on purpose: `MANIFEST.in` never grafts a root `csrc/`, so a two-copy
+tree is invisible in the built wheel/sdist and an artifact-only scan would pass
+vacuously.
 
-`check_installed.py` is the install gate. It refuses to run from a directory that
-shadows site-packages, asserts `import gridbook` pulls in **no** torch / triton /
-vLLM, and asserts `cuda_ext.csrc_dir()` resolves to a directory that actually
-contains `cb_gemv.cu`.
+`check_installed.py` is the install gate. It refuses to run from a directory
+that shadows site-packages, asserts `import gridbook` pulls in **no** torch,
+vLLM, or Triton module, and proves every source/header in the literal native
+serving floor resolves from `cuda_ext.csrc_dir()` inside site-packages.
 
 **Test selection.** The suite selects itself at runtime — every CUDA, vLLM or
 artifact-backed test is guarded by `pytest.skip` / `importorskip` /

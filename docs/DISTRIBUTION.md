@@ -6,7 +6,10 @@ now the sole owner of Gridbook runtime code, CUDA sources, tests, packaging,
 and releases. PrismaQuant consumes a pinned external Gridbook contract and no
 longer vendors the package. [`RELEASING.md`](RELEASING.md) is authoritative for
 current release steps; two-tree passages below are retained only to explain
-the failure mode that motivated single ownership.
+the failure mode that motivated single ownership. The current runtime contract
+also supersedes every fail-soft/Triton passage below: Gridbook has no Triton
+dependency or serving lane, required CUDA/CUTLASS kernels fail closed, and
+[`RELEASING.md`](RELEASING.md) carries the active gate.
 
 **Scope.** `gridbook` is technically finished enough to be used by strangers and
 is not being used by strangers. This document records *why* each distribution
@@ -738,9 +741,9 @@ else silently changes what is being gated.
       `[prismaquant-cb] WARNING: CUDA decode-GEMV extension unavailable` does
       **not** appear.
 - [ ] Confirm decode throughput matches the measured figure for that artifact in
-      `docs/BENCHMARKS.md` (e.g. 27B: ~10.3 tok/s). A silent Triton fallback is
-      the exact failure this gate exists to catch, and it is invisible without a
-      speed check.
+      `docs/BENCHMARKS.md` (e.g. 27B: ~10.3 tok/s). Missing required Gridbook
+      kernels now fail closed; this speed check catches a stale runtime or an
+      unintended native dispatch regression that symbol/load gates cannot.
 - [ ] Confirm on the wheel-installed path that both artifact registry keys
       resolve to the same implementation: canonical `"gridbook"` and the
       read-only legacy alias `"prismaquant"`. Published artifacts use the
@@ -826,8 +829,8 @@ Still open, and still blocking:
 > that `ROADMAP.md` "no longer list as 'planned' two things that shipped
 > (Persistent-N large-M prefill; batched-expert MoE prefill)". Both halves were
 > wrong. `ROADMAP.md` already records Persistent-N as *"Built, parity-green, and
-> **2–5.7× slower** than expand-then-GEMM at 27B shapes … The kernel is retained,
-> quarantined behind `PRISMAQUANT_ENABLE_PTC=1` … Do not enable it"* — an honest
+> **2–5.7× slower** than expand-then-GEMM at 27B shapes … The serving selector,
+> custom op, loader, and switch are deleted; only direct research source remains"* — an honest
 > negative result, not a plan. And `grep -i batched ROADMAP.md` returns nothing
 > (rc=1), so there was no second item to fix. The box would have read as a live
 > blocker that no one could action.

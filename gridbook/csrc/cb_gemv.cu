@@ -25,7 +25,8 @@
 //           -> f32 -> * scale -> bf16_rn).
 //
 // Scope: fp8 grid, `product` mode, n_sub=4 (sub_dim=2) — the shipped
-// FP8_CB_K{36,40,44,48} rungs. Anything else stays on the Triton fallback.
+// FP8_CB_K{36,40,44,48} rungs. Unsupported contracts fail before launch;
+// Gridbook has no alternate Triton implementation.
 // Compiled by torch.utils.cpp_extension WITHOUT fast-math (division and
 // conversion rounding must match torch exactly).
 
@@ -1752,7 +1753,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_expand_fp8_kernel(
 // Shared body for both expander entries: identical validation, identical
 // launch-config selection, identical kernel. `w_ptr` is the N*K byte
 // destination (allocated by the caller). Keeping this in ONE place is
-// deliberate: the allocating entry is on the shipping stock path, and any
+// deliberate: the allocating entry is on the shipping exact-expansion path, and any
 // drift between it and the out-variant would silently corrupt served weights.
 static void cb_expand_fp8_launch(const torch::Tensor& qw_padded,
                                  const torch::Tensor& cb_flat_fp8,
@@ -1834,8 +1835,8 @@ void cb_expand_fp8_into(torch::Tensor out, torch::Tensor qw_padded,
 //      specific address range as persisting FOR THAT STREAM. The window is a
 //      per-stream attribute, so every stream that touches the range (decode
 //      and GEMM alike) must carry it.
-// Everything degrades to false/no-op: an un-pinnable device must never be
-// fatal, python falls through to the stock path.
+// This research helper reports false/no-op on an un-pinnable device; no
+// production dispatch depends on it.
 // ---------------------------------------------------------------------------
 static int64_t l2_dev_attr(cudaDeviceAttr attr) {
   int dev = 0;

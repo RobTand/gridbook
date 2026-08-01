@@ -42,16 +42,16 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     # 3.13 measured end-to-end 2026-07-28 (clean python:3.13-slim container,
     # installed wheel, torch 2.13.0+cpu: 156 passed / 136 skipped / 0 failed).
-    # 3.14 stays out until torch and triton both ship wheels for it.
+    # 3.14 stays out until torch ships supported wheels for it.
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # Unpinned on purpose. gridbook is installed *into an environment that already
-# has vLLM*, whose torch/triton are typically local-version wheels
+# has vLLM*, whose torch is typically a local-version wheel
 # (e.g. 2.11.0+cu130) that no pin from PyPI can satisfy. huggingface-hub is a
 # direct import (config.py, linear.py) and was previously relied on
 # transitively via vLLM.
-dependencies = ["torch", "triton", "safetensors", "huggingface-hub"]
+dependencies = ["torch", "safetensors", "huggingface-hub"]
 
 [project.optional-dependencies]
 # vLLM is NOT a hard dependency: it is multi-GB, the reference serving builds

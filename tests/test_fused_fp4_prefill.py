@@ -21,8 +21,8 @@ Contracts pinned:
     and ragged N/K.
   * fp32-emulation tolerance on the kernel's OWN activation bucket
     (native NVFP4: per-tensor fp32 global x per-group ue4m3 SF). NOTE: this
-    bucket differs from the Triton/transient paths' fp32-group-scale QDQ —
-    the measured fused-vs-Triton delta (~7.5e-2 rel on random Linears) is a
+    bucket differs from the quality/transient path's fp32-group-scale QDQ —
+    the measured fused-vs-quality delta (~7.5e-2 rel on random Linears) is a
     property of the FORMAT's two activation buckets, not a kernel bug. The
     model A/B is now red, so the fused paths remain explicit opt-ins pending
     the audit's full reconsideration gates.
@@ -45,6 +45,8 @@ import torch
 
 codec = pytest.importorskip("gridbook.codec")
 fmt = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+
+from cb_torch_reference import cb_linear_reference  # noqa: E402
 
 if not torch.cuda.is_available():
     pytest.skip("needs CUDA", allow_module_level=True)
@@ -146,10 +148,7 @@ def run_pair(wctx, M, seed):
 def test_sass_fused_symbols_issue_omma_16864_and_no_qmma():
     so = Path(ext.__file__)
     cuobjdumps = []
-    for cand in ("cuobjdump",
-                 "/usr/local/cuda/bin/cuobjdump",
-                 os.path.join(os.path.dirname(torch.__file__), "..", "triton",
-                              "backends", "nvidia", "bin", "cuobjdump")):
+    for cand in ("cuobjdump", "/usr/local/cuda/bin/cuobjdump"):
         try:
             subprocess.run([cand, "--version"], capture_output=True, check=True)
             resolved = shutil.which(cand) or str(Path(cand).resolve())
@@ -160,17 +159,12 @@ def test_sass_fused_symbols_issue_omma_16864_and_no_qmma():
     assert cuobjdumps, (
         "enablement attestation requires cuobjdump; none is executable")
     # CUDA's split toolkit makes cuobjdump invoke nvdisasm as a separate
-    # executable.  Serving images may intentionally omit it from PATH while
-    # shipping compatible copies inside Triton packages; CUDA 12.8's copy,
-    # for example, cannot decode an sm_121 cubin, while tokenspeed_triton's
-    # CUDA 13.1 copy can. Try every available candidate and accept only a
-    # successful disassembly, preserving the instruction gate rather than
-    # skipping or weakening it because the first nvdisasm is too old.
-    site_root = Path(torch.__file__).resolve().parent.parent
+    # executable. Try every CUDA-toolkit candidate and accept only a successful
+    # disassembly, preserving the instruction gate rather than weakening it
+    # because the first nvdisasm is too old.
     nv_candidates = [
         shutil.which("nvdisasm"),
-        site_root / "tokenspeed_triton/backends/nvidia/bin/nvdisasm",
-        site_root / "triton/backends/nvidia/bin/nvdisasm",
+        Path("/usr/local/cuda/bin/nvdisasm"),
     ]
     errors = []
     sass = None
@@ -499,12 +493,13 @@ def test_static_lsq_quantized_fused_gemm_bitexact_vs_stock():
     assert torch.equal(y_fused.view(torch.uint16), y_ref.view(torch.uint16))
 
 
-def test_fused_vs_triton_bucket_delta_documented():
-    """The fused path's native-NVFP4 activation bucket vs the Triton decode
-    path's fp32-group-scale bucket: a real, bounded numerics difference (NOT
-    a kernel defect — the weight side is bit-exact between them). Recorded
-    here so a regression in EITHER direction is loud."""
-    from gridbook.kernels import cb_decode_linear
+def test_fused_vs_quality_bucket_delta_documented():
+    """Native-NVFP4 activation scales vs the quality-path FP32 group scales.
+
+    This is a real, bounded numerics difference rather than a weight-decode
+    defect.  The quality arm is decoded by a pure-Torch format reference, so
+    this gate cannot accidentally reintroduce an interpreted serving kernel.
+    """
     wctx = prep_weight(16, N=320, K=1536, mode="product",
                        coding=fmt.SCALE_CODING_TWO_TIER, seed=11)
     torch.manual_seed(11)
@@ -512,15 +507,15 @@ def test_fused_vs_triton_bucket_delta_documented():
     x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
     _, y_f, _ = run_pair(wctx, M, seed=11)
     xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
-    y_tri = cb_decode_linear(
+    y_quality = cb_linear_reference(
         xq, wctx["qwp"], wctx["cb_flat"],
         torch.zeros(N, dtype=torch.int32, device=DEV),
         torch.zeros(1, device=DEV),
         codec.build_compose_table(codec.TWO_TIER_SUB_TABLE).to(DEV),
         N=N, K=K, k_bits=wctx["k"], n_sub=2, type_size=wctx["ts"],
         is_fp4=True, is_v2=True)
-    rel = ((y_f.float() - y_tri.float()).norm()
-           / y_tri.float().norm().clamp_min(1e-6)).item()
+    rel = ((y_f.float() - y_quality.float()).norm()
+           / y_quality.float().norm().clamp_min(1e-6)).item()
     assert rel <= 0.15, f"bucket delta blew up: {rel:.3e}"
     assert rel >= 1e-4, "buckets identical?! the e4m3-SF snap vanished"
 
@@ -711,6 +706,9 @@ def test_moe_grouped_invalid_expert_id_traps_fail_closed(bad_eid):
     )
     env = os.environ.copy()
     env["CUDA_LAUNCH_BLOCKING"] = "1"
+    test_dir = str(Path(__file__).resolve().parent)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (test_dir, env.get("PYTHONPATH", "")) if part)
     proc = subprocess.run(
         [sys.executable, "-c", child_code], capture_output=True, text=True,
         env=env, timeout=180)
@@ -989,11 +987,9 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
     Equality is bitwise BF16, so no routing, padding, stage-2 expert identity or
     combine drift can hide behind a numerical tolerance.
     """
-    from gridbook.moe import (
-        MoEActivation,
-        PrismaQuantCBMoEMethod,
-        apply_moe_activation,
-    )
+    from gridbook.moe import PrismaQuantCBMoEMethod
+    from gridbook.native_cutlass import native_moe_activation
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
     monkeypatch.setenv("PRISMAQUANT_CB_GROUPED_TRIM", "1")
     k, n_sub, E, hidden, inter = 16, 2, 5, 256, 256
@@ -1051,7 +1047,10 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
         w13_cb_qweight=w13,
         w2_cb_qweight=w2,
     )
-    act = MoEActivation.from_str("silu")
+    try:
+        act = MoEActivation.from_str("silu")
+    except Exception:  # noqa: BLE001 - enum spelling differs across vLLM
+        act = MoEActivation.SILU
     cases = ("empty", "hotspot", "nonmonotonic", "balanced")
 
     for tile_m in (128, 256):
@@ -1087,7 +1086,7 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
                     k, n_sub, type_size, gs1)
                 intermediate = torch.empty(
                     (x_pad.shape[0], inter), dtype=gate_up.dtype, device=DEV)
-                apply_moe_activation(act, intermediate, gate_up)
+                native_moe_activation(act, intermediate, gate_up)
 
                 gs2 = stage2_scale
                 dense = _dense_native_role_reference(
@@ -1107,7 +1106,6 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
                     f"{int((grouped.view(torch.uint16) != reference.view(torch.uint16)).sum())}"
                 )
 
-
 def test_stagewise_activation_accumulation_decomposition(
         record_testsuite_property):
     """Decompose the activation-bucket, MMA, and grouping deltas by MoE stage.
@@ -1117,7 +1115,7 @@ def test_stagewise_activation_accumulation_decomposition(
     validation. B->C uses the pre-existing 1e-2 native-fused emulation bound.
     C->D must remain bitwise BF16 zero.
     """
-    from gridbook.moe import MoEActivation, apply_moe_activation
+    from gridbook.native_cutlass import native_moe_activation
 
     k, n_sub, E, hidden, inter = 16, 2, 3, 256, 256
     type_size = fmt.nvfp4_cb_type_size(
@@ -1163,7 +1161,7 @@ def test_stagewise_activation_accumulation_decomposition(
         # are not contaminated by propagation of an earlier branch's error.
         intermediate = torch.empty(
             (x_pad.shape[0], inter), dtype=stage1[2].dtype, device=DEV)
-        apply_moe_activation(MoEActivation.SILU, intermediate, stage1[2])
+        native_moe_activation("silu", intermediate, stage1[2])
         stage2 = _stagewise_fp4_decomposition(
             intermediate, segments, w2_ctx, w2, lut, compose, tile_m)
 

@@ -4,16 +4,17 @@ Every entry below is keyed to something you will actually see — a log line, an
 exception, or a number that is wrong. If your symptom is not here, please open an
 issue; [CONTRIBUTING.md](../CONTRIBUTING.md) lists what to include.
 
-**First, find out which path you are on.** Most "gridbook is slow" reports are
-really "the CUDA extension did not load". The check in
-[INSTALL.md](INSTALL.md#verify-the-install) answers that in ten seconds without
-serving a model.
+**First, verify the native kernel set.** Current Gridbook has no slow serving
+lane: if a required CUDA/CUTLASS extension did not load, the operation fails
+closed. The check in
+[INSTALL.md](INSTALL.md#verify-the-install) answers that directly without
+serving a model (a cold JIT build still takes roughly 30 seconds per extension).
 
 **A note on grepping.** The plugin's log lines and environment variables use the
 project's older `prismaquant` prefix, not `gridbook` — searching your vLLM log
 for "gridbook" will find nothing. Search for **`[prismaquant-cb]`**.
 
-- [The CUDA extension did not load (Triton fallback)](#the-cuda-extension-did-not-load-triton-fallback)
+- [The native extension did not load](#the-native-extension-did-not-load)
 - [Broken install: CUDA sources missing from the package](#broken-install-cuda-sources-missing-from-the-package)
 - [Incompatible JIT extension: the module loaded but has the wrong API](#incompatible-jit-extension-the-module-loaded-but-has-the-wrong-api)
 - [Fused prefill extension unavailable](#fused-prefill-extension-unavailable)
@@ -28,35 +29,39 @@ for "gridbook" will find nothing. Search for **`[prismaquant-cb]`**.
 - [Tensor parallel (`tp > 1`)](#tensor-parallel-tp--1)
 - [The model loads but generates garbage](#the-model-loads-but-generates-garbage)
 - [Other exceptions you may hit](#other-exceptions-you-may-hit)
-- [The first request stalls for ~30 seconds](#the-first-request-stalls-for-30-seconds)
+- [The first model load stalls for kernel compilation](#the-first-model-load-stalls-for-kernel-compilation)
 - [Benchmark numbers move between runs](#benchmark-numbers-move-between-runs)
 
 ---
 
-## The CUDA extension did not load (Triton fallback)
+<a id="the-cuda-extension-did-not-load-triton-fallback"></a>
+
+## The native extension did not load
 
 **Symptom** — on stderr, during model load:
 
 ```
 [prismaquant-cb] WARNING: gridbook's CUDA decode-GEMV extension could not be
-built (<ErrorType>: <message>); falling back to the Triton decode path (slow
-prototype). To get the CUDA path: install a CUDA toolchain matching your torch
-build ...
+built (<ErrorType>: <message>); native Gridbook execution is unavailable and
+serving will fail closed. To enable the native path: install a CUDA toolchain
+matching your torch build ...
 ```
 
-(Older plugin builds print `WARNING: CUDA decode-GEMV extension unavailable`.
-Same meaning.)
+(Older plugin builds may instead say that they are falling back to Triton. That
+message identifies the retired fail-soft release, not current behavior.)
 
-**What it means** — the plugin is serving **correct** output on the pre-CUDA
-reference kernels, which are several times slower. None of the published
-performance numbers are reachable on this path. It is not a correctness problem.
+**What it means** — a capability probe could not build/load native code. The
+first serving call that requires it raises `NativeKernelUnavailableError`; it
+does not run a different kernel or continue at prototype speed. Treat this as a
+broken serving environment even if model construction progressed far enough to
+emit more logs.
 
-For scale, on dense decode — where the fallback is unchanged code — the 27B
-measured **4.20 tok/s** on the Triton decode-GEMM against **10.28** on the CUDA
-GEMV. MoE loses more, and by an artifact-dependent amount. Those are the
-before/after numbers from when the CUDA kernels landed, **not** a fresh benchmark
-of today's fallback; [BENCHMARKS.md](BENCHMARKS.md#what-the-fallback-costs)
-states which parts were measured and which were not.
+For historical scale, the retired Triton dense decode prototype measured **4.20
+tok/s** on the 27B against **10.28** on the CUDA GEMV. MoE lost more by an
+artifact-dependent amount. Those before/after measurements explain why the
+fallback was removed; there is no current Triton arm to reproduce from a serving
+switch. [BENCHMARKS.md](BENCHMARKS.md#retired-triton-path-historical-cost)
+states which parts were measured and which were inferred.
 
 **Causes and fixes**, in order of likelihood:
 
@@ -67,8 +72,9 @@ states which parts were measured and which were not.
 | A compiler error from `nvcc` | Toolchain/torch mismatch, or an `nvcc` too old for your GPU's architecture. | `nvcc` 13.0 is the tested toolchain. Match the CUDA major version your torch was built against. |
 | Anything, but only inside a container that used to work | The ephemeral build cache is being rebuilt and failing. | See [persisting the cache](INSTALL.md#persisting-the-jit-build-cache). |
 
-`PRISMAQUANT_CB_DECODE=triton` also forces this path deliberately. If you (or a
-model card) set it, unset it.
+No current environment switch enables Triton. Remove obsolete
+`PRISMAQUANT_CB_DECODE=triton` or `PRISMAQUANT_CB_EXPAND=triton` settings from
+old scripts/model-card commands rather than relying on them for bisection.
 
 ---
 
@@ -88,7 +94,7 @@ in it, e.g. `FileNotFoundError: .../site-packages/gridbook/../csrc/cb_gemv.cu`.
 **Cause** — the `.cu` sources are not present in the installed package. This was
 a real defect in early builds: `csrc/` lived at the repo root and only the Python
 package was installed, so any non-editable `pip install` produced a
-working-but-slow server (reported in
+working-but-slow server in that retired release (reported in
 [issue #1](https://github.com/RobTand/gridbook/issues/1)). The sources now ship
 *inside* the package at `gridbook/csrc/`.
 
@@ -116,9 +122,10 @@ build directory '/opt/gridbook/ext-cache' has mode ..., owner uid:gid ..., and
 is ... by this process. Clear this extension's build directory ...
 ```
 
-The persistent-TC and fused loaders report the same module path, missing
-contract, and build-directory diagnostics. They remain fail-soft and return
-`None`, so their callers take the existing correct fallback.
+The fused loaders report the same module path, missing contract, and
+build-directory diagnostics. An optional optimized extension may
+return `None` only where the caller has a separately qualified **native** CUDA +
+CUTLASS route. A required serving operation raises; none selects Triton.
 
 **Cause** — this symptom proves only that a module loaded successfully but does
 not export the API the current Python code will call. A stale or corrupt build
@@ -148,12 +155,11 @@ inspect the directory from *inside* the serving container:
 docker exec <container> sh -lc 'ls -ld "$PRISMAQUANT_CB_EXT_DIR"; id'
 ```
 
-**Why it is reported rather than tolerated** — until the loaders checked, the
+**Why it fails closed** — until the loaders checked, the
 module was returned unexamined. A missing symbol then surfaced either as
 `AttributeError: module 'prismaquant_cb_ext' has no attribute '<name>'` raised
-mid-forward from inside a custom op, or — for the optional bindings, which read
-an absent symbol as "an older build" — as no error at all and a quietly slower
-server.
+mid-forward from inside a custom op, or — for optional bindings — as no error at
+all and an unproven dispatch. Current required symbols are validated before use.
 
 ---
 
@@ -167,10 +173,12 @@ stays on the transient expand path (the shipping default — this is expected on
 non-sm_120 GPUs and without nvcc).
 ```
 
-**This is usually fine.** It affects only prefills of 17–128 tokens, where a
-CUTLASS `sm_120`-family kernel would have been ~1.04–1.45× faster
-([KERNELS.md](KERNELS.md)). Everything falls back to the transient-expand path,
-which is the general shipping default.
+**This can be fine when the native transient route is qualified.** It affects
+eligible FP8-CB calls in the M=9–128 dispatch band; the measured M=32/64/128
+points were ~1.04–1.45× faster on the fused
+CUTLASS `sm_120`-family kernel
+([KERNELS.md](KERNELS.md)). Dispatch then uses native CUDA transient expansion
+plus CUTLASS GEMM, which is the general shipping path—not a Triton fallback.
 
 It is *expected* on any non-Blackwell GPU (the kernel is `sm_120`-family only)
 and anywhere `nvcc` is missing. It can also mean vLLM's bundled CUTLASS headers
@@ -357,20 +365,23 @@ higher.
 
 Work down this list:
 
-1. **Are you on the Triton fallback?** By far the most common cause — see
-   [above](#the-cuda-extension-did-not-load-triton-fallback). Run the
-   [install check](INSTALL.md#verify-the-install).
+1. **Are all required native extensions loaded?** Run the
+   [install check](INSTALL.md#verify-the-install) and inspect every
+   `[prismaquant-cb]` diagnostic. Current Gridbook fails when a required kernel
+   is missing; if a server merely becomes slow, first confirm you are not
+   running an older fail-soft Gridbook release.
 2. **Is `--enforce-eager` set?** Without it, decode measured *worse* — see
    [the next section](#do-i-really-need---enforce-eager).
-3. **Are any `PRISMAQUANT_*` variables set?** Several model cards and scripts set
-   escape hatches such as `PRISMAQUANT_CB_DECODE=triton` (forces the slow decode
-   path) or `PRISMAQUANT_CB_PREFILL=loop` (forces the per-expert MoE prefill).
-   Check with `env | grep PRISMAQUANT`.
-4. **MoE prefill on a large batch?** The default for fp8-CB MoE prefill is
-   `auto`, a measured per-layer path selection. On a Laguna-class 117B MoE the
-   CUDA chunk-expander took prefill from 293 → 1,821 tok/s at 8k and 207 → 1,822
-   at 63k (commit `8829c16`); if you are far below that, you are probably on an
-   older plugin, or on the Triton path.
+3. **Are any `PRISMAQUANT_*` variables set?** Old model cards and scripts may
+   carry retired Triton or MoE prefill-mode selectors. Remove retired selectors
+   and compare with the documented native defaults. Check with
+   `env | grep PRISMAQUANT`.
+4. **MoE prefill on a large batch?** Current dispatch is fixed: grouped CUDA
+   GEMV at M≤16, then quality-green fused CUTLASS for eligible FP8-CB calls or
+   exact BF16 expansion + the owned CUTLASS grouped bridge. The predecessor CUDA
+   chunk-expander path took Laguna-class prefill from 293 → 1,821 tok/s at 8k and
+   207 → 1,822 at 63k (commit `8829c16`), but those are historical—not a
+   throughput promise for the new bridge. Verify the artifact and plugin commit.
    `--max-num-batched-tokens 16384` matters here: chunked prefill re-expands per
    microbatch.
 5. **Large-M dense prefill is a known gap**, not a misconfiguration: ~1.44× the
@@ -385,9 +396,11 @@ It remains the conservative configuration used for the published 27B result,
 but it is no longer the only capture-safe choice.
 
 The old inline dispatch let a prefill-sized trace bake the wrong arm into a
-decode graph. The default `PRISMAQUANT_CB_DISPATCH=op` now wraps each complete
-Linear/MoE dispatch in one opaque custom op. A decode-size capture therefore
-records the GEMV arm, while prefill executes eagerly and chooses its own arm.
+decode graph. That is a historical failure of the retired pre-hardening path.
+Current Gridbook permanently wraps each complete Linear/MoE dispatch in one
+opaque custom op. A decode-size capture therefore records the GEMV arm, while
+prefill executes eagerly and chooses its own arm; there is no switch back to
+the old host branch.
 
 The validated candidate is:
 
@@ -395,14 +408,16 @@ The validated candidate is:
 --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8]}'
 ```
 
-Leave `PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE` unset and do not select
-`PRISMAQUANT_CB_DISPATCH=inline`. On the close-rate 0.6B canary this improved
-Gridbook's 32+256 whole-request latency by 20.1%, to within 5.9% of native;
-changed batch-1 and batch-4 prompts matched eager text, tokens, and token
-logprobs exactly. It also adds graph-capture startup time and memory, so choose
-capture sizes that match the concurrency you actually serve. The 295B FP4-v2
-path separately measured +24% decode. The published 27B FP8-CB artifact still
-needs the full streaming gate before its quickstart changes.
+Leave `PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE` unset. On the dated close-rate 0.6B
+canary, the opaque arm improved Gridbook's 32+256 whole-request latency by
+20.1%, to within 5.9% of native; changed batch-1 and batch-4 prompts matched
+eager text, tokens, and token logprobs exactly. That run predates the current
+permanent boundary and direct registered-operator FP8 binding, so it remains
+historical capture evidence rather than a benchmark of today's full serving
+stack. Graph capture also adds startup time and memory, so choose capture sizes
+that match the concurrency you actually serve. The 295B FP4-v2 path separately
+measured +24% decode. The published 27B FP8-CB artifact still needs the full
+streaming gate before its quickstart changes.
 
 The rules and evidence limits are in
 [KERNELS.md](KERNELS.md#cuda-graph-safety-rules) and
@@ -412,18 +427,24 @@ The rules and evidence limits are in
 
 ## Non-Blackwell GPU: what breaks
 
-The base FP4-CB path declares compute capability **8.0**, while FP8-CB's native
-prefill path requires **8.9** and is now checked during model construction. See
-the [hardware matrix](INSTALL.md#hardware-matrix) for the per-path breakdown.
+The grouped-BF16 CUTLASS kernel used by FP4-CB can compile for compute
+capability 8.0, but that is not the full FP4 serving floor. Every FP4-v2 quality
+path also needs the exact v2 expander, whose device prepare currently accepts
+only cc 12.0/12.1. FP8-CB native prefill requires cc 8.9 and is checked during
+model construction. See the [hardware matrix](INSTALL.md#hardware-matrix).
 
-- **`sm_89` / `sm_90` (RTX 4090, L40S, H100)** — decode and dense prefill are
-  *expected* to work (the decode kernel has no architecture guards); the mid-M
-  fused kernel fails soft with the warning above. **Inferred from code, untested
-  by the author.**
+- **`sm_89` / `sm_90` (RTX 4090, L40S, H100)** — FP8-only decode and dense
+  prefill are expected to work; when the optional Blackwell fused kernel is
+  ineligible, FP8 uses native CUDA expansion + CUTLASS. FP4-CB is rejected at
+  weight load because v2 expander prepare rejects these devices. The FP8 claim
+  is inferred from code and untested by the author.
 - **`sm_80` (A100)** — an FP8-CB artifact is rejected early with a clear
   `sm_89+` error. The former behavior loaded successfully and then failed at
-  `cutlass_scaled_mm` / `scaled_fp8_quant` on the first prompt longer than 16
-  tokens. FP4-CB retains its BF16 fallback, but is untested on this card.
+  the FP8 quantizer/scaled-matmul boundary on the first prompt longer than 16
+  tokens. Current Gridbook attests the registered native `torch.ops._C`
+  operators directly and never enters vLLM's fallback-capable Python wrapper.
+  FP4-CB is also rejected: the grouped-BF16 kernel can target SM80, but the
+  required v2 expander cannot prepare on this card.
 - Per-artifact groups matter too. The 27B's vision tower is stock NVFP4 W4A16 and
   needs a vLLM NVFP4 backend independently of gridbook.
 
@@ -472,18 +493,21 @@ predates its architecture support, and confirm the artifact is complete (see
 | `<prefix>: fp4 MoE experts require two-tier v2 scale coding` | The artifact uses the legacy fp4 scale plane for MoE experts, which has no expert transient path. Legacy-format artifact; report the model id. |
 | `<prefix>: in_features <K> not a multiple of ...` | The Linear's input width is not a multiple of the format's superblock — an artifact/export defect. |
 | `prismaquant shared-CB: no unique scheme for '<name>'` | The top-level MoE expert loader could not resolve a shared-expert Linear to exactly one format entry. Report with the model id and the full name in the message. |
-| `persistent-TC ext not enabled (PRISMAQUANT_ENABLE_PTC=1)` | You enabled a code path that requires the quarantined persistent-N kernel. **Do not set `PRISMAQUANT_ENABLE_PTC=1`** — that kernel is off by default because it measured *slower* than the shipping path and is under a stability quarantine. |
+| `prismaquant CB tensor '<name>' resolved to plain bf16 parameter '<target>'` | The architecture's shared-expert prefix did not resolve to a native CB Linear. Current Gridbook aliases HunYuan-V3 shared and MTP-nested forms; reaching this error means the architecture/prefix contract drifted. Model load stops because decoding CB into an upstream plain BF16 Linear could select a non-Gridbook kernel. Report both names and the model/vLLM versions. |
 
 ---
 
-## The first request stalls for ~30 seconds
+## The first model load stalls for kernel compilation
 
-Expected once per build cache: the CUDA extension JIT-compiles on first use.
+Expected once per build cache outside a prewarmed image: required CUDA/CUTLASS
+extensions JIT-compile while the model is loading. Production Gridbook resolves
+every reachable module before the model becomes serve-ready; compilation is not
+deferred to the first forward.
 Measured cold in the reference container (`vllm-node:latest`, compile-only, no
 GPU): **28.7 s** and **32.3 s** at `TORCH_CUDA_ARCH_LIST` 12.1 and 12.0, matching
 the 29.4 s / 29.7 s recorded in `gridbook/cuda_ext.py`. Call it ~30 s; it varies
 with the arch list and the host. The plugin deliberately warms it at *weight
-load* so the first request is not the one that pays — but in a container with an
+load* so no served request pays — but in a container with an
 ephemeral home directory you pay it on every start.
 
 Fix: [persist the build cache](INSTALL.md#persisting-the-jit-build-cache) with

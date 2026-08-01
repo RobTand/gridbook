@@ -14,18 +14,22 @@ measurements, and the 295B result carries **no quality-vs-teacher claim**.
 
 ## 2026-07-31 CUDA-graph canary — close-rate, not formal parity
 
-The current opaque per-layer dispatch (`PRISMAQUANT_CB_DISPATCH=op`) fixes the
-historical graph-capture failure described below. On a Qwen3 0.6B iteration
-pair, vLLM `FULL_DECODE_ONLY` with compilation mode 0 and capture sizes
-`[1,2,4,8]` measured:
+This is historical evidence from the commit named below. Its then-new opaque
+per-layer arm fixed the still-earlier host-branch graph-capture failure; current
+Gridbook makes that opaque boundary unconditional and has removed the old
+branch. On a Qwen3 0.6B iteration pair, vLLM `FULL_DECODE_ONLY` with compilation
+mode 0 and capture sizes `[1,2,4,8]` measured:
 
 Execution identity: GB10 `sm_121`, driver 595.84, TP=1, Gridbook 0.3.0 at
 `aea57dcb`, vLLM `0.23.1rc1.dev764+g54b16d8a9` / Torch 2.11.0 / CUDA 13.0 in
 image digest `sha256:d0840ff0e0ba1899a51bf4cb473f43d0c765288b8de708080ad9d95768615141`.
-The Gridbook arm is `FP8_CB_K36` (W8A8), default opaque dispatch, with no CUDA
-extension-build warning; the native arm is compressed-tensors NVFP4 (W4A4).
-The concrete native Linear backend and per-kernel fallback trace were not
-retained, another reason this row is a canary rather than release evidence.
+The Gridbook arm is `FP8_CB_K36` (W8A8), using that commit's opaque arm, with no
+CUDA extension-build warning; the native arm is compressed-tensors NVFP4
+(W4A4). The concrete native Linear backend and per-kernel fallback trace were
+not retained. This run also predates Gridbook's direct registered-operator FP8
+binding, which now bypasses the fallback-capable `vllm._custom_ops` wrapper.
+Those limits make this a historical graph-capture canary, not release evidence
+for the current operator stack.
 
 | Workload | Gridbook | native | Gridbook / native |
 |---|---:|---:|---:|
@@ -48,6 +52,57 @@ Use this small pair for iteration; a release claim still requires exact
 whole-artifact accounting, the same-session streaming protocol, and the 27B
 gate. The timings above are offline whole-request latency with three warmups
 and ten measured repetitions, not TTFT/TPOT measurements.
+
+## 2026-08-01 DSV4-shaped grouped-BF16 bridge microbenchmark
+
+This is a synthetic kernel measurement of the new quality-preserving bridge,
+not a served throughput result. It isolates already-expanded BF16 expert
+weights and already-QDQ'd BF16 activations; weight decode/expansion, activation
+QDQ, routing, activation, router combine, and model execution are excluded.
+Consequently it is independent of the FP4-CB `K14`/`K15` rung and is common
+infrastructure for the quality-kernel Gridbook arms in the planned ~92 GB
+comparison. It is not evidence for one allocation arm over another.
+
+Execution identity: one GB10 (`sm_121`), Torch `2.11.0+cu130`, CUDA 13.0,
+`vllm-node:latest` image ID `d0840ff0e0ba`. The extension was built and
+attested before timing. A seed-731 uniform synthetic router used DSV4-shaped
+`E=256`, `top_k=8`, `T=128`, hence `P=1024` routed pairs. The measured expert
+chunk was `[0,32)`: all 32 experts were active and owned 117 pairs; 250 of 256
+experts were active globally. The comparison is Gridbook's single owned
+CUTLASS grouped launch against the retired segmented reference: up to 32
+BF16 `F.linear` calls writing the same preallocated output segments.
+
+“Cold” is the first data invocation after extension attestation, tensor
+allocation, and a device synchronize; it excludes JIT compilation. “Warm” is
+the median of 30 individual CUDA-event samples after 10 alternating warmups.
+`reference / grouped` below is a speed ratio, so values below 1 mean the owned
+grouped kernel is slower.
+
+| DSV4 projection | BF16 GEMM shape per expert | grouped cold | segmented cold | grouped warm | segmented warm | reference / grouped, warm |
+|---|---|---:|---:|---:|---:|---:|
+| `w13` | `K=4096`, `N=4096` | 6.700 ms | 291.943 ms | 6.471 ms | 5.346 ms | 0.826× |
+| `w2` | `K=2048`, `N=4096` | 2.872 ms | 2.677 ms | 2.792 ms | 2.569 ms | 0.920× |
+
+The long-`K` `w13` routing sweep (router seed `731 + T`) remained a warm
+regression rather than a hidden crossover:
+
+| routed pairs `P` | pairs in measured chunk | grouped warm | segmented warm | reference / grouped |
+|---:|---:|---:|---:|---:|
+| 1,024 | 122 | 6.236 ms | 5.367 ms | 0.861× |
+| 4,096 | 522 | 6.419 ms | 5.453 ms | 0.850× |
+| 8,192 | 1,029 | 6.321 ms | 5.920 ms | 0.937× |
+
+**Interpretation:** the owned bridge avoids the pathological first cuBLAS
+initialization seen in the first `w13` reference call and removes the forbidden
+vendor/runtime fallback, but its current generic SM80-compatible
+`DefaultGemmGrouped` is **6–17% slower on warm GPU time** for these synthetic
+DSV4 shapes. The 292 ms cold reference value is one-time library setup and must
+not be multiplied by layers or requests. A `TileM=64` prototype did not improve
+the warm result. The concrete optimization opportunity is a CUTLASS 3.x
+SM100/SM121 grouped collective; the legacy grouped template has no SM100
+specialization. Until that work is measured end-to-end, this bridge is a
+quality/native-ownership result, not a prefill speed claim or a
+Blackwell-optimized kernel.
 
 ## What is being compared, and how
 
@@ -210,14 +265,14 @@ formats on the experts.
   projection, replacing ~10k host operations per token) took decode from 3.5 to
   ~33 tok/s — **faster than BF16**, within 8% of the native baseline, at 3× smaller
   and −43% ALL-KL.
-- **Prefill (updated 2026-07-23): solved.** The TTFT above was measured against
+- **Prefill (historical update 2026-07-23).** The TTFT above was measured against
   the old correctness-path per-expert prefill loop (~71k launches per 1400-token
-  prefill) and **no longer describes the shipping default**. A CUDA chunk-expander
+  prefill) and does not describe the current native-only path. A CUDA chunk-expander
   feeding vLLM's own fused-MoE grouped kernel replaced it; measured on
   Laguna-S-2.1 (117B MoE): **293 → 1,821 tok/s at 8k** and **207 → 1,822 tok/s at
-  63k** (commit `8829c16`). The current default is `auto` — a measured per-layer
-  selection over the candidate prefill paths. The 35B TTFT row has not been
-  re-measured on the new path.
+  63k** (commit `8829c16`). Current Gridbook instead owns the exact-BF16 CUTLASS
+  grouped bridge; neither the 35B TTFT row nor those Laguna figures have been
+  re-measured on that bridge.
 
 ---
 
@@ -301,43 +356,28 @@ family failures shared by all three builds — scenario churn at the quality pla
 
 ---
 
-## What the fallback costs
+## Retired Triton path: historical cost
 
-If `nvcc` is missing, the JIT build fails, or `PRISMAQUANT_CB_DECODE=triton` is
-set, the plugin keeps serving **correct** output on the pre-CUDA code paths.
-**There is no fresh benchmark of that configuration.** What there is:
+Current Gridbook has no Triton dependency or serving fallback. If a required
+native CUDA/CUTLASS extension is unavailable, serving fails closed. The numbers
+below are preserved because they motivated that policy; they are not a backend
+selection operators can reproduce on the current release.
 
-**Dense decode — measured, and the fallback code is unchanged.** On the 27B at
-5.5 bpp, the Triton decode-GEMM measured **4.20 tok/s** and the CUDA GEMV that
-replaced it measures **10.27–10.30 tok/s**. That Triton path is still what a
-dense CB Linear executes when `_cuda_gemv_ok()` is false — the gate is
-`PRISMAQUANT_CB_DECODE == "cuda"` **and** `get_ext() is not None`
-(`gridbook/linear.py`), and the miss falls through to the same `cb_gemm` call.
-The 4.20 figure was taken on the whole Triton-prototype configuration, which
-also predates the fp8-direct expander, so treat it as the pessimistic end.
+**Dense decode — historical measured comparison.** On the 27B at 5.5 bpp, the
+old Triton decode-GEMM measured **4.20 tok/s** and the CUDA GEMV that replaced it
+measured **10.27–10.30 tok/s**. The 4.20 figure came from the whole Triton-
+prototype configuration and predates the FP8-direct native expander, so it is
+not a fresh A/B against today's kernel set.
 
-**MoE decode — the grouped CUDA GEMV is skipped entirely; the magnitude depends
-on the artifact.** `_cuda_moe_ok()` in `gridbook/moe.py` returns `False` when
-`get_ext() is None`, and the call falls through to the prefill-family paths:
+**MoE decode — historical measured comparison.** The per-expert transient loop
+on the 35B measured **3.52 tok/s** before the native grouped kernel replaced it
+at **32.6–33.3 tok/s**. That ~10k-host-operation-per-token result demonstrated a
+launch problem, not a bandwidth limit. Its exact magnitude is artifact-specific
+and must not be used as an estimate for current native paths.
 
-- **fp8-CB** defaults to `auto`, whose candidates include chunked `stock`.
-- **fp4-CB** defaults to the conservative per-expert `loop`. Only an explicit
-  `PRISMAQUANT_CB_FUSED_FP4_MOE=1` (or `128`/`256`) attempts the fused-FP4
-  kernel; an ineligible opt-in falls back to `loop`. Operators can explicitly
-  select the now byte-budgeted `stock` path for a measured A/B.
-  Expect a large regression when the grouped decode kernel is gone, but its
-  exact size depends on the selected fallback and **has not been measured**.
-- The **3.52 tok/s** figure that used to be quoted here is the per-expert
-  transient loop the 35B measured before the grouped kernel replaced it
-  (**32.6–33.3 tok/s** after). It remains the right order of magnitude for what
-  the fp4 constraint-miss fallback or an explicit `PRISMAQUANT_CB_PREFILL=loop`
-  costs
-  (~10k host syncs/launches per token — a launch problem, not a bandwidth one).
-
-Prefill degrades too and is not separately quantified for the fallback.
-
-Sources: 27B dense before/after and 35B MoE before/after are the same served A/B
-runs as the tables above.
+Sources: the 27B dense and 35B MoE before/after figures are the same served A/B
+runs as the tables above. No claim is made for a current fallback because none
+exists.
 
 ---
 
@@ -361,9 +401,10 @@ runs as the tables above.
   exceeded their native decode rows, but batched/speculative decode, tail ITL,
   and the formal exact-byte workload matrix remain open. Large-M dense
   **prefill is not yet at native parity**: ~1.44× on the 27B (traffic-bound
-  transient expand). MoE prefill was the worst gap and is now the default CUDA
-  chunk-expander path (Laguna 117B: 293 → 1,821 tok/s at 8k)—the 35B TTFT row
-  above predates it. The GGUF prefill comparison (the 295B ~2.6×) is against a
+  transient expand). The predecessor MoE CUDA chunk-expander path measured
+  Laguna 117B at 293 → 1,821 tok/s at 8k; the 35B TTFT row predates it, and the
+  current owned CUTLASS grouped bridge still needs its own measurement. The GGUF
+  prefill comparison (the 295B ~2.6×) is against a
   *different* serving stack (llama.cpp CUDA-core IQ dequant), and is the clean
   "why native tiles win" number; it is not a claim of parity with vLLM's own
   native NVFP4/FP8 GEMM at large M.
@@ -375,8 +416,8 @@ runs as the tables above.
   *expected* to run from `sm_80` up, and only the mid-M fused prefill kernel is
   genuinely `sm_120`-family bound — but that is inferred from the code, not
   measured. Per-GPU expectations, with measured/inferred labelled, are in
-  [`INSTALL.md`](INSTALL.md#hardware-matrix). Without `nvcc` the Triton fallback
-  runs everywhere (correct, not fast).
+  [`INSTALL.md`](INSTALL.md#hardware-matrix). Without `nvcc` (or compatible
+  prebuilt native extensions), Gridbook cannot serve and fails closed.
 - **One published artifact per headline is not the same as three.** The 27B and
   295B artifacts are downloadable; **the 35B MoE artifact is not published** — its
   numbers are an internal measurement showing the format win reproduces on MoE,

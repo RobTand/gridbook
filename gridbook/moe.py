@@ -5,19 +5,18 @@ Each expert stack ships as ONE tensor per role: ``<q>.cb_qweight`` uint8
 ``(E, out, (in/256)·type_size)`` (+ fp8 ``<q>.weight_scale`` ``(E, out)``), where
 ``cb_qweight[e]`` is exactly the dense §1 superblock layout. All experts of a
 stack share one format + one codebook (per-layer uniformity, union-find at
-export; asserted here). Serving mirrors ``GGUFMoEMethod``: register w13/w2 expert
-buffers, then a per-expert **transient** decode (one expert's ``[out, in]`` bf16
-tile live at a time — INV-1, the dense transient pattern extended to experts).
+export; asserted here). Serving registers the w13/w2 stacks and dispatches only
+to owned native CUDA/CUTLASS kernels. Decode uses grouped GEMV. Quality prefill
+uses a gated FP8 collective, an explicitly contracted native NVFP4 collective,
+or exact activation QDQ plus bounded BF16 weight expansion feeding an owned
+grouped CUTLASS GEMM.
 
   w13 = fused gate_up_proj : (E, 2·inter, hidden)  -> cb_qweight (E, 2·inter, bytes)
   w2  = down_proj          : (E, hidden, inter)    -> cb_qweight (E, hidden, bytes)
 
-NOTE (post-27B GPU/vLLM validation): the FusedMoE weight-loader wiring and the
-routed forward are exercised by the synthetic-MoE serve smoke, deferred to the
-first idle GPU window (resource-discipline hold). The decode math per expert is
-the dense path (bit-exact CPU/triton-tested in test_cb_kernels / test_two_tier_v2);
-this file adds the expert-stack loop + buffer mapping. CPU unit tests below pin
-the buffer shapes, w13/w2 split, and per-layer uniformity.
+The loader attests every reachable native extension before model construction
+finishes, so no JIT build or implementation selection occurs in first forward
+or CUDA-graph capture.
 """
 from __future__ import annotations
 
@@ -33,10 +32,6 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
-from vllm.model_executor.layers.fused_moe.activation import (
-    MoEActivation,
-    apply_moe_activation,
-)
 from vllm.model_executor.utils import set_weight_attrs
 
 from . import codec
@@ -45,89 +40,29 @@ from .cb_fill_guard import (
     mark_filled,
     mark_unfilled,
 )
-from .expand import (
-    expand_cb_to_fp8,
-    expand_cb_to_value,
-    expand_fp4_v2_to_weight,
-)
-from .moe_autotune import (
-    STOCK as _AUTO_STOCK,
-    cb_prefill_auto,
-    record_autotune_timings,
-    shape_regime as autotune_shape_regime,
-)
 from .moe_gemv_select import cb_gemv_choice
-from .moe_l2 import (
-    L2_PIPELINE,
-    cb_l2_cap_bytes,
-    cb_l2_live_groups,
-    cb_l2_min_m,
-    cb_l2_pin_action,
-    cb_l2_plan,
-)
 from .moe_routing import (
-    cb_cached_expert_map,
     cb_cached_row_offsets,
     cb_grouped_pad_routing,
 )
-from .ops import dispatch_via_op, fp4_act_qdq_or_codec
+from .native_cutlass import (native_fp4_quant, native_fp8_quant,
+                             native_moe_activation,
+                             require_native_fp4_quant,
+                             require_native_fp8_cutlass,
+                             require_native_moe_activation)
 from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
     reciprocal_vector as _nvfp4_reciprocal_vector,
     require_identical_loaded_scales,
     rowwise_range_multiplier as _nvfp4_rowwise_range_multiplier,
 )
+from .ops import fp4_act_qdq_or_codec
 
 
 def _row_bytes(in_features: int, type_size: int) -> int:
     return (in_features // codec.SUPERBLOCK) * type_size
 
 
-def _window_fits_superblock(k: int, type_size: int) -> bool:
-    """Does the expanders' 8-byte codeword window stay inside ONE superblock?
-
-    The expand/decode kernels build a codeword from an 8-byte window anchored at
-    ``byte_base = bitpos // 8`` with ``bitpos = v_local * k`` and
-    ``v_local <= 31`` (256 weights / VEC_DIM 8), so the highest byte they touch
-    inside a superblock is ``(31k)//8 + 7``. When that is ``<= type_size - 1``
-    the last codeword of the last superblock of the last ROW is still in the
-    tensor and ``codec.pad_qweight``'s read slack is unnecessary.
-
-    * fp8-CB (``type_size = 4k``): false at every shipped rung (needs k > 56) —
-      the pad is load-bearing on the Triton branch.
-    * fp4-CB v2 (``type_size = 4k + 9``): true for every k >= 0 — the 9-byte
-      two-tier scale plane is the tail slack (the window may spill into the
-      scale bytes, which the kernel masks off, but never past the superblock).
-
-    Pure python ints (shape/config only): capture-safe, resolves host-side.
-    """
-    return (31 * int(k)) // 8 + 7 <= int(type_size) - 1
-
-
-# torch._grouped_mm — the single-launch ragged grouped GEMM (2d×3d: mat_a
-# [P,K] × mat_b [G,K,N] with cumulative-end offsets [G] -> [P,N]) that collapses
-# the batched-prefill per-expert-segment GEMMs into ONE kernel. Opt-in
-# (PRISMAQUANT_CB_PREFILL_GROUPED_MM=1) because its ragged-offset / B-layout
-# constraints on sm_121 are unproven in this tree; the segmented fallback is the
-# correctness-first default. Availability + first-use viability are cached so a
-# reject degrades to segmented once, not per forward.
-_GROUPED_MM_OK: bool | None = None
-
-# Every accepted public/diagnostic prefill selector. Historically every unknown
-# spelling fell through to ``batched`` -- the high-transient experimental path
-# that has crashed a large serve. Pin the environment once per process and fail
-# on typos or mid-serve mutation so one model cannot split its layers across
-# different execution contracts.
-_PREFILL_MODES = frozenset({
-    "auto",
-    "batched",
-    "grouped_fused",
-    "grouped_fused_r1",
-    "l2_pipeline",
-    "loop",
-    "stock",
-})
-_PREFILL_MODE_STATE: list[str | None] = []
 _FUSED_FP4_MOE_STATE: list[str] = []
 _FUSED_FP4_MOE_STATIC_MODES = frozenset(("1", "128", "256"))
 _FUSED_FP4_MOE_STATIC_LSQ_MODES = frozenset(
@@ -142,25 +77,6 @@ _FUSED_FP4_MOE_MODES = (
     | _FUSED_FP4_MOE_ROWWISE_MODES
 )
 _FUSED_FP4_MOE_ALLOWED_MODES = frozenset(("",)) | _FUSED_FP4_MOE_MODES
-
-
-def _requested_prefill_mode() -> str | None:
-    raw = os.environ.get("PRISMAQUANT_CB_PREFILL")
-    current = raw.strip() if raw is not None else None
-    if current == "" or (current is not None and current not in _PREFILL_MODES):
-        allowed = ", ".join(sorted(_PREFILL_MODES))
-        raise ValueError(
-            "invalid PRISMAQUANT_CB_PREFILL="
-            f"{raw!r}; expected one of: {allowed}, or leave it unset"
-        )
-    if not _PREFILL_MODE_STATE:
-        _PREFILL_MODE_STATE.append(current)
-    elif current != _PREFILL_MODE_STATE[0]:
-        raise RuntimeError(
-            "PRISMAQUANT_CB_PREFILL changed after Gridbook dispatch was fixed; "
-            "restart the process instead of mixing prefill contracts"
-        )
-    return _PREFILL_MODE_STATE[0]
 
 
 def _requested_fused_fp4_moe_mode() -> str:
@@ -188,37 +104,30 @@ def _requested_fused_fp4_moe_mode() -> str:
     return _FUSED_FP4_MOE_STATE[0]
 
 
-def _grouped_mm_available() -> bool:
-    global _GROUPED_MM_OK
-    if _GROUPED_MM_OK is None:
-        _GROUPED_MM_OK = hasattr(torch, "_grouped_mm")
-    return _GROUPED_MM_OK
-
-
-def _disable_grouped_mm(exc) -> None:
-    global _GROUPED_MM_OK
-    if _GROUPED_MM_OK:
-        import sys
-        print(f"[prismaquant-cb] torch._grouped_mm unusable for CB prefill "
-              f"({type(exc).__name__}: {exc}); using the segmented GEMM.",
-              file=sys.stderr, flush=True)
-    _GROUPED_MM_OK = False
+def _native_scaled_fp4_quant_available() -> bool:
+    """Whether the pinned native static-NVFP4 ABI can be attested."""
+    try:
+        require_native_fp4_quant("routed static FP4 activation")
+        return True
+    except RuntimeError:
+        return False
 
 
 # Backward-compatible private name for the integrated follow-on patch and its
 # focused tests.  The implementation lives in codec so dense, MoE and
 # top-level-loader codebook construction all enforce the same contract.
 _assert_cast_lossless = codec.assert_cast_lossless
+# Compatibility seam for focused CPU tests; implementation is the shared,
+# directly registered native ABI in ``native_cutlass``.
+_native_scaled_fp4_quant = native_fp4_quant
 
 
 class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
     """CB decode for RoutedExperts (FusedMoE) — one uniform CB format per layer."""
 
-    # Process-wide fail-loud state (see _cb_expand_ext_ok / _cuda_moe_ok).
-    _EXPAND_EXT_OK: bool | None = None   # cached cuda_ext probe for the expander
+    # Process-wide fail-loud state for native grouped decode.
     _DECODE_ENGAGED_LOGGED = False       # one-time decode-path engagement line
     _DECODE_DISABLED_LOGGED = False      # deduplicate a host-wide ext failure
-    _STOCK_BUDGET_WARNED = False         # deduplicate undersized-budget warning
 
     def __init__(self, quant_config, moe: FusedMoEConfig, scheme: dict,
                  prefix: str) -> None:
@@ -248,6 +157,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             raise NotImplementedError(
                 f"{prefix}: fp4 MoE experts require two-tier v2 scale coding "
                 "(fp4-v1 expert transient not yet implemented)")
+        if self.is_fp4 and (self.n_sub not in (1, 2)
+                            or self.type_size != 4 * self.k + 9):
+            raise NotImplementedError(
+                f"{prefix}: native FP4 MoE requires the v2 serialized layout "
+                "(n_sub in {1,2}, type_size=4*k+9)")
 
     # -- weight buffers (stacked experts) ------------------------------------
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
@@ -443,31 +357,70 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                   f"K={in_f} -> {'v2' if use_v2 else 'inherited'} ({why})",
                   flush=True)
         layer._cb_E = E
+
+        # Attest every native extension reachable from production dispatch at
+        # model load. JIT compilation must not occur inside first prefill or a
+        # CUDA-graph capture, and no missing kernel may select a stock/Triton
+        # substitute. FP8 uses the main extension for decode/QDQ/expansion;
+        # FP4 also needs the exact v2 expander. Both use the grouped CUTLASS
+        # quality bridge whenever the fused shape gate misses.
+        from .cuda_ext import (NativeKernelUnavailableError,
+                               require_bf16_grouped_ext, require_ext,
+                               require_fp4_v2_expander)
+        if layer._cb_hidden % 8 or layer._cb_inter % 8:
+            raise NativeKernelUnavailableError(
+                f"{self.prefix}: native BF16 grouped quality prefill requires "
+                "hidden and intermediate dimensions divisible by 8, got "
+                f"hidden={layer._cb_hidden}, intermediate={layer._cb_inter}")
+        require_ext(f"{self.prefix} routed CB decode/QDQ/expansion")
+        if self.is_fp4:
+            require_fp4_v2_expander(
+                f"{self.prefix} routed FP4-v2 expansion", device=dev)
+        else:
+            require_native_fp8_cutlass(
+                f"{self.prefix} routed FP8 quality prefill")
+        require_bf16_grouped_ext(
+            f"{self.prefix} routed quality prefill")
+        if not self._cuda_moe_ok(layer):
+            raise NativeKernelUnavailableError(
+                f"{self.prefix}: routed decode layout has no native grouped "
+                "CUDA kernel")
+        layer._cb_native_activation = require_native_moe_activation(
+            layer.activation.value, f"{self.prefix} routed activation")
+        # Resolve optional fused CUTLASS eligibility (and any JIT build) now;
+        # both False and True are cached before the first request.
+        if not self.is_fp4:
+            self._gf2_ok(layer)
+        else:
+            mode = _requested_fused_fp4_moe_mode()
+            layer._cb_fused_fp4_moe_mode = mode
+            if mode:
+                rowwise = mode in _FUSED_FP4_MOE_ROWWISE_MODES
+                static_lsq = mode in _FUSED_FP4_MOE_STATIC_LSQ_MODES
+                fused_ok = self._gf4_ok(
+                    layer, rowwise=rowwise, static_lsq=static_lsq
+                )
+                if not fused_ok:
+                    cache_attr = (
+                        "_cb_gf4_rowwise_ok_reason" if rowwise else
+                        "_cb_gf4_static_lsq_ok_reason" if static_lsq else
+                        "_cb_gf4_static_ok_reason"
+                    )
+                    reason = getattr(layer, cache_attr, "unknown constraint")
+                    from .cuda_ext import NativeKernelUnavailableError
+                    raise NativeKernelUnavailableError(
+                        f"{self.prefix}: requested native fused FP4 MoE mode "
+                        f"{mode!r} is unavailable ({reason}); changing to the "
+                        "exact BF16 bridge would violate the explicit "
+                        "activation contract")
+            elif self.n_sub != 2:
+                from .cuda_ext import NativeKernelUnavailableError
+                raise NativeKernelUnavailableError(
+                    f"{self.prefix}: signed FP4-CB experts have no exact "
+                    "native BF16 prefill bridge; select a supported native "
+                    "fused FP4 MoE activation mode")
         from .ops import register_cb_layer
         layer._cb_layer_id = register_cb_layer(self, layer)
-
-    # -- per-expert decode to a bounded transient [out, in] bf16 -------------
-    def _decode_expert(self, layer, which: str, e: int) -> torch.Tensor:
-        """Decode ONE expert's CB weight to a bf16 ``[out, in]`` transient
-        (INV-1: one expert live at a time). fp8: value × per-channel scale;
-        fp4 v2: value × composed group scale."""
-        qw = getattr(layer, f"{which}_cb_qweight")[e]          # (out, bytes)
-        out = qw.shape[0]
-        # w13 in=hidden (gate_up), w2 in=inter (down).
-        in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
-        qwp = codec.pad_qweight(qw.contiguous())
-        row0 = cb_cached_row_offsets(layer, out, qw.device)
-        if self.is_fp4:                                        # fp4 v2
-            W = expand_fp4_v2_to_weight(
-                qwp, layer._cb_flat, row0, layer._cb_compose,
-                out, in_f, self.k, self.n_sub, self.type_size)
-        else:                                                  # fp8
-            val = expand_cb_to_value(qwp, layer._cb_flat, row0,
-                                     out, in_f, self.k, self.n_sub,
-                                     self.type_size, is_fp4=False)
-            ws = getattr(layer, f"{which}_weight_scale")[e].to(torch.float32)
-            W = (val.float() * ws[:, None]).to(torch.bfloat16)
-        return W                                               # (out, in) bf16
 
     def apply(self, layer: RoutedExperts, x: torch.Tensor,
               topk_weights: torch.Tensor, topk_ids: torch.Tensor,
@@ -478,9 +431,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # shared_experts_input)`), producing shared_output, and _maybe_combine
         # adds it to our routed output — verified against the vLLM v0.23 runner
         # (moe_runner.py). The wrapper's `_layer` IS the shared_mlp module,
-        # whose CB weights we decoded to bf16 at load (moe_toplevel_loader), so
-        # the shared contribution is computed and included; a routed-only return
-        # here is the contract, NOT a dropped component. (The `_unpack` path also
+        # whose projections are native CB Linears through config prefix aliases,
+        # so the shared contribution is computed and included; a routed-only
+        # return here is the contract, NOT a dropped component. (The `_unpack` path also
         # accepts a `(shared, routed)` tuple for methods that fuse the shared
         # expert into their kernel — we don't, so single-tensor is correct.)
         del shared_experts, shared_experts_input
@@ -488,216 +441,77 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             raise NotImplementedError(
                 "apply_router_weight_on_input unsupported for CB MoE")
         # M-branch hoist (see ops.py/linear.py): the token-count branch AND
-        # the prefill loop's host syncs live inside ONE opaque custom op, so
+        # the prefill path's host routing/dispatch logic lives inside ONE
+        # opaque custom op, so
         # compile/capture at decode sizes record the grouped decode kernels
-        # and dynamo never traces the loop (mode-3 no longer needs the stock
-        # prefill path for graph safety). PRISMAQUANT_CB_DISPATCH=inline
-        # restores in-graph dispatch for A/B bisection.
-        # Unregistered layers (synthetic test fixtures that skip
-        # process_weights_after_loading) fall back to inline dispatch.
+        # and dynamo never traces the loop. Opaque dispatch is mandatory:
+        # exposing routing/pointwise ATen code to Inductor could generate
+        # Triton, which is outside Gridbook's native-only contract.
         lid = getattr(layer, "_cb_layer_id", None)
-        if lid is not None and dispatch_via_op():
-            from .ops import cb_moe_forward
-            return cb_moe_forward(x, topk_weights, topk_ids, lid)
-        return self._apply_inline(layer, x, topk_weights, topk_ids)
+        if lid is None:
+            from .cuda_ext import NativeKernelUnavailableError
+            raise NativeKernelUnavailableError(
+                f"{self.prefix}: CB MoE was not registered during "
+                "process_weights_after_loading")
+        from .ops import cb_moe_forward
+        return cb_moe_forward(x, topk_weights, topk_ids, lid)
 
     def _apply_inline(self, layer, x, topk_weights, topk_ids):
-        act = MoEActivation.from_str(layer.activation.value)
+        act = getattr(layer, "_cb_native_activation", layer.activation.value)
         num_tokens = x.shape[0]
 
-        # Decode regime: the grouped CUDA path — ONE kernel launch per
-        # projection covers every routed (token, expert) pair (the per-expert
-        # loop below costs ~10k host syncs/launches per token: 3.52 tok/s
-        # served vs BF16's 28.4 on the 35B A3B). Covers fp8-CB v1 and fp4-CB
-        # two-tier v2; _cuda_moe_ok gates the format (fp4-v1 has no grouped
-        # path yet and falls through to the loop below).
-        if num_tokens <= 16 and self._cuda_moe_ok(layer):
+        if num_tokens <= 16:
+            if not self._cuda_moe_ok(layer):
+                from .cuda_ext import NativeKernelUnavailableError
+                raise NativeKernelUnavailableError(
+                    f"{self.prefix}: routed decode requires Gridbook's native "
+                    "grouped CUDA GEMV extension")
             return self._apply_grouped_decode(
                 layer, x, topk_weights, topk_ids, act)
 
-        # Prefill / fallback (num_tokens > 16, or no grouped-CUDA decode path).
-        # Implementations, env-selected via PRISMAQUANT_CB_PREFILL. THE DEFAULT
-        # IS RESOLVED AT THE BOTTOM OF THIS BLOCK: 'auto' for fp8-CB, 'loop' for
-        # fp4-CB (see the `mode = os.environ.get(...) or (...)` line). Each entry
-        # below documents one candidate; none of them is the default by virtue of
-        # being listed first.
-        #
-        #   'batched' (opt-in) — _apply_prefill_batched. Round-1 cost model of
-        #     the loop it replaces: on Hy3 (192 experts, ~all hit at prefill) the
-        #     per-expert loop pays, PER HIT EXPERT, one act-QDQ + TWO Triton
-        #     transient expands (w13/w2, ~192×2 launches/layer) + two F.linear +
-        #     an index_add_ — the Triton-expand and QDQ launches are the dominant
-        #     remaining prefill structure cost (~112 tok/s). The batched path
-        #     issues ONE act-QDQ over all tokens and ONE expand per projection
-        #     per expert-CHUNK (the dense expander over a reshaped [(C*out),
-        #     bytes] view), collapsing those E expands + E QDQ passes to
-        #     E/chunk launches; the GEMM stays grouped/segmented bf16.
-        #
-        #   'loop' — _apply_prefill_loop, kept verbatim for A/B bisection. Its
-        #     hit-expert list already costs ONE host sync (the pre-fix per-expert
-        #     `sel.any()` cost E syncs — the dominant share of the 3.5 s TTFT);
-        #     the batched path preserves that one-sync property.
-        #
-        # Numerics: the two paths use BIT-IDENTICAL weights (same expander) and
-        # BIT-IDENTICAL per-token QDQ (QDQ is a per-row op — see
-        # _apply_prefill_batched); only the GEMM accumulation and the
-        # cross-expert combine reassociate (REASSOCIATION-CLASS), held to the
-        # tolerance contract by tests/test_moe_batched_prefill.py and gated by
-        # the served logprob A/B before adoption. Prefill is eager/uncaptured
-        # (FULL_DECODE_ONLY), so this path needs no CUDA-graph capture-safety.
-        # Batched never became a default and is not one now: the first
-        # 1.4k-token prefill on Hy3 crashed the serve (transient chunk tiles
-        # ~1.6 GB vs the loop's ~56 MB against thin post-KV slack, 2026-07-20),
-        # so it stays opt-in (PRISMAQUANT_CB_PREFILL=batched) pending an
-        # at-scale served gate, and it is not an 'auto' candidate.
-        #
-        #   'stock' — _apply_prefill_stock. The CAPTURE-SAFE successor to
-        #     'batched' (task 15): transiently expand each expert-CHUNK into a
-        #     HARDWARE format (fp8-CB -> fp8 bytes, fp4-CB-v2 -> bf16) and hand it
-        #     to vLLM's OWN fused-MoE grouped Triton kernel with DEVICE-SIDE
-        #     routing (moe_align_block_size). No host reads of device data
-        #     anywhere (no .tolist/.item/.cpu/nonzero-to-python) and a FIXED
-        #     python trip count (ceil(E/chunk) over ALL experts, empty experts a
-        #     masked pass) — the prerequisite for cudagraph_mode=FULL, which the
-        #     'batched' path's two .tolist() syncs + tensor-derived python bounds
-        #     preclude. Our activation QDQ is preserved: fp8 uses vLLM's per-token
-        #     fp8 dynamic between the two projections (bit-equivalent to
-        #     codec.fp8_dynamic_act_qdq — test_stock_fp8_quant_matches_codec),
-        #     fp4-v2 runs codec.fp4_group16_act_qdq explicitly on the module input
-        #     AND the intermediate. Opt-in: PRISMAQUANT_CB_PREFILL=stock.
-        # fp8-CB stock was measured at 5.5x the loop on Laguna-256E and is a
-        # candidate of the current 'auto' policy. fp4-CB stock remains an
-        # explicit fallback/A-B path: its BF16 transient is byte-budgeted
-        # below (42 experts / 1,184 MiB measured instead of the old 4,736 MiB
-        # whole-stack balloon on a 192-expert Hy3 band), and its packed slice
-        # no longer needs a padding copy. The unset fp4 policy remains unchanged
-        # rather than promoting a second numerical accumulation path.
-        #
-        #   'grouped_fused' — _apply_prefill_grouped_fused (round 1 of the MoE
-        #     fused campaign, OPT-IN). Drops the stock path's HBM e4m3 expand
-        #     round-trip (write N*K bytes, read them back) by decoding each
-        #     expert's packed CB rows INSIDE the CUTLASS prologue
-        #     (cb_fused_prefill_mm_scaled, the dense mid-M default). Round 1 is
-        #     a host-side loop over experts with ONE device->host sync per
-        #     layer (the E+1 segment boundaries); round 2 replaces the loop
-        #     with a true array-of-problems grouped CUTLASS over the same
-        #     collective. Any constraint miss falls through to 'stock'.
-        #
-        #     ROUND 2 (_apply_prefill_grouped_fused_v2) is what
-        #     'grouped_fused' selects when the grouped binding is present: ONE
-        #     launch per projection stage over a TileM-padded, expert-sorted row
-        #     collective, retiring R1's 2*E launches (~5-10 ms/layer of pure
-        #     launch overhead once R1 had removed the expand round-trip).
-        #     'grouped_fused_r1' forces R1 — the bisection reference R2 is
-        #     validated against.
-        #     grouped_fused is NOT a fixed default (it is an 'auto' candidate):
-        # it won on the 35B (+9%, KL gate passed) but REGRESSED on
-        # Laguna-class (1,503 vs 1,821 tok/s @8k,
-        # 2026-07-26): R2 re-decodes each expert's B per M-tile
-        # (ceil(m_e/TileM) x) and pads to tile multiples — decode redundancy
-        # scales with expert SIZE, and Laguna's experts are ~6x the 35B's.
-        # Promotion reverted per the two-model ladder rule; grouped_fused
-        # stays opt-in.
-        #
-        #   'l2_pipeline' — _apply_prefill_l2_pipeline (round 4). Decodes into
-        #     an L2-PINNED rotating scratch pair instead of a fresh HBM tile,
-        #     attacking the decoded-weight round-trip the earlier rounds left
-        #     (~17 of ~42 ms/layer on a large-expert MoE). Falls through to
-        #     'stock' when the build/format/window cap misses. It is also a
-        #     candidate of 'auto' — no promotion is decided in code.
-        #
-        #   'auto' — _apply_prefill_auto (OPT-IN until a two-model gate clears
-        #     it). The principled end state: MEASURE stock and grouped_fused (at
-        #     each compiled TileM) once per layer on the layer's own real inputs
-        #     and cache the argmin. No shape heuristic, no model table — the
-        #     regression above is exactly the kind of model-dependent crossover
-        #     that a static default cannot express.
-        # fp8-CB default: 'auto' — measured per-layer selection over stock +
-        # grouped_fused at every rung-feasible TileM (cuda-event timing on
-        # the first qualifying prefill, cached; deterministic stock output
-        # on the tuning call). Two-model gate 2026-07-26: 35B 4,405 vs best
-        # fixed 4,285; Laguna-class 2,063 vs best fixed 1,821 — auto >= best
-        # fixed mode on both. Composed paths are individually KL-gated.
-        # NOTE: l2_pipeline is DIAGNOSTIC-ONLY (2026-07-27): wedged the live
-        # serve three times (overlapped: stream/capture deadlock; serial:
-        # still wedges despite non-default-stream test battery green). The
-        # L2-residency hypothesis remains unmeasured; do not add it to auto
-        # candidates until a live serve survives a full prefill battery.
-        # fp4-MMA fused MoE prefill. One tile-indexed grouped
-        # block-scaled launch per projection stage (OMMA.SF.16864, k=64),
-        # the fp8 grouped_fused_v2 mechanism with the packed-CB decode in the
-        # producer/prologue. Static values: "1"/"128" tile_m=128 and "256"
-        # tile_m=256. Runtime per-row values: "rowwise"/"rowwise128" and
-        # "rowwise256". Static modes require the artifact's fully attested,
-        # stage-specific activation scalars; static-LSQ modes keep those same
-        # scalars and packed activation bytes while fitting the existing EVT
-        # residual per row. Only explicit rowwise modes may fuse a legacy
-        # artifact. An explicit PRISMAQUANT_CB_PREFILL remains
-        # authoritative and bypasses this opt-in attempt, so stock/loop remain
-        # real bisection controls rather than being silently preempted.
-        # Explicit opt-in until a served quality gate and routing-shape ladder
-        # pass. Tile 128 is 5.2-5.6x faster than the per-expert loop on the
-        # measured shapes, but its padding cost has a sharp token-count cliff.
-        # The same failed-promotion-screen and incomplete served-evidence caveat
-        # as the dense gate in linear.py applies.
-        requested_mode = _requested_prefill_mode()
-        if requested_mode is None and self.is_fp4 and num_tokens > 16:
-            gf4 = _requested_fused_fp4_moe_mode()
-            if gf4 in _FUSED_FP4_MOE_MODES:
+        if self.is_fp4:
+            mode = getattr(layer, "_cb_fused_fp4_moe_mode", None)
+            if mode is None:
+                # Production fixes this at model load. This branch supports
+                # deliberately minimal test layers without changing serving.
+                mode = _requested_fused_fp4_moe_mode()
+            if mode in _FUSED_FP4_MOE_MODES:
                 out = self._apply_prefill_grouped_fused_fp4(
                     layer, x, topk_weights, topk_ids, act,
-                    tile_m=256 if gf4.endswith("256") else 128,
-                    rowwise=gf4 in _FUSED_FP4_MOE_ROWWISE_MODES,
-                    static_lsq=gf4 in _FUSED_FP4_MOE_STATIC_LSQ_MODES)
+                    tile_m=256 if mode.endswith("256") else 128,
+                    rowwise=mode in _FUSED_FP4_MOE_ROWWISE_MODES,
+                    static_lsq=mode in _FUSED_FP4_MOE_STATIC_LSQ_MODES)
                 if out is not None:
                     return out
+                from .cuda_ext import NativeKernelUnavailableError
+                raise NativeKernelUnavailableError(
+                    f"{self.prefix}: requested native fused FP4 MoE mode "
+                    f"{mode!r} became unavailable after model load")
+            return self._apply_prefill_native_bf16(
+                layer, x, topk_weights, topk_ids, act)
 
-        # Preserve current policy: fp8 uses measured auto; fp4 defaults to the
-        # conservative loop. Only the explicit FUSED_FP4_MOE gate above tries
-        # the fused path, falling back here on a constraint miss. Stock remains
-        # explicitly selectable, with safe byte budgeting and a zero-copy view.
-        mode = requested_mode or ("auto" if not self.is_fp4 else "loop")
-        if mode == "auto":
-            return self._apply_prefill_auto(
+        # FP8-CB keeps its quality-gated decode-in-prologue CUTLASS path where
+        # eligible. Every miss uses exact QDQ and bounded native BF16 expansion
+        # feeding Gridbook's owned grouped CUTLASS bridge.
+        out = self._apply_prefill_grouped_fused_v2(
                 layer, x, topk_weights, topk_ids, act)
-        if mode in ("grouped_fused", "grouped_fused_r1"):
-            out = None
-            if mode == "grouped_fused":
-                out = self._apply_prefill_grouped_fused_v2(
-                    layer, x, topk_weights, topk_ids, act)
-            if out is None:
-                out = self._apply_prefill_grouped_fused(
-                    layer, x, topk_weights, topk_ids, act)
-            if out is not None:
-                return out
-            return self._apply_prefill_stock(
+        if out is None:
+            out = self._apply_prefill_grouped_fused(
                 layer, x, topk_weights, topk_ids, act)
-        if mode == "l2_pipeline":
-            out = self._apply_prefill_l2_pipeline(
-                layer, x, topk_weights, topk_ids, act)
-            if out is not None:
-                return out
-            return self._apply_prefill_stock(
-                layer, x, topk_weights, topk_ids, act)
-        if mode == "loop":
-            return self._apply_prefill_loop(
-                layer, x, topk_weights, topk_ids, act)
-        if mode == "stock":
-            return self._apply_prefill_stock(
-                layer, x, topk_weights, topk_ids, act)
-        if mode == "batched":
-            return self._apply_prefill_batched(
-                layer, x, topk_weights, topk_ids, act)
-        raise AssertionError(f"unhandled validated CB prefill mode: {mode}")
+        if out is not None:
+            return out
+        return self._apply_prefill_native_bf16(
+            layer, x, topk_weights, topk_ids, act)
 
     # -- prefill: fp4 grouped FUSED (block-scaled decode-in-prologue) --------
     def _gf4_ok(self, layer, *, rowwise: bool = False,
                 static_lsq: bool = False) -> bool:
         """Eligibility for the fp4 grouped fused prefill (cached per layer).
-        Mirrors cb_fused_fp4_moe_grouped's TORCH_CHECKs so a miss is a safe
-        fall-through to the shipping fp4 modes with a cached diagnostic. Static,
-        static-LSQ, and rowwise activation symbol families are isolated from
-        each other."""
+        Mirrors cb_fused_fp4_moe_grouped's TORCH_CHECKs and records a diagnostic
+        before serving starts. An explicit activation selector fails closed on
+        a miss; unset product FP4 uses the exact native BF16 bridge. Static,
+        static-LSQ, and rowwise symbol families are isolated from each other.
+        """
         if rowwise and static_lsq:
             return False
         cache_attr = (
@@ -749,14 +563,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 and codec.fp4_value_lut_nbytes(self.k, self.n_sub)
                 > codec.FP4_FUSED_LUT_MAX_BYTES):
             reason = "decoded codebook exceeds the fused LUT capacity"
-        if reason is None and not rowwise and not static_lsq:
-            try:
-                import vllm._custom_ops as vops
-                have_quantizer = hasattr(vops, "scaled_fp4_quant")
-            except Exception:  # noqa: BLE001
-                have_quantizer = False
-            if not have_quantizer:
-                reason = "vLLM scaled_fp4_quant is unavailable"
+        if (reason is None and not rowwise and not static_lsq
+                and not _native_scaled_fp4_quant_available()):
+            reason = "direct native scaled_fp4_quant ABI is unavailable"
         if reason is None:
             from .cuda_ext import get_fused_fp4_ext
             fext = get_fused_fp4_ext()
@@ -779,7 +588,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             )
             print(
                 f"[prismaquant-cb] fused_fp4_moe {self.prefix} "
-                f"mode={family} -> fallback ({reason})",
+                f"mode={family} -> unavailable ({reason})",
                 flush=True,
             )
         return bool(ok)
@@ -811,9 +620,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             )
             return fext.cb_nvfp4_quantize_static_lsq(x2.contiguous(), gs)
 
-        import vllm._custom_ops as vops
         gs = getattr(layer, f"_cb_fp4_input_global_scale_{which}")
-        aq, sf = vops.scaled_fp4_quant(x2, gs)
+        aq, sf = _native_scaled_fp4_quant(x2, gs)
         recip = _nvfp4_reciprocal_vector(
             layer, which=which, scale=gs, rows=x2.shape[0]
         )
@@ -835,8 +643,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             layer, rowwise=rowwise, static_lsq=static_lsq
         ):
             return None
-        if ((rowwise or static_lsq)
-                and x.dtype not in (torch.bfloat16, torch.float16)):
+        if x.dtype not in (torch.bfloat16, torch.float16):
+            return None
+        if tile_m not in (128, 256):
             return None
         from .cuda_ext import get_fused_fp4_ext
         fext = get_fused_fp4_ext()
@@ -864,7 +673,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         w13 = layer.w13_cb_qweight.data
         w2 = layer.w2_cb_qweight.data
 
-        # ---- routing: identical to the fp8 grouped_fused_v2 path -----------
+        # Stable expert grouping plus tile padding remains entirely on device;
+        # padding rows gather the appended zero row and scatter into throwaway
+        # destination T.
         pair_expert = topk_ids.reshape(-1).to(torch.long)
         pair_token = torch.arange(T, device=dev, dtype=torch.long) \
             .repeat_interleave(top_k)
@@ -875,11 +686,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         expert_ids, row_src, is_pad, n_blocks = cb_grouped_pad_routing(
             topk_ids, E, tile_m)
         if os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1":
-            # Kept intentionally: a host-read-free replacement must either
-            # launch the full static-capacity tail (a performance change) or
-            # teach the grouped kernel to consume n_blocks on device. A tensor
-            # slice bound still performs this same host conversion implicitly.
-            nb = int(n_blocks.item())                # THE one sync (optional)
+            nb = int(n_blocks.item())
             expert_ids = expert_ids[:nb].contiguous()
             row_src = row_src[:nb * tile_m]
             is_pad = is_pad[:nb * tile_m]
@@ -887,30 +694,27 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         rows = ptok_sorted.index_select(0, row_src)
         dest = torch.where(is_pad, torch.full_like(rows, T), rows)
         x1 = torch.cat([x, x.new_zeros((1, Kh))])
-        a_pad = x1.index_select(0, dest).contiguous()               # [Mp, Kh]
-        Mp = a_pad.shape[0]
+        a_pad = x1.index_select(0, dest).contiguous()
+        padded_rows = a_pad.shape[0]
 
-        # stage 1: gate_up = a_pad @ W13[expert_of_tile]^T
         aq1, sfa1, recip1 = self._fp4_quant(
             layer, a_pad, "w13", rowwise=rowwise,
-            static_lsq=static_lsq, fext=fext
-        )
+            static_lsq=static_lsq, fext=fext)
         del a_pad
         gate_up = fext.cb_fused_fp4_moe_grouped(
             aq1, sfa1, w13, lut, compose,
             recip1, ones_n1, expert_ids,
-            N1, Kh, kb, self.n_sub, self.type_size, True, tile_m)   # [Mp, N1]
+            N1, Kh, kb, self.n_sub, self.type_size, True, tile_m)
         del aq1, sfa1
-        a = torch.empty((Mp, d), dtype=gate_up.dtype, device=dev)
-        apply_moe_activation(act, a, gate_up)                       # silu(g)*u
+        activated = torch.empty(
+            (padded_rows, d), dtype=gate_up.dtype, device=dev)
+        native_moe_activation(act, activated, gate_up)
         del gate_up
 
-        # stage 2: y = act @ W2[expert_of_tile]^T — SAME expert_ids.
         aq2, sfa2, recip2 = self._fp4_quant(
-            layer, a, "w2", rowwise=rowwise,
-            static_lsq=static_lsq, fext=fext
-        )
-        del a
+            layer, activated, "w2", rowwise=rowwise,
+            static_lsq=static_lsq, fext=fext)
+        del activated
         y = fext.cb_fused_fp4_moe_grouped(
             aq2, sfa2, w2, lut, compose,
             recip2, ones_kh, expert_ids,
@@ -922,6 +726,147 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         out = torch.zeros((T + 1, Kh), dtype=x.dtype, device=dev)
         out.index_add_(0, dest, y.to(out.dtype))
         return out[:T]
+
+    def _native_bf16_chunk(self, layer) -> int:
+        """Fixed expert chunk for the bounded BF16 CUTLASS bridge.
+
+        The larger w13 transient is the sizing authority. A user override is
+        retained for measurement, while the default keeps each decoded chunk
+        under one GiB. All values are model/config integers, so no device read
+        or routing-dependent Python control flow enters the hot path.
+        """
+        E = int(layer._cb_E)
+        override = os.environ.get("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
+        if override is not None and override.strip():
+            try:
+                value = int(override)
+            except ValueError as exc:
+                raise ValueError(
+                    "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK must be positive") \
+                    from exc
+            if value <= 0:
+                raise ValueError(
+                    "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK must be positive")
+            return min(E, value)
+        raw_budget = os.environ.get("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES")
+        try:
+            budget = int(raw_budget) if raw_budget else (1 << 30)
+        except ValueError as exc:
+            raise ValueError(
+                "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES must be positive") from exc
+        if budget <= 0:
+            raise ValueError(
+                "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES must be positive")
+        per_expert = (2 * int(layer._cb_inter)
+                      * int(layer._cb_hidden) * 2)  # w13 BF16 bytes
+        return max(1, min(E, budget // max(1, per_expert)))
+
+    def _expand_native_bf16_slice(self, layer, which: str,
+                                  c0: int, c1: int) -> torch.Tensor:
+        """Expand one contiguous expert slice to exact BF16 natively."""
+        from . import ops as pq_ops
+
+        packed = getattr(layer, f"{which}_cb_qweight")[c0:c1].contiguous()
+        n_e = c1 - c0
+        out_f = int(packed.shape[1])
+        in_f = (int(layer._cb_hidden) if which == "w13"
+                else int(layer._cb_inter))
+        rows = n_e * out_f
+        raw = packed.reshape(rows, -1)
+        if self.is_fp4:
+            if not (self.is_v2 and self.n_sub == 2
+                    and self.type_size == 4 * self.k + 9):
+                from .cuda_ext import NativeKernelUnavailableError
+                raise NativeKernelUnavailableError(
+                    f"{self.prefix}: native quality prefill supports only "
+                    "FP4-CB-v2 product experts (n_sub=2, type_size=4k+9)")
+            weight = pq_ops.cb_expand_fp4_v2(
+                raw.view(-1), layer._cb_flat, layer._cb_compose,
+                0, rows, in_f, self.k, self.type_size)
+        else:
+            row0 = cb_cached_row_offsets(layer, rows, packed.device)
+            # FP8 codeword loads use an aligned 8-byte window that may cross
+            # the logical end of a row. Preserve the main expander's required
+            # per-row read slack; the stacked checkpoint plane itself is
+            # tightly packed and does not provide it for the final row.
+            raw = codec.pad_qweight(raw)
+            value = pq_ops.cb_expand_fp8(
+                raw, self._stock_cb_flat_fp8(layer), row0,
+                rows, in_f, self.k, self.n_sub, self.type_size)
+            scale = getattr(layer, f"{which}_weight_scale")[c0:c1] \
+                .reshape(rows).to(torch.float32)
+            weight = (value.float() * scale[:, None]).to(torch.bfloat16)
+        return weight.view(n_e, out_f, in_f)
+
+    def _apply_prefill_native_bf16(self, layer, x, topk_weights,
+                                   topk_ids, act):
+        """Quality-preserving routed prefill using owned native kernels.
+
+        Weight decode is bit-exact FP4-v2/FP8-CB -> BF16; activation QDQ is the
+        same exact native QDQ used by decode, both before FC1 and between FC1
+        and FC2. Matrix multiplication is one device-scheduled CUTLASS grouped
+        launch per expert chunk. Routing stays device-resident and zero-token
+        experts remain zero-M CUTLASS problems (no host compaction or sync).
+        """
+        from . import ops as pq_ops
+
+        if x.dtype is not torch.bfloat16:
+            raise TypeError("native CB MoE prefill requires BF16 activations")
+        E = int(layer._cb_E)
+        T = int(x.shape[0])
+        top_k = int(topk_ids.shape[-1])
+        hidden = int(layer._cb_hidden)
+        inter = int(layer._cb_inter)
+        pair_expert = topk_ids.reshape(-1).to(torch.int64)
+        order = torch.argsort(pair_expert, stable=True)
+        pair_token = torch.arange(
+            T, dtype=torch.int64, device=x.device).repeat_interleave(top_k)
+        rows = pair_token.index_select(0, order)
+        counts = torch.bincount(pair_expert, minlength=E)
+        expert_ends = torch.cumsum(
+            counts, 0, dtype=torch.int32).contiguous()
+
+        xq = (pq_ops.fp4_act_qdq(x) if self.is_fp4
+              else pq_ops.fp8_act_qdq(x))
+        x_sorted = xq.index_select(0, rows).contiguous()
+        pair_count = int(x_sorted.shape[0])
+        chunk = self._native_bf16_chunk(layer)
+
+        gate_up = torch.empty(
+            (pair_count, 2 * inter), dtype=torch.bfloat16, device=x.device)
+        for c0 in range(0, E, chunk):
+            c1 = min(E, c0 + chunk)
+            weight = self._expand_native_bf16_slice(
+                layer, "w13", c0, c1)
+            pq_ops.cb_bf16_grouped_mm_out(
+                gate_up, x_sorted, weight, expert_ends, c0)
+            del weight
+
+        activated = torch.empty(
+            (pair_count, inter), dtype=torch.bfloat16, device=x.device)
+        native_moe_activation(act, activated, gate_up)
+        del gate_up
+        aq = (pq_ops.fp4_act_qdq(activated) if self.is_fp4
+              else pq_ops.fp8_act_qdq(activated))
+        del activated
+
+        pair_output = torch.empty(
+            (pair_count, hidden), dtype=torch.bfloat16, device=x.device)
+        for c0 in range(0, E, chunk):
+            c1 = min(E, c0 + chunk)
+            weight = self._expand_native_bf16_slice(
+                layer, "w2", c0, c1)
+            pq_ops.cb_bf16_grouped_mm_out(
+                pair_output, aq, weight, expert_ends, c0)
+            del weight
+
+        pair_weight = topk_weights.reshape(-1).index_select(0, order) \
+            .to(pair_output.dtype)
+        pair_output.mul_(pair_weight[:, None])
+        output = torch.zeros((T, hidden), dtype=x.dtype, device=x.device)
+        output.index_add_(0, rows, pair_output.to(output.dtype))
+        return output
+
 
     # -- prefill: grouped FUSED (decode-in-prologue, round 1) ---------------
     def _gf_ok(self, layer) -> bool:
@@ -974,16 +919,18 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
     def _apply_prefill_grouped_fused(self, layer, x, topk_weights, topk_ids,
                                      act):
-        """ROUND 1 of the MoE grouped fused prefill
-        (``PRISMAQUANT_CB_PREFILL=grouped_fused``, OPT-IN). Returns ``None`` on
-        any constraint miss so the caller falls through to 'stock'.
+        """ROUND 1 of the native FP8-CB grouped fused prefill.
 
-        WHAT IT REMOVES. The stock path CUDA-expands each expert chunk's packed
-        CB rows into an HBM e4m3 tile and then runs vLLM's Triton fused-MoE
-        grouped GEMM over that tile: N*K bytes written, then read straight back
-        — a pure round-trip tax (~17 ms/layer expand vs ~25 ms/layer GEMM on a
-        256-expert reference). ``cb_fused_prefill_mm_scaled`` decodes the packed
-        rows INSIDE the CUTLASS prologue, so the tile never exists.
+        Returns ``None`` on any constraint miss so the caller falls through to
+        the owned native BF16 quality bridge. Eligibility is resolved by the
+        fixed native dispatch; the retired ``PRISMAQUANT_CB_PREFILL`` selector
+        is not part of the serving contract.
+
+        WHAT IT REMOVES. The native quality bridge expands each expert chunk's
+        packed CB rows into a bounded BF16 tile and runs Gridbook's owned
+        grouped CUTLASS GEMM over it. ``cb_fused_prefill_mm_scaled`` instead
+        decodes the packed rows INSIDE the CUTLASS prologue, so the transient
+        tile never exists.
 
         ROUTING / SYNC DESIGN. Per (token, expert) PAIR p = t*top_k + j:
         ``pair_expert = topk_ids.reshape(-1)``. A STABLE argsort by expert makes
@@ -999,9 +946,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         control flow) — same class as 'batched'; prefill is eager
         (FULL_DECODE_ONLY), so that costs nothing today.
 
-        NUMERICS. Activations: the same per-token fp8-dynamic QDQ the stock path
-        uses (``moe_kernel_quantize_input``, bit-equivalent to
-        codec.fp8_dynamic_act_qdq — test_stock_fp8_quant_matches_codec) on the
+        NUMERICS. Activations: the registered native per-token FP8 quantizer,
+        bit-equivalent to ``codec.fp8_dynamic_act_qdq``, runs on the
         module input AND the intermediate, gathered per expert (QDQ is a
         per-row op, so gather-after-quant == quant-after-gather bit-exactly).
         Weights: the fused prologue's decode is bit-exact vs the expander.
@@ -1017,10 +963,6 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         """
         if not self._gf_ok(layer):
             return None
-        from vllm.platforms import current_platform
-        from vllm.model_executor.layers.fused_moe.utils import (
-            moe_kernel_quantize_input,
-        )
         from .cuda_ext import get_fused_ext
         fext = get_fused_ext()
 
@@ -1034,7 +976,6 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         d = N1 // 2
         lut = self._stock_cb_flat_fp8(layer)
         kb = self.k
-        fp8_dtype = current_platform.fp8_dtype()
 
         out = torch.zeros_like(x)
 
@@ -1050,8 +991,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         bounds = bounds_t.tolist()                                 # THE one sync
 
         # ---- input activation QDQ, ONCE over all token rows ----------------
-        a1, a1s = moe_kernel_quantize_input(
-            x, None, fp8_dtype, per_act_token_quant=True)
+        a1, a1s = native_fp8_quant(x)
         a1s = a1s.reshape(-1).to(torch.float32)
 
         w13q = layer.w13_cb_qweight.data
@@ -1075,12 +1015,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             del ae, ase
             a = torch.empty((gate_up.shape[0], d), dtype=gate_up.dtype,
                             device=dev)
-            apply_moe_activation(act, a, gate_up)                  # silu(g)*u
+            native_moe_activation(act, a, gate_up)                # silu(g)*u
             del gate_up
 
-            # intermediate QDQ — the stock path's exact function
-            a2, a2s = moe_kernel_quantize_input(
-                a, None, fp8_dtype, per_act_token_quant=True)
+            # Intermediate QDQ uses the same native per-token quantizer.
+            a2, a2s = native_fp8_quant(a)
             del a
 
             # stage 2: y = a2 @ W2[e]^T
@@ -1166,10 +1105,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
     def _apply_prefill_grouped_fused_v2(self, layer, x, topk_weights, topk_ids,
                                         act, *, tile_m=None):
-        """ROUND 2 of the MoE grouped fused prefill (selected by
-        ``PRISMAQUANT_CB_PREFILL=grouped_fused`` when the grouped binding
-        exists). Returns ``None`` on any constraint miss so the caller falls
-        back to R1 and then to 'stock'.
+        """ROUND 2 of the native FP8-CB grouped fused prefill.
+
+        The fixed native dispatch tries this grouped binding when eligible.
+        Any constraint miss falls back to R1 and then to the owned native BF16
+        quality bridge; no retired runtime prefill selector is consulted.
 
         WHAT IT REMOVES. R1 already decodes CB rows inside the CUTLASS prologue,
         so the only structural cost it left is the HOST LOOP: 2*E dense kernel
@@ -1207,8 +1147,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         prerequisite for future CUDA-graph capture of prefill (today prefill is
         eager/FULL_DECODE_ONLY, so the trim is the better default).
 
-        NUMERICS. Identical contract to R1: the stock path's own
-        ``moe_kernel_quantize_input`` per-token fp8 QDQ on the module input AND
+        NUMERICS. Identical contract to R1: the registered native per-token
+        FP8 quantizer runs on the module input AND
         the intermediate (a per-row op, so gather-after-quant ==
         quant-after-gather bit-exactly), bit-exact prologue weight decode, and
         the same fp32 EVT ``bf16_rn(b_scale * (a_scale * acc))`` rounding order.
@@ -1225,10 +1165,6 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         """
         if not self._gf2_ok(layer):
             return None
-        from vllm.platforms import current_platform
-        from vllm.model_executor.layers.fused_moe.utils import (
-            moe_kernel_quantize_input,
-        )
         from .cuda_ext import get_fused_ext
         fext = get_fused_ext()
 
@@ -1242,7 +1178,6 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         d = N1 // 2
         lut = self._stock_cb_flat_fp8(layer)
         kb = self.k
-        fp8_dtype = current_platform.fp8_dtype()
         # Never hardcode a tile: the kernel owns which TileM it compiled.
         tile_m = int(fext.cb_fused_moe_tile_m() if tile_m is None else tile_m)
         if tile_m <= 0:
@@ -1270,8 +1205,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             is_pad = is_pad[:nb * tile_m]
 
         # ---- input activation QDQ, ONCE over all token rows ----------------
-        a1, a1s = moe_kernel_quantize_input(
-            x, None, fp8_dtype, per_act_token_quant=True)
+        a1, a1s = native_fp8_quant(x)
         a1s = a1s.reshape(-1).to(torch.float32)
 
         # ONE index vector does both the gather and the scatter: real rows map
@@ -1300,11 +1234,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if gate_up is None:                          # binding has no TileM knob
             return None
         a = torch.empty((gate_up.shape[0], d), dtype=gate_up.dtype, device=dev)
-        apply_moe_activation(act, a, gate_up)                      # silu(g)*u
+        native_moe_activation(act, a, gate_up)                    # silu(g)*u
         del gate_up
 
-        a2, a2s = moe_kernel_quantize_input(
-            a, None, fp8_dtype, per_act_token_quant=True)
+        a2, a2s = native_fp8_quant(a)
         del a
 
         # stage 2: y = a2 @ W2[expert_of_tile]^T — SAME expert_ids, the row
@@ -1325,1238 +1258,6 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         out.index_add_(0, dest, y.to(out.dtype))
         return out[:T]
 
-    # -- prefill: L2-resident rotating scratch (round 4) --------------------
-    def _l2_ok(self, layer) -> bool:
-        """Eligibility for the L2 pipeline (cached per layer; the answer never
-        changes after load). Requirements, each a silent fall-through:
-
-          * fp8-CB — the path decodes to native e4m3 bytes and feeds
-            ``cutlass_scaled_mm``, the same W8A8 GEMM class the dense path
-            trusts; fp4-CB has no faithful packed-NVFP4 transient (see
-            ``_apply_prefill_stock``).
-          * per-(expert,out) weight scales present (the GEMM's b_scales).
-          * K % SUPERBLOCK on both projections (the expander's own constraint).
-          * 3-D stacked qweights whose ``[c0:c1]`` slice is a CONTIGUOUS view,
-            so the decode reads a raw slice with no pad and no copy — the same
-            property ``_expand_stack_slice`` relies on.
-          * an extension build carrying ``cb_expand_fp8_into``: the allocating
-            expander cannot be used here (a fresh allocation lands outside the
-            pinned address range), and an older build must degrade to stock.
-        """
-        ok = getattr(layer, "_cb_l2_ok", None)
-        if ok is not None:
-            return ok
-        ok = (not self.is_fp4
-              and self.n_sub == 4
-              and hasattr(layer, "w13_weight_scale")
-              and layer._cb_hidden % codec.SUPERBLOCK == 0
-              and layer._cb_inter % codec.SUPERBLOCK == 0)
-        if ok:
-            for which, in_f in (("w13", layer._cb_hidden),
-                                ("w2", layer._cb_inter)):
-                qw = getattr(layer, f"{which}_cb_qweight")
-                rb = _row_bytes(in_f, self.type_size)
-                ok = ok and (qw.dim() == 3 and qw.stride(2) == 1
-                             and qw.stride(1) == rb and qw.shape[2] == rb
-                             and qw.stride(0) == qw.shape[1] * rb)
-        if ok:
-            from . import ops as pq_ops
-            ok = pq_ops.cb_expand_fp8_into_available()
-        if ok:
-            try:
-                from vllm import _custom_ops as vllm_ops  # noqa: F401
-                ok = hasattr(vllm_ops, "cutlass_scaled_mm")
-            except Exception:  # noqa: BLE001 — treat as "not offered"
-                ok = False
-        layer._cb_l2_ok = bool(ok)
-        return layer._cb_l2_ok
-
-    @staticmethod
-    def _l2_ext_call(name, *args, default=None):
-        """Call an OPTIONAL L2 binding. The window API ships independently of
-        the expander, so every one of these is getattr+try guarded: an older
-        extension must mean 'no L2 lever', never a crashed serve."""
-        try:
-            from .cuda_ext import get_ext
-            ext = get_ext()
-            fn = getattr(ext, name, None) if ext is not None else None
-            if fn is None:
-                return default
-            return fn(*args)
-        except Exception:  # noqa: BLE001 — an absent/failing knob is not fatal
-            return default
-
-    def _l2_plan(self, layer):
-        """The rotating-pair plan for this layer, cached on it.
-
-        The cap is DERIVED (``moe_l2.cb_l2_cap_bytes``) from what the device
-        reports for persisting L2, halved because the pinned window must cover
-        BOTH halves of the arena; ``torch.cuda``'s L2 size is the fallback when
-        the extension predates the query. ``PRISMAQUANT_CB_L2_WINDOW_MB``
-        overrides the per-half cap for bisection only. The expert tile is sized
-        on the LARGER projection (w13's ``2*inter*hidden``), because one arena
-        serves both stages.
-        """
-        plan = getattr(layer, "_cb_l2_plan", "unset")
-        if plan != "unset":
-            return plan
-        persist = self._l2_ext_call("l2_persisting_max_bytes", default=None)
-        if not persist:
-            try:
-                props = torch.cuda.get_device_properties(
-                    layer.w13_cb_qweight.device)
-                persist = int(getattr(props, "L2_cache_size", 0) or 0)
-            except Exception:  # noqa: BLE001
-                persist = 0
-        cap = cb_l2_cap_bytes(
-            persist,
-            env_mb=os.environ.get("PRISMAQUANT_CB_L2_WINDOW_MB"),
-            max_window_bytes=self._l2_ext_call("l2_max_window_bytes",
-                                               default=None))
-        force = os.environ.get("PRISMAQUANT_CB_L2_GROUP")
-        expert_bytes = max(2 * layer._cb_inter * layer._cb_hidden,
-                           layer._cb_hidden * layer._cb_inter)   # e4m3 = 1 B
-        plan = cb_l2_plan(layer._cb_E, expert_bytes, cap,
-                          force_group=int(force) if force else None)
-        layer._cb_l2_plan = plan
-        return plan
-
-    def _l2_arena(self, layer, plan):
-        """Allocate the arena ONCE per layer and cache it on the layer.
-
-        ONE contiguous RAW-BYTE (uint8) block — the expander's ``out`` contract
-        — reinterpreted as e4m3 per unit; the two halves are slices of it, so a
-        SINGLE
-        pinning window covers both (a persisting window is one address range per
-        stream — two separate allocations could not both be covered). It is
-        never freed: re-allocating per forward would move the address out from
-        under the pinned window and would also churn the caching allocator
-        across streams.
-        """
-        buf = getattr(layer, "_cb_l2_scratch", None)
-        if buf is None or buf.numel() < plan.arena_bytes:
-            buf = torch.empty(plan.arena_bytes, dtype=torch.uint8,
-                              device=layer.w13_cb_qweight.device)
-            layer._cb_l2_scratch = buf
-        return buf
-
-    def _l2_stream(self, main):
-        """A side stream for the DIAGNOSTIC overlapped variant, cached per
-        ``(device, current stream)``.
-
-        The round-4 original cached ONE ``torch.cuda.Stream()`` on ``self`` for
-        the life of the process. That handle then got reused under whatever
-        stream happened to be current at the next call — and vLLM serves on its
-        own non-default stream, not the default stream every synthetic test ran
-        on. Keying the cache on the CURRENT stream makes a handle usable only in
-        the exact context it was created for, so a stream captured under one
-        serving context can never be replayed against another. (Creating one per
-        forward would also be correct, but a CUDA stream create/destroy per
-        layer per forward is itself a heavyweight driver call; the keyed cache
-        keeps the steady state free.)
-        """
-        cache = getattr(self, "_l2_side_streams", None)
-        if cache is None:
-            cache = self._l2_side_streams = {}
-        key = (main.device, main.cuda_stream)
-        s = cache.get(key)
-        if s is None:
-            s = cache[key] = torch.cuda.Stream(device=main.device)
-        return s
-
-    def _l2_pin(self, arena, nbytes, streams) -> bool:
-        """Claim the persisting-access window on every stream that touches the
-        arena. The window is a per-STREAM attribute, so a stream whose accesses
-        are not covered streams its traffic past L2 — exactly the traffic this
-        round exists to keep resident.
-
-        NOT called per forward — see ``_l2_pin_window`` for the lifecycle and
-        ``moe_l2.cb_l2_pin_action`` for why (these calls are device-wide and
-        implicitly synchronizing)."""
-        ok = True
-        for s in streams:
-            with torch.cuda.stream(s):
-                ok = bool(self._l2_ext_call(
-                    "l2_pin_region", arena, int(nbytes), default=False)) and ok
-        return ok
-
-    def _l2_unpin(self, streams) -> None:
-        """Release the window on the given streams."""
-        for s in streams:
-            with torch.cuda.stream(s):
-                self._l2_ext_call("l2_unpin")
-
-    def _l2_pin_window(self, layer, arena, nbytes, streams) -> bool:
-        """Idempotent pin: do the device-wide work only when the
-        ``(arena address, streams)`` key actually changes.
-
-        The decision itself is ``moe_l2.cb_l2_pin_action`` (pure, CPU-tested);
-        this method is only its CUDA effect plus the per-layer memo.
-
-        LIFETIME SPLIT (the correction to round 5's over-fix). The DEVICE-WIDE
-        carve-out reservation is grow-only and effectively once per process —
-        re-issuing it per layer per forward is synchronizing and drove a live
-        serve's throughput to zero. The PER-STREAM window is a different animal:
-        cheap to set, but it must be cleared before we hand the stream back
-        (``_l2_reset_window``, called from the caller's ``finally``). Round 5
-        removed BOTH, which left our window attached to vLLM's serving stream
-        for the life of the process — every later kernel on that stream then ran
-        pointed at a foreign address range, which is the leading suspect for the
-        third live wedge.
-        """
-        key = (int(arena.data_ptr()), int(nbytes),
-               tuple(int(s.cuda_stream) for s in streams))
-        cur = getattr(layer, "_cb_l2_pinned_key", None)
-        unpin_first, pin = cb_l2_pin_action(cur, key)
-        if unpin_first:
-            # The old key's streams are the ones recorded with it; releasing on
-            # the CURRENT streams would leave a stale window on a stream we no
-            # longer touch, so the streams travel with the memo.
-            self._l2_unpin(getattr(layer, "_cb_l2_pinned_streams", streams))
-            layer._cb_l2_pinned_key = None
-        if not pin:
-            return cur is not None
-        ok = self._l2_pin(arena, nbytes, streams)
-        if ok:
-            layer._cb_l2_pinned_key = key
-            layer._cb_l2_pinned_streams = tuple(streams)
-        return ok
-
-    def _l2_reset_window(self, streams) -> None:
-        """Clear the per-stream access-policy window on every stream we set it
-        on. Cheap (a stream attribute, no device-wide call), so it belongs in a
-        per-forward ``finally``: the invariant is that vLLM's serving stream
-        never carries our window outside our own forward. The device-wide
-        carve-out reservation deliberately survives — see _l2_pin_window."""
-        for s in streams:
-            with torch.cuda.stream(s):
-                self._l2_ext_call("l2_reset_window")
-
-    def _apply_prefill_l2_pipeline(self, layer, x, topk_weights, topk_ids,
-                                   act):
-        """ROUND 4: decode into an L2-PINNED rotating scratch pair
-        (``PRISMAQUANT_CB_PREFILL=l2_pipeline``). Returns ``None`` on any
-        constraint miss so the caller falls through to 'stock'.
-
-        WHAT IT REMOVES. Rounds 1-3 attacked launch count and tile redundancy.
-        What is left on a large-expert MoE is the decoded-weight ROUND TRIP: the
-        stock path writes each expert's ``N_e x K`` e4m3 tile to HBM and the very
-        next kernel reads it back (~17 ms of ~42 ms/layer). Here the decode
-        writes into one half of a small, address-stable arena held in L2 by a
-        persisting-access window, and the GEMM reads that half back — ideally
-        out of L2. The bytes are the SAME bytes (same expander), so this is a
-        placement change, not a numerics change.
-
-        UNIT SEQUENCE. The work is a flat list of DECODE UNITS, two per live
-        expert group: ``[(g0,w13), (g0,w2), (g1,w13), (g1,w2), ...]``. Unit ``u``
-        decodes into ``arena[u % 2]``, so the alternation is uniform across the
-        stage boundary. Groups no token routed to are dropped from the list using
-        only the E+1 offsets the routing already fetched
-        (``cb_l2_live_groups``), so an empty group costs neither a launch nor
-        window residency.
-
-        SERIAL IS THE DEFAULT (and the only path a serve takes). Decode unit
-        ``u`` into its half, then GEMM from that half — all on the CURRENT
-        stream, with no side stream, no events and no ``wait_stream``. Two
-        reasons, one structural and one measured:
-
-          * STRUCTURAL. vLLM serves on its own non-default stream and may run a
-            small batch inside a CUDA-graph capture. Cross-stream event waits
-            against a stream that is not part of the capture are illegal there
-            and HANG rather than error — which is exactly what the overlapped
-            variant did on its first qualifying prefill (throughput -> 0, request
-            stuck Running, no OOM, no watchdog line). Every synthetic test ran on
-            the DEFAULT stream, which is why the suite was green.
-          * MEASURED. There is no overlap win to give up. ``gridbook/csrc/cb_fused_gemm.cu``
-            records chunked-expand + GEMM overlap at 0.74-0.79x of SERIAL speed
-            on this part: unified memory at ~273 GB/s leaves the expander no
-            spare bandwidth for the GEMM to hide behind, so the two streams
-            contend instead of overlapping.
-
-        The rotating pair is KEPT in the serial path: it is what the arena
-        sizing and the single pinned window are built around, and one stream
-        already orders decode-before-GEMM and GEMM-before-overwrite, so no
-        cross-buffer synchronization is needed at all. Buffer reuse is safe by
-        program order.
-
-        The overlapped variant survives behind ``PRISMAQUANT_CB_L2_OVERLAP=1``
-        (``_l2_units_overlapped``) for diagnosis only.
-
-        NUMERICS. Weight bytes are bit-identical to stock (same expander kernel,
-        same packed rows, only the destination differs). Activations use the
-        stock path's own per-token fp8 dynamic QDQ on the input AND the
-        intermediate (a per-row op, so gather-after-quant == quant-after-gather
-        bit-exactly). ``cutlass_scaled_mm`` applies per-token a_scales and
-        per-channel b_scales in its fp32 EVT epilogue and rounds ONCE to bf16 —
-        the promoted rounding order, the same one the dense fp8 path ships. Only
-        the GEMM accumulation and the cross-expert combine reassociate
-        (REASSOCIATION-CLASS, the suite's 2e-2 contract).
-
-        FALL-THROUGH. ``None`` (-> stock) when the format/build gate misses, or
-        when the LARGEST expert tile exceeds the derived per-half cap: no
-        rotation of that pair could keep a tile resident, so paying the
-        pipeline's bookkeeping would be dishonest. If ``l2_pin_region`` reports
-        the window unavailable we still RUN (rather than fall through): the
-        rotating pair is a real structural change on its own — a bounded,
-        reused transient in place of stock's per-chunk allocation — and the R3
-        tuner is what decides whether it wins. Falling through there would hide
-        a candidate the tuner exists to judge. (It is NOT overlap that carries
-        this path: the default is serial by construction, and overlap measured
-        as a LOSS on this part — see the serial-default note above.)
-        """
-        if x.shape[0] < cb_l2_min_m(
-                os.environ.get("PRISMAQUANT_CB_L2_MIN_M")):
-            # TINY-M FLOOR. Below the mid-M boundary the per-expert pipeline is
-            # pure bookkeeping: 2 launches per live group plus a pinned window,
-            # to move a handful of rows. The R3 tuner would never propose R4
-            # here (its own guard is M>=1024), but the DIRECT env mode bypasses
-            # the tuner, so the floor has to live in the path.
-            return None
-        if not self._l2_ok(layer):
-            return None
-        plan = self._l2_plan(layer)
-        if plan is None:                     # tile > window cap, or no window
-            return None
-
-        from vllm import _custom_ops as vllm_ops
-        from vllm.platforms import current_platform
-        from vllm.model_executor.layers.fused_moe.utils import (
-            moe_kernel_quantize_input,
-        )
-        from . import ops as pq_ops
-
-        E = layer._cb_E
-        T = x.shape[0]
-        top_k = topk_ids.shape[-1]
-        dev = x.device
-        Kh = layer._cb_hidden
-        inter = layer._cb_inter
-        N1 = 2 * inter
-        d = N1 // 2
-        lut = self._stock_cb_flat_fp8(layer)
-        fp8_dtype = current_platform.fp8_dtype()
-
-        # ---- routing: R1's construction verbatim (ONE host sync) -----------
-        pair_expert = topk_ids.reshape(-1).to(torch.long)
-        pair_token = torch.arange(T, device=dev, dtype=torch.long) \
-            .repeat_interleave(top_k)
-        order = torch.argsort(pair_expert, stable=True)          # STABLE
-        ptok_sorted = pair_token[order]
-        pw_sorted = topk_weights.reshape(-1)[order]
-        counts = torch.bincount(pair_expert, minlength=E)
-        bounds = torch.cat([counts.new_zeros(1),
-                            torch.cumsum(counts, 0)]).tolist()   # THE one sync
-
-        live = cb_l2_live_groups(plan.groups, bounds)
-        out = torch.zeros_like(x)
-        if not live:
-            return out
-
-        # ---- input activation QDQ, ONCE over all token rows ----------------
-        a1, a1s = moe_kernel_quantize_input(
-            x, None, fp8_dtype, per_act_token_quant=True)
-        a1s = a1s.reshape(-1, 1).to(torch.float32)
-
-        arena = self._l2_arena(layer, plan)
-        halves = [arena[:plan.buffer_bytes],
-                  arena[plan.buffer_bytes:2 * plan.buffer_bytes]]
-        main = torch.cuda.current_stream()
-        overlap = os.environ.get("PRISMAQUANT_CB_L2_OVERLAP") == "1"
-        if overlap and torch.cuda.is_current_stream_capturing():
-            # Cross-stream waits against a non-captured stream are not legal
-            # inside a graph capture; the driver hangs instead of erroring.
-            # Refuse rather than risk it — stock is capture-clean.
-            return None
-        side = self._l2_stream(main) if overlap else None
-        streams = (main, side) if overlap else (main,)
-        # Row-offset vector for the expander: zeros, one per decoded row, sized
-        # once for the worst unit and sliced — allocating it per unit would put
-        # a fresh H2D-shaped allocation on the hot path for a constant.
-        row0 = getattr(layer, "_cb_l2_row0", None)
-        max_rows = plan.group_size * max(N1, Kh)
-        if row0 is None or row0.numel() < max_rows:
-            row0 = torch.zeros(max_rows, dtype=torch.int32, device=dev)
-            layer._cb_l2_row0 = row0
-
-        units = []
-        for e0, e1, p0, p1 in live:
-            units.append(("w13", e0, e1, p0, p1))
-            units.append(("w2", e0, e1, p0, p1))
-
-        def _decode(unit, buf_idx):
-            which, e0, e1, _p0, _p1 = unit
-            n_e = e1 - e0
-            out_f = N1 if which == "w13" else Kh
-            in_f = Kh if which == "w13" else inter
-            rows = n_e * out_f
-            packed = getattr(layer, f"{which}_cb_qweight")[e0:e1]
-            pq_ops.cb_expand_fp8_into(
-                halves[buf_idx], packed.reshape(rows, -1), lut,
-                row0[:rows], rows, in_f, self.k, self.n_sub, self.type_size)
-
-        def _weights(unit, buf_idx):
-            which, e0, e1, _p0, _p1 = unit
-            n_e = e1 - e0
-            out_f = N1 if which == "w13" else Kh
-            in_f = Kh if which == "w13" else inter
-            # Raw bytes ARE the e4m3 tile (the expander writes e4m3 bit
-            # patterns); reinterpret, never convert.
-            return (halves[buf_idx][:n_e * out_f * in_f]
-                    .view(torch.float8_e4m3fn).view(n_e, out_f, in_f))
-
-        # The intermediate activations of the w13 unit, consumed by the w2 unit
-        # of the SAME group. A one-slot holder rather than a closure-local, so
-        # both drivers below share one definition of the GEMM work.
-        carry = [None]
-
-        def _gemm_unit(unit, buf_idx):
-            which, e0, e1, _p0, _p1 = unit
-            W = _weights(unit, buf_idx)
-            if which == "w13":
-                group_a2 = []
-                for e in range(e0, e1):
-                    q0, q1 = bounds[e], bounds[e + 1]
-                    if q1 == q0:
-                        group_a2.append(None)
-                        continue
-                    rows = ptok_sorted[q0:q1]
-                    ae = a1.index_select(0, rows).contiguous()
-                    ase = a1s.index_select(0, rows).contiguous()
-                    gate_up = vllm_ops.cutlass_scaled_mm(
-                        ae, W[e - e0].t(), ase,
-                        layer.w13_weight_scale[e].reshape(1, N1).to(
-                            torch.float32),
-                        torch.bfloat16)
-                    a = torch.empty((gate_up.shape[0], d),
-                                    dtype=gate_up.dtype, device=dev)
-                    apply_moe_activation(act, a, gate_up)
-                    del gate_up
-                    a2, a2s = moe_kernel_quantize_input(
-                        a, None, fp8_dtype, per_act_token_quant=True)
-                    group_a2.append((a2.contiguous(),
-                                     a2s.reshape(-1, 1).to(torch.float32)))
-                carry[0] = group_a2
-            else:
-                for e in range(e0, e1):
-                    q0, q1 = bounds[e], bounds[e + 1]
-                    got = carry[0][e - e0]
-                    if got is None:
-                        continue
-                    a2, a2s = got
-                    y = vllm_ops.cutlass_scaled_mm(
-                        a2, W[e - e0].t(), a2s,
-                        layer.w2_weight_scale[e].reshape(1, Kh).to(
-                            torch.float32),
-                        torch.bfloat16)
-                    rows = ptok_sorted[q0:q1]
-                    y = y * pw_sorted[q0:q1, None].to(y.dtype)
-                    out.index_add_(0, rows, y.to(out.dtype))
-                carry[0] = None
-
-        # PIN. Idempotent and off the per-forward path: the reservation/reset
-        # pair is device-wide and implicitly synchronizing, so re-issuing it per
-        # layer per forward is a throughput sink by itself. Skipped entirely
-        # under graph capture, where a device-limit call is not legal; the rest
-        # of the serial path is capture-clean (one stream, no events, no host
-        # sync beyond the routing sync the caller already performs).
-        if not torch.cuda.is_current_stream_capturing():
-            self._l2_pin_window(layer, arena, plan.arena_bytes, streams)
-
-        try:
-            if overlap:
-                self._l2_units_overlapped(units, _decode, _gemm_unit, main, side)
-            else:
-                # SERIAL (default). One stream orders decode-before-GEMM and the
-                # next decode after the GEMMs that read that half, so the
-                # rotation needs no events at all. The rotation is kept because
-                # the arena sizing and the single pinned window are defined over
-                # the pair.
-                for u, unit in enumerate(units):
-                    i = u % 2
-                    _decode(unit, i)
-                    _gemm_unit(unit, i)
-        finally:
-            # Hand the stream back clean. Cheap (stream attribute only); the
-            # device-wide reservation is NOT touched here.
-            self._l2_reset_window(streams)
-        return out
-
-    @staticmethod
-    def _l2_units_overlapped(units, decode, gemm_unit, main, side):
-        """DIAGNOSTIC-ONLY overlapped driver (``PRISMAQUANT_CB_L2_OVERLAP=1``).
-
-        KNOWN TO HANG A LIVE SERVE. It is retained unchanged because its hazard
-        logic is correct and worth keeping for later analysis; what is not safe
-        is the CONTEXT — vLLM's non-default current stream and possible graph
-        capture, where cross-stream waits against a non-captured stream hang.
-        Do not put this on a serving path.
-
-        EVENT STRUCTURE (a missed dependency is a silent WRONG ANSWER, not a
-        crash, so it is spelled out). Two event pairs, indexed by buffer:
-
-          * ``dec_done[i]`` recorded on the SIDE stream after the decode that
-            fills buffer ``i``; the MAIN stream waits on it before any GEMM that
-            reads buffer ``i`` — RAW (produce-then-consume).
-          * ``gemm_done[i]`` recorded on the MAIN stream after the LAST GEMM
-            that reads buffer ``i``; the SIDE stream waits on it before the next
-            decode that overwrites buffer ``i`` — WAR (the reuse hazard a naive
-            double-buffer forgets).
-
-        The loop issues the decode of unit ``u+1`` (buffer ``j=(u+1)%2``) BEFORE
-        the GEMMs of unit ``u`` (buffer ``i=u%2``) — that is the whole overlap.
-        Buffer ``j`` was last read by unit ``u-1``, so the side stream first
-        waits ``gemm_done[j]`` (skipped at ``u==0``). ``side.wait_stream(main)``
-        at entry orders the first decode after the prologue and after any prior
-        use of the arena; ``main.wait_stream(side)`` at exit leaves nothing
-        outstanding.
-        """
-        dec_done = [torch.cuda.Event() for _ in range(2)]
-        gemm_done = [torch.cuda.Event() for _ in range(2)]
-        side.wait_stream(main)                   # arena free; prologue visible
-
-        def _decode_on(u, b):
-            with torch.cuda.stream(side):
-                decode(units[u], b)
-            dec_done[b].record(side)
-
-        _decode_on(0, 0)
-        for u, unit in enumerate(units):
-            i = u % 2
-            main.wait_event(dec_done[i])         # RAW: decode -> GEMM
-            if u + 1 < len(units):
-                j = (u + 1) % 2
-                if u >= 1:
-                    # WAR: buffer j was last READ by unit u-1.
-                    side.wait_event(gemm_done[j])
-                _decode_on(u + 1, j)
-            gemm_unit(unit, i)
-            gemm_done[i].record(main)            # WAR release for buffer i
-        main.wait_stream(side)                   # nothing outstanding on side
-
-    # -- prefill: MEASURED per-layer path selection -------------------------
-    def _prefill_candidates(self, layer, x, topk_weights, topk_ids, act):
-        """The prefill paths worth measuring for THIS layer, as
-        ``[(name, thunk)]`` with 'stock' first. grouped_fused appears once per
-        TileM the build actually compiled for this layer's rung; if the grouped
-        binding or the rung constraints are unmet the list is just 'stock', and
-        auto degenerates to the default with one wasted timing call."""
-        cands = [(_AUTO_STOCK, lambda: self._apply_prefill_stock(
-            layer, x, topk_weights, topk_ids, act))]
-        if self._gf2_ok(layer):
-            for tm in self._gf2_tile_sizes(layer):
-                cands.append((
-                    f"grouped_fused:tile_m={tm}",
-                    # Bind tm per iteration — a bare closure would capture the
-                    # loop variable and time the last tile N times.
-                    (lambda t: lambda: self._apply_prefill_grouped_fused_v2(
-                        layer, x, topk_weights, topk_ids, act, tile_m=t))(tm)))
-        # Round 4 is just another candidate: it returns None (-> disqualified,
-        # like every other gate here) when the build/format/window cap misses,
-        # so no promotion decision is taken in code — the tuner MEASURES it
-        # against stock on this layer's own inputs.
-        #
-        # ...but it is OPT-IN inside auto (PRISMAQUANT_CB_L2_AUTOTUNE=1) until
-        # its GPU gates have actually RUN. 'auto' is now the shipping default,
-        # so anything in this list is reachable by a default serve; l2_pipeline
-        # is the only candidate here whose parity, ragged/zero-row and
-        # buffer-rotation RACE tests have never executed (they are skip-only
-        # while the box is under the wedge quarantine). An unmeasured path that
-        # the default can silently select is exactly the promotion-without-
-        # evidence this repo forbids. PRISMAQUANT_CB_PREFILL=l2_pipeline still
-        # selects it directly, which is how the GPU session measures it; drop
-        # this gate once those tests are green on real hardware.
-        if (os.environ.get("PRISMAQUANT_CB_L2_AUTOTUNE") == "1"
-                and self._l2_ok(layer) and self._l2_plan(layer) is not None):
-            cands.append((L2_PIPELINE, lambda: self._apply_prefill_l2_pipeline(
-                layer, x, topk_weights, topk_ids, act)))
-        return cands
-
-    def _apply_prefill_auto(self, layer, x, topk_weights, topk_ids, act):
-        """MEASURED per-layer prefill selection (``PRISMAQUANT_CB_PREFILL=auto``
-        — the fp8-CB DEFAULT since the two-model gate cleared it in 3062fbf:
-        35B 4,405 tok/s vs stock 3,932, Laguna-class 2,063 vs stock 1,821).
-        Thin adapter: the policy —
-        threshold, per-layer caching, determinism, forcing — lives in
-        ``moe_autotune.cb_prefill_auto``, which is torch-only so it is testable
-        without vLLM/CUDA. This method only supplies the candidates."""
-        return cb_prefill_auto(
-            layer, x.shape[0],
-            lambda: self._prefill_candidates(
-                layer, x, topk_weights, topk_ids, act),
-            lambda: self._apply_prefill_stock(
-                layer, x, topk_weights, topk_ids, act),
-            min_m=int(os.environ.get("PRISMAQUANT_CB_AUTOTUNE_MIN_M")
-                      or "1024"),
-            forced=os.environ.get("PRISMAQUANT_CB_PREFILL_AUTO_FORCE") or None,
-            log=self._log_prefill_choice)
-
-    def _log_prefill_choice(self, best, timings, forced=False, layer=None,
-                            num_tokens=None):
-        """One line per layer, to stderr like every other gate on this path.
-        This is the evidence trail: a serving run must be able to show WHY it
-        picked what it picked, with the measurements that decided it.
-
-        R21: the same measurements also go to a DURABLE sink — a per-(format,
-        shape regime, box) JSONL table — so "two boxes' cost tables disagree in
-        ranking", the forcing function for a time term in the allocator
-        objective, becomes observable instead of anecdotal. The stderr line is
-        unchanged."""
-        detail = " ".join(f"{n}={timings[n]:.3f}ms" for n in sorted(timings))
-        print(f"[prismaquant-cb] prefill auto {self.prefix}: "
-              f"{'forced' if forced else 'chose'} {best}"
-              + (f" | {detail}" if detail else ""),
-              file=sys.stderr, flush=True)
-        try:
-            record_autotune_timings(
-                best, timings,
-                layer_prefix=self.prefix,
-                fmt=("NVFP4_CB_K%d" if self.is_fp4 else "FP8_CB_K%d") % self.k,
-                regime=autotune_shape_regime(
-                    num_tokens if num_tokens is not None else 0,
-                    n_experts=getattr(layer, "_cb_E", None),
-                    intermediate=getattr(layer, "_cb_inter", None),
-                ),
-                forced=forced,
-                sink_dir=os.environ.get("PRISMAQUANT_CB_ARTIFACT_DIR"),
-            )
-        except Exception:                      # noqa: BLE001 — never fail a serve
-            pass
-
-    # -- prefill: per-expert loop (bisection reference) ---------------------
-    def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
-        """Original per-expert prefill loop (PRISMAQUANT_CB_PREFILL=loop): the
-        validated-numerics reference the batched path must match. Per hit expert,
-        QDQ that expert's rows, decode its w13/w2 to a bounded bf16 transient
-        (_decode_expert, INV-1 one expert live), two F.linear (bf16 MMA), and a
-        router-weighted index_add_ combine in expert-ascending order."""
-        out = torch.zeros_like(x)
-        # ONE host sync for the hit-expert list (the pre-fix per-expert
-        # `bool(sel.any())` cost E syncs per layer per forward).
-        hit = torch.bincount(
-            topk_ids.reshape(-1), minlength=layer._cb_E) > 0
-        hit_experts = hit.nonzero(as_tuple=True)[0].tolist()   # one sync
-        for e in hit_experts:
-            sel = (topk_ids == e)
-            tok_idx, slot = torch.where(sel)                   # tokens -> expert e
-            xe = codec.fp4_group16_act_qdq(x[tok_idx]) if self.is_fp4 \
-                else codec.fp8_dynamic_act_qdq(x[tok_idx])
-            xe = xe.to(torch.bfloat16)
-            W13 = self._decode_expert(layer, "w13", e)         # (2*inter, hidden)
-            gate_up = torch.nn.functional.linear(xe, W13)      # (n_e, 2*inter)
-            del W13
-            d = gate_up.shape[-1] // 2
-            a = torch.empty(gate_up.shape[:-1] + (d,), dtype=gate_up.dtype,
-                            device=gate_up.device)
-            apply_moe_activation(act, a, gate_up)              # silu(gate)*up
-            aq = (codec.fp4_group16_act_qdq(a) if self.is_fp4
-                  else codec.fp8_dynamic_act_qdq(a)).to(torch.bfloat16)
-            W2 = self._decode_expert(layer, "w2", e)           # (hidden, inter)
-            oe = torch.nn.functional.linear(aq, W2)            # (n_e, hidden)
-            del W2
-            oe = oe * topk_weights[tok_idx, slot][:, None].to(oe.dtype)
-            out.index_add_(0, tok_idx, oe.to(out.dtype))
-        return out
-
-    # -- prefill: batched-expert path (default) -----------------------------
-    def _apply_prefill_batched(self, layer, x, topk_weights, topk_ids, act, *,
-                               use_grouped_mm=None, chunk=None):
-        """Batched prefill (PRISMAQUANT_CB_PREFILL=batched). Replaces the
-        per-expert loop's E Triton expands + E QDQ passes with ONE act-QDQ over
-        all tokens and ONE expand per projection per expert-CHUNK, then a
-        grouped/segmented bf16 GEMM over the per-expert token groups.
-
-        INV-1: the transient weight tile is bounded to ONE chunk of experts
-        (PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK, default 64 — ~1.6 GB for Hy3's
-        3072×4096 w13, vs ~7.2 GB for all 192 at once), expanded right before
-        its GEMM and freed right after; w13 is freed before w2 is expanded, so
-        peak is one chunk's LARGER projection, not their sum.
-
-        Numerics vs _apply_prefill_loop: weights are bit-identical (same
-        expander, same per-(expert,out) scale) and the per-token QDQ is
-        bit-identical because BOTH fp8-dynamic and fp4-group16 activation QDQ are
-        PER-TOKEN-ROW operations — codec.fp8_dynamic_act_qdq /
-        fp4_group16_act_qdq reshape to rows and quantise each row from its own
-        amax with no cross-row coupling, so QDQ(x)[sel] == QDQ(x[sel])
-        row-for-row (test_qdq_once_equals_per_selection). One act-QDQ over all
-        tokens therefore reproduces the loop's per-expert QDQ(x[tok_idx]) on the
-        same rows. Only the GEMM accumulation and cross-expert combine
-        reassociate (REASSOCIATION-CLASS)."""
-        if use_grouped_mm is None:
-            use_grouped_mm = os.environ.get(
-                "PRISMAQUANT_CB_PREFILL_GROUPED_MM", "0") == "1"
-        if chunk is None:
-            chunk = int(os.environ.get(
-                "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK") or "64")
-        chunk = max(1, chunk)
-        T = x.shape[0]
-        topk = topk_ids.shape[-1]
-        dev = x.device
-        out = torch.zeros_like(x)
-
-        # ONE activation QDQ over ALL token rows (per-row op — see docstring).
-        xq = (codec.fp4_group16_act_qdq(x) if self.is_fp4
-              else codec.fp8_dynamic_act_qdq(x)).to(torch.bfloat16)
-
-        # (token, expert, weight) pairs from the full topk grid, sorted
-        # expert-ascending and STABLE so within-expert row order stays
-        # token-major — exactly the loop's torch.where(topk_ids==e) order (the
-        # per-segment GEMM then bit-matches the loop; only the combine
-        # reassociates). pair p = t*topk + j -> expert topk_ids[t,j].
-        pair_expert = topk_ids.reshape(-1)                     # [P] = T*topk
-        pair_token = torch.arange(T, device=dev, dtype=torch.long) \
-            .repeat_interleave(topk)                            # [P]
-        pair_weight = topk_weights.reshape(-1)                 # [P]
-        order = torch.argsort(pair_expert, stable=True)
-        ptok_sorted = pair_token[order]
-        pw_sorted = pair_weight[order]
-
-        counts = torch.bincount(pair_expert, minlength=layer._cb_E)   # [E]
-        hit_experts_t = counts.nonzero(as_tuple=True)[0]              # ascending
-        hit_offsets_t = torch.cat([
-            counts.new_zeros(1),
-            torch.cumsum(counts[hit_experts_t], 0)])                 # [n_hit+1]
-        # Two O(1) host syncs (NOT O(E)): the hit-expert ids and their
-        # sorted-array segment boundaries. Everything above stays GPU-resident.
-        hit_experts = hit_experts_t.tolist()
-        hit_offsets = hit_offsets_t.tolist()
-        n_hit = len(hit_experts)
-
-        for c0 in range(0, n_hit, chunk):
-            c1 = min(n_hit, c0 + chunk)
-            these = hit_experts[c0:c1]                         # python ids
-            p0, p1 = hit_offsets[c0], hit_offsets[c1]
-            if p1 == p0:
-                continue
-            # local per-expert segment bounds within this chunk's [p0, p1).
-            bounds = [hit_offsets[c0 + i] - p0 for i in range(c1 - c0 + 1)]
-            xrows = xq[ptok_sorted[p0:p1]]                     # [Pc, hidden]
-
-            # stage 1: gate_up = xrows @ W13[e]^T (grouped).
-            W13 = self._expand_expert_stack(layer, "w13", these)  # [C,2i,hidden]
-            gate_up = self._grouped_gemm(xrows, W13, bounds, use_grouped_mm)
-            del W13, xrows
-            d = gate_up.shape[-1] // 2
-            a = torch.empty(gate_up.shape[:-1] + (d,), dtype=gate_up.dtype,
-                            device=dev)
-            apply_moe_activation(act, a, gate_up)             # silu(gate)*up
-            del gate_up
-            aq = (codec.fp4_group16_act_qdq(a) if self.is_fp4
-                  else codec.fp8_dynamic_act_qdq(a)).to(torch.bfloat16)
-            del a
-
-            # stage 2: y = aq @ W2[e]^T (grouped).
-            W2 = self._expand_expert_stack(layer, "w2", these)    # [C,hidden,i]
-            y = self._grouped_gemm(aq, W2, bounds, use_grouped_mm)  # [Pc,hidden]
-            del W2, aq
-
-            y = y * pw_sorted[p0:p1, None].to(y.dtype)        # router weight
-            out.index_add_(0, ptok_sorted[p0:p1], y.to(out.dtype))
-            del y
-        return out
-
-    def _expand_expert_stack(self, layer, which: str, experts) -> torch.Tensor:
-        """Decode a CHUNK of experts' CB weights to a stacked bf16 tile
-        ``[C, out, in]`` in ONE Triton launch: the dense expander runs over the
-        reshaped ``[(C*out), row_bytes]`` view. Every expert-row is an
-        independent decode keyed only by its own packed bytes + the shared
-        per-layer codebook at offset 0 — exactly what ``_decode_expert`` does per
-        expert — so the stacked tile is BIT-IDENTICAL to stacking
-        ``_decode_expert`` over ``experts`` (test_batched_expand_matches_decode).
-        INV-1: bounded to one chunk; the caller frees it after the GEMM."""
-        packed = getattr(layer, f"{which}_cb_qweight")[experts]   # [C,out,bytes]
-        C, out_f = packed.shape[0], packed.shape[1]
-        in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
-        qwp = codec.pad_qweight(packed.reshape(C * out_f, -1).contiguous())
-        # ``C`` is routing-dependent on this legacy hit-expert path.  Do not
-        # retain an exact-size cache here: many request distributions could
-        # otherwise accumulate one buffer for every C in [1, E].  The stock
-        # path below has static chunk shapes and is safe to cache.
-        row0 = torch.zeros(C * out_f, dtype=torch.int32, device=packed.device)
-        if self.is_fp4:                                        # fp4 two-tier v2
-            W = expand_fp4_v2_to_weight(
-                qwp, layer._cb_flat, row0, layer._cb_compose,
-                C * out_f, in_f, self.k, self.n_sub, self.type_size)
-        else:                                                  # fp8
-            val = expand_cb_to_value(qwp, layer._cb_flat, row0, C * out_f, in_f,
-                                     self.k, self.n_sub, self.type_size,
-                                     is_fp4=False)
-            ws = getattr(layer, f"{which}_weight_scale")[experts].reshape(
-                C * out_f).to(torch.float32)
-            W = (val.float() * ws[:, None]).to(torch.bfloat16)
-        return W.view(C, out_f, in_f)
-
-    def _grouped_gemm(self, x, w_stack, bounds, use_grouped_mm):
-        """Grouped bf16 GEMM: ``out[bounds[g]:bounds[g+1]] = x[seg] @ w_stack[g]^T``.
-
-        Default = segmented — one ``F.linear`` per group over the pre-expanded
-        chunk weights, BIT-IDENTICAL per segment to the loop's per-expert
-        ``F.linear(xe, W)`` (same cuBLAS call, same stable row order). Opt-in
-        ``PRISMAQUANT_CB_PREFILL_GROUPED_MM=1`` collapses the groups into ONE
-        ``torch._grouped_mm`` launch (reassociation-class vs the loop), degrading
-        to segmented if _grouped_mm is absent or rejects the ragged offsets /
-        transposed-B layout on this build."""
-        P = x.shape[0]
-        out_f = w_stack.shape[1]
-        G = w_stack.shape[0]
-        if use_grouped_mm and _grouped_mm_available():
-            try:
-                offs = torch.tensor(bounds[1:], dtype=torch.int32,
-                                    device=x.device)
-                # 2d×3d: mat_a [P,K] × mat_b [G,K,N] (w_stack^T) -> [P,N]. Cast
-                # to x.dtype so gate_up/y stay bf16 like the loop's F.linear
-                # (grouped_mm may accumulate out to fp32).
-                return torch._grouped_mm(
-                    x, w_stack.transpose(1, 2), offs=offs).to(x.dtype)
-            except Exception as exc:  # noqa: BLE001 — degrade, never crash serve
-                _disable_grouped_mm(exc)
-        y = torch.empty((P, out_f), dtype=x.dtype, device=x.device)
-        for g in range(G):
-            s0, s1 = bounds[g], bounds[g + 1]
-            if s1 > s0:                                        # skip 0-token seg
-                y[s0:s1] = torch.nn.functional.linear(x[s0:s1], w_stack[g])
-        return y
-
-    # -- prefill: capture-safe stock-kernel path (task 15) ------------------
-    def _apply_prefill_stock(self, layer, x, topk_weights, topk_ids, act, *,
-                             chunk=None):
-        """Capture-safe batched prefill (PRISMAQUANT_CB_PREFILL=stock): transient
-        expansion of each expert-CHUNK into a HARDWARE format consumed by vLLM's
-        OWN fused-MoE grouped Triton kernel with DEVICE-SIDE routing. The
-        successor to _apply_prefill_batched, which cannot be CUDA-graph captured
-        (its hit-expert list + segment bounds are read to host via two .tolist()
-        syncs and drive python control flow). This path is the prerequisite for
-        cudagraph_mode=FULL (drafter capture + captured decode target).
-
-        CAPTURE-SAFETY CONTRACT (the hard requirement beyond correctness):
-          * NO host reads of device data — no .tolist / .item / .cpu / .nonzero
-            -> python anywhere in the path. Routing is resolved entirely on-device
-            by vLLM's moe_align_block_size (a C++/Triton op vLLM itself captures in
-            its EP decode graphs); num_tokens_post_padded stays a device scalar
-            consumed as a kernel arg, never read back.
-          * FIXED python trip count — the chunk loop runs ceil(E/chunk) times over
-            ALL E experts (never a hit-filtered subset); an empty chunk costs one
-            masked pass. Every loop bound comes from a shape or config int, never
-            from a tensor value, so the unrolled capture is identical every replay.
-          * Per-chunk EP shard — a chunk of ``chunk`` experts is selected by an
-            expert_map (global->local, -1 outside; built from python ints), and
-            moe_align_block_size(..., ignore_invalid_experts=True) produces LOCAL
-            expert_ids for exactly that shard (out-of-chunk pairs excluded). This
-            is vLLM's own expert-parallel mechanism, reused to bound the transient
-            weight tile to ONE chunk (INV-1) instead of all E experts at once.
-
-        TWO-STAGE STRUCTURE (this build exposes only the MONOLITHIC fused_experts,
-        which does its own intermediate quant with no seam for ours — so we call
-        the underlying per-projection kernel dispatch_fused_moe_kernel TWICE with
-        OUR activation QDQ between, mirroring fused_experts_impl exactly): the same
-        moe_align routing tensors serve both projections (stage 1: A=[M,hidden],
-        top_k=T; stage 2: A=[M*T,inter], top_k=1 — the kernel indexes A by
-        offs_token//top_k, so one routing covers both).
-
-        ACTIVATION QDQ — part of the validated numerics, never dropped:
-          * fp8-CB: the stock W8A8 kernel's built-in per-token fp8-dynamic activation
-            quant (moe_kernel_quantize_input) is bit-equivalent to
-            codec.fp8_dynamic_act_qdq (test_stock_fp8_quant_matches_codec) and IS
-            the transient the dense linear.py fp8 prefill already trusts, so it runs
-            the input AND intermediate quant. Weights expand DIRECTLY to fp8 bytes
-            (expand_cb_to_fp8, the dense fp8-direct transient over the [C*out,bytes]
-            stack view) + the per-(expert,out) weight_scale — a plain per-channel
-            fp8 checkpoint, native tensor cores.
-          * fp4-CB-v2: no faithful packed-NVFP4 exists (a CB codebook value is not
-            on the E2M1 grid, so re-quantising to NVFP4 would double-quantise), and
-            this build has no split W4A4 grouped MoE we can wedge our group-16 QDQ
-            into — so we ship the stated FALLBACK: expand to bf16 (exact CB
-            reconstruct, expand_fp4_v2_to_weight) + the stock BF16 grouped kernel,
-            with codec.fp4_group16_act_qdq run EXPLICITLY on the input and the
-            intermediate (still capture-safe, still native Triton).
-
-        Numerics vs _apply_prefill_loop: weights bit-identical (same expanders,
-        fp8-byte gather == the loop's val.to(e4m3)); activation QDQ per-token
-        identical (fp8-dynamic proven; fp4-group16 is ours verbatim). Only the GEMM
-        accumulation (fp8 fp32-accum vs the loop's bf16 F.linear) and the
-        cross-chunk combine reassociate (REASSOCIATION-CLASS), held to the suite's
-        2e-2 tolerance by tests/test_moe_stock_prefill.py and gated by the served
-        logprob A/B before adoption.
-
-        Memory (INV-1): one projection's chunk tile is live at a time (w13 freed
-        before w2 expands); Hy3 (E=192, 2i=3072, hidden=4096) at chunk=16 =>
-        16*3072*4096 = 192 MiB fp8 w13 (~2x for the bf16 fp4 tile), vs the crashed
-        batched path's ~1.6 GB. The chunk env is PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK;
-        with it unset the default comes from _stock_chunk_default — 256 for fp8-CB
-        (the 1 B/elt CUDA-expanded transient) and BYTE-BUDGETED for fp4-CB, whose
-        2 B/elt bf16 transient balloons to a measured 4,736 MiB at that flat 256
-        on the Hy3 CB band."""
-        # vLLM fused-MoE internals imported lazily: the stable public surface is
-        # at module top; these are version-fragile, and a build lacking them must
-        # fail only this opt-in path, never the module import (CPU codec tests).
-        import triton.language as tl
-        from vllm.platforms import current_platform
-        from vllm.model_executor.layers.fused_moe.config import (
-            _get_config_dtype_str,
-        )
-        from vllm.model_executor.layers.fused_moe.fused_moe import (
-            dispatch_fused_moe_kernel,
-            try_get_optimal_moe_config,
-        )
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
-            moe_align_block_size,
-        )
-        from vllm.model_executor.layers.fused_moe.utils import (
-            moe_kernel_quantize_input,
-        )
-
-        if chunk is None:
-            chunk = self._stock_chunk_default(layer, x.dtype)
-        chunk = max(1, chunk)
-        is_fp8 = not self.is_fp4
-        E = layer._cb_E
-        M = x.shape[0]
-        top_k = topk_ids.shape[-1]
-        dev = x.device
-        Kh = layer._cb_hidden                         # hidden (w13 in, w2 out)
-        inter = layer._cb_inter                       # moe intermediate
-        N1 = 2 * inter                                # w13 out (gate_up)
-        d = N1 // 2                                    # silu halves gate_up
-        fp8_dtype = current_platform.fp8_dtype()
-        compute_type = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16,
-                        torch.float32: tl.float32}[x.dtype]
-
-        # Kernel tile config (block sizes) — computed ONCE from shapes/config so
-        # BLOCK_SIZE_M is identical across chunks (moe_align + both dispatches
-        # must agree). E=chunk here only tunes group_m; correctness-independent.
-        cfg_dtype = _get_config_dtype_str(x.dtype, use_fp8_w8a8=is_fp8)
-        config = try_get_optimal_moe_config(
-            (chunk, N1, Kh), (chunk, Kh, inter), top_k, cfg_dtype, M)
-        block_m = config["BLOCK_SIZE_M"]
-
-        topk_ids_i = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.contiguous()
-        out = torch.zeros_like(x)
-
-        # Input activation quant is x-only -> compute ONCE (only the intermediate
-        # a2 is per-chunk). fp8: vLLM per-token fp8 dynamic (== codec, proven);
-        # fp4-v2: our group-16 RTN, run explicitly.
-        _timing = os.environ.get("PRISMAQUANT_CB_PREFILL_TIMING") == "1"
-        if _timing:
-            torch.cuda.synchronize()
-            _t = {"qdq": 0.0, "align": 0.0, "expand": 0.0, "gemm": 0.0,
-                  "act": 0.0, "combine": 0.0}
-            import time as _time
-            _tw0 = _time.time()
-            _t0 = _time.time()
-        if is_fp8:
-            a1, a1s = moe_kernel_quantize_input(
-                x, None, fp8_dtype, per_act_token_quant=True)
-        else:
-            a1 = fp4_act_qdq_or_codec(x)
-            a1s = None
-        if _timing:
-            torch.cuda.synchronize(); _t["qdq"] += _time.time() - _t0
-
-        for c0 in range(0, E, chunk):                 # FIXED trip = ceil(E/chunk)
-            c1 = min(E, c0 + chunk)
-            expert_map = self._stock_chunk_expert_map(
-                layer, c0, c1, E, dev)
-            # Device-side routing for THIS expert shard (local ids, out-of-chunk
-            # pairs excluded). Shared verbatim by both projections.
-            if _timing: _t0 = _time.time()
-            sorted_ids, expert_ids, num_pad = moe_align_block_size(
-                topk_ids_i, block_m, E, expert_map, ignore_invalid_experts=True)
-            if _timing:
-                torch.cuda.synchronize(); _t["align"] += _time.time() - _t0
-
-            # ---- stage 1: gate_up = x @ W13[e]^T -------------------------------
-            if _timing: _t0 = _time.time()
-            W13 = self._expand_stack_slice(layer, "w13", c0, c1, to_fp8=is_fp8)
-            # W2's expand has no dependency on stage 1 — run it on a side
-            # stream so it hides under the stage-1 GEMM + activation. The
-            # peak transient grows by |W2| (~0.8 GB on Laguna); the serve
-            # slack gate is the sizing authority. Prefill is eager
-            # (FULL_DECODE_ONLY graphs), so side-stream use is capture-safe.
-            # PRISMAQUANT_CB_PREFILL_OVERLAP=0 restores serial (bisection).
-            # Measured NULL on 35B-A3B (17 ms/layer, both arms identical,
-            # 2026-07-26); stays opt-in until a positive exists at any scale.
-            _ovl = (is_fp8 and os.environ.get(
-                "PRISMAQUANT_CB_PREFILL_OVERLAP") == "1")
-            W2 = None
-            if _ovl:
-                if not hasattr(self, "_ovl_stream"):
-                    self._ovl_stream = torch.cuda.Stream()
-                self._ovl_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self._ovl_stream):
-                    W2 = self._expand_stack_slice(
-                        layer, "w2", c0, c1, to_fp8=is_fp8)
-            if _timing:
-                torch.cuda.synchronize(); _t["expand"] += _time.time() - _t0
-            ic1 = torch.empty((M, top_k, N1), dtype=x.dtype, device=dev)
-            b1s = layer.w13_weight_scale[c0:c1] if is_fp8 else None    # [nE, 2i]
-            if _timing: _t0 = _time.time()
-            dispatch_fused_moe_kernel(
-                a1, W13, ic1, a1s, b1s, None, topk_weights, sorted_ids,
-                expert_ids, num_pad, False, top_k, config,
-                compute_type=compute_type, use_fp8_w8a8=is_fp8,
-                use_int8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=False,
-                per_channel_quant=is_fp8, block_shape=None, B_bias=None)
-            if _timing:
-                torch.cuda.synchronize(); _t["gemm"] += _time.time() - _t0
-            del W13
-
-            # silu(gate)*up over the routed rows (garbage in unrouted rows is
-            # never read by stage 2 — same masking as fused_experts_impl).
-            ic2 = torch.empty((M * top_k, d), dtype=x.dtype, device=dev)
-            if _timing: _t0 = _time.time()
-            apply_moe_activation(act, ic2, ic1.view(-1, N1))
-            if _timing:
-                torch.cuda.synchronize(); _t["act"] += _time.time() - _t0
-            del ic1
-
-            # ---- intermediate activation QDQ (part of the numerics) -----------
-            if _timing: _t0 = _time.time()
-            if is_fp8:
-                a2, a2s = moe_kernel_quantize_input(
-                    ic2, None, fp8_dtype, per_act_token_quant=True)
-                b2s = layer.w2_weight_scale[c0:c1]            # [nE, hidden]
-            else:
-                a2 = fp4_act_qdq_or_codec(ic2)
-                a2s = b2s = None
-            if _timing:
-                torch.cuda.synchronize(); _t["qdq"] += _time.time() - _t0
-            del ic2
-
-            # ---- stage 2: y = a @ W2[e]^T, router-weighted --------------------
-            if _timing: _t0 = _time.time()
-            if W2 is None:
-                W2 = self._expand_stack_slice(
-                    layer, "w2", c0, c1, to_fp8=is_fp8)
-            else:
-                # W2 was expanded on the side stream under stage 1; order
-                # stage 2 after it and pin its lifetime to this stream.
-                torch.cuda.current_stream().wait_stream(self._ovl_stream)
-                W2.record_stream(torch.cuda.current_stream())
-            if _timing:
-                torch.cuda.synchronize(); _t["expand"] += _time.time() - _t0
-            ic3 = torch.empty((M, top_k, Kh), dtype=x.dtype, device=dev)
-            ic3.zero_()                                       # out-of-chunk slots
-            if _timing: _t0 = _time.time()
-            dispatch_fused_moe_kernel(
-                a2, W2, ic3, a2s, b2s, None, topk_weights, sorted_ids,
-                expert_ids, num_pad, True, 1, config,
-                compute_type=compute_type, use_fp8_w8a8=is_fp8,
-                use_int8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=False,
-                per_channel_quant=is_fp8, block_shape=None, B_bias=None)
-            if _timing:
-                torch.cuda.synchronize(); _t["gemm"] += _time.time() - _t0
-            del W2
-            # Combine this shard's top_k contributions and accumulate (the loop's
-            # index_add_ over experts, one expert-partition per chunk).
-            if _timing: _t0 = _time.time()
-            out += ic3.sum(dim=1).to(out.dtype)
-            del ic3
-            if _timing:
-                torch.cuda.synchronize(); _t["combine"] += _time.time() - _t0
-        if _timing:
-            _tot = _time.time() - _tw0
-            _acc = sum(_t.values())
-            print(f"[cb-prefill-timing] M={M} total={_tot*1000:.0f}ms "
-                  + " ".join(f"{k}={v*1000:.0f}ms" for k, v in _t.items())
-                  + f" other={(_tot-_acc)*1000:.0f}ms", flush=True)
-        return out
-
-    def _stock_chunk_default(self, layer, _dtype=None) -> int:
-        """Expert-chunk count for ``_apply_prefill_stock`` (INV-1 sizing).
-
-        ``PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK`` overrides everything (bisection
-        / A-B parity), exactly as before. Otherwise:
-
-        * **fp8-CB — 256, unchanged.** Its transient is 1 B/elt and it rides the
-          CUDA expander; the measured default stays put.
-        * **fp4-CB-v2 — byte-budgeted.** The fp4 transient is bf16 (2 B/elt) and
-          there is no fp4 CUDA expander, so a flat 256 allocates
-          ``min(E, 256) x 2*inter x hidden x 2 B`` per stage: on the Hy3 CB band
-          (E=192, 2*inter=3072, hidden=4096) that is **4,736 MiB measured**
-          (4,608 MiB analytic) — ~3x the ~1.6 GB slack gate documented on the
-          'stock' arm above, and the same transient class that crashed a
-          1.4k-token Hy3 prefill on 2026-07-20. Size the chunk from a BYTE
-          budget (``PRISMAQUANT_CB_PREFILL_CHUNK_BYTES``, default 1 GiB) against
-          the LARGER of the two stage tiles instead, so the peak is a constant
-          of the config rather than a function of E: Hy3 -> chunk 42, 5 fixed
-          trips, 1,184 MiB measured (1.175x the 1,008 MiB analytic tile), flat
-          across layers, 0.283 s vs 0.302 s per prefill forward at M=2048. The
-          launch win over the per-expert loop is 192/42 = 4.6x, not 192x.
-
-        Capture-safety unchanged: every input here is a python/config int
-        (shapes and env), never a tensor value, so the trip count stays a
-        constant of the captured graph.
-        """
-        E = int(layer._cb_E)
-        if E <= 0:
-            raise ValueError("CB expert count must be a positive integer")
-
-        def _positive_env(name: str, default: int | None = None) -> int:
-            raw = os.environ.get(name)
-            if raw is None or raw.strip() == "":
-                if default is None:
-                    raise ValueError(f"{name} is required")
-                return default
-            try:
-                value = int(raw)
-            except ValueError as exc:
-                raise ValueError(f"{name} must be a positive integer, got "
-                                 f"{raw!r}") from exc
-            if value <= 0:
-                raise ValueError(f"{name} must be a positive integer, got "
-                                 f"{raw!r}")
-            return value
-
-        env = os.environ.get("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
-        if env is not None and env.strip() != "":
-            return min(E, _positive_env(
-                "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK"))
-        if not self.is_fp4:
-            return 256
-        budget = _positive_env("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES", 1 << 30)
-        # expand_fp4_v2_to_weight always emits BF16, independent of x.dtype.
-        elt = 2
-        # w13 tile (2*inter x hidden) >= w2 tile (hidden x inter) always.
-        per_expert = 2 * int(layer._cb_inter) * int(layer._cb_hidden) * elt
-        if (per_expert > budget
-                and not PrismaQuantCBMoEMethod._STOCK_BUDGET_WARNED):
-            print("[prismaquant-cb] WARNING: one fp4 stock-prefill expert "
-                  f"tile ({per_expert} bytes) exceeds "
-                  f"PRISMAQUANT_CB_PREFILL_CHUNK_BYTES={budget}; using chunk "
-                  "1, so the budget cannot be met.", file=sys.stderr,
-                  flush=True)
-            PrismaQuantCBMoEMethod._STOCK_BUDGET_WARNED = True
-        return max(1, min(E, budget // max(1, per_expert)))
-
-    @staticmethod
-    def _stock_chunk_expert_map(layer, c0: int, c1: int, E: int,
-                                dev) -> torch.Tensor:
-        """global->local expert_map for one chunk shard: experts [c0, c1) map to
-        [0, c1-c0), all others -1. Built from python ints only (no tensor read)
-        and cached by exact layer/device/bounds, so it is a persistent constant
-        of the captured graph."""
-        return cb_cached_expert_map(layer, c0, c1, E, dev)
-
-    def _expand_stack_slice(self, layer, which: str, c0: int, c1: int, *,
-                            to_fp8: bool) -> torch.Tensor:
-        """Decode a CONTIGUOUS chunk of experts [c0, c1) to a stacked transient
-        ``[nE, out, in]`` in ONE expander launch over the reshaped
-        ``[(nE*out), row_bytes]`` view — identical to stacking _decode_expert over
-        the chunk (test_stock_expand_matches_decode), but slice-indexed (a view,
-        no advanced-index copy) so it never issues an index-tensor H2D sync under
-        capture. ``to_fp8`` picks the fp8-direct byte transient (expand_cb_to_fp8,
-        for the W8A8 kernel); else the bf16 transient (fp4-v2 value x composed
-        scale, or fp8 value x per-channel scale).
-
-        RAW-VIEW / PAD CONTRACT. ``codec.pad_qweight``'s right pad exists because
-        the expanders read an 8-byte codeword window at ``byte_base =
-        (bitpos // 8)`` with ``bitpos <= 31*k`` (256 weights, VEC_DIM 8), i.e. up
-        to byte ``(31k)//8 + 7`` inside a superblock. In-bounds inside the
-        superblock is therefore ``(31k)//8 + 7 <= type_size - 1``
-        (``_window_fits_superblock``):
-
-          * **fp8-CB, type_size = 4k** -> needs ``k > 56``; at the shipped
-            k in {36,44,48} the last superblock of the last row overruns by ~2 B,
-            so the pad IS load-bearing for the Triton branch (kept). The CUDA
-            expander stages exactly ``type_size`` bytes per superblock into smem
-            and needs neither the pad nor the ``.contiguous()`` copy.
-          * **fp4-CB v2, type_size = 4k + 9** (4k index bytes + 1 super-exponent
-            + 8 sub-nibble bytes) -> ``(31k)//8 + 7 <= 3.875k + 7 <= 4k + 8``
-            holds for EVERY k >= 0. The 9-byte scale plane IS the tail slack: the
-            window can spill into the scale bytes (masked off by the kernel's
-            ``mask_k``) but can never leave the superblock, let alone the row. So
-            the pad is dead weight for fp4 and the RAW slice view goes straight
-            to the expander — the same win as the fp8 branch, reached by
-            arithmetic rather than by a new kernel, and bit-identical because the
-            padding bytes were never read (GPU-verified: ``PRISMAQUANT_CB_EXPAND
-            =pad`` vs default gave ``torch.equal`` logits, max|delta| 0.0, on
-            both a uniform and a mixed-rung Hy3 layer). On Hy3 w13 at chunk 42
-            the dropped ``F.pad`` was a 143.7 MiB alloc + copy per stage per
-            chunk (+49 MiB of measured peak).
-
-        ``PRISMAQUANT_CB_EXPAND=triton`` (fp8) / ``=pad`` (fp4) restore the
-        padded call for bisection."""
-        packed = getattr(layer, f"{which}_cb_qweight")[c0:c1]      # view [nE,o,b]
-        nE = c1 - c0
-        out_f = packed.shape[1]
-        in_f = layer._cb_hidden if which == "w13" else layer._cb_inter
-        row0 = cb_cached_row_offsets(layer, nE * out_f, packed.device)
-        _expand_env = os.environ.get("PRISMAQUANT_CB_EXPAND")
-        if to_fp8:                                                # fp8 bytes
-            # CUDA expander (2.1x the Triton one, byte-identical) on the RAW
-            # slice view: the kernel stages exactly type_size bytes per
-            # superblock into smem, so it needs neither the +8 row pad nor
-            # the .contiguous() copy the Triton path required — that pair
-            # cost ~26 ms/layer of pure memcpy on Laguna-256E prefill.
-            # PRISMAQUANT_CB_EXPAND=triton restores the old path (bisection).
-            # The extension probe is NOT optional: pq_ops.cb_expand_fp8 calls
-            # get_ext().cb_expand_fp8 with no None check of its own (ops.py's
-            # docstring says "Caller must check cuda_ext.get_ext()"), so on a
-            # host where the JIT build failed this branch raises AttributeError
-            # mid-prefill instead of falling back — breaking the fallback
-            # contract cuda_ext.py's own module docstring advertises.
-            if (_expand_env == "triton"
-                    or not self._cb_expand_ext_ok()):
-                qwp = codec.pad_qweight(
-                    packed.reshape(nE * out_f, -1).contiguous())
-                W = expand_cb_to_fp8(
-                    qwp, self._stock_cb_flat_fp8(layer), row0, nE * out_f,
-                    in_f, self.k, self.n_sub, self.type_size)
-            else:
-                from . import ops as pq_ops
-                W = pq_ops.cb_expand_fp8(
-                    packed.reshape(nE * out_f, -1),
-                    self._stock_cb_flat_fp8(layer), row0, nE * out_f, in_f,
-                    self.k, self.n_sub, self.type_size)
-        elif self.is_fp4:                                         # fp4 two-tier v2
-            # RAW unpadded view — no F.pad alloc, no .contiguous() copy. The
-            # Triton expander indexes by qw.stride(0), so an unpadded row stride
-            # is legal, and type_size = 4k+9 puts the 8-byte codeword window
-            # in-bounds by construction (pad contract in the docstring). Output
-            # is bit-identical to the padded call: the pad bytes were never read.
-            # The predicate is re-checked per rung rather than assumed, so an
-            # exotic future type_size falls back to the pad instead of reading
-            # out of bounds. PRISMAQUANT_CB_EXPAND=pad forces the old copy.
-            raw = packed.reshape(nE * out_f, -1)      # view (dim-0 slice), no copy
-            qw = raw
-            if (_expand_env == "pad"
-                    or not _window_fits_superblock(self.k, self.type_size)):
-                qw = codec.pad_qweight(raw.contiguous())
-            W = expand_fp4_v2_to_weight(
-                qw, layer._cb_flat, row0, layer._cb_compose, nE * out_f, in_f,
-                self.k, self.n_sub, self.type_size)
-        else:                                                     # fp8 -> bf16
-            qwp = codec.pad_qweight(
-                packed.reshape(nE * out_f, -1).contiguous())
-            val = expand_cb_to_value(qwp, layer._cb_flat, row0, nE * out_f, in_f,
-                                     self.k, self.n_sub, self.type_size,
-                                     is_fp4=False)
-            ws = getattr(layer, f"{which}_weight_scale")[c0:c1].reshape(
-                nE * out_f).to(torch.float32)
-            W = (val.float() * ws[:, None]).to(torch.bfloat16)
-        return W.view(nE, out_f, in_f)
-
-    @staticmethod
-    def _cb_expand_ext_ok() -> bool:
-        """Is the JIT CUDA extension (which owns ``cb_expand_fp8``) loaded?
-
-        Probed once and cached on the class; resolves at capture time with no
-        device read. ``ops.cb_expand_fp8`` dereferences ``get_ext()``
-        unconditionally, so a caller that skips this probe gets an
-        ``AttributeError`` on a host with no usable nvcc rather than the Triton
-        fallback ``cuda_ext.get_ext`` promises."""
-        ok = PrismaQuantCBMoEMethod._EXPAND_EXT_OK
-        if ok is None:
-            from .cuda_ext import get_ext
-            ext = get_ext()
-            ok = ext is not None and hasattr(ext, "cb_expand_fp8")
-            if not ok:
-                print("[prismaquant-cb] WARNING: CUDA expand extension "
-                      "unavailable — stock prefill falls back to the padded "
-                      "Triton expander (correct, measurably slower).",
-                      file=sys.stderr, flush=True)
-            PrismaQuantCBMoEMethod._EXPAND_EXT_OK = ok
-        return ok
 
     def _stock_cb_flat_fp8(self, layer) -> torch.Tensor:
         """The per-layer codebook re-encoded to E4M3 bytes for the fp8-direct
@@ -2584,24 +1285,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             fmt_ok = ((self.n_sub == 4 and not self.is_fp4)
                       or (self.n_sub in (1, 2) and self.is_fp4
                           and self.is_v2))
-            ok = (fmt_ok and os.environ.get(
-                "PRISMAQUANT_CB_DECODE", "cuda") == "cuda")
+            ok = fmt_ok
             if ok:
                 from .cuda_ext import get_ext
                 ok = get_ext() is not None
                 if not ok:
-                    # This used to cache ok=False with NO log line, and apply()
-                    # then fell through to the full-E stock-prefill path AT
-                    # DECODE — numerically correct, so nothing downstream can
-                    # tell, but a different throughput class entirely. A
-                    # benchmark taken on that path looks valid and measures the
-                    # wrong thing; say so on stderr instead.
                     cls = PrismaQuantCBMoEMethod
                     if not cls._DECODE_DISABLED_LOGGED:
-                        print("[prismaquant-cb] WARNING: grouped CUDA decode "
-                              "extension unavailable; the grouped path is "
-                              "disabled and the configured runtime fallback "
-                              "will be used. Throughput may differ.",
+                        print("[prismaquant-cb] ERROR: grouped CUDA decode "
+                              "extension unavailable; native-only routed "
+                              "execution will fail closed.",
                               file=sys.stderr, flush=True)
                         cls._DECODE_DISABLED_LOGGED = True
             if ok and not self.is_fp4:
@@ -2612,10 +1305,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             layer._cb_moe_cuda_ok = ok
             if ok and not PrismaQuantCBMoEMethod._DECODE_ENGAGED_LOGGED:
                 # Positive counterpart to the warning above: one line per
-                # process proving WHICH decode path a run actually engaged, so
-                # a log can settle it after the fact regardless of why the fast
-                # path might have disengaged (missing extension,
-                # PRISMAQUANT_CB_DECODE override, or an unsupported format).
+                # process proving WHICH decode path a run actually engaged.
                 print("[prismaquant-cb] decode=grouped-cuda", flush=True)
                 PrismaQuantCBMoEMethod._DECODE_ENGAGED_LOGGED = True
         return ok
@@ -2628,7 +1318,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         bf16(val*scale), fp32-accum GEMVs, per-add bf16 combine in the loop's
         expert-ascending order."""
         from . import ops as pq_ops
-        T, K_hidden = x.shape
+        T = x.shape[0]
         topk = topk_ids.shape[-1]
         # Pairs sorted (token-major, expert-ascending) — the loop's
         # index_add_ order per token. All GPU, no host syncs.
@@ -2682,7 +1372,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         d = gate_up.shape[-1] // 2
         a = torch.empty(gate_up.shape[:-1] + (d,), dtype=gate_up.dtype,
                         device=gate_up.device)
-        apply_moe_activation(act, a, gate_up)
+        native_moe_activation(act, a, gate_up)
 
         if self.is_fp4:
             aq = fp4_act_qdq_or_codec(a)

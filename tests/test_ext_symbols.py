@@ -30,7 +30,6 @@ def _stub(name, symbols, *, path=None):
 
 _LOADER_STATE = (
     ("_ext", "_tried"),
-    ("_ptc", "_ptc_tried"),
     ("_fused", "_fused_tried"),
     ("_fused_fp4", "_fused_fp4_tried"),
 )
@@ -83,13 +82,19 @@ def _prepare_fp4_loader(monkeypatch, tmp_path):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 1))
 
 
+def _prepare_fused_loader(monkeypatch, tmp_path):
+    import torch
+
+    cutlass = _prepare_cutlass(monkeypatch, tmp_path)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 1))
+    return cutlass
+
+
 @pytest.mark.parametrize(
     "loader_name,value_name,tried_name,lock_name,symbols,prepare",
     [
         ("get_ext", "_ext", "_tried", "_ext_lock", "_EXT_SYMBOLS",
          "main"),
-        ("get_persistent_ext", "_ptc", "_ptc_tried", "_ptc_lock",
-         "_PTC_SYMBOLS", "ptc"),
         ("get_fused_fp4_ext", "_fused_fp4", "_fused_fp4_tried",
          "_fused_fp4_lock", "_FUSED_FP4_SYMBOL_FAMILIES", "fp4"),
         ("get_fused_ext", "_fused", "_fused_tried", "_fused_lock",
@@ -107,13 +112,10 @@ def test_cold_load_is_published_once_to_concurrent_callers(
     happen once.
     """
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
-    if prepare == "ptc":
-        monkeypatch.setenv("PRISMAQUANT_ENABLE_PTC", "1")
-        _prepare_cutlass(monkeypatch, tmp_path)
-    elif prepare == "fp4":
+    if prepare == "fp4":
         _prepare_fp4_loader(monkeypatch, tmp_path)
     elif prepare == "fused":
-        _prepare_cutlass(monkeypatch, tmp_path)
+        _prepare_fused_loader(monkeypatch, tmp_path)
 
     declared = getattr(cuda_ext, symbols)
     if symbols == "_FUSED_FP4_SYMBOL_FAMILIES":
@@ -207,7 +209,6 @@ def test_concurrent_failed_load_is_memoized_once(monkeypatch, capsys,
     "loader_name,value_name,tried_name,lock_name",
     [
         ("get_ext", "_ext", "_tried", "_ext_lock"),
-        ("get_persistent_ext", "_ptc", "_ptc_tried", "_ptc_lock"),
         ("get_fused_fp4_ext", "_fused_fp4", "_fused_fp4_tried",
          "_fused_fp4_lock"),
         ("get_fused_ext", "_fused", "_fused_tried", "_fused_lock"),
@@ -247,6 +248,36 @@ def test_extra_symbols_do_not_matter(tmp_path):
     assert cuda_ext._require_symbols(
         mod, cuda_ext._EXT_SYMBOLS, build_dir=str(tmp_path),
         source="cb_gemv.cu") is mod
+
+
+def test_required_fp4_v2_expander_is_device_attested_at_load(monkeypatch):
+    calls = []
+
+    class PreparedExt:
+        @staticmethod
+        def cb_gemv_v2_prepare():
+            calls.append("prepare")
+
+    ext = PreparedExt()
+    monkeypatch.setattr(cuda_ext, "require_ext_v2", lambda operation: ext)
+    assert cuda_ext.require_fp4_v2_expander("dense FP4 quality") is ext
+    assert calls == ["prepare"]
+
+
+def test_required_fp4_v2_expander_normalizes_device_prepare_failure(
+        monkeypatch):
+    class UnsupportedExt:
+        @staticmethod
+        def cb_gemv_v2_prepare():
+            raise RuntimeError("compute capability 8.0 is unsupported")
+
+    monkeypatch.setattr(
+        cuda_ext, "require_ext_v2", lambda operation: UnsupportedExt())
+    with pytest.raises(
+        cuda_ext.NativeKernelUnavailableError,
+        match=r"compute capability 12\.0 or 12\.1.*load-time device",
+    ):
+        cuda_ext.require_fp4_v2_expander("routed FP4 quality")
 
 
 def test_require_symbols_accepts_a_one_shot_iterable(tmp_path):
@@ -341,7 +372,6 @@ def _exports(cu_name):
 
 @pytest.mark.parametrize("required,cu_name", [
     (cuda_ext._EXT_SYMBOLS, "cb_gemv.cu"),
-    (cuda_ext._PTC_SYMBOLS, "cb_persistent_tc.cu"),
     (cuda_ext._FUSED_SYMBOLS, "cb_fused_gemm.cu"),
 ])
 def test_strict_symbols_exist_in_packaged_source(required, cu_name):
@@ -443,47 +473,6 @@ def test_get_ext_reports_incomplete_install_separately(monkeypatch, capsys):
     error = capsys.readouterr().err
     assert "broken gridbook install" in error
     assert "missing cb_gemv.cu" in error
-
-
-# ---------------------------------------------------------------------------
-# Persistent tensor-core extension
-# ---------------------------------------------------------------------------
-
-
-def test_persistent_loader_is_opt_in_and_does_not_build(monkeypatch):
-    calls = _patch_load(monkeypatch, _stub("ptc", cuda_ext._PTC_SYMBOLS))
-    monkeypatch.delenv("PRISMAQUANT_ENABLE_PTC", raising=False)
-    assert cuda_ext.get_persistent_ext() is None
-    assert not calls
-
-
-def test_persistent_loader_accepts_complete_module(monkeypatch, tmp_path):
-    monkeypatch.setenv("PRISMAQUANT_ENABLE_PTC", "1")
-    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
-    _prepare_cutlass(monkeypatch, tmp_path)
-    good = _stub("ptc", cuda_ext._PTC_SYMBOLS)
-    calls = _patch_load(monkeypatch, good)
-    assert cuda_ext.get_persistent_ext() is good
-    assert calls[0][1]["build_directory"] == str(tmp_path / "ptc")
-
-
-def test_persistent_loader_refuses_missing_binding(monkeypatch, tmp_path):
-    monkeypatch.setenv("PRISMAQUANT_ENABLE_PTC", "1")
-    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
-    _prepare_cutlass(monkeypatch, tmp_path)
-    _patch_load(monkeypatch, _stub("ptc", ()))
-    with pytest.warns(UserWarning, match="incompatible persistent-TC") as seen:
-        assert cuda_ext.get_persistent_ext() is None
-    assert "cb_prefill_persistent_tc" in str(seen[0].message)
-
-
-def test_persistent_loader_reports_build_exception(monkeypatch, tmp_path):
-    monkeypatch.setenv("PRISMAQUANT_ENABLE_PTC", "1")
-    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
-    _prepare_cutlass(monkeypatch, tmp_path)
-    _patch_load(monkeypatch, error=RuntimeError("nvcc failed"))
-    with pytest.warns(UserWarning, match="persistent-TC ext unavailable"):
-        assert cuda_ext.get_persistent_ext() is None
 
 
 # ---------------------------------------------------------------------------
@@ -651,17 +640,19 @@ def test_fused_fp4_reports_build_exception(monkeypatch, capsys, tmp_path):
 
 def test_fused_fp8_accepts_dense_only_module(monkeypatch, tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
-    _prepare_cutlass(monkeypatch, tmp_path)
+    _prepare_fused_loader(monkeypatch, tmp_path)
     dense = _stub("fused", cuda_ext._FUSED_SYMBOLS)
     calls = _patch_load(monkeypatch, dense)
     assert cuda_ext.get_fused_ext() is dense
     assert calls[0][1]["build_directory"] == str(tmp_path / "fused")
+    assert "-gencode=arch=compute_121a,code=sm_121a" in \
+        calls[0][1]["extra_cuda_cflags"]
 
 
 def test_fused_fp8_refuses_grouped_without_dense_prerequisite(
         monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
-    _prepare_cutlass(monkeypatch, tmp_path)
+    _prepare_fused_loader(monkeypatch, tmp_path)
     grouped = _stub(
         "fused", ("cb_fused_moe_grouped", "cb_fused_moe_tile_m"))
     _patch_load(monkeypatch, grouped)
@@ -673,12 +664,26 @@ def test_fused_fp8_refuses_grouped_without_dense_prerequisite(
 
 def test_fused_fp8_reports_build_exception(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
-    _prepare_cutlass(monkeypatch, tmp_path)
+    _prepare_fused_loader(monkeypatch, tmp_path)
     _patch_load(monkeypatch, error=RuntimeError("CUTLASS failed"))
     assert cuda_ext.get_fused_ext() is None
     error = capsys.readouterr().err
     assert "fused prefill extension unavailable" in error
     assert "CUTLASS failed" in error
+
+
+def test_fused_fp8_rejects_non_blackwell_target(
+        monkeypatch, capsys, tmp_path):
+    import torch
+
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _prepare_cutlass(monkeypatch, tmp_path)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+    calls = _patch_load(monkeypatch, _stub("fused", cuda_ext._FUSED_SYMBOLS))
+    assert cuda_ext.get_fused_ext() is None
+    assert calls == []
+    error = capsys.readouterr().err
+    assert "requires compute capability 12.0 or 12.1, got 9.0" in error
 
 
 def test_no_fake_extension_modules_leak_into_sys_modules():

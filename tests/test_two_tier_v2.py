@@ -1,7 +1,8 @@
-"""Two-tier v2 scale coding — plugin compose path (docs/lanes/nvfp4-cb/
-two-tier-scale-spec.md §4). The kernel composes the E4M3 scale plane in-register
-from the packed 9 bytes (1 E8M0 super + 8 sub nibble bytes) and must match
-`nvfp4_cb_reconstruct` bit-exactly. Venv (triton + prismaquant, no vLLM); the
+"""Two-tier v2 scale coding — native/plugin compose path.
+
+The serving kernels compose the E4M3 scale plane from the packed 9 bytes
+(1 E8M0 super + 8 sub-nibble bytes).  These tests compare that format contract
+to an independent pure-Torch decoder and ``nvfp4_cb_reconstruct``.  The
 dispatch test is vLLM-guarded.
 
   PYTHONPATH=/home/rob/prismaquant:/home/rob/gridbook \
@@ -12,10 +13,10 @@ import pytest
 import torch
 
 codec = pytest.importorskip("gridbook.codec")
-kernels = pytest.importorskip("gridbook.kernels")
 fmt = pytest.importorskip("prismaquant.nvfp4_cb_formats")
 
-cb_decode_linear = kernels.cb_decode_linear
+from cb_torch_reference import cb_linear_reference  # noqa: E402
+
 DEV = "cuda"
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA device unavailable")
@@ -35,8 +36,7 @@ def test_compose_table_matches_reference():
 @pytest.mark.parametrize("k", [13, 16, 17, 18, 20, 24])
 @pytest.mark.parametrize("M", [1, 17])
 def test_v2_decode_matches_reconstruct(k, M):
-    """Pack a weight with two-tier v2, decode-GEMM via the kernel's in-kernel
-    compose, and match nvfp4_cb_reconstruct @ x (bf16 accum)."""
+    """Pack a v2 weight and match the independent decode to reconstruct @ x."""
     torch.manual_seed(k)
     rows, in_f = 128, 512                    # in % 256 == 0
     w = torch.randn(rows, in_f, device=DEV) * 0.05
@@ -56,9 +56,10 @@ def test_v2_decode_matches_reconstruct(k, M):
     compose = codec.build_compose_table(codec.TWO_TIER_SUB_TABLE).to(DEV)
     row_off = torch.zeros(rows, dtype=torch.int32, device=DEV)
     qwp = codec.pad_qweight(packed)
-    y = cb_decode_linear(x, qwp, cb_flat, row_off, torch.zeros(1, device=DEV),
-                         compose, N=rows, K=in_f, k_bits=k, n_sub=2,
-                         type_size=ts, is_fp4=True, is_v2=True)
+    y = cb_linear_reference(
+        x, qwp, cb_flat, row_off, torch.zeros(1, device=DEV), compose,
+        N=rows, K=in_f, k_bits=k, n_sub=2, type_size=ts, is_fp4=True,
+        is_v2=True)
     rel = (y.float() - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
     assert rel <= 1e-2, f"k={k} M={M}: v2 decode rel err {rel:.4e}"
 

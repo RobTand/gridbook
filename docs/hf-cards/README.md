@@ -1,5 +1,12 @@
 # Staged Hugging Face card blocks
 
+**Status:** historical staging audit from 2026-07-28. Its packaging/apply-gate
+observations and the three rendered per-model files preserve what was proposed
+then; do not treat them as current runtime guidance. Current Gridbook has no
+Triton dependency or serving fallback and fails closed when required native
+CUDA/CUTLASS kernels are unavailable. Re-render from the updated
+[`_TEMPLATE.md`](_TEMPLATE.md) before any future card update.
+
 **Nothing in this directory has been uploaded.** These are *staged* model-card
 edits for the three published `gridbook` artifacts on the Hub. A human applies
 them; no agent or CI in this repo pushes to Hugging Face.

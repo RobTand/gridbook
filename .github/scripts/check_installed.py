@@ -13,8 +13,9 @@ prove:
 2. The packaged CUDA sources resolve **from site-packages**, through the same
    ``importlib.resources`` lookup the runtime JIT builder uses.  The historical
    bug was a repo-root-relative ``os.pardir`` join that resolved to
-   ``<site-packages>/csrc`` (nonexistent) and silently fell back to the slow
-   Triton path.
+   ``<site-packages>/csrc`` (nonexistent). Older releases silently selected a
+   slow Triton fallback; the native-only runtime now fails the affected CB
+   operator closed.
 
 Deliberately NOT asserted here: that the extension compiles.  That needs nvcc
 and is a manual pre-release gate -- see docs/RELEASING.md.
@@ -36,9 +37,10 @@ ENTRY_POINT_GROUP = "vllm.general_plugins"
 
 REQUIRED_SOURCES = [
     "csrc/cb_gemv.cu",
+    "csrc/cb_gemv_v2.cu",
+    "csrc/cb_bf16_grouped_gemm.cu",
     "csrc/cb_fused_gemm.cu",
     "csrc/cb_fused_fp4_gemm.cu",
-    "csrc/cb_persistent_tc.cu",
     "csrc/cutlass_fork/sm120_cb_mma_tma.hpp",
     "csrc/cutlass_fork/sm120_cb_fused_mma.hpp",
     "csrc/cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
@@ -130,7 +132,7 @@ def main() -> int:
     if not csrc.is_dir():
         err(f"{csrc} is not a directory. The wheel did not ship "
             f"{PKG}/csrc -- every CUDA extension build will fail with "
-            f"FileNotFoundError and the plugin will fall back to Triton.")
+            f"FileNotFoundError and native CB execution will fail closed.")
     else:
         missing = [r for r in REQUIRED_SOURCES if not (files(PKG) / r).is_file()]
         if missing:
@@ -140,12 +142,11 @@ def main() -> int:
                f"from site-packages")
 
     # -- the runtime resolver ------------------------------------------------
-    # NOT torch-gated.  Every torch import inside cuda_ext is function-local
-    # (they live in get_ext/get_fused_ext/get_persistent_ext), so the module
-    # imports and csrc_dir() resolves in a bare `--no-deps` install -- measured
-    # in a torch-less venv, 2026-07-28.  Gating this on torch would have made
-    # the check vacuous in exactly the install job that is most likely to be
-    # missing the packaged sources.
+    # NOT torch-gated. Every torch import inside cuda_ext is function-local
+    # (inside the JIT loader functions), so the module imports and csrc_dir()
+    # resolves in a bare `--no-deps` install -- measured in a torch-less venv,
+    # 2026-07-28. Gating this on torch would have made the check vacuous in
+    # exactly the install job most likely to be missing packaged sources.
     from gridbook import cuda_ext
 
     resolver = getattr(cuda_ext, "csrc_dir", None)

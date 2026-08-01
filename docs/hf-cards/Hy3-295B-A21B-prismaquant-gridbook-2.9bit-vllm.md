@@ -156,8 +156,8 @@ applying this card**, or render the local-directory form instead.
 present on master (`gridbook/csrc/cb_persistent_tc.cu`,
 `gridbook/csrc/smem_probe_tilem.cu`,
 `gridbook/csrc/cutlass_fork/sm120_cb_persistent_mma.hpp`,
-`gridbook/csrc/cutlass_fork/sm120_expert_row_broadcast.hpp`, `gridbook/moe_autotune.py`,
-`gridbook/moe_l2.py`, `gridbook/moe_routing.py`) — plus
+`gridbook/csrc/cutlass_fork/sm120_expert_row_broadcast.hpp` and
+`gridbook/moe_routing.py`) — plus
 `serving/gridbook/vllm_prismaquant.egg-info/{PKG-INFO,SOURCES.txt,entry_points.txt,…}`:
 build artifacts published under the **pre-rename** package name. HF repos are not
 rsynced from this tree, so this copy drifts permanently, and because it is the

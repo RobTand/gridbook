@@ -2,16 +2,12 @@
 
 The contract is EQUALITY, not tolerance. ``gridbook/linear.py`` and
 ``gridbook/moe.py`` both document that the fp4 act-QDQ deliberately runs OUTSIDE
-the CB kernel so CUDA-vs-Triton numerics stay aligned; a tolerance here would
-silently break that alignment and the divergence would only surface as a quality
-delta nobody could attribute. Finite outputs are compared through an integer
-view of the raw bf16 bits, including the sign bit of zero.
+the matrix kernel so every native serving route shares one quality bucket; a
+tolerance here would silently break that alignment and the divergence would
+only surface as a quality delta nobody could attribute. Finite outputs are
+compared through an integer view of the raw BF16 bits, including sign-zero.
 
-The eager codec is the oracle. It is still live at the per-expert reference loop
-(``moe._apply_prefill_loop``), the batched prefill (``moe._apply_prefill_batched``)
-and the Triton ``cb_gemm`` path (``linear._apply_inline``) — this change
-deliberately did NOT rewrite those — so the oracle is an independent
-implementation, not the thing under test wearing a hat.
+The eager codec is the independent oracle for the native activation-QDQ op.
 
 Entirely CUDA-gated: with no extension build (no nvcc / no GPU) the whole module
 skips, in line with the suite's runtime self-selection convention
@@ -199,10 +195,11 @@ def test_resolver_matches_codec():
     x = torch.randn(4, 3072, device=DEV, dtype=torch.bfloat16)
     ref = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
     assert _bit_equal(ref, ops.fp4_act_qdq_or_codec(x))
-    # fp32 input takes the eager branch by dtype (the op is bf16-only).
+    # CUDA fp32 used to take an eager codec branch. Native-only serving rejects
+    # it instead; CPU remains the numerical-oracle lane.
     xf = x.float()
-    ref32 = codec.fp4_group16_act_qdq(xf).to(torch.bfloat16)
-    assert _bit_equal(ref32, ops.fp4_act_qdq_or_codec(xf))
+    with pytest.raises(TypeError, match="CUDA BF16"):
+        ops.fp4_act_qdq_or_codec(xf)
 
     # An available CUDA extension must not make a CPU bf16 tensor call a CUDA-
     # only op.  The resolver's eager fallback is device-generic.

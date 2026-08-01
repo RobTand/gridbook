@@ -20,24 +20,30 @@ list](#published-artifacts).
 
 | | Requirement |
 |---|---|
-| **GPU** | NVIDIA **Blackwell `sm_120` / `sm_121`** for the native-speed path (GB10 / DGX Spark is the reference; RTX 5090 is user-reported). Older NVIDIA cards partly work — read the [compatibility table](#compatibility) before assuming. |
-| **CUDA toolchain** | `nvcc` on `PATH` **in the process that serves**, matching your torch build. Kernels are **JIT-compiled on first model load** (~30 s once, then cached), *not* at `pip install` time. `nvcc` 13.0 is the tested toolchain. |
+| **GPU** | NVIDIA **Blackwell `sm_120` / `sm_121`** for the complete native path (GB10 / DGX Spark is the reference; RTX 5090 is user-reported). Some FP8-only paths may work on older NVIDIA cards; FP4-CB 0.5 serving does not — read the [compatibility table](#compatibility). |
+| **CUDA toolchain** | `nvcc` on `PATH` **in the process that serves**, matching your torch build. Kernels are **JIT-compiled on first model load** (~30 s once, then cached), *not* at `pip install` time. `nvcc` 13.0 is the tested toolchain. A required extension that cannot be built is a serving error. |
 | **PyTorch** | whatever build your vLLM uses (measured: `2.11.0+cu130`). |
 | **vLLM** | already installed — gridbook is a plugin, not a runtime. Measured against `0.23.1rc1.dev764+g54b16d8a9`; see [compatibility](#compatibility). |
 | **Parallelism** | **`tp=1` only.** The plugin has no tensor-parallel handling; multi-GPU sharding of CB weights is not implemented. |
 | **Python** | ≥ 3.10 (measured on 3.12). |
 
-Without `nvcc`, or on a non-Blackwell GPU, the plugin still loads and produces
-**correct** output through fallback kernels — but they are a correctness path,
-not a speed path. For dense decode the fallback is unchanged code and the gap is
-measured: the Triton decode-GEMM did **4.20 tok/s** on the 27B where the CUDA
-GEMV does **10.28**. For MoE the grouped CUDA GEMV is skipped entirely and the
-regression is larger but artifact-dependent — that is a *historical*
-before/after, not a fresh benchmark of today's fallback, and
-[`BENCHMARKS.md`](docs/BENCHMARKS.md#what-the-fallback-costs) says exactly what
-was and was not measured. See
-[TROUBLESHOOTING](docs/TROUBLESHOOTING.md#the-cuda-extension-did-not-load-triton-fallback)
-for how to tell which path you are on.
+Gridbook has **no Triton dependency or serving lane**. Its production operators
+are packaged native CUDA support kernels and CUTLASS GEMM/grouped-GEMM kernels;
+if the native kernel required by an artifact, shape, or GPU cannot be loaded,
+serving fails closed with the missing operation and build guidance. It does not
+continue on a slower implementation. The old Triton prototype measured **4.20
+tok/s** on the 27B where the native CUDA GEMV measured **10.28 tok/s**; that is
+historical evidence from the retired path, not a selectable fallback or a
+current benchmark. See
+[TROUBLESHOOTING](docs/TROUBLESHOOTING.md#the-native-extension-did-not-load)
+for build failures.
+
+The serving boundary is permanently an opaque registered custom op. For FP8
+transient paths Gridbook calls vLLM's registered native CUDA quantizer and
+CUTLASS scaled-matmul operators directly, after checking their ABI and shape
+contract; it does not call the fallback-capable `vllm._custom_ops` wrappers.
+MoE activations likewise call registered `torch.ops._C` CUDA operators directly;
+the vLLM helper with a Triton SWIGLUSTEP branch is not part of Gridbook dispatch.
 
 ---
 
@@ -88,12 +94,14 @@ curl -s http://localhost:8000/v1/completions \
        "prompt": "The capital of France is", "max_tokens": 8, "temperature": 0}'
 ```
 
-**How to tell it is actually working.** The failure is silent by design (the
-plugin fail-softs to Triton rather than refusing to serve), so check for the
-warning rather than for a crash:
+**How to tell it is actually working.** Native-kernel availability is a serving
+contract, so a missing required extension is explicit:
 
-- **Bad** — a `[prismaquant-cb] WARNING:` line on stderr saying the CUDA
-  decode-GEMV extension could not be built means you are on the slow path.
+- **Bad** — a `[prismaquant-cb] ERROR:` or `WARNING:` line explicitly saying a
+  **required** native operation is unavailable means Gridbook cannot serve that
+  operation; the subsequent load/forward fails closed rather than selecting
+  another backend. A shape-specialized optimization may be unavailable only
+  when its diagnostic names a separately qualified native CUDA/CUTLASS route.
   (Grep your vLLM log for `[prismaquant-cb]`, not for `gridbook` — the runtime
   log prefix still uses the project's older name.)
 - **Good** — no such line, and the first model load pauses ~30 s the first time
@@ -103,9 +111,10 @@ warning rather than for a crash:
 
 Notes:
 
-- **`--enforce-eager` remains the published 27B configuration.** The default
-  opaque dispatch now makes a mode-0 `FULL_DECODE_ONLY` graph a supported
-  optimization candidate; it improved the close-rate 0.6B canary by 20.1% and
+- **`--enforce-eager` remains the published 27B configuration.** The permanent
+  opaque dispatch makes a mode-0 `FULL_DECODE_ONLY` graph a supported
+  optimization candidate; on the dated close-rate 0.6B canary it improved
+  latency by 20.1% and
   replayed changed inputs exactly. Keep eager for the quickstart until the same
   graph configuration clears the 27B streaming gate. Details and the exact
   flags: [`KERNELS.md`](docs/KERNELS.md#cuda-graph-safety-rules).
@@ -143,22 +152,27 @@ activation headroom; see [`docs/INSTALL.md`](docs/INSTALL.md#per-artifact-requir
 
 ## Compatibility
 
-The native path is Blackwell-targeted, but the decode kernel is *not*
-arch-specific — this table separates what was **measured** from what is
-**inferred from the code and untested**. Nothing here is inferred silently.
+The native path is Blackwell-targeted. The main decode translation unit is not
+arch-specific, but that alone does not make an FP4-CB artifact portable:
+every FP4-v2 quality path uses the v2 exact expander, whose device prepare
+currently admits only CUDA cc 12.0/12.1. The owned grouped-BF16 CUTLASS GEMM is
+SM80-compatible in isolation; the required expander sets the full FP4 serving
+floor. This table separates what was **measured** from what is **inferred from
+the code and untested**.
 
-| GPU class | Decode (M ≤ 16) | Dense FP8-CB prefill | Mid-M fused prefill (16 < M ≤ 128) | Verdict |
+| GPU class | Dense small-M (M ≤ 8) | FP8-CB M = 9–128 | Native general / FP4 quality path | Verdict |
 |---|---|---|---|---|
-| **GB10 / DGX Spark, `sm_121`** | CUDA GEMV | expand → stock W8A8 GEMM | CUTLASS `sm120` | **MEASURED.** Every published number comes from this box. |
-| **RTX 5090, `sm_120`** | same | same | same | **USER-REPORTED** working (vLLM 0.25.1, 27B artifact, [issue #1](https://github.com/RobTand/gridbook/issues/1)) after that issue's memory patches. No speed numbers published; the exact `nvcc` arch flag (`sm_120` vs the measured `sm_121`) is untested here. |
-| **H100 `sm_90`, RTX 4090 / L40S `sm_89`** | expected to work — the decode kernel contains no arch guards, no inline PTX and no `-arch` flag | expected to work (needs `sm_89+` fp8 support) | **fails, fail-softs** to the expand path with a warning (the fused kernel is `sm_120`-family only) | **INFERRED, UNTESTED.** Also gated by whatever the artifact's non-CB groups need (e.g. the 27B vision tower's NVFP4). |
-| **A100 `sm_80`** | expected to work for FP4-CB | **rejected at load**: FP8-CB requires `sm_89+` for its shipping prefill path | n/a | **UNTESTED.** Gridbook fails early with the hardware requirement instead of loading a serve that will fail above 16 tokens; FP4-CB retains its BF16 fallback. |
-| **Supported NVIDIA GPU, no `nvcc`** | Triton fallback | Triton/stock fallback | n/a | **Correct, slow.** Use for numerics verification and CI, not for serving. |
+| **GB10 / DGX Spark, `sm_121`** | native CUDA GEMV | fused CUTLASS when eligible; otherwise CUDA expand → CUTLASS W8A8 | FP8: CUDA expand → CUTLASS; FP4 M>8: native BF16 expand → Gridbook CUTLASS grouped GEMM (`E=1`); fused native-NVFP4 remains opt-in | **MEASURED target.** Published results below predate the final native-only dispatch and remain tied to their recorded commits. |
+| **RTX 5090, `sm_120`** | same dispatch | same dispatch | same dispatch | **USER-REPORTED** working (vLLM 0.25.1, 27B artifact, [issue #1](https://github.com/RobTand/gridbook/issues/1)) before the final native-only dispatch. No new speed numbers are published; the exact `nvcc` arch flag (`sm_120` vs measured `sm_121`) is untested here. |
+| **H100 `sm_90`, RTX 4090 / L40S `sm_89`** | FP8-CB decode is expected to work; an FP4-CB layer is rejected at weight load | Blackwell fused kernel ineligible; CUDA expand → CUTLASS expected for FP8 (`sm_89+`) | FP8 native expansion + CUTLASS expected; FP4 unavailable because v2 expander prepare rejects the device | **FP8-ONLY IS INFERRED / UNTESTED. FP4-CB IS UNSUPPORTED IN 0.5.** Also gated by non-CB groups in the artifact. |
+| **A100 `sm_80`** | no complete production lane: FP8 prefill needs `sm_89+`, and FP4 load requires cc 12.0/12.1 | FP8-CB rejected | grouped BF16 GEMM supports SM80, but the required FP4-v2 expander rejects the device | **UNSUPPORTED FOR PRODUCTION CB SERVING IN 0.5.** No slow fallback is selected. |
+| **Supported NVIDIA GPU, no `nvcc`** | unavailable | unavailable | unavailable | **FAILS CLOSED.** Prebuild and package compatible native extensions, or provide `nvcc` in the serving environment. |
 | **Non-NVIDIA** | unsupported | unsupported | unsupported | **UNSUPPORTED / UNQUALIFIED.** The canceled ROCm prototype is not shipped or dispatched. |
 
 Tested software stack (verified in-container, 2026-07-28): vLLM
-`0.23.1rc1.dev764+g54b16d8a9`, torch `2.11.0+cu130`, triton `3.6.0`,
-transformers `5.13.0`, CUDA `13.0.88`, Python `3.12.3`, **arm64**. vLLM `0.25.1`
+`0.23.1rc1.dev764+g54b16d8a9`, torch `2.11.0+cu130`, transformers `5.13.0`,
+CUDA `13.0.88`, Python `3.12.3`, **arm64**. The image also contained Triton as
+a vLLM dependency, but Gridbook neither depends on nor dispatches it. vLLM `0.25.1`
 and `0.23.1rc1.dev1060` are user-reported working on x86 + RTX 5090 (issue #1).
 Everything else is untested. See
 [`docs/INSTALL.md`](docs/INSTALL.md#tested-software-stack) for how versions can
@@ -196,10 +210,17 @@ tile *is* an NVFP4/FP8 tile:
    above native-format speed.
 2. **Prefill (large M):** the layer's weight tile is expanded **transiently** into
    a scratch buffer (bounded — never a resident dense weight), then run through
-   the stock native GEMM.
+   CUTLASS. FP8 quantization/scaled GEMM use the directly registered native CUDA
+   operators; FP4's quality path uses Gridbook's owned grouped-BF16 CUTLASS
+   bridge.
 
 Formats mix per-Linear with plain NVFP4, FP8 and BF16 inside one standard
-`safetensors` checkpoint. See [`docs/MOTIVATION.md`](docs/MOTIVATION.md) for the
+`safetensors` checkpoint. The 0.5 native dense serving gate is deliberately
+narrower than the format spec: CB Linears must be biasless, and FP4 must be an
+unsigned product rung with v2 scale coding. A non-`None` bias, signed S-rung,
+or FP4-v1 dense layer is never routed through an unowned framework operation:
+the public dense method rejects bias, and model load rejects the two unsupported
+FP4 families. See [`docs/MOTIVATION.md`](docs/MOTIVATION.md) for the
 full argument and [`docs/KERNELS.md`](docs/KERNELS.md) for the kernel design.
 
 ---
@@ -246,13 +267,18 @@ arithmetic band and the single-seed noise band.
   shipped artifact scored 88/100 (130/148) on the ship config, against 87 for the
   GGUF IQ build and 86 for GGUF k-quant, with a measured single-seed churn band of
   ±2–3 points across serving configs.
-- **FP8-CB MoE prefill auto-selection is shipped.** Its transient CUDA
-  candidate measured 293 → **1,821 tok/s** at 8k and 207 → **1,822 tok/s** at
-  63k on Laguna-S-2.1 (117B MoE) after the chunk-expander landed (commit
-  `8829c16`); the default measures candidates per layer rather than always
-  choosing that one. FP4-CB still defaults to its conservative loop, and
-  activation-preserving fused large-M MoE remains open — see the canonical
-  [`kernel TODO`](ROADMAP.md#kernel-todo-canonical).
+- **MoE prefill is native and fail-closed.** `M≤16` uses the owned grouped CUDA
+  GEMV; above 16, FP8-CB uses a quality-green fused CUTLASS path when eligible
+  and otherwise exact BF16 expansion + the owned CUTLASS grouped bridge, while
+  FP4-CB uses that exact quality bridge directly. The predecessor CUDA
+  chunk-expander path measured 293 → **1,821 tok/s** at 8k and 207 → **1,822
+  tok/s** at 63k on Laguna-S-2.1 (commit `8829c16`); those historical numbers
+  are not measurements of the new owned grouped bridge. The bridge's current
+  generic SM80-compatible schedule is not Blackwell-optimized: on synthetic
+  DSV4 shapes it measured **6–17% slower** than segmented BF16 matmuls at warm
+  steady state. It is currently a quality/native-ownership result, not a speed
+  claim. The v0.4.2 fused native-NVFP4 MoE route remains an explicit opt-in;
+  its published evidence boundary does not qualify it as the production path.
 - **Large-M dense prefill is the honest remaining gap**: ~1.44× the native GEMM's
   TTFT on the 27B.
 
@@ -266,7 +292,7 @@ arithmetic band and the single-seed noise band.
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | Real failure modes keyed to the exact message you see, with cause and fix. |
 | [`docs/SPEC.md`](docs/SPEC.md) | **Normative format specification** — byte layout, product-VQ, v1/v2 scale coding, codebook sidecar, config vocabulary, extensibility contract. Implementation-independent, MUST/SHOULD language. |
 | [`docs/MOTIVATION.md`](docs/MOTIVATION.md) | Why the 2–4 bpp regime needs codebooks, why serving has been the blocker, and an honest comparison to GGUF k-quant/IQ. |
-| [`docs/KERNELS.md`](docs/KERNELS.md) | Serving kernel design: transient-expand prefill, fused act-QDQ decode GEMV, two-tier in-register scale compose, grouped MoE GEMV, Triton fallbacks, CUDA-graph rules. |
+| [`docs/KERNELS.md`](docs/KERNELS.md) | Serving kernel design: native transient-expand prefill, fused act-QDQ decode GEMV, two-tier in-register scale compose, CUTLASS GEMM/grouped GEMM, fail-closed dispatch, CUDA-graph rules. |
 | [`docs/PLUGIN.md`](docs/PLUGIN.md) | Operator reference for the plugin itself: dispatch, kernel set, environment switches. |
 | [`docs/DELEGATED-NVFP4-MOE.md`](docs/DELEGATED-NVFP4-MOE.md) | Version-scoped backend selection for a **non-CB** NVFP4 MoE group on GB10 (`sm_121`), including Marlin's generic weight-only warning and a fail/unknown preflight policy. |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | The measured results with full hardware/protocol context and caveats. |
@@ -304,7 +330,10 @@ separate research pipeline that *produces* gridbook artifacts —
   wrapper on specific *model classes* (HunYuan-V3, Laguna, Qwen3.5-MoE and their
   MTP drafters) whose loaders map MoE experts at the top level and would
   otherwise not recognise stacked codebook expert tensors. That wrap is inert for
-  non-CB checkpoints. Nothing in `vllm/` is modified.
+  non-CB checkpoints. Shared-CB projections, including MTP-nested shared
+  experts, are aliased to native CB Linears; resolving one to a plain BF16
+  Linear is a load error, not a compatibility fallback. Nothing in `vllm/` is
+  modified.
 - This repository **serves** the format; it does not produce artifacts.
   [PrismaQuant](https://github.com/RobTand/prismaquant) is the one canonical
   producer, while the [spec](docs/SPEC.md) and conformance fixtures keep the

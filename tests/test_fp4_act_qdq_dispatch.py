@@ -1,35 +1,10 @@
-"""CPU-safe dispatch and FakeTensor contracts for fp4 activation QDQ."""
-import types
+"""CPU-oracle and FakeTensor contracts for native FP4 activation QDQ."""
 
 import pytest
 import torch
 
 from gridbook import codec, ops
-from gridbook import cuda_ext
-
-
-@pytest.fixture(autouse=True)
-def _reset_capability(monkeypatch):
-    monkeypatch.setattr(ops, "_FP4_ACT_QDQ_OK", None)
-
-
-def test_missing_symbol_is_a_supported_eager_fallback(monkeypatch, capsys):
-    monkeypatch.setattr(cuda_ext, "get_ext", lambda: object())
-    assert ops.fp4_act_qdq_ok() is False
-    assert "symbol is missing" in capsys.readouterr().err
-
-
-def test_capability_probe_accepts_the_required_symbol(monkeypatch, capsys):
-    ext = types.SimpleNamespace(fp4_act_qdq=object())
-    monkeypatch.setattr(cuda_ext, "get_ext", lambda: ext)
-    assert ops.fp4_act_qdq_ok() is True
-    assert "act-qdq fp4=cuda" in capsys.readouterr().out
-
-
 def test_cpu_bf16_never_reaches_the_cuda_only_op(monkeypatch):
-    monkeypatch.setattr(
-        ops, "fp4_act_qdq_ok",
-        lambda: pytest.fail("CPU input should short-circuit before the probe"))
     monkeypatch.setattr(
         ops, "fp4_act_qdq",
         lambda x: pytest.fail("CPU input reached the CUDA-only op"))

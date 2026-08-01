@@ -3,9 +3,12 @@
 
 This schema-v6 harness complements, and does not replace, the two-arm v5
 ``validate_fused_nvfp4_ab.py`` entry point.  It loads exactly one vLLM engine
-and measures three activation/execution contracts in that engine:
+and measures three activation/execution contracts in that engine.  Dense mode
+retains the established FP32-emulated baseline; MoE uses Gridbook's exact
+native-BF16 quality path as its baseline:
 
-* ``baseline``: Gridbook's FP32-emulated group-scale activation QDQ;
+* ``baseline``: dense FP32-emulated group-scale activation QDQ, or MoE exact
+  CB-to-BF16 expansion, native activation QDQ, and owned CUTLASS grouped GEMMs;
 * ``static``: artifact-attested global FP32 activation scales plus UE4M3
   group factors; and
 * ``rowwise``: an independent runtime scale per activation row plus UE4M3
@@ -172,7 +175,8 @@ def scoped_three_arm_selector(
     )
     if expected_moe and v5.PREFILL_ENV in environ:
         raise RuntimeError(
-            f"{v5.PREFILL_ENV} must remain unset for grouped-MoE validation"
+            f"removed legacy selector {v5.PREFILL_ENV} is set; grouped-MoE "
+            "validation requires a native-only environment"
         )
     env_before = {
         name: environ[name] if name in environ else _MISSING
@@ -394,9 +398,9 @@ def _candidate_dispatch_gates(
             "pass": dispatch["fused_success_fraction"] == 1.0,
         }
     else:
-        gates["never_entered_loop"] = {
-            "observed_loop_calls": dispatch["loop_calls"],
-            "pass": dispatch["loop_calls"] == 0,
+        gates["never_entered_native_bf16_baseline"] = {
+            "observed_native_bf16_calls": dispatch["native_bf16_calls"],
+            "pass": dispatch["native_bf16_calls"] == 0,
         }
     return {"arm": arm, **gates}
 
@@ -472,13 +476,17 @@ def core_integrity_gates(
     }
     if execution_mode != "dense":
         gates.update({
-            "baseline_positive_loop_dispatch": {
-                "observed_loop_calls": dispatch["baseline"]["loop_calls"],
-                "pass": dispatch["baseline"]["loop_calls"] > 0,
+            "baseline_positive_native_bf16_dispatch": {
+                "observed_native_bf16_calls": (
+                    dispatch["baseline"]["native_bf16_calls"]
+                ),
+                "pass": dispatch["baseline"]["native_bf16_calls"] > 0,
             },
-            "baseline_loop_no_errors": {
-                "observed_errors": dispatch["baseline"]["loop_errors"],
-                "pass": dispatch["baseline"]["loop_errors"] == 0,
+            "baseline_native_bf16_no_errors": {
+                "observed_errors": (
+                    dispatch["baseline"]["native_bf16_errors"]
+                ),
+                "pass": dispatch["baseline"]["native_bf16_errors"] == 0,
             },
         })
     return gates
@@ -621,6 +629,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     os.environ[v5.FUSED_MOE_ENV] = ""
     inherited_prefill = os.environ.get(v5.PREFILL_ENV)
     if args.mode != "dense":
+        # Retired selector: sanitize inherited state so the report cannot be
+        # misread as evidence for a removed serving path.
         os.environ.pop(v5.PREFILL_ENV, None)
     started = time.monotonic()
     bootstrap = validation_common.prepare_validation(
@@ -860,13 +870,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "created_at": v5._utc_now(),
         "scope": f"{args.mode} NVFP4-CB prefill; TP=1; one in-process vLLM engine",
         "activation_contract": {
-            "baseline": "fp32-emulated group-scale FP4 activation QDQ",
+            "baseline": (
+                "fp32-emulated group-scale FP4 activation QDQ"
+                if args.mode == "dense"
+                else "exact native FP4 activation QDQ + exact CB-to-BF16 "
+                "weight expansion + owned CUTLASS grouped BF16 GEMMs"
+            ),
             "static": "artifact-attested global FP32 scale + UE4M3 factors",
             "rowwise": "independent runtime row scale + UE4M3 factors",
             "rowwise_range_multiplier": (
                 nvfp4_activation_contract.rowwise_range_multiplier()
             ),
             "all_same_contract": False,
+        },
+        "dispatch_telemetry_contract": {
+            "dense_baseline_unchanged": True,
+            "moe_baseline": "_apply_prefill_native_bf16",
+            "legacy_prefill_selector_supported": False,
+            "native_only": True,
         },
         "settings": validation_common.shared_report_settings(
             bootstrap,
