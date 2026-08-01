@@ -27,7 +27,11 @@ _pq_fmts = pytest.importorskip(
     "prismaquant.nvfp4_cb_formats",
     reason="monorepo-only (prismaquant); not part of the gridbook distribution",
 )
-_bit_split = _pq_fmts._bit_split
+_pq_layout = pytest.importorskip(
+    "prismaquant.cb_layout",
+    reason="monorepo-only producer layout contract is unavailable",
+)
+bit_split = _pq_layout.bit_split
 nvfp4_cb_reconstruct = _pq_fmts.nvfp4_cb_reconstruct
 nvfp4_cb_unpack = _pq_fmts.nvfp4_cb_unpack
 
@@ -115,7 +119,7 @@ def test_unpack_bitexact(art, qname):
     fields = nvfp4_cb_unpack(packed, k, grid, mode, (N, in_f),
                              codebook=subs, scales=ws)
     idx = fields["indices"].to(torch.int64)              # (N, nvec, n_sub)
-    widths = _bit_split(k, n_sub)
+    widths = bit_split(k, n_sub)
     off, code_ref = 0, torch.zeros_like(idx[..., 0])
     for i in range(n_sub):
         code_ref |= idx[..., i] << off
