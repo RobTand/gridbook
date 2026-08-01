@@ -679,6 +679,11 @@ def _fp4_fused_loaded_layer(role_refs, widths):
     layer.logical_widths = list(widths)
     layer._cb_input_size = _K
     method.process_weights_after_loading(layer)
+    # This helper isolates post-load multi-LUT routing. Production artifacts
+    # reach it only after the activation-contract loader has attested and
+    # installed the static native-FP4 scale; model that completed gate here.
+    method.has_static_fp4_activation = True
+    layer._cb_fp4_input_global_scale = torch.tensor([3.0])
     return method, layer
 
 
