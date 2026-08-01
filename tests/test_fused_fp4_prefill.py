@@ -333,6 +333,48 @@ def test_fused_multilut_distinct_merged_roles_bitexact_vs_stock():
     assert not torch.equal(y_fused[:, :role_n], y_fused[:, role_n:])
 
 
+def test_fused_multilut_persistent_cta_reuse_bitexact_vs_stock():
+    """A persistent CTA must reload the LUT when its next N tile changes.
+
+    Two N tiles are too small to exercise CUTLASS's persistent scheduler:
+    each resident CTA sees at most one role and a lifetime ``lut_resident``
+    boolean appears correct.  Two hundred fifty-six alternating role tiles
+    exceed the one-large-CTA-per-SM residency of every qualified Blackwell
+    target and deterministically expose stale-LUT reuse.
+    """
+    k, role_n, ntiles, K, M = 16, 128, 256, 256, 128
+    wctx = prep_weight(k, N=role_n, K=K, mode="product",
+                       coding=fmt.SCALE_CODING_TWO_TIER, seed=1801)
+    packed = wctx["qwp"].repeat(ntiles, 1).contiguous()
+    lut0 = wctx["lut"]
+    lut1 = torch.bitwise_xor(
+        lut0, torch.tensor(0x88, device=DEV, dtype=torch.uint8))
+    luts = torch.cat((lut0, lut1)).contiguous()
+    tile_ids = (torch.arange(ntiles, dtype=torch.int32, device=DEV) & 1) \
+        .contiguous()
+
+    b_tiles = [wctx["b_packed"] if tile % 2 == 0
+               else wctx["b_packed"] ^ 0x88
+               for tile in range(ntiles)]
+    b_packed = torch.cat(b_tiles, dim=0).contiguous()
+    scales = wctx["scales"].repeat(ntiles, 1)
+    sfb = codec.swizzle_sf_plane(
+        scales.to(torch.float8_e4m3fn).view(torch.uint8)).contiguous()
+    N = role_n * ntiles
+
+    torch.manual_seed(1802)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    aq, sfa, _, recip = quant_act(x)
+    a_scales = recip.reshape(1).expand(M).contiguous().float()
+    b_scales = torch.ones(N, dtype=torch.float32, device=DEV)
+    y_ref = ext.sm120_nvf4_mm_scaled(
+        aq, sfa, b_packed, sfb, a_scales, b_scales, N, K)
+    y_fused = ext.cb_fused_fp4_prefill_mm_scaled(
+        aq, sfa, packed, luts, wctx["compose"], a_scales, b_scales,
+        N, K, k, wctx["n_sub"], wctx["ts"], True, tile_ids)
+    assert torch.equal(y_fused.view(torch.uint16), y_ref.view(torch.uint16))
+
+
 def test_fused_vs_triton_bucket_delta_documented():
     """The fused path's native-NVFP4 activation bucket vs the Triton decode
     path's fp32-group-scale bucket: a real, bounded numerics difference (NOT

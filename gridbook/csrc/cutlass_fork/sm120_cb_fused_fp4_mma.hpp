@@ -663,6 +663,8 @@ struct CollectiveMma<
   static constexpr int SfPerTile = TileN * (TileK / 16);   // SF bytes / K-tile
   static constexpr int SfPerThread = SfPerTile / ThreadCount;
   static_assert(SfPerTile % ThreadCount == 0, "SF count must divide thread count");
+  static_assert(ThreadCount == 256,
+                "coalesced CB decoder assumes eight 32-thread MMA warps");
 
   template <class SBNoSw, class SBSw, class SFBLayout1>
   CUTLASS_DEVICE void
@@ -694,9 +696,16 @@ struct CollectiveMma<
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < CwPerThread; ++i) {
-      const int linear = thread_idx + i * ThreadCount;
-      const int r = linear & (TileN - 1);
-      const int vl = linear / TileN;                 // 0..15 in this K-tile
+      // Give each warp two complete rows instead of one codeword from 32
+      // different rows.  Lanes 0..15 read all 16 contiguous codewords of one
+      // row and lanes 16..31 do the same for its neighbour; eight iterations
+      // cover the 128-row tile.  The old row-major linearization made every
+      // warp issue 32 unrelated, odd-stride global transactions per loop and
+      // discarded most of each cache sector.
+      const int warp = thread_idx >> 5;
+      const int lane = thread_idx & 31;
+      const int r = (i * 8 + warp) * 2 + (lane >> 4);
+      const int vl = lane & 15;                      // 0..15 in this K-tile
       int n_glob = n_base + r;
       n_glob = n_glob < N_rows ? n_glob : (N_rows - 1);
       const uint8_t* row_g = gp + int64_t(n_glob) * row_stride + sb_off;
@@ -735,13 +744,12 @@ struct CollectiveMma<
       // position-independent tensor apply it to NIBBLE offsets — measured
       // via the smem debug dump as a row-dependent 16/32-nibble block
       // permutation. So: plain (non-swizzle) layout -> nibble offset ->
-      // byte offset -> swizzle functor in byte space.
+      // byte offset -> swizzle functor in byte space. ``lb`` is four-byte
+      // aligned and this swizzle preserves its low two address bits, so the
+      // complete decoded codeword is one aligned shared-memory store.
       const int lnib = sB_nosw(r, vl * 8);
       const int lb = lnib >> 1;
-      CUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < 4; ++j) {
-        sB_base[sB_sw(lb + j)] = uint8_t(out32 >> (8 * j));
-      }
+      *reinterpret_cast<uint32_t*>(sB_base + sB_sw(lb)) = out32;
     }
 
     // SFB: one ue4m3 byte per (row, group-of-16), gathered from the row's
@@ -752,9 +760,13 @@ struct CollectiveMma<
     const uint8_t* comp = shared_tensors.smem_compose.data();
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < SfPerThread; ++i) {
-      const int linear = thread_idx + i * ThreadCount;
-      const int r = linear & (TileN - 1);
-      const int g = linear / TileN;                  // 0..7 in this K-tile
+      // Four rows per warp, with eight adjacent group-scale lanes per row.
+      // Besides coalescing the odd-stride row accesses, this lets the cache
+      // merge the eight repeated exponent-byte reads of a v2 row.
+      const int warp = thread_idx >> 5;
+      const int lane = thread_idx & 31;
+      const int r = (i * 8 + warp) * 4 + (lane >> 3);
+      const int g = lane & 7;                        // 0..7 in this K-tile
       const int gs = half * 8 + g;                   // group in superblock
       int n_glob = n_base + r;
       n_glob = n_glob < N_rows ? n_glob : (N_rows - 1);
@@ -876,23 +888,33 @@ struct CollectiveMma<
     // TMA transaction is in flight. A multi-LUT dense CTA waits for its first
     // stage descriptor, which publishes the checked N-tile identity under that
     // same pipeline barrier.
-    if (!lut_resident_ && params.ptr_lut_tile_ids == nullptr) {
+    if (resident_lut_block_id_ < 0 &&
+        params.ptr_lut_tile_ids == nullptr) {
       load_lut(shared_tensors, params, thread_idx, 0);
       cutlass::arch::NamedBarrier::sync(
           thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-      lut_resident_ = true;
+      resident_lut_block_id_ = 0;
     }
 
     int t_abs = 0;
     pipeline.consumer_wait(smem_pipe_read);
-    if (!lut_resident_) {
+    if (params.ptr_lut_tile_ids != nullptr) {
       const uint8_t* slot = shared_tensors.smem_BP.data()
           + read_stage * CbStageDescBytes;
       const int lut_block_id = *reinterpret_cast<const int32_t*>(slot + 12);
-      load_lut(shared_tensors, params, thread_idx, lut_block_id);
-      cutlass::arch::NamedBarrier::sync(
-          thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-      lut_resident_ = true;
+      // The CUTLASS kernel owns one CollectiveMainloop for the complete
+      // persistent scheduler loop.  A CTA can therefore consume more than
+      // one (M,N) work tile, and those tiles need not share an N-role/LUT.
+      // Track the exact resident identity and refresh it only when the next
+      // work tile names a different block.  The first-stage pipeline wait
+      // makes its descriptor visible; the named barrier completes all LUT
+      // writes before any thread decodes that tile.
+      if (lut_block_id != resident_lut_block_id_) {
+        load_lut(shared_tensors, params, thread_idx, lut_block_id);
+        cutlass::arch::NamedBarrier::sync(
+            thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+        resident_lut_block_id_ = lut_block_id;
+      }
     }
     decode_stage(shared_tensors, sB_base, sB_nosw, sB_sw, sfb_layout, params,
                  read_stage, t_abs >> 1, t_abs & 1, thread_idx);
@@ -964,9 +986,10 @@ struct CollectiveMma<
   }
 
 private:
-  // Per-thread, whole-kernel-lifetime flag (the kernel declares ONE
-  // CollectiveMainloop outside the scheduler loop) — see the fp8 fork.
-  bool lut_resident_ = false;
+  // Per-thread, whole-kernel-lifetime identity (the kernel declares ONE
+  // CollectiveMainloop outside the persistent scheduler loop).  ``-1`` is
+  // the not-yet-staged sentinel; all MMA threads update this in lock-step.
+  int resident_lut_block_id_ = -1;
   bool debug_dumped_ = false;
 };
 
