@@ -2,12 +2,25 @@
 from __future__ import annotations
 
 import ast
+from importlib import metadata
+import os
 from pathlib import Path
 import re
 
 
-ROOT = Path(__file__).resolve().parents[1]
-PACKAGE = ROOT / "gridbook"
+TEST_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_PACKAGE = TEST_ROOT / "gridbook"
+if SOURCE_PACKAGE.is_dir():
+    ROOT = TEST_ROOT
+    PACKAGE = SOURCE_PACKAGE
+else:
+    # Release CI stages tests outside the checkout specifically to exercise the
+    # non-editable wheel. Scan the package that Python actually imported rather
+    # than passing vacuously because ``<staged-tests>/../gridbook`` is absent.
+    import gridbook
+
+    PACKAGE = Path(gridbook.__file__).resolve().parent
+    ROOT = PACKAGE.parent
 
 
 def _is_triton_module(name: str | None) -> bool:
@@ -136,15 +149,30 @@ def test_distribution_does_not_depend_on_triton():
     # Python 3.10 is supported and has no stdlib tomllib. Inspect every TOML
     # requirement array while ignoring comments, which is sufficient for this
     # static package-policy ratchet and keeps it runnable at the declared floor.
-    text = (ROOT / "pyproject.toml").read_text()
-    arrays = re.findall(
-        r"(?ms)^(?:requires|dependencies|[A-Za-z0-9_-]+)\s*=\s*\[(.*?)\]",
-        text,
+    source_roots = [TEST_ROOT]
+    for variable in ("GRIDBOOK_SOURCE_ROOT", "GITHUB_WORKSPACE"):
+        value = os.environ.get(variable)
+        if value:
+            source_roots.append(Path(value).expanduser())
+    pyproject = next(
+        (root / "pyproject.toml" for root in source_roots
+         if (root / "pyproject.toml").is_file()),
+        None,
     )
-    assert arrays, "pyproject.toml has no dependency arrays"
-    requirements = re.findall(
-        r"[\"']\s*([^\"']+)\s*[\"']", "\n".join(arrays)
-    )
+    if pyproject is not None:
+        text = pyproject.read_text()
+        arrays = re.findall(
+            r"(?ms)^(?:requires|dependencies|[A-Za-z0-9_-]+)\s*=\s*\[(.*?)\]",
+            text,
+        )
+        assert arrays, "pyproject.toml has no dependency arrays"
+        requirements = re.findall(
+            r"[\"']\s*([^\"']+)\s*[\"']", "\n".join(arrays)
+        )
+    else:
+        # A wheel intentionally does not ship pyproject.toml. Its installed
+        # Core Metadata is the release artifact's authoritative dependency set.
+        requirements = metadata.requires("gridbook") or []
 
     def package_name(requirement: str) -> str:
         return re.split(r"[\s\[<>=!~;]", requirement.strip(), maxsplit=1)[0] \
