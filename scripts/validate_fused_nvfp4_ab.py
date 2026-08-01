@@ -14,7 +14,9 @@ The two arms intentionally do not have the same activation contract:
 * fused static modes: native NVFP4 attested per-tensor global scale + UE4M3
   group factors;
 * fused rowwise modes: native NVFP4 independent runtime scale per row + UE4M3
-  group factors.
+  group factors;
+* fused static-LSQ modes: the same attested fixed-G native payload as static,
+  with only its existing per-row output residual least-squares corrected.
 
 Consequently the useful quality outputs are target-token NLL/PPL and paired
 top-K coarse KL, not tensor equality.  Optional one-token request wall timing
@@ -103,7 +105,10 @@ FUSED_ENV = "PRISMAQUANT_CB_FUSED_FP4"
 FUSED_MOE_ENV = "PRISMAQUANT_CB_FUSED_FP4_MOE"
 PREFILL_ENV = "PRISMAQUANT_CB_PREFILL"
 VLLM_MP_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
-DENSE_FUSED_MODES = ("1", "midm", "rowwise", "rowwise_midm")
+DENSE_FUSED_MODES = (
+    "1", "midm", "static_lsq", "static_lsq_midm",
+    "rowwise", "rowwise_midm",
+)
 _TEACHER_QUALITY_PROMOTION_GATES = (
     "max_teacher_fused_mean_kl",
     "max_teacher_fused_kl_regression",
@@ -740,8 +745,12 @@ class DenseDispatchProbe:
             record["apply_shapes"][shape] += 1
             if m > self.prefill_threshold:
                 record["fp4_prefill_calls"] += 1
-                mode_allows = self.fused_mode in ("1", "rowwise") or (
-                    self.fused_mode in ("midm", "rowwise_midm") and m <= 128
+                mode_allows = self.fused_mode in (
+                    "1", "static_lsq", "rowwise",
+                ) or (
+                    self.fused_mode in (
+                        "midm", "static_lsq_midm", "rowwise_midm",
+                    ) and m <= 128
                 )
                 if record["arm"] == "fused" and bias is None and mode_allows:
                     record["candidate_gate_opportunities"] += 1
@@ -784,12 +793,18 @@ class DenseDispatchProbe:
             probe._on_apply(method, layer, x, bias)
             return original_apply(method, layer, x, bias)
 
-        def wrapped_try(method, layer, x, n, k, m, *, rowwise=False):
+        def wrapped_try(
+            method, layer, x, n, k, m, *, rowwise=False, static_lsq=False,
+        ):
             shape = probe._on_try_start(method, layer, n, k, m)
             try:
                 if rowwise:
                     output = original_try(
                         method, layer, x, n, k, m, rowwise=True
+                    )
+                elif static_lsq:
+                    output = original_try(
+                        method, layer, x, n, k, m, static_lsq=True
                     )
                 else:
                     output = original_try(method, layer, x, n, k, m)
@@ -1959,8 +1974,19 @@ def _finalize_gate_report(
         for name in _TEACHER_QUALITY_PROMOTION_GATES
         if name not in teacher_quality_thresholds_present
     ]
+    settings = report.get("settings")
+    chunked_prefill_contract = (
+        settings.get("chunked_prefill_contract")
+        if isinstance(settings, Mapping)
+        else None
+    )
+    chunked_prefill_promotion_compatible = bool(
+        isinstance(chunked_prefill_contract, Mapping)
+        and chunked_prefill_contract.get("promotion_compatible") is True
+    )
     promotion_contract_complete = (
         full_vocab_teacher_present and not teacher_quality_thresholds_missing
+        and chunked_prefill_promotion_compatible
     )
     report["promotion_contract"] = {
         "teacher_full_vocab_kl_required": True,
@@ -1972,6 +1998,10 @@ def _finalize_gate_report(
         ),
         "teacher_quality_thresholds_present": teacher_quality_thresholds_present,
         "teacher_quality_thresholds_missing": teacher_quality_thresholds_missing,
+        "chunked_prefill_execution_contract_required": True,
+        "chunked_prefill_promotion_compatible": (
+            chunked_prefill_promotion_compatible
+        ),
         "complete": promotion_contract_complete,
         "coarse_kl_may_reject_but_cannot_greenlight": True,
     }
@@ -1986,6 +2016,8 @@ def _finalize_gate_report(
         if not full_vocab_teacher_present
         else "screening_only_teacher_quality_thresholds_required"
         if teacher_quality_thresholds_missing
+        else "screening_only_chunked_prefill_contract_incompatible"
+        if not chunked_prefill_promotion_compatible
         else "candidate_only_requires_served_validation"
     )
 
@@ -2036,8 +2068,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     probe.install()
     engine = validation_common.load_candidate_engine(
-        bootstrap, args, probe=probe
+        bootstrap, args, probe=probe, attest_chunked_prefill=True
     )
+    chunked_prefill_contract = engine.chunked_prefill_contract
+    if chunked_prefill_contract is None:
+        raise RuntimeError("chunked-prefill contract attestation did not run")
     llm = engine.llm
     quality_sampling = engine.quality_sampling
     timing_sampling = engine.timing_sampling
@@ -2180,6 +2215,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     fused_dispatch = aggregate_dispatch(fused_records)
     observed_pids = sorted(set(baseline_dispatch["pids"] + fused_dispatch["pids"]))
     core_gates = {
+        "chunked_prefill_execution_contract": (
+            validation_common.chunked_prefill_integrity_gate(
+                chunked_prefill_contract
+            )
+        ),
         "same_process_dispatch": {
             "expected_pid": os.getpid(),
             "observed_pids": observed_pids,
@@ -2282,7 +2322,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "activation_contract": {
             "baseline": "fp32-emulated group-scale FP4 activation QDQ",
-            "fused": "native NVFP4 global FP32 scale + per-group UE4M3 factors",
+            "fused": (
+                "native NVFP4 attested fixed-G payload + per-row least-squares "
+                "EVT residual"
+                if args.fused_mode.startswith("static_lsq")
+                else "native NVFP4 global FP32 scale + per-group UE4M3 factors"
+            ),
             "same_contract": False,
         },
         "settings": validation_common.shared_report_settings(
@@ -2299,6 +2344,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             inherited_prefill=inherited_prefill,
             prefill_threshold=linear.PREFILL_M_THRESHOLD,
             measurement_settings={
+                "chunked_prefill": chunked_prefill_contract[
+                    "resolved_enabled"
+                ],
+                "chunked_prefill_contract": chunked_prefill_contract,
                 "warmup_pairs": args.warmup_pairs,
                 "timing_repeats": args.timing_repeats,
                 "measurement_only": bool(

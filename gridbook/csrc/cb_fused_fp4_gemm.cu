@@ -179,7 +179,7 @@ void check_dense_packed_row_storage(torch::Tensor const& packed,
 }
 
 // ---------------------------------------------------------------------------
-// Row-wise native-NVFP4 activation quantization.
+// Native-NVFP4 activation quantization.
 //
 // vLLM's public scaled_fp4_quant takes one global scale for the complete
 // [M,K] tensor.  That makes one row's bytes depend on the other rows present
@@ -188,6 +188,19 @@ void check_dense_packed_row_storage(torch::Tensor const& packed,
 // each row and preserve the standard UE4M3-group/E2M1 payload contract.  This
 // is one activation primitive shared by future dense and grouped dispatch; it
 // does not duplicate either weight decoder or GEMM.
+//
+// The experimental static-LSQ policy deliberately keeps the artifact's fixed
+// global scale G, and therefore emits the same E2M1/SFA bytes as vLLM's
+// scaled_fp4_quant.  Once those native-QDQ bytes are fixed, it computes the
+// least-squares residual independently for every row.  If q_raw is the
+// E2M1*UE4M3 value consumed by the MMA, then
+//
+//   r / G = (x dot (q_raw/G)) / ((q_raw/G) dot (q_raw/G)) / G
+//         = (x dot q_raw) / (q_raw dot q_raw).
+//
+// That final expression is both cheaper and numerically better conditioned.
+// Only the existing per-row EVT operand changes; the packed activation bytes,
+// weight representation, decoder, and GEMM stay exactly the same.
 
 __device__ __forceinline__ float cb_rcp_approx_ftz(float value) {
   float result;
@@ -233,6 +246,25 @@ __device__ __forceinline__ uint32_t cb_pack_e2m1x8(float const (&values)[8]) {
 #endif
 }
 
+__device__ __forceinline__ float cb_unpack_e2m1(uint32_t packed, int item) {
+  uint32_t const code = (packed >> (item * 4)) & 0xfu;
+  // E2M1 finite magnitudes in encoding order.  Preserve signed zero only in
+  // the serialized nibble; it is immaterial to either dot product.  A switch
+  // avoids a dynamically indexed local array in this register-sensitive path.
+  float value;
+  switch (code & 7u) {
+    case 0: value = 0.0f; break;
+    case 1: value = 0.5f; break;
+    case 2: value = 1.0f; break;
+    case 3: value = 1.5f; break;
+    case 4: value = 2.0f; break;
+    case 5: value = 3.0f; break;
+    case 6: value = 4.0f; break;
+    default: value = 6.0f; break;
+  }
+  return (code & 8u) ? -value : value;
+}
+
 __device__ __forceinline__ int64_t cb_sfa_swizzle_offset(
     int row, int group, int groups) {
   // K is required to be a multiple of 256, hence groups=K/16 is already a
@@ -242,13 +274,20 @@ __device__ __forceinline__ int64_t cb_sfa_swizzle_offset(
       + (row / 128) * (512 * (groups / 4));
 }
 
-template <typename InputT>
+enum class CbNvfp4ActivationPolicy : int {
+  kRowwiseRange = 0,
+  kStaticLsq = 1,
+};
+
+template <typename InputT, CbNvfp4ActivationPolicy Policy>
 __device__ __forceinline__ void cb_nvfp4_quantize_rows_body(
     InputT const* __restrict__ input,
     uint8_t* __restrict__ packed,
     uint8_t* __restrict__ sfa,
     float* __restrict__ a_scales,
+    float fixed_global_scale,
     int M, int K, float range_multiplier) {
+  constexpr bool kStaticLsq = Policy == CbNvfp4ActivationPolicy::kStaticLsq;
   int const row = static_cast<int>(blockIdx.x);
   int const groups = K / 16;
   if (row >= M) {
@@ -260,46 +299,62 @@ __device__ __forceinline__ void cb_nvfp4_quantize_rows_body(
   }
 
   InputT const* row_input = input + static_cast<int64_t>(row) * K;
-  float local_max = 0.0f;
-  for (int col = static_cast<int>(threadIdx.x); col < K;
-       col += static_cast<int>(blockDim.x)) {
-    local_max = fmaxf(local_max, fabsf(cb_input_to_float(row_input[col])));
-  }
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    local_max = fmaxf(local_max,
-                      __shfl_down_sync(0xffffffffu, local_max, offset));
-  }
-  __shared__ float warp_max[8];
+  __shared__ float warp_reduce_0[8];
+  __shared__ float warp_reduce_1[8];
   int const lane = static_cast<int>(threadIdx.x) & 31;
   int const warp = static_cast<int>(threadIdx.x) >> 5;
-  if (lane == 0) {
-    warp_max[warp] = local_max;
-  }
-  __syncthreads();
-  if (warp == 0) {
-    float block_max = lane < 8 ? warp_max[lane] : 0.0f;
+
+  float row_max = 0.0f;
+  float global_scale = 1.0f;
+  if constexpr (kStaticLsq) {
+    global_scale = fixed_global_scale;
+  } else {
+    float local_max = 0.0f;
+    for (int col = static_cast<int>(threadIdx.x); col < K;
+         col += static_cast<int>(blockDim.x)) {
+      local_max = fmaxf(local_max, fabsf(cb_input_to_float(row_input[col])));
+    }
     for (int offset = 16; offset > 0; offset >>= 1) {
-      block_max = fmaxf(block_max,
-                        __shfl_down_sync(0xffffffffu, block_max, offset));
+      local_max = fmaxf(local_max,
+                        __shfl_down_sync(0xffffffffu, local_max, offset));
     }
     if (lane == 0) {
-      warp_max[0] = block_max;
+      warp_reduce_0[warp] = local_max;
     }
-  }
-  __syncthreads();
+    __syncthreads();
+    if (warp == 0) {
+      float block_max = lane < 8 ? warp_reduce_0[lane] : 0.0f;
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        block_max = fmaxf(
+            block_max,
+            __shfl_down_sync(0xffffffffu, block_max, offset));
+      }
+      if (lane == 0) {
+        warp_reduce_0[0] = block_max;
+      }
+    }
+    __syncthreads();
 
-  float const row_max = warp_max[0];
-  float global_scale = 1.0f;
-  if (row_max > 0.0f && isfinite(row_max)) {
-    global_scale = __fdiv_rn(range_multiplier * 6.0f, row_max);
-  }
-  if (threadIdx.x == 0) {
-    a_scales[row] = row_max > 0.0f && isfinite(row_max)
-        ? __fdiv_rn(1.0f, global_scale)
-        : 0.0f;
+    row_max = warp_reduce_0[0];
+    if (row_max > 0.0f && isfinite(row_max)) {
+      global_scale = __fdiv_rn(range_multiplier * 6.0f, row_max);
+    }
+    if (threadIdx.x == 0) {
+      a_scales[row] = row_max > 0.0f && isfinite(row_max)
+          ? __fdiv_rn(1.0f, global_scale)
+          : 0.0f;
+    }
   }
 
   uint8_t* row_packed = packed + static_cast<int64_t>(row) * (K / 2);
+  float local_xq = 0.0f;
+  float local_qq = 0.0f;
+  bool valid_quant_scale;
+  if constexpr (kStaticLsq) {
+    valid_quant_scale = global_scale > 0.0f && isfinite(global_scale);
+  } else {
+    valid_quant_scale = row_max > 0.0f && isfinite(row_max);
+  }
   for (int group = static_cast<int>(threadIdx.x); group < groups;
        group += static_cast<int>(blockDim.x)) {
     float values[16];
@@ -312,7 +367,7 @@ __device__ __forceinline__ void cb_nvfp4_quantize_rows_body(
     }
 
     float sf_value = 0.0f;
-    if (group_max > 0.0f && row_max > 0.0f && isfinite(row_max)) {
+    if (group_max > 0.0f && valid_quant_scale) {
       sf_value = global_scale * (group_max * cb_rcp_approx_ftz(6.0f));
       sf_value = fminf(sf_value, 448.0f);
     }
@@ -340,8 +395,48 @@ __device__ __forceinline__ void cb_nvfp4_quantize_rows_body(
           : values[item + 8] * normalize;
     }
     uint32_t* group_out = reinterpret_cast<uint32_t*>(row_packed + group * 8);
-    group_out[0] = cb_pack_e2m1x8(low);
-    group_out[1] = cb_pack_e2m1x8(high);
+    uint32_t const packed_low = cb_pack_e2m1x8(low);
+    uint32_t const packed_high = cb_pack_e2m1x8(high);
+    group_out[0] = packed_low;
+    group_out[1] = packed_high;
+
+    if constexpr (kStaticLsq) {
+#pragma unroll
+      for (int item = 0; item < 8; ++item) {
+        float const q_low = cb_unpack_e2m1(packed_low, item) * narrowed_sf;
+        float const q_high = cb_unpack_e2m1(packed_high, item) * narrowed_sf;
+        local_xq = fmaf(values[item], q_low, local_xq);
+        local_qq = fmaf(q_low, q_low, local_qq);
+        local_xq = fmaf(values[item + 8], q_high, local_xq);
+        local_qq = fmaf(q_high, q_high, local_qq);
+      }
+    }
+  }
+
+  if constexpr (kStaticLsq) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      local_xq += __shfl_down_sync(0xffffffffu, local_xq, offset);
+      local_qq += __shfl_down_sync(0xffffffffu, local_qq, offset);
+    }
+    if (lane == 0) {
+      warp_reduce_0[warp] = local_xq;
+      warp_reduce_1[warp] = local_qq;
+    }
+    __syncthreads();
+    if (warp == 0) {
+      float block_xq = lane < 8 ? warp_reduce_0[lane] : 0.0f;
+      float block_qq = lane < 8 ? warp_reduce_1[lane] : 0.0f;
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        block_xq += __shfl_down_sync(0xffffffffu, block_xq, offset);
+        block_qq += __shfl_down_sync(0xffffffffu, block_qq, offset);
+      }
+      if (lane == 0) {
+        a_scales[row] = (block_qq > 0.0f && isfinite(block_qq)
+                         && isfinite(block_xq))
+            ? __fdiv_rn(block_xq, block_qq)
+            : __fdiv_rn(1.0f, global_scale);
+      }
+    }
   }
 }
 
@@ -358,8 +453,9 @@ __global__ void cb_nvfp4_quantize_rows_bf16_kernel(
     uint8_t* __restrict__ sfa,
     float* __restrict__ a_scales,
     int M, int K, float range_multiplier) {
-  cb_nvfp4_quantize_rows_body(
-      input, packed, sfa, a_scales, M, K, range_multiplier);
+  cb_nvfp4_quantize_rows_body<
+      __nv_bfloat16, CbNvfp4ActivationPolicy::kRowwiseRange>(
+      input, packed, sfa, a_scales, 0.0f, M, K, range_multiplier);
 }
 
 __global__ void cb_nvfp4_quantize_rows_fp16_kernel(
@@ -368,17 +464,45 @@ __global__ void cb_nvfp4_quantize_rows_fp16_kernel(
     uint8_t* __restrict__ sfa,
     float* __restrict__ a_scales,
     int M, int K, float range_multiplier) {
-  cb_nvfp4_quantize_rows_body(
-      input, packed, sfa, a_scales, M, K, range_multiplier);
+  cb_nvfp4_quantize_rows_body<
+      half, CbNvfp4ActivationPolicy::kRowwiseRange>(
+      input, packed, sfa, a_scales, 0.0f, M, K, range_multiplier);
+}
+
+__global__ void cb_nvfp4_quantize_static_lsq_bf16_kernel(
+    __nv_bfloat16 const* __restrict__ input,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sfa,
+    float* __restrict__ a_scales,
+    float global_scale,
+    int M, int K) {
+  cb_nvfp4_quantize_rows_body<
+      __nv_bfloat16, CbNvfp4ActivationPolicy::kStaticLsq>(
+      input, packed, sfa, a_scales, global_scale, M, K, 0.0f);
+}
+
+__global__ void cb_nvfp4_quantize_static_lsq_fp16_kernel(
+    half const* __restrict__ input,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sfa,
+    float* __restrict__ a_scales,
+    float global_scale,
+    int M, int K) {
+  cb_nvfp4_quantize_rows_body<
+      half, CbNvfp4ActivationPolicy::kStaticLsq>(
+      input, packed, sfa, a_scales, global_scale, M, K, 0.0f);
 }
 
 namespace {
 
-void cb_nvfp4_quantize_rows_out(torch::Tensor input,
-                                torch::Tensor packed,
-                                torch::Tensor sfa,
-                                torch::Tensor a_scales,
-                                double range_multiplier) {
+void cb_nvfp4_quantize_out_impl(
+    torch::Tensor input,
+    torch::Tensor packed,
+    torch::Tensor sfa,
+    torch::Tensor a_scales,
+    double range_multiplier,
+    std::optional<float> fixed_global_scale) {
+  bool const static_lsq = fixed_global_scale.has_value();
   TORCH_CHECK(input.is_cuda(), "input must be CUDA");
   TORCH_CHECK(input.dim() == 2 && input.is_contiguous() &&
               input.stride(1) == 1 && input.stride(0) == input.size(1),
@@ -392,9 +516,11 @@ void cb_nvfp4_quantize_rows_out(torch::Tensor input,
               "input dimensions exceed int32 kernel limits");
   TORCH_CHECK(input.size(1) % 256 == 0,
               "input K must be a multiple of 256");
-  TORCH_CHECK(std::isfinite(range_multiplier) && range_multiplier > 0.0 &&
-              range_multiplier <= 448.0,
-              "range_multiplier must be finite and in (0,448]");
+  if (!static_lsq) {
+    TORCH_CHECK(std::isfinite(range_multiplier) && range_multiplier > 0.0 &&
+                range_multiplier <= 448.0,
+                "range_multiplier must be finite and in (0,448]");
+  }
 
   int const M = static_cast<int>(input.size(0));
   int const K = static_cast<int>(input.size(1));
@@ -421,23 +547,59 @@ void cb_nvfp4_quantize_rows_out(torch::Tensor input,
   dim3 const block(256);
   dim3 const grid(padded_m);
   if (input.scalar_type() == torch::kBFloat16) {
-    ::cb_nvfp4_quantize_rows_bf16_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
-        packed.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(),
-        a_scales.data_ptr<float>(), M, K,
-        static_cast<float>(range_multiplier));
+    if (static_lsq) {
+      ::cb_nvfp4_quantize_static_lsq_bf16_kernel<<<grid, block, 0, stream>>>(
+          reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+          packed.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(),
+          a_scales.data_ptr<float>(), *fixed_global_scale, M, K);
+    } else {
+      ::cb_nvfp4_quantize_rows_bf16_kernel<<<grid, block, 0, stream>>>(
+          reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+          packed.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(),
+          a_scales.data_ptr<float>(), M, K,
+          static_cast<float>(range_multiplier));
+    }
   } else {
-    ::cb_nvfp4_quantize_rows_fp16_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<half const*>(input.data_ptr()),
-        packed.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(),
-        a_scales.data_ptr<float>(), M, K,
-        static_cast<float>(range_multiplier));
+    if (static_lsq) {
+      ::cb_nvfp4_quantize_static_lsq_fp16_kernel<<<grid, block, 0, stream>>>(
+          reinterpret_cast<half const*>(input.data_ptr()),
+          packed.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(),
+          a_scales.data_ptr<float>(), *fixed_global_scale, M, K);
+    } else {
+      ::cb_nvfp4_quantize_rows_fp16_kernel<<<grid, block, 0, stream>>>(
+          reinterpret_cast<half const*>(input.data_ptr()),
+          packed.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(),
+          a_scales.data_ptr<float>(), M, K,
+          static_cast<float>(range_multiplier));
+    }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void cb_nvfp4_quantize_rows_out(torch::Tensor input,
+                                torch::Tensor packed,
+                                torch::Tensor sfa,
+                                torch::Tensor a_scales,
+                                double range_multiplier) {
+  cb_nvfp4_quantize_out_impl(
+      input, packed, sfa, a_scales, range_multiplier, std::nullopt);
+}
+
+void cb_nvfp4_quantize_static_lsq_out(torch::Tensor input,
+                                      double global_scale,
+                                      torch::Tensor packed,
+                                      torch::Tensor sfa,
+                                      torch::Tensor a_scales) {
+  float const global_scale_f32 = static_cast<float>(global_scale);
+  TORCH_CHECK(std::isfinite(global_scale) && std::isfinite(global_scale_f32) &&
+              global_scale_f32 > 0.0f,
+              "global_scale must round to a finite positive float32 value");
+  cb_nvfp4_quantize_out_impl(
+      input, packed, sfa, a_scales, 0.0, global_scale_f32);
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-cb_nvfp4_quantize_rows(torch::Tensor input, double range_multiplier) {
+allocate_nvfp4_quant_outputs(torch::Tensor input) {
   TORCH_CHECK(input.dim() == 2, "input must be rank 2");
   int64_t const M = input.size(0);
   int64_t const K = input.size(1);
@@ -447,8 +609,23 @@ cb_nvfp4_quantize_rows(torch::Tensor input, double range_multiplier) {
   auto sfa = torch::empty({padded_m * (K / 16)},
       input.options().dtype(torch::kUInt8));
   auto a_scales = torch::empty({M}, input.options().dtype(torch::kFloat32));
+  return {packed, sfa, a_scales};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+cb_nvfp4_quantize_rows(torch::Tensor input, double range_multiplier) {
+  auto [packed, sfa, a_scales] = allocate_nvfp4_quant_outputs(input);
   cb_nvfp4_quantize_rows_out(
       input, packed, sfa, a_scales, range_multiplier);
+  return {packed, sfa, a_scales};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+cb_nvfp4_quantize_static_lsq(torch::Tensor input,
+                             double global_scale) {
+  auto [packed, sfa, a_scales] = allocate_nvfp4_quant_outputs(input);
+  cb_nvfp4_quantize_static_lsq_out(
+      input, global_scale, packed, sfa, a_scales);
   return {packed, sfa, a_scales};
 }
 
@@ -941,6 +1118,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("a_scales"), py::arg("range_multiplier") = 448.0,
         "Allocation-free row-wise native NVFP4 activation quantization for "
         "CUDA graphs and cached serving workspaces.");
+  m.def("cb_nvfp4_quantize_static_lsq", &cb_nvfp4_quantize_static_lsq,
+        py::arg("input"), py::arg("global_scale"),
+        "Experimental fixed-G native NVFP4 activation quantization with a "
+        "per-row least-squares EVT residual. Packed E2M1 and SFA bytes match "
+        "scaled_fp4_quant(input, global_scale); no alternate weight or GEMM "
+        "representation is created.");
+  m.def("cb_nvfp4_quantize_static_lsq_out",
+        &cb_nvfp4_quantize_static_lsq_out,
+        py::arg("input"), py::arg("global_scale"), py::arg("packed"),
+        py::arg("sfa"), py::arg("a_scales"),
+        "Allocation-free fixed-G NVFP4 quantization plus per-row LSQ residual "
+        "for non-default streams and CUDA graphs.");
   m.def("sm120_nvf4_mm_scaled", &sm120_nvf4_mm_scaled,
         "STOCK sm120 block-scaled NVF4 GEMM (packed e2m1 A/B + swizzled ue4m3 "
         "SF planes) at the fused kernel's exact TiledMma/tile/epilogue config "

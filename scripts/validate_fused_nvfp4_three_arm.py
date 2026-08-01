@@ -437,12 +437,11 @@ def core_integrity_gates(
             "observed_errors": dispatch["baseline"]["probe_errors"],
             "pass": dispatch["baseline"]["probe_errors"] == 0,
         },
-        "chunked_prefill_execution_contract": {
-            **dict(chunked_prefill_contract),
-            "pass": (
-                chunked_prefill_contract.get("promotion_compatible") is True
-            ),
-        },
+        "chunked_prefill_execution_contract": (
+            validation_common.chunked_prefill_integrity_gate(
+                chunked_prefill_contract
+            )
+        ),
         "selector_cache_attestation": {
             "expected_measurements": expected_measurements,
             "observed_measurements": len(selector_attestations),

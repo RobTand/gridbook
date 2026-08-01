@@ -137,3 +137,35 @@ def test_live_vllm_e4m3_underflow_boundary_matches_reference():
     assert sf_live_logical[0, NONZERO_SF_GROUPS].tolist() == [1, 1, 1]
     assert torch.equal(sf_live_logical, sf_ref.view(torch.uint8))
     assert torch.equal(packed_live.view(torch.uint8), packed_ref)
+
+
+def test_live_static_lsq_preserves_midpoint_and_underflow_payload_boundaries():
+    """Fixed G=1 must not let residual fitting perturb native payload bytes."""
+
+    vops = _require_live_scaled_fp4_quant()
+    from gridbook.cuda_ext import get_fused_fp4_ext
+
+    ext = get_fused_fp4_ext()
+    if ext is None or not hasattr(ext, "cb_nvfp4_quantize_static_lsq"):
+        pytest.skip("static-LSQ fused FP4 extension unavailable")
+    midpoint = torch.tensor(
+        MIDPOINT_ROW * 16, dtype=torch.bfloat16, device="cuda"
+    )
+    underflow = _underflow_row(torch.device("cuda"))
+    x = torch.stack((midpoint, underflow, torch.zeros_like(midpoint))).contiguous()
+    global_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+
+    packed, sfa, residuals = ext.cb_nvfp4_quantize_static_lsq(x, 1.0)
+    packed_live, sfa_live = vops.scaled_fp4_quant(x, global_scale)
+    logical = _logical_vllm_sf(sfa, x.shape[0], x.shape[1] // codec.FP4_GROUP)
+    logical_live = _logical_vllm_sf(
+        sfa_live, x.shape[0], x.shape[1] // codec.FP4_GROUP
+    )
+
+    assert torch.equal(packed, packed_live)
+    assert torch.equal(logical, logical_live)
+    assert torch.isfinite(residuals).all()
+    assert (residuals[:2] > 0).all()
+    # q dot q is exactly zero only for the final all-zero row, so r=1 and the
+    # original static residual r/G remains one rather than becoming NaN/zero.
+    assert residuals[2].item() == 1.0

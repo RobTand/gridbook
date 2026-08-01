@@ -55,16 +55,24 @@ PREFILL_M_THRESHOLD = int(os.environ.get("PRISMAQUANT_PREFILL_M_THRESHOLD", "16"
 
 # fp4-MMA fused prefill gate (OPT-IN, default OFF): "" = off (the shipping
 # fp4 dispatch is byte-identical); "1"/"midm" use the artifact's attested
-# static activation scalar; "rowwise"/"rowwise_midm" derive an independent
-# native-NVFP4 scalar for every runtime row and therefore require no serialized
-# activation metadata. The ``*_midm`` modes cover only 16 < M <= 128. Every
-# mode remains an explicit experiment until its served quality/performance gate
-# passes; old artifacts can enter the fused path only through a rowwise mode.
+# static activation scalar; ``static_lsq`` keeps that exact scalar and payload
+# but fits the existing EVT residual independently per row; "rowwise" derives
+# an independent native-NVFP4 scalar for every runtime row and therefore needs
+# no serialized activation metadata. The ``*_midm`` modes cover only
+# 16 < M <= 128. Every mode remains an explicit experiment until its served
+# quality/performance gate passes; old artifacts can enter only a rowwise mode.
 _FP4_FUSED_MODE: list = []
 
 _FP4_FUSED_STATIC_MODES = frozenset(("1", "midm"))
+_FP4_FUSED_STATIC_LSQ_MODES = frozenset((
+    "static_lsq", "static_lsq_midm",
+))
 _FP4_FUSED_ROWWISE_MODES = frozenset(("rowwise", "rowwise_midm"))
-_FP4_FUSED_MODES = _FP4_FUSED_STATIC_MODES | _FP4_FUSED_ROWWISE_MODES
+_FP4_FUSED_MODES = (
+    _FP4_FUSED_STATIC_MODES
+    | _FP4_FUSED_STATIC_LSQ_MODES
+    | _FP4_FUSED_ROWWISE_MODES
+)
 _FP4_FUSED_ALLOWED_MODES = frozenset(("",)) | _FP4_FUSED_MODES
 
 
@@ -83,8 +91,8 @@ def _fp4_fused_mode() -> str:
     if current not in _FP4_FUSED_ALLOWED_MODES:
         raise ValueError(
             "invalid PRISMAQUANT_CB_FUSED_FP4="
-            f"{current!r}; expected '', '1', 'midm', 'rowwise', or "
-            "'rowwise_midm'"
+            f"{current!r}; expected '', '1', 'midm', 'static_lsq', "
+            "'static_lsq_midm', 'rowwise', or 'rowwise_midm'"
         )
     if not _FP4_FUSED_MODE:
         _FP4_FUSED_MODE.append(current)
@@ -282,6 +290,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             prefix=self.prefix,
             expected=expected_scales,
         )
+        # The static-LSQ binding takes the already-attested F32 by value.  Keep
+        # vLLM's device scalar above for the ordinary static ABI, while avoiding
+        # a steady-state device-to-host read (and making malformed direct fixed-G
+        # calls reject synchronously before kernel launch).
+        layer._cb_fp4_input_global_scale_f32 = float(expected_scales[0])
 
     def process_weights_after_loading(self, layer):
         dev = layer.cb_qweight.device
@@ -513,13 +526,20 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 and bool(ok))
 
     # -- fp4-MMA fused prefill (opt-in; see the dispatch site below) ---------
-    def _fused_fp4_ok(self, layer, K: int, *, rowwise: bool = False) -> bool:
+    def _fused_fp4_ok(self, layer, K: int, *, rowwise: bool = False,
+                      static_lsq: bool = False) -> bool:
         """Eligibility for the fused fp4 block-scaled prefill (cached per
         layer). Mirrors the kernel's TORCH_CHECKs so a miss is a silent
-        fall-through, never a crash. Static and rowwise activation families
-        are cached separately so probing one can never authorize the other."""
-        cache_attr = ("_cb_fp4_fused_rowwise_ok" if rowwise
-                      else "_cb_fp4_fused_static_ok")
+        fall-through, never a crash. Static, static-LSQ, and rowwise activation
+        families are cached separately so probing one cannot authorize another.
+        """
+        if rowwise and static_lsq:
+            return False
+        cache_attr = (
+            "_cb_fp4_fused_rowwise_ok" if rowwise else
+            "_cb_fp4_fused_static_lsq_ok" if static_lsq else
+            "_cb_fp4_fused_static_ok"
+        )
         ok = getattr(layer, cache_attr, None)
         if ok is not None:
             return ok
@@ -533,6 +553,12 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
               and K % 256 == 0
               and layer._cb_N % 8 == 0
               and self.type_size == 4 * self.k + (9 if self.is_v2 else 16))
+        if ok and static_lsq:
+            # This host scalar exists only after the producer contract payload
+            # and loaded tensor bits have passed the fail-closed load gate.
+            ok = getattr(
+                layer, "_cb_fp4_input_global_scale_f32", None
+            ) is not None
         if ok:
             ok = (codec.fp4_value_lut_nbytes(self.k, self.n_sub)
                   <= codec.FP4_FUSED_LUT_MAX_BYTES)
@@ -563,7 +589,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                         dtype=torch.int32, device=ro.device)
                 layer._cb_fp4_fused_lut_ok = bool(ok)
             ok = bool(ok)
-        if ok and not rowwise:
+        if ok and not rowwise and not static_lsq:
             try:
                 import vllm._custom_ops as vops
                 ok = hasattr(vops, "scaled_fp4_quant")
@@ -575,15 +601,23 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             ok = (fext is not None
                   and hasattr(fext, "cb_fused_fp4_prefill_mm_scaled")
                   and (not rowwise
-                       or hasattr(fext, "cb_nvfp4_quantize_rows")))
+                       or hasattr(fext, "cb_nvfp4_quantize_rows"))
+                  and (not static_lsq or hasattr(
+                      fext, "cb_nvfp4_quantize_static_lsq")))
         setattr(layer, cache_attr, bool(ok))
         return bool(ok)
 
     def _try_fused_fp4(self, layer, x, N: int, K: int, M: int, *,
-                       rowwise: bool = False):
+                       rowwise: bool = False, static_lsq: bool = False):
         """One fused NVF4 block-scaled GEMM over this layer's packed rows, or
         None if ineligible (the caller then runs the shipping path)."""
-        if not self._fused_fp4_ok(layer, K, rowwise=rowwise):
+        if static_lsq:
+            eligible = self._fused_fp4_ok(layer, K, static_lsq=True)
+        else:
+            # Preserve the historical call shape for instrumentation and
+            # compatibility wrappers that know only the rowwise flag.
+            eligible = self._fused_fp4_ok(layer, K, rowwise=rowwise)
+        if not eligible:
             return None
         from .cuda_ext import get_fused_fp4_ext
         fext = get_fused_fp4_ext()
@@ -624,6 +658,16 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # GEMM, or artifact representation is duplicated for this mode.
             aq, sfa, a_scales = fext.cb_nvfp4_quantize_rows(
                 x2.contiguous(), _nvfp4_rowwise_range_multiplier()
+            )
+        elif static_lsq:
+            if x2.dtype not in (torch.bfloat16, torch.float16):
+                return None
+            # Keep the producer-attested G and its native E2M1/SFA payload.
+            # The shared activation kernel changes only the existing per-row
+            # EVT residual to the least-squares optimum for those fixed bytes.
+            gs = layer._cb_fp4_input_global_scale_f32
+            aq, sfa, a_scales = fext.cb_nvfp4_quantize_static_lsq(
+                x2.contiguous(), gs
             )
         else:
             import vllm._custom_ops as vops
@@ -679,10 +723,12 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                       and M > PREFILL_M_THRESHOLD else "")
         if (fused_mode in _FP4_FUSED_MODES
                 and not (fused_mode.endswith("midm") and M > 128)):
-            y = self._try_fused_fp4(
-                layer, x, N, K, M,
-                rowwise=fused_mode in _FP4_FUSED_ROWWISE_MODES,
-            )
+            mode_kwargs = {}
+            if fused_mode in _FP4_FUSED_ROWWISE_MODES:
+                mode_kwargs["rowwise"] = True
+            elif fused_mode in _FP4_FUSED_STATIC_LSQ_MODES:
+                mode_kwargs["static_lsq"] = True
+            y = self._try_fused_fp4(layer, x, N, K, M, **mode_kwargs)
             if y is not None:
                 return y
 

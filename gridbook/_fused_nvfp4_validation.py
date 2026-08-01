@@ -433,6 +433,21 @@ def attest_chunked_prefill_contract(
     }
 
 
+def chunked_prefill_integrity_gate(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Attach the one promotion decision to an attested resolved contract.
+
+    Both validation schemas use this exact gate so a warning/conflicting vLLM
+    override cannot be informational in one report and fatal in the other.
+    """
+
+    return {
+        **dict(contract),
+        "pass": contract.get("promotion_compatible") is True,
+    }
+
+
 def score_teacher(
     bootstrap: ValidationBootstrap,
     args: Any,

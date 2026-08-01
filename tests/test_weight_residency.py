@@ -181,7 +181,10 @@ def test_dense_fp4_fused_prefill_is_opt_in(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "value", ["1", "midm", "rowwise", "rowwise_midm"]
+    "value", [
+        "1", "midm", "static_lsq", "static_lsq_midm",
+        "rowwise", "rowwise_midm",
+    ]
 )
 def test_dense_fp4_fused_prefill_explicit_modes(monkeypatch, value):
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
@@ -223,6 +226,30 @@ def test_dense_rowwise_modes_reach_only_the_rowwise_activation_family(
     )
     assert out.shape == (32, 8)
     assert observed == [True]
+
+
+@pytest.mark.parametrize("value", ["static_lsq", "static_lsq_midm"])
+def test_dense_static_lsq_modes_reach_only_the_lsq_activation_family(
+    monkeypatch, value
+):
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.is_fp4 = True
+    observed = []
+
+    def attempt(
+        layer, x, n, k, m, *, rowwise=False, static_lsq=False,
+    ):
+        observed.append((rowwise, static_lsq))
+        return torch.zeros(m, n, dtype=x.dtype)
+
+    method._try_fused_fp4 = attempt
+    layer = types.SimpleNamespace(_cb_N=8, _cb_K=256)
+    out = method._apply_inline(
+        layer, torch.zeros(32, 256, dtype=torch.bfloat16)
+    )
+    assert out.shape == (32, 8)
+    assert observed == [(False, True)]
 
 
 @pytest.mark.parametrize(
@@ -290,12 +317,14 @@ def test_dense_static_and_rowwise_eligibility_are_isolated(monkeypatch):
     class FusedExt:
         cb_fused_fp4_prefill_mm_scaled = object()
         cb_nvfp4_quantize_rows = object()
+        cb_nvfp4_quantize_static_lsq = object()
 
     monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: FusedExt())
     # A legacy artifact is rejected by the unchanged static family even when
     # every kernel symbol exists, but the explicit rowwise family may run.
     assert method._fused_fp4_ok(layer, 256) is False
     assert method._fused_fp4_ok(layer, 256, rowwise=True) is True
+    assert method._fused_fp4_ok(layer, 256, static_lsq=True) is False
 
 
 def test_dense_rowwise_eligibility_requires_quantizer_and_gemm(monkeypatch):
@@ -310,6 +339,7 @@ def test_dense_rowwise_eligibility_requires_quantizer_and_gemm(monkeypatch):
         _cb_N=8,
         _cb_row_offset=torch.zeros(8, dtype=torch.int32),
         _cb_fp4_input_global_scale=torch.tensor(2.0),
+        _cb_fp4_input_global_scale_f32=2.0,
     )
 
     vops = types.ModuleType("vllm._custom_ops")
@@ -327,6 +357,57 @@ def test_dense_rowwise_eligibility_requires_quantizer_and_gemm(monkeypatch):
     )
     assert method._fused_fp4_ok(layer, 256) is True
     assert method._fused_fp4_ok(layer, 256, rowwise=True) is False
+    assert method._fused_fp4_ok(layer, 256, static_lsq=True) is False
+
+
+def test_dense_static_lsq_eligibility_requires_contract_and_matching_symbol(
+    monkeypatch,
+):
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.is_fp4 = True
+    method.is_v2 = True
+    method.has_static_fp4_activation = True
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    layer = types.SimpleNamespace(
+        _cb_N=8,
+        _cb_row_offset=torch.zeros(8, dtype=torch.int32),
+        _cb_fp4_input_global_scale=torch.tensor(2.0),
+        _cb_fp4_input_global_scale_f32=2.0,
+    )
+
+    from gridbook import cuda_ext
+
+    class LsqExt:
+        cb_fused_fp4_prefill_mm_scaled = object()
+        cb_nvfp4_quantize_static_lsq = object()
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: LsqExt())
+    assert method._fused_fp4_ok(layer, 256, static_lsq=True) is True
+
+    unstamped_layer = types.SimpleNamespace(
+        _cb_N=8,
+        _cb_row_offset=torch.zeros(8, dtype=torch.int32),
+        _cb_fp4_input_global_scale=torch.tensor(2.0),
+    )
+    assert method._fused_fp4_ok(
+        unstamped_layer, 256, static_lsq=True
+    ) is False
+
+    legacy = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    legacy.is_fp4 = True
+    legacy.is_v2 = True
+    legacy.has_static_fp4_activation = False
+    legacy.k = 16
+    legacy.n_sub = 2
+    legacy.type_size = 73
+    legacy_layer = types.SimpleNamespace(
+        _cb_N=8, _cb_row_offset=torch.zeros(8, dtype=torch.int32)
+    )
+    assert legacy._fused_fp4_ok(
+        legacy_layer, 256, static_lsq=True
+    ) is False
 
 
 @pytest.fixture(autouse=True)

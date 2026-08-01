@@ -407,6 +407,35 @@ def test_rowwise_quantized_fused_gemm_bitexact_vs_stock():
     assert torch.equal(y_fused.view(torch.uint16), y_ref.view(torch.uint16))
 
 
+def test_static_lsq_quantized_fused_gemm_bitexact_vs_stock():
+    """The LSQ residual must flow through the sole existing GEMM exactly.
+
+    A heterogeneous residual vector makes this sensitive to epilogue row
+    indexing; stock and CB collectives consume the exact same activation bytes
+    and residuals, isolating the fused weight decoder at the integration seam.
+    """
+    k, M, N, K = 16, 128, 256, 1024
+    wctx = prep_weight(k, N=N, K=K, mode="product",
+                       coding=fmt.SCALE_CODING_TWO_TIER, seed=1821)
+    torch.manual_seed(1822)
+    amplitudes = torch.logspace(
+        -2, 2, M, dtype=torch.float32, device=DEV).reshape(M, 1)
+    x = (torch.randn(M, K, dtype=torch.float32, device=DEV)
+         * amplitudes).to(torch.bfloat16).contiguous()
+    global_scale = 2.5
+    aq, sfa, a_scales = ext.cb_nvfp4_quantize_static_lsq(x, global_scale)
+    b_scales = torch.ones(N, dtype=torch.float32, device=DEV)
+
+    assert torch.unique(a_scales.view(torch.int32)).numel() > M // 2
+    y_ref = ext.sm120_nvf4_mm_scaled(
+        aq, sfa, wctx["b_packed"], wctx["sfb_sw"], a_scales, b_scales,
+        N, K)
+    y_fused = ext.cb_fused_fp4_prefill_mm_scaled(
+        aq, sfa, wctx["qwp"], wctx["lut"], wctx["compose"], a_scales,
+        b_scales, N, K, k, wctx["n_sub"], wctx["ts"], wctx["is_v2"])
+    assert torch.equal(y_fused.view(torch.uint16), y_ref.view(torch.uint16))
+
+
 def test_fused_vs_triton_bucket_delta_documented():
     """The fused path's native-NVFP4 activation bucket vs the Triton decode
     path's fp32-group-scale bucket: a real, bounded numerics difference (NOT

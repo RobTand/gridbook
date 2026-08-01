@@ -267,6 +267,7 @@ def test_dense_contracted_scale_load_is_fail_closed_and_merged_exact(tmp_path):
     method._finalize_static_activation_scale(layer, targets)
     assert layer._cb_fp4_input_global_scale.ndim == 0
     assert torch.equal(layer._cb_fp4_input_global_scale, torch.tensor(2.5))
+    assert layer._cb_fp4_input_global_scale_f32 == 2.5
     layer._cb_N = 24
     layer._cb_row_offset = torch.zeros(24, dtype=torch.int32)
     assert method._fused_fp4_ok(layer, 256) is False  # no loaded kernel state
@@ -321,6 +322,69 @@ def test_static_scale_makes_native_quantization_chunk_invariant(monkeypatch):
     assert torch.equal(calls[0][0][0] * calls[0][1],
                        calls[1][0][0] * calls[1][1])
     assert calls[0][1].item() == calls[1][1].item() == 3.0
+
+
+def test_dense_static_lsq_uses_attested_g_and_existing_fused_gemm(monkeypatch):
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    method.is_v2 = True
+    method._sub_table = [1.0] * 16
+    method._fused_fp4_ok = (
+        lambda layer, K, *, rowwise=False, static_lsq=False: static_lsq
+    )
+    layer = types.SimpleNamespace(
+        _cb_fp4_input_global_scale=torch.tensor(3.0),
+        _cb_fp4_input_global_scale_f32=3.0,
+        _cb_fp4_lut=torch.ones(1),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(8),
+        _cb_qw_padded=torch.ones(8, 73, dtype=torch.uint8),
+    )
+
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = lambda *_args: pytest.fail(
+        "static_lsq must use the shared Gridbook activation primitive"
+    )
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    from gridbook import cuda_ext
+
+    calls = []
+
+    class Ext:
+        @staticmethod
+        def cb_nvfp4_quantize_static_lsq(x, global_scale):
+            packed = x[:, :128].to(torch.float32).round().to(torch.uint8)
+            sfa = torch.zeros(128 * 16, dtype=torch.uint8)
+            residual = torch.arange(
+                1, x.shape[0] + 1, dtype=torch.float32
+            )
+            calls.append(("quant", x.clone(), global_scale, residual.clone()))
+            return packed, sfa, residual
+
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(
+            aq, sfa, packed_weight, lut, compose, a_scales, b_scales,
+            n, k, k_bits, n_sub, type_size, is_v2, lut_tile_ids,
+        ):
+            calls.append(("gemm", aq, sfa, a_scales.clone(), packed_weight))
+            return torch.zeros(aq.shape[0], n, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: Ext())
+    x = torch.arange(2 * 256, dtype=torch.bfloat16).reshape(2, 256)
+    out = method._try_fused_fp4(
+        layer, x, 8, 256, 2, static_lsq=True
+    )
+
+    assert out.shape == (2, 8)
+    assert calls[0][0] == "quant"
+    assert calls[0][2] == 3.0
+    assert calls[1][0] == "gemm"
+    assert torch.equal(calls[1][3], calls[0][3])
+    assert calls[1][4] is layer._cb_qw_padded
 
 
 def test_dense_rowwise_quantizer_outputs_feed_the_existing_fused_gemm(

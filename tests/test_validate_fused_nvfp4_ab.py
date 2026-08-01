@@ -41,7 +41,7 @@ ab = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = ab
 SPEC.loader.exec_module(ab)
 
-V5_HELP_SHA256 = "34c0e1bde4a7a543c400248fc46ac9bfd8f535baacb8cbbeb7534ad0e6140628"
+V5_HELP_SHA256 = "c7ac242795ca86dd2afbe88103d6f646780229412eb08b7d6c6f2edf187f2696"
 
 
 class _Logprob:
@@ -57,7 +57,10 @@ def test_v5_schema_and_cli_help_are_compatibility_locked():
     )
     assert ab.SCHEMA == "gridbook.fused-nvfp4-ab.v5"
     assert ab.ARMS == ("baseline", "fused")
-    assert ab.DENSE_FUSED_MODES == ("1", "midm", "rowwise", "rowwise_midm")
+    assert ab.DENSE_FUSED_MODES == (
+        "1", "midm", "static_lsq", "static_lsq_midm",
+        "rowwise", "rowwise_midm",
+    )
     assert hashlib.sha256(completed.stdout).hexdigest() == V5_HELP_SHA256
 
 
@@ -93,6 +96,17 @@ def test_shared_engine_bootstrap_preserves_v5_llm_and_sampling_contract():
     class FakeLLM:
         def __init__(self, **kwargs):
             calls.append(("llm", kwargs))
+            self.llm_engine = SimpleNamespace(
+                vllm_config=SimpleNamespace(
+                    scheduler_config=SimpleNamespace(
+                        enable_chunked_prefill=kwargs["enable_chunked_prefill"]
+                    ),
+                    model_config=SimpleNamespace(
+                        is_chunked_prefill_supported=False,
+                        runner_type="generate",
+                    ),
+                )
+            )
 
     class FakeSampling:
         def __init__(self, **kwargs):
@@ -118,7 +132,7 @@ def test_shared_engine_bootstrap_preserves_v5_llm_and_sampling_contract():
     )
     probe = SimpleNamespace(restore=lambda: calls.append(("restore", {})))
     engine = ab.validation_common.load_candidate_engine(
-        bootstrap, args, probe=probe
+        bootstrap, args, probe=probe, attest_chunked_prefill=True
     )
     llm_kwargs = calls[0][1]
     assert llm_kwargs == {
@@ -150,7 +164,37 @@ def test_shared_engine_bootstrap_preserves_v5_llm_and_sampling_contract():
         "temperature": 0.0,
         "detokenize": False,
     }
+    assert engine.chunked_prefill_contract["requested"] == "disable"
+    assert engine.chunked_prefill_contract["resolved_enabled"] is False
+    assert engine.chunked_prefill_contract["promotion_compatible"] is True
     assert all(name != "restore" for name, _payload in calls)
+
+
+def test_v5_run_requires_resolved_chunked_prefill_attestation():
+    source = inspect.getsource(ab.run)
+    assert "attest_chunked_prefill=True" in source
+    assert "chunked_prefill_contract" in source
+
+
+def test_shared_chunked_prefill_gate_is_fail_closed_and_schema_shared():
+    compatible = {
+        "requested": "auto",
+        "resolved_enabled": True,
+        "promotion_compatible": True,
+    }
+    incompatible = {
+        **compatible,
+        "promotion_compatible": False,
+    }
+    assert ab.validation_common.chunked_prefill_integrity_gate(
+        compatible
+    )["pass"] is True
+    assert ab.validation_common.chunked_prefill_integrity_gate(
+        incompatible
+    )["pass"] is False
+    assert "validation_common.chunked_prefill_integrity_gate" in inspect.getsource(
+        ab.run
+    )
 
 
 def test_pair_order_is_prompt_paired_and_counterbalanced():
@@ -180,6 +224,11 @@ def test_activate_arm_mutates_env_and_clears_cached_mode():
         "fused", fused_mode="rowwise", environ=environ, mode_cache=cache
     ) == "rowwise"
     assert environ[ab.FUSED_ENV] == "rowwise"
+    assert cache == []
+    assert ab.activate_arm(
+        "fused", fused_mode="static_lsq", environ=environ, mode_cache=cache
+    ) == "static_lsq"
+    assert environ[ab.FUSED_ENV] == "static_lsq"
     assert cache == []
     with pytest.raises(ValueError, match="unknown arm"):
         ab.activate_arm("other", fused_mode="1", environ=environ, mode_cache=cache)
@@ -1121,6 +1170,50 @@ def test_dense_dispatch_probe_forwards_rowwise_family_without_losing_telemetry()
         probe.restore()
 
 
+def test_dense_dispatch_probe_forwards_static_lsq_without_losing_telemetry():
+    observed = []
+
+    class Layer:
+        _cb_N = 512
+        _cb_K = 256
+
+    class X:
+        def numel(self):
+            return 64 * 256
+
+    class Method:
+        is_fp4 = True
+        prefix = "model.layers.0.mlp.down_proj"
+
+        def _try_fused_fp4(
+            self, layer, x, n, k, m, *, rowwise=False, static_lsq=False,
+        ):
+            del layer, x, n, k, m
+            observed.append((rowwise, static_lsq))
+            return object()
+
+        def _apply_inline(self, layer, x, bias=None):
+            del bias
+            return self._try_fused_fp4(
+                layer, x, layer._cb_N, layer._cb_K,
+                x.numel() // layer._cb_K, static_lsq=True,
+            )
+
+    probe = ab.DenseDispatchProbe(
+        Method, prefill_threshold=16, fused_mode="static_lsq"
+    )
+    probe.install()
+    try:
+        with probe.measurement("fused", "static_lsq") as record:
+            assert Method()._apply_inline(Layer(), X()) is not None
+        assert observed == [(False, True)]
+        assert record["candidate_gate_opportunities"] == 1
+        assert record["fused_attempts"] == 1
+        assert record["fused_successes"] == 1
+    finally:
+        probe.restore()
+
+
 def test_moe_probe_proves_loop_and_grouped_fused_routes_without_torch():
     class X:
         shape = (128, 1024)
@@ -1322,6 +1415,9 @@ def test_gate_finalization_distinguishes_measurement_screen_and_promotion():
 
     promotion = {
         "quality": {"delta": {"kl_baseline_to_fused": {"mean": 0.1}}},
+        "settings": {
+            "chunked_prefill_contract": {"promotion_compatible": True}
+        },
         "teacher_quality": {
             "baseline": {
                 "kl_mode": ab.KL_FULL_VOCAB,
@@ -1351,6 +1447,30 @@ def test_gate_finalization_distinguishes_measurement_screen_and_promotion():
     ]
     assert promotion["promotion_recommendation"] == (
         "candidate_only_requires_served_validation"
+    )
+
+    incompatible = {
+        **promotion,
+        "settings": {
+            "chunked_prefill_contract": {"promotion_compatible": False}
+        },
+    }
+    ab._finalize_gate_report(
+        SimpleNamespace(**{
+            **screening_args,
+            "teacher_full_vocab_kl": True,
+            "max_teacher_fused_mean_kl": 0.20,
+            "max_teacher_fused_kl_regression": 0.03,
+        }),
+        incompatible,
+        core_gates,
+    )
+    assert incompatible["promotion_contract"]["complete"] is False
+    assert incompatible["promotion_contract"][
+        "chunked_prefill_promotion_compatible"
+    ] is False
+    assert incompatible["promotion_recommendation"] == (
+        "screening_only_chunked_prefill_contract_incompatible"
     )
 
 
