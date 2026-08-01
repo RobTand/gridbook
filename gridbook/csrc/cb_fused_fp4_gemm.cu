@@ -35,7 +35,11 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <climits>
+#include <cmath>
 #include <optional>
 
 #include <pybind11/stl.h>
@@ -172,6 +176,280 @@ void check_dense_packed_row_storage(torch::Tensor const& packed,
               " rows of ", required_row_bytes, " bytes at stride ",
               packed.stride(0), " from storage offset ",
               packed.storage_offset());
+}
+
+// ---------------------------------------------------------------------------
+// Row-wise native-NVFP4 activation quantization.
+//
+// vLLM's public scaled_fp4_quant takes one global scale for the complete
+// [M,K] tensor.  That makes one row's bytes depend on the other rows present
+// in the request.  The GEMMs in this file already consume one residual
+// a_scale per M row, so derive a full-range global scale independently for
+// each row and preserve the standard UE4M3-group/E2M1 payload contract.  This
+// is one activation primitive shared by future dense and grouped dispatch; it
+// does not duplicate either weight decoder or GEMM.
+
+__device__ __forceinline__ float cb_rcp_approx_ftz(float value) {
+  float result;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;\n"
+               : "=f"(result) : "f"(value));
+  return result;
+}
+
+template <typename InputT>
+__device__ __forceinline__ float cb_input_to_float(InputT value);
+
+template <>
+__device__ __forceinline__ float cb_input_to_float(__nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
+
+template <>
+__device__ __forceinline__ float cb_input_to_float(half value) {
+  return __half2float(value);
+}
+
+__device__ __forceinline__ uint32_t cb_pack_e2m1x8(float const (&values)[8]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t packed;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(packed)
+      : "f"(values[0]), "f"(values[1]), "f"(values[2]), "f"(values[3]),
+        "f"(values[4]), "f"(values[5]), "f"(values[6]), "f"(values[7]));
+  return packed;
+#else
+  return 0;
+#endif
+}
+
+__device__ __forceinline__ int64_t cb_sfa_swizzle_offset(
+    int row, int group, int groups) {
+  // K is required to be a multiple of 256, hence groups=K/16 is already a
+  // multiple of four and no separate K padding term is needed.
+  return (row % 32) * 16 + ((row / 32) % 4) * 4 + (group % 4)
+      + (group / 4) * 512
+      + (row / 128) * (512 * (groups / 4));
+}
+
+template <typename InputT>
+__device__ __forceinline__ void cb_nvfp4_quantize_rows_body(
+    InputT const* __restrict__ input,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sfa,
+    float* __restrict__ a_scales,
+    int M, int K, float range_multiplier) {
+  int const row = static_cast<int>(blockIdx.x);
+  int const groups = K / 16;
+  if (row >= M) {
+    for (int group = static_cast<int>(threadIdx.x); group < groups;
+         group += static_cast<int>(blockDim.x)) {
+      sfa[cb_sfa_swizzle_offset(row, group, groups)] = 0;
+    }
+    return;
+  }
+
+  InputT const* row_input = input + static_cast<int64_t>(row) * K;
+  float local_max = 0.0f;
+  for (int col = static_cast<int>(threadIdx.x); col < K;
+       col += static_cast<int>(blockDim.x)) {
+    local_max = fmaxf(local_max, fabsf(cb_input_to_float(row_input[col])));
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_max = fmaxf(local_max,
+                      __shfl_down_sync(0xffffffffu, local_max, offset));
+  }
+  __shared__ float warp_max[8];
+  int const lane = static_cast<int>(threadIdx.x) & 31;
+  int const warp = static_cast<int>(threadIdx.x) >> 5;
+  if (lane == 0) {
+    warp_max[warp] = local_max;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    float block_max = lane < 8 ? warp_max[lane] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      block_max = fmaxf(block_max,
+                        __shfl_down_sync(0xffffffffu, block_max, offset));
+    }
+    if (lane == 0) {
+      warp_max[0] = block_max;
+    }
+  }
+  __syncthreads();
+
+  float const row_max = warp_max[0];
+  float global_scale = 1.0f;
+  if (row_max > 0.0f && isfinite(row_max)) {
+    global_scale = __fdiv_rn(range_multiplier * 6.0f, row_max);
+  }
+  if (threadIdx.x == 0) {
+    a_scales[row] = row_max > 0.0f && isfinite(row_max)
+        ? __fdiv_rn(1.0f, global_scale)
+        : 0.0f;
+  }
+
+  uint8_t* row_packed = packed + static_cast<int64_t>(row) * (K / 2);
+  for (int group = static_cast<int>(threadIdx.x); group < groups;
+       group += static_cast<int>(blockDim.x)) {
+    float values[16];
+    float group_max = 0.0f;
+#pragma unroll
+    for (int item = 0; item < 16; ++item) {
+      float const value = cb_input_to_float(row_input[group * 16 + item]);
+      values[item] = value;
+      group_max = fmaxf(group_max, fabsf(value));
+    }
+
+    float sf_value = 0.0f;
+    if (group_max > 0.0f && row_max > 0.0f && isfinite(row_max)) {
+      sf_value = global_scale * (group_max * cb_rcp_approx_ftz(6.0f));
+      sf_value = fminf(sf_value, 448.0f);
+    }
+    __nv_fp8_e4m3 stored_sf = __nv_fp8_e4m3(sf_value);
+    uint8_t const sf_byte = stored_sf.__x;
+    sfa[cb_sfa_swizzle_offset(row, group, groups)] = sf_byte;
+    float const narrowed_sf = static_cast<float>(stored_sf);
+
+    float normalize = 0.0f;
+    if (narrowed_sf != 0.0f) {
+      normalize = cb_rcp_approx_ftz(
+          narrowed_sf * cb_rcp_approx_ftz(global_scale));
+    }
+    float low[8];
+    float high[8];
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+      // A zero UE4M3 scale makes the complete group numerical zero. Preserve
+      // the input sign on the E2M1 zero payload, matching vLLM/PTX.
+      low[item] = narrowed_sf == 0.0f
+          ? copysignf(0.0f, values[item])
+          : values[item] * normalize;
+      high[item] = narrowed_sf == 0.0f
+          ? copysignf(0.0f, values[item + 8])
+          : values[item + 8] * normalize;
+    }
+    uint32_t* group_out = reinterpret_cast<uint32_t*>(row_packed + group * 8);
+    group_out[0] = cb_pack_e2m1x8(low);
+    group_out[1] = cb_pack_e2m1x8(high);
+  }
+}
+
+// Keep the registered CUDA entry points non-templated and outside the
+// anonymous namespace. NVCC emits host launch stubs for __global__ functions
+// and cannot disambiguate this file's anonymous namespace from CUTE's own
+// anonymous namespace on CUDA 13. The typed device body remains shared, so
+// the FP16/BF16 paths cannot drift.
+}  // namespace
+
+__global__ void cb_nvfp4_quantize_rows_bf16_kernel(
+    __nv_bfloat16 const* __restrict__ input,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sfa,
+    float* __restrict__ a_scales,
+    int M, int K, float range_multiplier) {
+  cb_nvfp4_quantize_rows_body(
+      input, packed, sfa, a_scales, M, K, range_multiplier);
+}
+
+__global__ void cb_nvfp4_quantize_rows_fp16_kernel(
+    half const* __restrict__ input,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sfa,
+    float* __restrict__ a_scales,
+    int M, int K, float range_multiplier) {
+  cb_nvfp4_quantize_rows_body(
+      input, packed, sfa, a_scales, M, K, range_multiplier);
+}
+
+namespace {
+
+void cb_nvfp4_quantize_rows_out(torch::Tensor input,
+                                torch::Tensor packed,
+                                torch::Tensor sfa,
+                                torch::Tensor a_scales,
+                                double range_multiplier) {
+  TORCH_CHECK(input.is_cuda(), "input must be CUDA");
+  TORCH_CHECK(input.dim() == 2 && input.is_contiguous() &&
+              input.stride(1) == 1 && input.stride(0) == input.size(1),
+              "input must be contiguous [M,K]");
+  TORCH_CHECK(input.scalar_type() == torch::kBFloat16 ||
+              input.scalar_type() == torch::kFloat16,
+              "input must be bfloat16 or float16");
+  TORCH_CHECK(input.size(0) > 0 && input.size(1) > 0,
+              "input M and K must be positive");
+  TORCH_CHECK(input.size(0) <= INT_MAX && input.size(1) <= INT_MAX,
+              "input dimensions exceed int32 kernel limits");
+  TORCH_CHECK(input.size(1) % 256 == 0,
+              "input K must be a multiple of 256");
+  TORCH_CHECK(std::isfinite(range_multiplier) && range_multiplier > 0.0 &&
+              range_multiplier <= 448.0,
+              "range_multiplier must be finite and in (0,448]");
+
+  int const M = static_cast<int>(input.size(0));
+  int const K = static_cast<int>(input.size(1));
+  int const padded_m = ((M + 127) / 128) * 128;
+  int64_t const sfa_size = static_cast<int64_t>(padded_m) * (K / 16);
+  TORCH_CHECK(packed.is_cuda() && packed.scalar_type() == torch::kUInt8 &&
+              packed.dim() == 2 && packed.size(0) == M &&
+              packed.size(1) == K / 2 && packed.is_contiguous(),
+              "packed must be contiguous CUDA uint8 [M,K/2]");
+  TORCH_CHECK(sfa.is_cuda() && sfa.scalar_type() == torch::kUInt8 &&
+              sfa.numel() == sfa_size && sfa.is_contiguous(),
+              "sfa must be contiguous CUDA uint8 with ", sfa_size,
+              " elements");
+  TORCH_CHECK(a_scales.is_cuda() &&
+              a_scales.scalar_type() == torch::kFloat32 &&
+              a_scales.numel() == M && a_scales.is_contiguous(),
+              "a_scales must be contiguous CUDA float32 [M]");
+  check_same_cuda_device(input, packed, "packed");
+  check_same_cuda_device(input, sfa, "sfa");
+  check_same_cuda_device(input, a_scales, "a_scales");
+
+  const c10::cuda::OptionalCUDAGuard guard(input.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 const block(256);
+  dim3 const grid(padded_m);
+  if (input.scalar_type() == torch::kBFloat16) {
+    ::cb_nvfp4_quantize_rows_bf16_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+        packed.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(),
+        a_scales.data_ptr<float>(), M, K,
+        static_cast<float>(range_multiplier));
+  } else {
+    ::cb_nvfp4_quantize_rows_fp16_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<half const*>(input.data_ptr()),
+        packed.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(),
+        a_scales.data_ptr<float>(), M, K,
+        static_cast<float>(range_multiplier));
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+cb_nvfp4_quantize_rows(torch::Tensor input, double range_multiplier) {
+  TORCH_CHECK(input.dim() == 2, "input must be rank 2");
+  int64_t const M = input.size(0);
+  int64_t const K = input.size(1);
+  int64_t const padded_m = ((M + 127) / 128) * 128;
+  auto packed = torch::empty({M, K / 2},
+      input.options().dtype(torch::kUInt8));
+  auto sfa = torch::empty({padded_m * (K / 16)},
+      input.options().dtype(torch::kUInt8));
+  auto a_scales = torch::empty({M}, input.options().dtype(torch::kFloat32));
+  cb_nvfp4_quantize_rows_out(
+      input, packed, sfa, a_scales, range_multiplier);
+  return {packed, sfa, a_scales};
 }
 
 // Policy rebind: builder-constructed blockscaled collective -> the CB fused
@@ -653,6 +931,16 @@ std::vector<int64_t> smem_report_fp4() {
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("cb_nvfp4_quantize_rows", &cb_nvfp4_quantize_rows,
+        py::arg("input"), py::arg("range_multiplier") = 448.0,
+        "Row-wise native NVFP4 activation quantization: contiguous BF16/FP16 "
+        "[M,K] -> packed E2M1 A, CUTLASS-swizzled UE4M3 SFA, and one FP32 "
+        "residual scale per row. Each row is independent of its batch peers.");
+  m.def("cb_nvfp4_quantize_rows_out", &cb_nvfp4_quantize_rows_out,
+        py::arg("input"), py::arg("packed"), py::arg("sfa"),
+        py::arg("a_scales"), py::arg("range_multiplier") = 448.0,
+        "Allocation-free row-wise native NVFP4 activation quantization for "
+        "CUDA graphs and cached serving workspaces.");
   m.def("sm120_nvf4_mm_scaled", &sm120_nvf4_mm_scaled,
         "STOCK sm120 block-scaled NVF4 GEMM (packed e2m1 A/B + swizzled ue4m3 "
         "SF planes) at the fused kernel's exact TiledMma/tile/epilogue config "
