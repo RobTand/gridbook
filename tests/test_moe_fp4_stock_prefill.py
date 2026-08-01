@@ -105,6 +105,7 @@ def _method(moe, *, grid, k, n_sub, type_size, is_v2=True):
     m.prefix = "test"
     m.scheme = {"grid": grid, "k": k, "n_sub": n_sub, "type_size": type_size}
     m.is_fp4 = grid == "fp4"
+    m.has_static_fp4_activation = grid == "fp4"
     m.is_v2 = is_v2
     m.k = k
     m.n_sub = n_sub
@@ -125,6 +126,8 @@ def _fp8(moe, k=44):
 def _layer(E=HY3["E"], hidden=HY3["hidden"], inter=HY3["inter"]):
     lay = types.SimpleNamespace()
     lay._cb_E, lay._cb_hidden, lay._cb_inter = E, hidden, inter
+    lay._cb_fp4_input_global_scale_w13 = torch.ones(1)
+    lay._cb_fp4_input_global_scale_w2 = torch.ones(1)
     return lay
 
 
@@ -224,6 +227,64 @@ def test_moe_fused_fp4_selector_enforces_lut_smem_limit(
 
     monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: FusedExt())
     assert method._gf4_ok(layer) is expected
+
+
+def test_legacy_moe_artifact_is_fused_ineligible(moe):
+    method = _fp4(moe)
+    method.has_static_fp4_activation = False
+    assert method._gf4_ok(_layer(E=4, hidden=512, inter=256)) is False
+
+
+def test_moe_native_quant_uses_distinct_static_stage_scales(
+    moe, monkeypatch
+):
+    method = _fp4(moe)
+    layer = _layer(E=4, hidden=512, inter=256)
+    layer._cb_fp4_input_global_scale_w13 = torch.tensor([2.5])
+    layer._cb_fp4_input_global_scale_w2 = torch.tensor([1.25])
+    observed = []
+    vops = types.ModuleType("vllm._custom_ops")
+
+    def quantize(x, scale):
+        observed.append(scale.item())
+        return x * scale, torch.zeros(x.shape[0], 1)
+
+    vops.scaled_fp4_quant = quantize
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    rows = torch.ones(3, 16)
+    _aq1, _sf1, reciprocal1 = method._fp4_quant(layer, rows, "w13")
+    _aq2, _sf2, reciprocal2 = method._fp4_quant(layer, rows, "w2")
+    assert observed == [2.5, 1.25]
+    assert torch.equal(reciprocal1, torch.full((3,), 0.4))
+    assert torch.equal(reciprocal2, torch.full((3,), 0.8))
+
+
+def test_moe_create_and_per_layer_loader_own_static_scalars(moe):
+    method = _fp4(moe)
+    layer = types.SimpleNamespace()
+    layer.register_parameter = lambda name, value: setattr(layer, name, value)
+
+    def original_load(weights):
+        for name, _value in weights:
+            yield "delegated:" + name
+
+    layer.load_weights = original_load
+    method.create_weights(
+        layer, num_experts=4, hidden_size=512,
+        intermediate_size_per_partition=256,
+        params_dtype=torch.bfloat16, weight_loader=None,
+    )
+    assert torch.isnan(layer.w13_input_global_scale).all()
+    assert torch.isnan(layer.w2_input_global_scale).all()
+    loaded = list(layer.load_weights(iter([
+        ("gate_up_proj.input_global_scale", torch.tensor([2.5])),
+        ("down_proj.input_global_scale", torch.tensor([1.25])),
+    ])))
+    assert loaded == ["w13_input_global_scale", "w2_input_global_scale"]
+    assert layer.w13_input_global_scale.item() == 2.5
+    assert layer.w2_input_global_scale.item() == 1.25
 
 
 def test_default_prefill_mode_fp8_is_still_auto(moe, monkeypatch):

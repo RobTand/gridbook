@@ -55,6 +55,7 @@ def _install_vllm_stubs():
 
     parameter.ModelWeightParameter = _StubParam
     parameter.ChannelQuantScaleParameter = _StubParam
+    parameter.PerTensorScaleParameter = _StubParam
     base = _mod("vllm.model_executor.layers.quantization.base_config")
 
     class QuantizationConfig:

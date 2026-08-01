@@ -67,6 +67,7 @@ def _install_vllm_stubs():
 
     parameter.ModelWeightParameter = _StubParam
     parameter.ChannelQuantScaleParameter = _StubParam
+    parameter.PerTensorScaleParameter = _StubParam
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -218,12 +219,14 @@ def test_dense_fused_fp4_selector_enforces_lut_smem_limit(
     method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
     method.is_fp4 = True
     method.is_v2 = True
+    method.has_static_fp4_activation = True
     method.k = k
     method.n_sub = n_sub
     method.type_size = 4 * k + 9
     layer = types.SimpleNamespace(
         _cb_N=8,
         _cb_row_offset=torch.zeros(8, dtype=torch.int32),
+        _cb_fp4_input_global_scale=torch.ones(1, dtype=torch.float32),
     )
 
     vops = types.ModuleType("vllm._custom_ops")

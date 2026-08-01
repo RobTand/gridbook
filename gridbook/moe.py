@@ -71,6 +71,11 @@ from .moe_routing import (
     cb_grouped_pad_routing,
 )
 from .ops import dispatch_via_op, fp4_act_qdq_or_codec
+from .nvfp4_activation_contract import (
+    CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
+    reciprocal_vector as _nvfp4_reciprocal_vector,
+    require_identical_loaded_scales,
+)
 
 
 def _row_bytes(in_features: int, type_size: int) -> int:
@@ -209,6 +214,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         self.k = int(scheme["k"])
         self.n_sub = int(scheme["n_sub"])
         self.type_size = int(scheme["type_size"])
+        self.has_static_fp4_activation = (
+            self.is_fp4
+            and scheme.get("activation_contract")
+            == _NVFP4_ACTIVATION_CONTRACT_KEY
+        )
         sc = scheme.get("scale_coding")
         if isinstance(sc, dict):
             self.is_v2 = sc.get("kind") == codec.SCALE_CODING_TWO_TIER
@@ -268,6 +278,17 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2s, dict(attrs))
             layer.register_parameter("w2_weight_scale", w2s)
 
+        if getattr(self, "has_static_fp4_activation", False):
+            for which in ("w13", "w2"):
+                scale = torch.nn.Parameter(
+                    torch.full((1,), float("nan"), dtype=torch.float32),
+                    requires_grad=False,
+                )
+                set_weight_attrs(scale, dict(attrs))
+                layer.register_parameter(
+                    f"{which}_input_global_scale", scale
+                )
+
         # Instance-level load hook (GGUF-plugin pattern, zero core patches):
         # vLLM's RoutedExperts.load_weights maps checkpoint names by
         # substring-replacing the projection name, which (a) derives DOTTED
@@ -284,6 +305,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 "down_proj.cb_qweight": "w2_cb_qweight",
                 "gate_up_proj.weight_scale": "w13_weight_scale",
                 "down_proj.weight_scale": "w2_weight_scale",
+                "gate_up_proj.input_global_scale": (
+                    "w13_input_global_scale"
+                ),
+                "down_proj.input_global_scale": "w2_input_global_scale",
             }
 
             def _cb_load_weights(weights):
@@ -298,7 +323,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                                 f"{tuple(w.shape)} != param {tuple(p.shape)}"
                                 f" — stacked (E, out, bytes) contract violated")
                         p.data.copy_(w.to(p.dtype))
-                        mark_filled(p)          # fill path 1 of 2 (per-layer)
+                        if pname.endswith("cb_qweight"):
+                            mark_filled(p)      # fill path 1 of 2 (per-layer)
                         yield pname
                     else:
                         deferred.append((name, w))
@@ -320,6 +346,32 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         dev = layer.w13_cb_qweight.device
         E = layer.w13_cb_qweight.shape[0]
         codebooks = self.quant_config.get_codebooks()
+        if getattr(self, "has_static_fp4_activation", False):
+            stage_targets = self.quant_config.moe_activation_stage_targets(
+                self.prefix
+            )
+            for which in ("w13", "w2"):
+                param_name = f"{which}_input_global_scale"
+                if not hasattr(layer, param_name):
+                    raise ValueError(
+                        f"{self.prefix}: contracted FP4-CB MoE has no "
+                        f"{param_name} parameter"
+                    )
+                targets = stage_targets[which]
+                if not targets:
+                    raise ValueError(
+                        f"{self.prefix}: contracted FP4-CB MoE has no "
+                        f"physical activation target for {which}"
+                    )
+                expected = self.quant_config.activation_scales_for_targets(
+                    targets
+                )
+                scale = require_identical_loaded_scales(
+                    getattr(layer, param_name).data,
+                    prefix=f"{self.prefix}.{which}",
+                    expected=expected,
+                )
+                setattr(layer, f"_cb_fp4_input_global_scale_{which}", scale)
         ref = self.scheme["codebook_ref"]
         names = ref if isinstance(ref, list) else [ref]
         subs = [codebooks[n].to(dev) for n in names]
@@ -617,6 +669,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if ok is not None:
             return ok
         ok = (self.is_fp4 and self.is_v2
+              and getattr(self, "has_static_fp4_activation", False)
+              and getattr(layer, "_cb_fp4_input_global_scale_w13", None)
+              is not None
+              and getattr(layer, "_cb_fp4_input_global_scale_w2", None)
+              is not None
               and 12 <= self.k <= 24
               and self.n_sub in (1, 2)
               and self.type_size == 4 * self.k + 9
@@ -638,15 +695,17 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         layer._cb_gf4_ok = bool(ok)
         return layer._cb_gf4_ok
 
-    def _fp4_quant(self, x2: torch.Tensor):
+    def _fp4_quant(self, layer, x2: torch.Tensor, which: str):
         """Native NVFP4 activation quant (packed e2m1 + swizzled ue4m3 SFA +
-        the per-row fp32 residual for the EVT). Per-tensor global scale, so
-        quant-after-gather == gather-after-quant per row."""
+        the per-row fp32 residual for the EVT). The producer-calibrated static
+        global scale is stage-specific and batch-invariant, so quant-after-
+        gather == gather-after-quant per row and chunking cannot change it."""
         import vllm._custom_ops as vops
-        amax = x2.float().abs().amax()
-        gs = ((448.0 * 6.0) / amax.clamp_min(1e-12)).to(torch.float32)
+        gs = getattr(layer, f"_cb_fp4_input_global_scale_{which}")
         aq, sf = vops.scaled_fp4_quant(x2, gs)
-        recip = (1.0 / gs).reshape(1)
+        recip = _nvfp4_reciprocal_vector(
+            layer, which=which, scale=gs, rows=x2.shape[0]
+        )
         return aq, sf.view(torch.uint8).reshape(-1), recip
 
     def _apply_prefill_grouped_fused_fp4(self, layer, x, topk_weights,
@@ -714,11 +773,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         Mp = a_pad.shape[0]
 
         # stage 1: gate_up = a_pad @ W13[expert_of_tile]^T
-        aq1, sfa1, recip1 = self._fp4_quant(a_pad)
+        aq1, sfa1, recip1 = self._fp4_quant(layer, a_pad, "w13")
         del a_pad
         gate_up = fext.cb_fused_fp4_moe_grouped(
             aq1, sfa1, w13, lut, compose,
-            recip1.expand(Mp).contiguous(), ones_n1, expert_ids,
+            recip1, ones_n1, expert_ids,
             N1, Kh, kb, self.n_sub, self.type_size, True, tile_m)   # [Mp, N1]
         del aq1, sfa1
         a = torch.empty((Mp, d), dtype=gate_up.dtype, device=dev)
@@ -726,11 +785,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         del gate_up
 
         # stage 2: y = act @ W2[expert_of_tile]^T — SAME expert_ids.
-        aq2, sfa2, recip2 = self._fp4_quant(a)
+        aq2, sfa2, recip2 = self._fp4_quant(layer, a, "w2")
         del a
         y = fext.cb_fused_fp4_moe_grouped(
             aq2, sfa2, w2, lut, compose,
-            recip2.expand(Mp).contiguous(), ones_kh, expert_ids,
+            recip2, ones_kh, expert_ids,
             Kh, inter, kb, self.n_sub, self.type_size, True, tile_m)
         del aq2, sfa2
 

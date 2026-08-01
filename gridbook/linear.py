@@ -21,12 +21,18 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
+    PerTensorScaleParameter,
 )
 
 from . import codec
 from .expand import expand_cb_to_fp8, expand_fp4_v2_to_weight
 from .ops import (cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op,
                   fp4_act_qdq_or_codec)
+from .nvfp4_activation_contract import (
+    CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
+    reciprocal_vector as _nvfp4_reciprocal_vector,
+    require_identical_loaded_scales,
+)
 
 # NOTE: the fused-sibling fallback map (qkv_proj, gate_up_proj, in_proj_qkvz,
 # in_proj_ba) used to be duplicated here. It — and the namespace handling around
@@ -113,6 +119,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         self.k = int(scheme["k"])
         self.n_sub = int(scheme["n_sub"])
         self.type_size = int(scheme["type_size"])
+        self.has_static_fp4_activation = (
+            self.is_fp4
+            and scheme.get("activation_contract")
+            == _NVFP4_ACTIVATION_CONTRACT_KEY
+        )
         # Two-tier v2 scale coding (fp4 only) — absence of scale_coding ⇒ v1.
         sc = scheme.get("scale_coding")
         if isinstance(sc, dict):
@@ -145,6 +156,23 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             data=torch.empty(rows, row_bytes, dtype=torch.uint8),
             input_dim=1, output_dim=0, weight_loader=weight_loader)
         layer.register_parameter("cb_qweight", cb_qweight)
+
+        if getattr(self, "has_static_fp4_activation", False):
+            # One slot per vLLM logical shard is the standard
+            # compressed-tensors scalar ABI.  NaN initialization makes an
+            # absent checkpoint tensor (or a missed shard) observable at the
+            # load-finalization gate instead of becoming an arbitrary scale.
+            input_global_scale = PerTensorScaleParameter(
+                data=torch.full(
+                    (len(output_partition_sizes),),
+                    float("nan"),
+                    dtype=torch.float32,
+                ),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter(
+                "input_global_scale", input_global_scale
+            )
 
         if not self.is_fp4:
             weight_scale = ChannelQuantScaleParameter(
@@ -226,6 +254,26 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             f"'{tail}', found {len(hits)} — cannot resolve merged-role row split")
         return hits[0]
 
+    def _finalize_static_activation_scale(self, layer,
+                                          shard_prefixes: list[str]) -> None:
+        """Fail-closed load gate for the contracted dense scale parameter."""
+
+        if not getattr(self, "has_static_fp4_activation", False):
+            return
+        if not hasattr(layer, "input_global_scale"):
+            raise ValueError(
+                f"{self.prefix}: contracted FP4-CB layer has no "
+                "input_global_scale parameter"
+            )
+        expected_scales = self.quant_config.activation_scales_for_targets(
+            shard_prefixes
+        )
+        layer._cb_fp4_input_global_scale = require_identical_loaded_scales(
+            layer.input_global_scale.data,
+            prefix=self.prefix,
+            expected=expected_scales,
+        )
+
     def process_weights_after_loading(self, layer):
         dev = layer.cb_qweight.device
         codebooks = self.quant_config.get_codebooks()
@@ -234,6 +282,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # per-row offset MUST cover every output row (its length == N), else the
         # decode/expand kernels read cb_row_offset out of bounds.
         shard_prefixes = self._shard_roles()
+        self._finalize_static_activation_scale(layer, shard_prefixes)
         widths = list(layer.logical_widths)
         if len(shard_prefixes) == len(widths):
             # One CB role per logical shard: a genuinely fused module (qkv_proj /
@@ -463,6 +512,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         if ok is not None:
             return ok
         ok = (self.is_fp4
+              and getattr(self, "has_static_fp4_activation", False)
+              and getattr(layer, "_cb_fp4_input_global_scale", None) is not None
               and 12 <= self.k <= 24
               and self.n_sub in (1, 2)
               and K % 256 == 0
@@ -546,10 +597,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 else torch.zeros(1, dtype=torch.uint8, device=dev))
             layer._cb_fp4_ones = torch.ones(N, dtype=torch.float32, device=dev)
         x2 = x.reshape(-1, K)
-        amax = x2.float().abs().amax()
-        gs = ((448.0 * 6.0) / amax.clamp_min(1e-12)).to(torch.float32)
+        gs = layer._cb_fp4_input_global_scale
         aq, sfa = vops.scaled_fp4_quant(x2, gs)
-        a_scales = (1.0 / gs).reshape(1).expand(M).contiguous()
+        a_scales = _nvfp4_reciprocal_vector(
+            layer, which="dense", scale=gs, rows=M
+        )
         # Preserve the original single-LUT launch contract (and its overlap of
         # LUT staging with the first A/SFA TMA). Only a genuinely multi-block
         # projection needs the per-N-tile indirection.

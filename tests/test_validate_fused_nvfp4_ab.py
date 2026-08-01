@@ -146,6 +146,7 @@ linear_api.register_weight_loader_v2_supported_method = lambda cls: cls
 parameters = module("vllm.model_executor.parameter")
 parameters.ChannelQuantScaleParameter = type("ChannelQuantScaleParameter", (), {})
 parameters.ModelWeightParameter = type("ModelWeightParameter", (), {})
+parameters.PerTensorScaleParameter = type("PerTensorScaleParameter", (), {})
 fused_moe = module("vllm.model_executor.layers.fused_moe")
 fused_moe.RoutedExperts = type("RoutedExperts", (), {})
 moe_config = module("vllm.model_executor.layers.fused_moe.config")

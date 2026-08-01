@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -34,6 +35,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from .runtime_contract import load_runtime_contract
+from .nvfp4_activation_contract import (
+    CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
+    TENSOR_SUFFIX as _NVFP4_ACTIVATION_TENSOR_SUFFIX,
+    parse_contract as _parse_nvfp4_activation_contract,
+    validate_payload as _validate_nvfp4_activation_payload,
+)
 try:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
 except Exception:  # pragma: no cover - older vLLM
@@ -216,6 +223,12 @@ class PrismaQuantConfig(QuantizationConfig):
         # codebook can never be fetched from different revisions if a mutable
         # requested tag moves between the two lazy reads.
         self._sidecar_source: tuple[str, str | None] | None = None
+        # Producer-owned static W4A4 contract.  The record is validated while
+        # resolving config; the exact physical scalar payload is verified once
+        # against safetensors, then shared by dense and MoE loaders.
+        self._nvfp4_activation_contract: dict | None = None
+        self._nvfp4_activation_scales: dict[str, float] | None = None
+        self._target_physical_name: dict[str, str] = {}
 
     def _get_sidecar_source(self) -> tuple[str, str | None]:
         if self._sidecar_source is None:
@@ -274,6 +287,154 @@ class PrismaQuantConfig(QuantizationConfig):
                 f"the current device reports sm_{capability[0]}{capability[1]}"
             )
 
+    @staticmethod
+    def _validate_cb_activation_scheme(
+        scheme: dict, target: str, contract: dict | None
+    ) -> None:
+        """Validate a custom scheme's top-level activation-contract link."""
+
+        reference = scheme.get("activation_contract")
+        grid = scheme.get("grid")
+        if reference is not None and grid != "fp4":
+            raise ValueError(
+                f"CB target {target!r}: activation_contract is fp4-only"
+            )
+        if reference is not None and reference != _NVFP4_ACTIVATION_CONTRACT_KEY:
+            raise ValueError(
+                f"CB target {target!r}: unsupported activation_contract "
+                f"{reference!r}"
+            )
+        if reference is not None and contract is None:
+            raise ValueError(
+                f"CB target {target!r}: references "
+                f"{_NVFP4_ACTIVATION_CONTRACT_KEY!r}, but the top-level "
+                "execution contract is absent"
+            )
+        if (reference is not None and contract is not None
+                and target not in contract["target_names"]):
+            raise ValueError(
+                f"CB target {target!r}: activation_contract scalar is absent "
+                "from execution_contracts.nvfp4_w4a4.target_names"
+            )
+        if contract is not None and grid == "fp4" and reference is None:
+            raise ValueError(
+                f"CB target {target!r}: contracted artifacts require every "
+                "custom FP4-CB scheme to declare activation_contract="
+                f"{_NVFP4_ACTIVATION_CONTRACT_KEY!r}"
+            )
+
+    def _activation_safetensor_files(self) -> list[str]:
+        """Resolve the minimum safetensors set that can contain scale tensors."""
+
+        model_dir, revision = self._get_sidecar_source()
+        suffix = "." + _NVFP4_ACTIVATION_TENSOR_SUFFIX
+        if os.path.isdir(model_dir):
+            files = sorted(str(path) for path in Path(model_dir).glob(
+                "*.safetensors"))
+            if not files:
+                raise ValueError(
+                    f"contracted Gridbook artifact {model_dir!r} contains no "
+                    "safetensors files"
+                )
+            return files
+
+        # An index lets a Hub load fetch only shards containing the tiny
+        # scalars instead of pulling unrelated weight shards early.
+        from huggingface_hub import hf_hub_download
+        try:
+            from huggingface_hub.utils import EntryNotFoundError
+        except ImportError:  # pragma: no cover - older huggingface-hub
+            EntryNotFoundError = FileNotFoundError
+        try:
+            index_path = hf_hub_download(
+                repo_id=model_dir,
+                filename="model.safetensors.index.json",
+                revision=revision,
+            )
+        except EntryNotFoundError:
+            return [hf_hub_download(
+                repo_id=model_dir,
+                filename="model.safetensors",
+                revision=revision,
+            )]
+        with open(index_path) as fh:
+            index = json.load(fh)
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise ValueError(
+                "model.safetensors.index.json has no object weight_map"
+            )
+        shard_names = sorted({
+            filename for name, filename in weight_map.items()
+            if str(name).endswith(suffix)
+        })
+        if not shard_names:
+            raise ValueError(
+                "contracted Gridbook artifact index lists no "
+                f"*{suffix} tensors"
+            )
+        return [hf_hub_download(
+            repo_id=model_dir, filename=filename, revision=revision
+        ) for filename in shard_names]
+
+    def _read_nvfp4_activation_scales(self) -> dict[str, torch.Tensor]:
+        """Read every physical ``*.input_global_scale`` scalar from storage."""
+
+        from safetensors import safe_open
+
+        suffix = "." + _NVFP4_ACTIVATION_TENSOR_SUFFIX
+        found: dict[str, torch.Tensor] = {}
+        sources: dict[str, str] = {}
+        for filename in self._activation_safetensor_files():
+            with safe_open(filename, framework="pt", device="cpu") as reader:
+                for name in reader.keys():
+                    if not name.endswith(suffix):
+                        continue
+                    target = name[: -len(suffix)]
+                    if target in found:
+                        raise ValueError(
+                            f"duplicate {name!r} in {sources[target]!r} and "
+                            f"{filename!r}"
+                        )
+                    found[target] = reader.get_tensor(name)
+                    sources[target] = filename
+        return found
+
+    def _ensure_nvfp4_activation_payload(self) -> None:
+        if self._nvfp4_activation_contract is None:
+            return
+        if self._nvfp4_activation_scales is None:
+            raw = self._read_nvfp4_activation_scales()
+            self._nvfp4_activation_scales = _validate_nvfp4_activation_payload(
+                self._nvfp4_activation_contract, raw
+            )
+
+    def activation_scales_for_targets(self, targets: list[str]) -> list[float]:
+        """Return attested F32 values for resolved custom-CB target keys."""
+
+        self._ensure_resolved()
+        if self._nvfp4_activation_contract is None:
+            return []
+        self._ensure_nvfp4_activation_payload()
+        assert self._nvfp4_activation_scales is not None
+        values = []
+        for target in targets:
+            physical = self._target_physical_name.get(target)
+            if physical is None:
+                raise ValueError(
+                    f"CB target {target!r} declares the NVFP4 activation "
+                    "contract but has no physical tensor identity"
+                )
+            try:
+                values.append(self._nvfp4_activation_scales[physical])
+            except KeyError as exc:
+                raise ValueError(
+                    f"contracted CB target {target!r} expects physical scalar "
+                    f"{physical}.{_NVFP4_ACTIVATION_TENSOR_SUFFIX}, but it is "
+                    "absent from the attested payload"
+                ) from exc
+        return values
+
     # -- lazy resolution of the (possibly pointer) quant config --------------
     def _ensure_resolved(self) -> None:
         if self._resolved:
@@ -286,6 +447,31 @@ class PrismaQuantConfig(QuantizationConfig):
                     model_dir, cfg_file, revision=revision)) as fh:
                 cfg = json.load(fh)
             self.codebook_file = cfg.get("codebook_file", self.codebook_file)
+        self._nvfp4_activation_contract = _parse_nvfp4_activation_contract(cfg)
+
+        # Preserve the producer's physical spelling before resolver namespace
+        # canonicalization.  Digest membership is over these exact names.
+        physical_by_canonical: dict[str, str] = {}
+        for group in cfg["config_groups"].values():
+            scheme = group.get("scheme")
+            if scheme is None:
+                continue
+            if not isinstance(scheme, dict):
+                raise ValueError("CB config group scheme must be an object")
+            for raw_target in group.get("targets", []):
+                target = str(raw_target)
+                self._validate_cb_activation_scheme(
+                    scheme, target, self._nvfp4_activation_contract
+                )
+                if scheme.get("activation_contract") is None:
+                    continue
+                canonical = _canonical_target(target)
+                previous = physical_by_canonical.setdefault(canonical, target)
+                if previous != target:
+                    raise ValueError(
+                        f"contracted CB targets {previous!r} and {target!r} "
+                        f"collapse to runtime namespace {canonical!r}"
+                    )
         # Normalise stored namespaces ONCE, here, so all downstream resolution
         # (ours and the delegated CT config's) sees canonical target names.
         cfg = dict(cfg)
@@ -298,6 +484,7 @@ class PrismaQuantConfig(QuantizationConfig):
         self._full_config = cfg
         self.config_groups = cfg["config_groups"]
         self.ignore = list(cfg["ignore"])
+        self._target_physical_name = physical_by_canonical
         stock_groups: dict = {}
         for name, g in self.config_groups.items():
             if "scheme" in g:                        # CB group (our vocabulary)
@@ -309,6 +496,9 @@ class PrismaQuantConfig(QuantizationConfig):
         self._alias_collapsed_shared_prefixes()
         self.ct_config = (self._build_ct_config(stock_groups)
                           if stock_groups else None)
+        # Validate the complete payload now, including delegated stock NVFP4
+        # targets that Gridbook's custom methods will never otherwise see.
+        self._ensure_nvfp4_activation_payload()
         self._resolved = True
 
     def _alias_collapsed_shared_prefixes(self) -> None:
@@ -329,6 +519,10 @@ class PrismaQuantConfig(QuantizationConfig):
         for t in [k for k in self.target_scheme if ".shared_mlp." in k]:
             alias = t.replace(".shared_mlp.", ".")
             self.target_scheme.setdefault(alias, self.target_scheme[t])
+            if t in self._target_physical_name:
+                self._target_physical_name.setdefault(
+                    alias, self._target_physical_name[t]
+                )
             self._cb_targets.add(alias)
         self.ignore.extend(ig.replace(".shared_mlp.", ".")
                            for ig in list(self.ignore) if ".shared_mlp." in ig)
@@ -348,6 +542,9 @@ class PrismaQuantConfig(QuantizationConfig):
         ct_dict["ignore"] = list(self.ignore) + sorted(self._cb_targets)
         ct_dict.pop("codebook_file", None)
         ct_dict.pop("provenance", None)
+        # Gridbook has already attested this producer-owned container record;
+        # compressed-tensors does not define the field in its own schema.
+        ct_dict.pop("execution_contracts", None)
         raw_fmt = str(self._full_config.get("format", ""))
         if raw_fmt in ("", "nvfp4_cb", "fp8_cb", "cb", "mixed-precision"):
             ct_dict["format"] = "mixed-precision"
@@ -495,10 +692,11 @@ class PrismaQuantConfig(QuantizationConfig):
                    for k in self.shard_target_keys(prefix)]
         if not schemes:
             return None
-        fmt_keys = ("grid", "mode", "k", "n_sub", "type_size")
-        sig = {kk: schemes[0][kk] for kk in fmt_keys}
+        fmt_keys = ("grid", "mode", "k", "n_sub", "type_size",
+                    "activation_contract")
+        sig = {kk: schemes[0].get(kk) for kk in fmt_keys}
         for s in schemes[1:]:
-            if {kk: s[kk] for kk in fmt_keys} != sig:
+            if {kk: s.get(kk) for kk in fmt_keys} != sig:
                 raise ValueError(
                     f"fused module {prefix} maps to mixed CB decode "
                     "formats — export union-find should prevent this")
@@ -580,8 +778,27 @@ class PrismaQuantConfig(QuantizationConfig):
         # here: ``_canonical_prefix`` only rewrites the ``language_model``
         # wrapper, i.e. it renames the SAME module; it can never move a match to
         # a different layer index or leaf.
+        matches = self._moe_target_keys(prefix)
+        if not matches:
+            return None
+        schemes = [self.target_scheme[name] for name in matches]
+        fmt_keys = ("grid", "mode", "k", "n_sub", "type_size",
+                    "activation_contract")
+        signature = {key: schemes[0].get(key) for key in fmt_keys}
+        for scheme in schemes[1:]:
+            if {key: scheme.get(key) for key in fmt_keys} != signature:
+                raise ValueError(
+                    f"MoE stack {prefix} maps to mixed CB decode/activation "
+                    "contracts — export union-find should prevent this"
+                )
+        return schemes[0]
+
+    def _moe_target_keys(self, prefix: str) -> list[str]:
+        """Resolved CB projection target keys below one RoutedExperts prefix."""
+
         bases = _candidate_bases(prefix)
-        for name, sch in self.target_scheme.items():
+        matches = []
+        for name in self.target_scheme:
             if name.split(".")[-1] not in _MOE_LEAVES:
                 continue
             variants = _candidate_bases(name)
@@ -591,8 +808,22 @@ class PrismaQuantConfig(QuantizationConfig):
             # scheme to the live ``experts`` stack.
             if any(v.startswith(b.rstrip(".") + ".")
                    for v in variants for b in bases):
-                return sch
-        return None
+                matches.append(name)
+        return sorted(set(matches))
+
+    def moe_activation_stage_targets(self, prefix: str) -> dict[str, list[str]]:
+        """Contracted physical roles feeding the w13 and w2 expert stages."""
+
+        self._ensure_resolved()
+        matches = self._moe_target_keys(prefix)
+        by_leaf: dict[str, list[str]] = {}
+        for name in matches:
+            by_leaf.setdefault(name.rsplit(".", 1)[-1], []).append(name)
+        w13 = by_leaf.get("gate_up_proj") or (
+            by_leaf.get("gate_proj", []) + by_leaf.get("up_proj", [])
+        )
+        w2 = by_leaf.get("down_proj", [])
+        return {"w13": sorted(w13), "w2": sorted(w2)}
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper):
         self._ensure_resolved()
@@ -618,6 +849,9 @@ class PrismaQuantConfig(QuantizationConfig):
         self.ignore = (hf_to_vllm_mapper.apply_list(literal_ignores)
                        + regex_ignores)
         self.target_scheme = hf_to_vllm_mapper.apply_dict(self.target_scheme)
+        self._target_physical_name = hf_to_vllm_mapper.apply_dict(
+            self._target_physical_name
+        )
         self._cb_targets = set(
             hf_to_vllm_mapper.apply_list(sorted(self._cb_targets)))
         if self.ct_config is not None:
