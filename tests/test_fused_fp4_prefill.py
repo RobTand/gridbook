@@ -866,12 +866,21 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
     method.k = k
     method.n_sub = n_sub
     method.type_size = type_size
+    method.has_static_fp4_activation = True
     method._sub_table = codec.TWO_TIER_SUB_TABLE
+    # This is a routing/grouped-dispatch oracle, so give both the production
+    # method and the independent dense reference the same fixed, artifact-like
+    # activation contract.  Deriving a fresh batch amax here would exercise the
+    # retired dynamic contract and make the test bypass the static safety gate.
+    stage1_scale = torch.tensor([512.0], dtype=torch.float32, device=DEV)
+    stage2_scale = torch.tensor([256.0], dtype=torch.float32, device=DEV)
     layer = types.SimpleNamespace(
         _cb_E=E,
         _cb_hidden=hidden,
         _cb_inter=inter,
         _cb_flat=cb_flat,
+        _cb_fp4_input_global_scale_w13=stage1_scale,
+        _cb_fp4_input_global_scale_w2=stage2_scale,
         w13_cb_qweight=w13,
         w2_cb_qweight=w2,
     )
@@ -905,8 +914,7 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
                 x_pad = torch.cat((x, x.new_zeros((1, hidden)))) \
                     .index_select(0, dest).contiguous()
 
-                gs1 = ((448.0 * 6.0) /
-                       x_pad.float().abs().amax().clamp_min(1e-12)).float()
+                gs1 = stage1_scale
                 gate_up = _dense_native_role_reference(
                     x_pad, segments, w13, lut, compose, 2 * inter, hidden,
                     k, n_sub, type_size, gs1)
@@ -914,8 +922,7 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
                     (x_pad.shape[0], inter), dtype=gate_up.dtype, device=DEV)
                 apply_moe_activation(act, intermediate, gate_up)
 
-                gs2 = ((448.0 * 6.0) /
-                       intermediate.float().abs().amax().clamp_min(1e-12)).float()
+                gs2 = stage2_scale
                 dense = _dense_native_role_reference(
                     intermediate, segments, w2, lut, compose, hidden, inter,
                     k, n_sub, type_size, gs2)
