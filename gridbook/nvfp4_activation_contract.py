@@ -225,7 +225,10 @@ def require_identical_loaded_scales(
             f"{prefix}: fused logical shards have non-identical "
             f"{TENSOR_SUFFIX} values"
         )
-    return data.reshape(-1)[:1].contiguous()
+    # vLLM's native scaled_fp4_quant runtime ABI consumes a scalar tensor.  The
+    # checkpoint/PerTensorScaleParameter ABI is [logical_shards], so retain the
+    # registered parameter but expose one 0-D view to the fused call sites.
+    return data.reshape(-1)[0].reshape(())
 
 
 def reciprocal_vector(layer, *, which: str, scale: torch.Tensor,

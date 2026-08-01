@@ -111,7 +111,8 @@ def test_merged_scale_slots_and_physical_targets_require_identical_f32_bits():
     scale = require_identical_loaded_scales(
         torch.tensor([3.25, 3.25]), prefix="qkv", expected=[3.25, 3.25]
     )
-    assert torch.equal(scale, torch.tensor([3.25]))
+    assert scale.ndim == 0
+    assert torch.equal(scale, torch.tensor(3.25))
     with pytest.raises(ValueError, match="non-identical"):
         require_identical_loaded_scales(
             torch.tensor([3.25, 3.5]), prefix="qkv", expected=[3.25, 3.25]

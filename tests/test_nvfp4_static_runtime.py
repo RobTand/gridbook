@@ -265,7 +265,8 @@ def test_dense_contracted_scale_load_is_fail_closed_and_merged_exact(tmp_path):
         method._finalize_static_activation_scale(layer, targets)
     layer.input_global_scale.data.fill_(2.5)
     method._finalize_static_activation_scale(layer, targets)
-    assert torch.equal(layer._cb_fp4_input_global_scale, torch.tensor([2.5]))
+    assert layer._cb_fp4_input_global_scale.ndim == 0
+    assert torch.equal(layer._cb_fp4_input_global_scale, torch.tensor(2.5))
     layer._cb_N = 24
     layer._cb_row_offset = torch.zeros(24, dtype=torch.int32)
     assert method._fused_fp4_ok(layer, 256) is False  # no loaded kernel state
