@@ -509,14 +509,19 @@ _FUSED_FP4_BUILD_INPUTS = (
     "cb_fused_fp4_gemm.cu",
     "cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
 )
-_FUSED_FP4_ABI_SCHEMA = 1
+_FUSED_FP4_ABI_SCHEMA = 4
 
 
-# Both families are guarded independently at their call sites
-# (linear._try_fused_fp4 and moe._gf4_ok). A binary containing either family
-# remains useful and must not be rejected merely because the other was built
+# All families are guarded independently at their call sites
+# (linear._try_fused_fp4 and moe._gf4_ok). A binary containing any one family
+# remains useful and must not be rejected merely because another was built
 # from a different revision.
 _FUSED_FP4_SYMBOL_FAMILIES = (
+    ("row-wise activation", (
+        "cb_nvfp4_quantize_rows", "cb_nvfp4_quantize_rows_out")),
+    ("static-LSQ activation", (
+        "cb_nvfp4_quantize_static_lsq",
+        "cb_nvfp4_quantize_static_lsq_out")),
     ("dense prefill", ("cb_fused_fp4_prefill_mm_scaled",)),
     ("grouped MoE prefill", ("cb_fused_fp4_moe_grouped",)),
 )

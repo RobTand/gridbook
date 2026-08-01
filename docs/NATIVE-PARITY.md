@@ -182,10 +182,15 @@ used as evidence for W4A4 merely because both reuse a native weight family.
 
 The opt-in fused native-FP4 prefill path is another contract-changing cell, not
 a transparent acceleration switch: it moves activation scaling from the
-FP32-emulated group-scale bucket to native UE4M3 factors. Keep it explicitly
-labelled and opt-in until its own same-session served KL/PPL/task and routing/
-shape gates pass; arithmetic or latency parity alone cannot promote it. The
-current promotion screen is red; see the
+FP32-emulated group-scale bucket to native UE4M3 factors. The dense
+`static_lsq` policy preserves the producer-attested global scale and native
+payload while fitting only the existing per-row residual; it reuses the same
+packed weights, decoder, and GEMM. Its short exact screen passed, but the exact
+two-window long screen failed NLL/PPL and the larger long screen's passing point
+estimate did not statistically establish the gate. Keep it explicitly labelled
+and opt-in until same-session >=4B/MoE KL/PPL/tasks and served routing/shape/SLO
+gates pass; arithmetic, raw latency, or one small-model cell cannot promote it.
+See the
 [dated enablement audit](audits/fused_nvfp4_enablement_2026-07-31.md).
 
 ## Approximate 0.6B smoke matrix

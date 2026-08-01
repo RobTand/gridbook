@@ -334,23 +334,50 @@ def swizzle_sf_plane(sf_bytes: torch.Tensor) -> torch.Tensor:
 def nvfp4_act_quant_ref(x2: torch.Tensor, global_scale: torch.Tensor):
     """Torch reference of native NVFP4 activation quantization (the fused
     kernel's activation bucket): per-tensor fp32 global scale x per-group-16
-    e4m3 SF, e2m1 RTN data. Returns (packed [M, K/2] uint8, sf_bytes
-    [M, K/16] uint8, recip fp32 scalar tensor). NOTE: this is deliberately
-    NOT codec.fp4_group16_act_qdq — the hardware SF operand is ue4m3, so the
-    Triton path's fp32 group scale is unrepresentable (see the lane doc)."""
+    e4m3 SF, e2m1 round-to-nearest-even data.  E4M3 scale underflow is
+    represented by byte zero and forces that group's E2M1 payload to numerical
+    zero (while preserving its sign bit), matching vLLM
+    ``scaled_fp4_quant``. Returns (packed [M, K/2] uint8,
+    sf_bytes [M, K/16] uint8, recip fp32 scalar tensor). NOTE: this is
+    deliberately NOT codec.fp4_group16_act_qdq — the hardware SF operand is
+    ue4m3, so the Triton path's fp32 group scale is unrepresentable (see the
+    lane doc).  vLLM uses hardware approximate reciprocals when applying an
+    arbitrary global scale, which plain Torch cannot reproduce bit-for-bit;
+    this reference pins the serialized layout and explicit rounding/underflow
+    contracts, not every packed byte for every input."""
     M, K = x2.shape
     xs = x2.float() * global_scale
     g = xs.reshape(M, K // FP4_GROUP, FP4_GROUP)
-    sf = (g.abs().amax(dim=-1) / NVFP4_GRID_MAX).clamp(
-        2.0 ** -9, FP8_ELEMENT_MAX).to(_E4M3)
+    sf = (g.abs().amax(dim=-1) / NVFP4_GRID_MAX).clamp_max(
+        FP8_ELEMENT_MAX).to(_E4M3)
     sf_f = sf.to(torch.float32)
-    grid = _fp4_qdq_grid(x2.device)
-    xg = (g / sf_f.unsqueeze(-1)).clamp(-NVFP4_GRID_MAX, NVFP4_GRID_MAX)
-    idx = torch.bucketize(xg.contiguous(), grid)
-    lo = grid[(idx - 1).clamp_min(0)]
-    hi = grid[idx.clamp_max(grid.numel() - 1)]
-    q = torch.where((hi - xg).abs() <= (xg - lo).abs(), hi, lo)
-    codes = fp4_e2m1_codes(q.reshape(M, K))
+    sf_nonzero = sf_f != 0
+    safe_sf = torch.where(sf_nonzero, sf_f, torch.ones_like(sf_f))
+    xg = (g / safe_sf.unsqueeze(-1)).clamp(
+        -NVFP4_GRID_MAX, NVFP4_GRID_MAX)
+
+    # The four-bit payload uses IEEE-style nearest-even ties over the E2M1
+    # magnitude code index.  This is not equivalent to always choosing one
+    # side of a signed, sorted grid: successive midpoint ties alternate
+    # between the lower and upper magnitude rung.
+    mag = torch.tensor(_E2M1, dtype=torch.float32, device=x2.device)
+    xmag = xg.abs().contiguous()
+    upper_idx = torch.bucketize(xmag, mag).clamp_max(mag.numel() - 1)
+    lower_idx = (upper_idx - 1).clamp_min(0)
+    lower = mag[lower_idx]
+    upper = mag[upper_idx]
+    lower_dist = xmag - lower
+    upper_dist = upper - xmag
+    choose_upper = upper_dist < lower_dist
+    ties = upper_dist == lower_dist
+    choose_upper |= ties & ((upper_idx & 1) == 0)
+    mag_idx = torch.where(choose_upper, upper_idx, lower_idx)
+    mag_idx = torch.where(sf_nonzero.unsqueeze(-1), mag_idx,
+                          torch.zeros_like(mag_idx))
+    # PTX E2M1 conversion preserves the sign of a value that rounds to zero,
+    # including every element of an underflowed scale-factor group.
+    sign = torch.signbit(g).to(torch.uint8) << 3
+    codes = (mag_idx.to(torch.uint8) | sign).reshape(M, K)
     return (pack_e2m1_codes(codes), sf.view(torch.uint8),
             (1.0 / global_scale).to(torch.float32))
 

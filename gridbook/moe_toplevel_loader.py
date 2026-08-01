@@ -16,6 +16,8 @@ HunYuan V3 (``HYV3ForCausalLM``) is exactly this shape. Our exporter writes
     model.layers.N.mlp.experts.down_proj.cb_qweight      uint8 (E, hidden,  bytes)
     model.layers.N.mlp.experts.gate_up_proj.weight_scale f32   (E, 2·inter)   # fp8 rungs only
     model.layers.N.mlp.experts.down_proj.weight_scale    f32   (E, hidden)    # fp8 rungs only
+    model.layers.N.mlp.experts.gate_up_proj.input_global_scale f32 (1,)       # contracted fp4
+    model.layers.N.mlp.experts.down_proj.input_global_scale    f32 (1,)       # contracted fp4
 
 These match neither the arch's ``stacked_params_mapping`` (experts skipped) nor
 its ``expert_params_mapping`` (which matches per-expert ``experts.{eid}.…``
@@ -116,6 +118,8 @@ _CB_EXPERT_SUFFIX_TO_LEAF: dict[str, str] = {
     ".experts.down_proj.cb_qweight": "w2_cb_qweight",
     ".experts.gate_up_proj.weight_scale": "w13_weight_scale",
     ".experts.down_proj.weight_scale": "w2_weight_scale",
+    ".experts.gate_up_proj.input_global_scale": "w13_input_global_scale",
+    ".experts.down_proj.input_global_scale": "w2_input_global_scale",
 }
 
 
@@ -173,6 +177,7 @@ def map_cb_expert_name(name: str) -> str | None:
 
 _CB_QWEIGHT_SUFFIX = ".cb_qweight"
 _WEIGHT_SCALE_SUFFIX = ".weight_scale"
+_INPUT_GLOBAL_SCALE_SUFFIX = ".input_global_scale"
 
 # Standard vLLM fusions, as a fallback when the model class exposes no
 # packed_modules_mapping (only the leaves we route matter here).
@@ -200,7 +205,7 @@ def _build_reverse_fusion(packed_modules_mapping) -> dict[str, tuple[str, int]]:
 
 def resolve_shared_cb_target(name: str, params_dict,
                              reverse_fusion) -> tuple[str, int] | None:
-    """Resolve a checkpoint CB tensor (``….cb_qweight`` / ``….weight_scale``) to
+    """Resolve a checkpoint CB tensor (packed weight or either scale) to
     the bf16 ``.weight`` param vLLM built for a shared-expert-style Linear, or
     ``None`` when it is NOT such a tensor (delegate to the original loader).
 
@@ -216,10 +221,13 @@ def resolve_shared_cb_target(name: str, params_dict,
     """
     if name.endswith(_CB_QWEIGHT_SUFFIX):
         base = name[: -len(_CB_QWEIGHT_SUFFIX)]
-        is_scale = False
+        scalar_suffix = None
     elif name.endswith(_WEIGHT_SCALE_SUFFIX):
         base = name[: -len(_WEIGHT_SCALE_SUFFIX)]
-        is_scale = True
+        scalar_suffix = _WEIGHT_SCALE_SUFFIX
+    elif name.endswith(_INPUT_GLOBAL_SCALE_SUFFIX):
+        base = name[: -len(_INPUT_GLOBAL_SCALE_SUFFIX)]
+        scalar_suffix = _INPUT_GLOBAL_SCALE_SUFFIX
     else:
         return None
     parent, _, leaf = base.rpartition(".")
@@ -232,14 +240,15 @@ def resolve_shared_cb_target(name: str, params_dict,
         # A weight_scale whose OWN param exists is a stock-CT tensor (a joint
         # menu can put a shared-expert Linear on vanilla fp8: it has .weight AND
         # .weight_scale params) — never an orphaned CB scale. Defer.
-        if is_scale and fbase + _WEIGHT_SCALE_SUFFIX in params_dict:
+        if (scalar_suffix is not None
+                and fbase + scalar_suffix in params_dict):
             return None
         if fbase + ".weight" in params_dict:
             return fbase + ".weight", shard   # merged bf16 target (gate|up)
     # Direct (unfused) case: down_proj, or a non-fused projection.
     if base + _CB_QWEIGHT_SUFFIX in params_dict:
         return None                           # vLLM built a CB Linear here
-    if is_scale and base + _WEIGHT_SCALE_SUFFIX in params_dict:
+    if scalar_suffix is not None and base + scalar_suffix in params_dict:
         return None                           # stock-CT scale with a real home
     if base + ".weight" in params_dict:
         return base + ".weight", 0
@@ -371,6 +380,8 @@ def _load_shared_cb(model, buf: dict, params_dict, reverse_fusion,
     for nm, w in buf.items():
         if nm.endswith(_CB_QWEIGHT_SUFFIX):
             b, key = nm[: -len(_CB_QWEIGHT_SUFFIX)], "qw"
+        elif nm.endswith(_INPUT_GLOBAL_SCALE_SUFFIX):
+            b, key = nm[: -len(_INPUT_GLOBAL_SCALE_SUFFIX)], "input_scale"
         else:
             b, key = nm[: -len(_WEIGHT_SCALE_SUFFIX)], "scale"
         bases.setdefault(b, {})[key] = w
@@ -581,7 +592,8 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                     param.data.copy_(w.to(param.dtype))
                     # fill path 2 of 2 (top-level): stamp the sentinel that
                     # process_weights_after_loading checks (cb_fill_guard).
-                    mark_filled(param)
+                    if mapped.endswith("cb_qweight"):
+                        mark_filled(param)
                     loaded.add(mapped)
                     continue
                 # Shared-expert CB tensor whose module vLLM built as plain bf16

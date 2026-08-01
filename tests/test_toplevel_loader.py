@@ -34,6 +34,10 @@ def test_map_cb_expert_name_positive():
     assert map_cb_expert_name(P + "down_proj.cb_qweight") == P + "w2_cb_qweight"
     assert map_cb_expert_name(P + "gate_up_proj.weight_scale") == P + "w13_weight_scale"
     assert map_cb_expert_name(P + "down_proj.weight_scale") == P + "w2_weight_scale"
+    assert map_cb_expert_name(P + "gate_up_proj.input_global_scale") == \
+        P + "w13_input_global_scale"
+    assert map_cb_expert_name(P + "down_proj.input_global_scale") == \
+        P + "w2_input_global_scale"
     # prefix-agnostic (pure suffix rewrite): works with or without model. prefix
     assert map_cb_expert_name("layers.7.mlp.experts.down_proj.cb_qweight") == \
         "layers.7.mlp.experts.w2_cb_qweight"
@@ -153,6 +157,36 @@ def test_wrapper_defers_unmappable_expert_name():
     assert m.delegated == ["model.layers.80.mlp.experts.gate_up_proj.cb_qweight"]
 
 
+def test_wrapper_routes_static_expert_scales_without_weight_scale_confusion():
+    P = "model.layers.1.mlp.experts."
+
+    class _FakeCausalLM:
+        def __init__(self):
+            self._params = {
+                P + "w13_input_global_scale": torch.full((1,), float("nan")),
+                P + "w2_input_global_scale": torch.full((1,), float("nan")),
+            }
+            self.delegated = []
+
+        def named_parameters(self):
+            return list(self._params.items())
+
+        def load_weights(self, weights):
+            self.delegated.extend(name for name, _ in weights)
+            return set()
+
+    install_toplevel_cb_expert_loader(_FakeCausalLM)
+    model = _FakeCausalLM()
+    loaded = model.load_weights(iter([
+        (P + "gate_up_proj.input_global_scale", torch.tensor([2.5])),
+        (P + "down_proj.input_global_scale", torch.tensor([1.25])),
+    ]))
+    assert model.delegated == []
+    assert loaded == {P + "w13_input_global_scale", P + "w2_input_global_scale"}
+    assert model._params[P + "w13_input_global_scale"].item() == 2.5
+    assert model._params[P + "w2_input_global_scale"].item() == 1.25
+
+
 def test_wrapper_shape_mismatch_raises():
     class _FakeCausalLM:
         def __init__(self):
@@ -213,6 +247,9 @@ def test_resolve_shared_cb_fused_gate_up():
     # fp8 weight_scale routes exactly like its cb_qweight sibling.
     assert resolve_shared_cb_target(P + ".gate_proj.weight_scale", params, _REV) \
         == (P + ".gate_up_proj.weight", 0)
+    assert resolve_shared_cb_target(
+        P + ".gate_proj.input_global_scale", params, _REV
+    ) == (P + ".gate_up_proj.weight", 0)
 
 
 def test_resolve_shared_cb_direct_down():
@@ -222,6 +259,9 @@ def test_resolve_shared_cb_direct_down():
         == (P + ".down_proj.weight", 0)
     assert resolve_shared_cb_target(P + ".down_proj.weight_scale", params, _REV) \
         == (P + ".down_proj.weight", 0)
+    assert resolve_shared_cb_target(
+        P + ".down_proj.input_global_scale", params, _REV
+    ) == (P + ".down_proj.weight", 0)
 
 
 def test_resolve_shared_cb_defers_dense_and_fused_cb():
@@ -229,14 +269,18 @@ def test_resolve_shared_cb_defers_dense_and_fused_cb():
     # REGISTERED cb_qweight param -> defer to the original loader (return None).
     params = {
         "model.layers.1.self_attn.qkv_proj.cb_qweight",   # fused attn (q/k/v)
+        "model.layers.1.self_attn.qkv_proj.input_global_scale",
         "model.layers.1.self_attn.o_proj.cb_qweight",      # dense o_proj
+        "model.layers.1.self_attn.o_proj.input_global_scale",
         "model.layers.0.mlp.down_proj.cb_qweight",         # dense L0 MLP (CB)
     }
     for n in [
         "model.layers.1.self_attn.q_proj.cb_qweight",       # -> qkv_proj (CB)
         "model.layers.1.self_attn.v_proj.weight_scale",
+        "model.layers.1.self_attn.v_proj.input_global_scale",
         "model.layers.1.self_attn.o_proj.cb_qweight",
         "model.layers.1.self_attn.o_proj.weight_scale",
+        "model.layers.1.self_attn.o_proj.input_global_scale",
         "model.layers.0.mlp.down_proj.cb_qweight",
     ]:
         assert resolve_shared_cb_target(n, params, _REV) is None, n

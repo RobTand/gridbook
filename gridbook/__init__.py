@@ -13,7 +13,7 @@ falls back to a correct-but-slow Triton path.
 # Single source of truth for package and release metadata. Gridbook is the sole
 # owner of its runtime; producer repositories consume a released version or an
 # immutable commit and never mirror this package tree.
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 
 def register() -> None:

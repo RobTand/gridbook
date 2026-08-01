@@ -21,12 +21,19 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
+    PerTensorScaleParameter,
 )
 
 from . import codec
 from .expand import expand_cb_to_fp8, expand_fp4_v2_to_weight
 from .ops import (cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op,
                   fp4_act_qdq_or_codec)
+from .nvfp4_activation_contract import (
+    CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
+    reciprocal_vector as _nvfp4_reciprocal_vector,
+    require_identical_loaded_scales,
+    rowwise_range_multiplier as _nvfp4_rowwise_range_multiplier,
+)
 
 # NOTE: the fused-sibling fallback map (qkv_proj, gate_up_proj, in_proj_qkvz,
 # in_proj_ba) used to be duplicated here. It — and the namespace handling around
@@ -47,11 +54,26 @@ from .ops import (cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op,
 PREFILL_M_THRESHOLD = int(os.environ.get("PRISMAQUANT_PREFILL_M_THRESHOLD", "16"))
 
 # fp4-MMA fused prefill gate (OPT-IN, default OFF): "" = off (the shipping
-# fp4 dispatch is byte-identical), "1" = fused block-scaled prefill for all
-# M > PREFILL_M_THRESHOLD, "midm" = only 16 < M <= 128 (the fp8 kernel's
-# measured niche). Promotion to a default requires a served A/B per
-# docs/lanes/nvfp4-cb/STANDARDS.md — the activation bucket changes.
+# fp4 dispatch is byte-identical); "1"/"midm" use the artifact's attested
+# static activation scalar; ``static_lsq`` keeps that exact scalar and payload
+# but fits the existing EVT residual independently per row; "rowwise" derives
+# an independent native-NVFP4 scalar for every runtime row and therefore needs
+# no serialized activation metadata. The ``*_midm`` modes cover only
+# 16 < M <= 128. Every mode remains an explicit experiment until its served
+# quality/performance gate passes; old artifacts can enter only a rowwise mode.
 _FP4_FUSED_MODE: list = []
+
+_FP4_FUSED_STATIC_MODES = frozenset(("1", "midm"))
+_FP4_FUSED_STATIC_LSQ_MODES = frozenset((
+    "static_lsq", "static_lsq_midm",
+))
+_FP4_FUSED_ROWWISE_MODES = frozenset(("rowwise", "rowwise_midm"))
+_FP4_FUSED_MODES = (
+    _FP4_FUSED_STATIC_MODES
+    | _FP4_FUSED_STATIC_LSQ_MODES
+    | _FP4_FUSED_ROWWISE_MODES
+)
+_FP4_FUSED_ALLOWED_MODES = frozenset(("",)) | _FP4_FUSED_MODES
 
 
 def _fp4_fused_mode() -> str:
@@ -66,10 +88,11 @@ def _fp4_fused_mode() -> str:
     # teacher/task/served-SLO evidence remains incomplete. See
     # docs/audits/fused_nvfp4_enablement_2026-07-31.md.
     current = os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "").strip()
-    if current not in ("", "1", "midm"):
+    if current not in _FP4_FUSED_ALLOWED_MODES:
         raise ValueError(
             "invalid PRISMAQUANT_CB_FUSED_FP4="
-            f"{current!r}; expected '', '1', or 'midm'"
+            f"{current!r}; expected '', '1', 'midm', 'static_lsq', "
+            "'static_lsq_midm', 'rowwise', or 'rowwise_midm'"
         )
     if not _FP4_FUSED_MODE:
         _FP4_FUSED_MODE.append(current)
@@ -87,6 +110,60 @@ def _fp4_fused_mode() -> str:
 # 2.7x at M=4, 1.2x at M=8, and LOSES (0.66x) at M=16 where Triton's tl.dot
 # amortizes x across the row tile.
 CUDA_GEMV_M_MAX = int(os.environ.get("PRISMAQUANT_CB_CUDA_M_MAX", "8"))
+
+# The dense native-NVFP4 collective owns one 128-row N tile per CTA.  A fused
+# projection may therefore use more than one interned codebook block as long as
+# every tile resolves to exactly one block.  Keep this in lockstep with
+# ``TileShapeFp4`` in csrc/cb_fused_fp4_gemm.cu; the extension independently
+# validates the resulting tile map at its public boundary.
+FP4_FUSED_TILE_N = 128
+FP4_FUSED_TILE_M_WIDE = 256
+
+# One entry per CUDA device. ``get_device_properties`` queries cached runtime
+# metadata and does not synchronize the device; keeping the result here also
+# removes that query from steady-state dispatch.  A failed query is cached as
+# zero so shape selection fails closed to the long-standing TileM=128 kernel.
+_FP4_DENSE_SM_COUNTS: dict[int, int] = {}
+
+
+def _fp4_dense_sm_count(device: torch.device) -> int:
+    if device.type != "cuda":
+        return 0
+    try:
+        index = device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        index = int(index)
+    except Exception:  # noqa: BLE001 - optional optimization, fail closed
+        return 0
+    cached = _FP4_DENSE_SM_COUNTS.get(index)
+    if cached is not None:
+        return cached
+    try:
+        count = int(torch.cuda.get_device_properties(index).multi_processor_count)
+        if count <= 0:
+            count = 0
+    except Exception:  # noqa: BLE001 - optional optimization, fail closed
+        count = 0
+    _FP4_DENSE_SM_COUNTS[index] = count
+    return count
+
+
+def _fp4_dense_tile_m(M: int, N: int, sm_count: int) -> int:
+    """Select the measured dense fused tile without under-filling the GPU.
+
+    TileM=256 halves weight decode work per output row, but loses by about 20%
+    when its grid has at most half of GB10's SM count.  Interleaved K24 A/Bs
+    crossed over once the grid reached two thirds of the device: 32 CTAs on a
+    48-SM GB10.  Keep that occupancy floor explicit and device-relative.
+    """
+    if M < FP4_FUSED_TILE_M_WIDE or sm_count <= 0:
+        return 128
+    grid_ctas = ((M + FP4_FUSED_TILE_M_WIDE - 1)
+                 // FP4_FUSED_TILE_M_WIDE) * ((N + FP4_FUSED_TILE_N - 1)
+                                               // FP4_FUSED_TILE_N)
+    occupancy_floor = (2 * sm_count + 2) // 3
+    return FP4_FUSED_TILE_M_WIDE if grid_ctas >= occupancy_floor else 128
 
 # NOTE on a rejected variant (2026-07-18): N-chunking the transient expand +
 # GEMM with side-stream overlap measured 0.46x (small-N GEMMs lose more than
@@ -106,6 +183,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         self.k = int(scheme["k"])
         self.n_sub = int(scheme["n_sub"])
         self.type_size = int(scheme["type_size"])
+        self.has_static_fp4_activation = (
+            self.is_fp4
+            and scheme.get("activation_contract")
+            == _NVFP4_ACTIVATION_CONTRACT_KEY
+        )
         # Two-tier v2 scale coding (fp4 only) — absence of scale_coding ⇒ v1.
         sc = scheme.get("scale_coding")
         if isinstance(sc, dict):
@@ -138,6 +220,23 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             data=torch.empty(rows, row_bytes, dtype=torch.uint8),
             input_dim=1, output_dim=0, weight_loader=weight_loader)
         layer.register_parameter("cb_qweight", cb_qweight)
+
+        if getattr(self, "has_static_fp4_activation", False):
+            # One slot per vLLM logical shard is the standard
+            # compressed-tensors scalar ABI.  NaN initialization makes an
+            # absent checkpoint tensor (or a missed shard) observable at the
+            # load-finalization gate instead of becoming an arbitrary scale.
+            input_global_scale = PerTensorScaleParameter(
+                data=torch.full(
+                    (len(output_partition_sizes),),
+                    float("nan"),
+                    dtype=torch.float32,
+                ),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter(
+                "input_global_scale", input_global_scale
+            )
 
         if not self.is_fp4:
             weight_scale = ChannelQuantScaleParameter(
@@ -219,6 +318,31 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             f"'{tail}', found {len(hits)} — cannot resolve merged-role row split")
         return hits[0]
 
+    def _finalize_static_activation_scale(self, layer,
+                                          shard_prefixes: list[str]) -> None:
+        """Fail-closed load gate for the contracted dense scale parameter."""
+
+        if not getattr(self, "has_static_fp4_activation", False):
+            return
+        if not hasattr(layer, "input_global_scale"):
+            raise ValueError(
+                f"{self.prefix}: contracted FP4-CB layer has no "
+                "input_global_scale parameter"
+            )
+        expected_scales = self.quant_config.activation_scales_for_targets(
+            shard_prefixes
+        )
+        layer._cb_fp4_input_global_scale = require_identical_loaded_scales(
+            layer.input_global_scale.data,
+            prefix=self.prefix,
+            expected=expected_scales,
+        )
+        # The static-LSQ binding takes the already-attested F32 by value.  Keep
+        # vLLM's device scalar above for the ordinary static ABI, while avoiding
+        # a steady-state device-to-host read (and making malformed direct fixed-G
+        # calls reject synchronously before kernel launch).
+        layer._cb_fp4_input_global_scale_f32 = float(expected_scales[0])
+
     def process_weights_after_loading(self, layer):
         dev = layer.cb_qweight.device
         codebooks = self.quant_config.get_codebooks()
@@ -227,6 +351,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # per-row offset MUST cover every output row (its length == N), else the
         # decode/expand kernels read cb_row_offset out of bounds.
         shard_prefixes = self._shard_roles()
+        self._finalize_static_activation_scale(layer, shard_prefixes)
         widths = list(layer.logical_widths)
         if len(shard_prefixes) == len(widths):
             # One CB role per logical shard: a genuinely fused module (qkv_proj /
@@ -256,6 +381,9 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # tensor values) is deliberate: differently named codebooks remain
         # distinct even when their current contents happen to match.
         block_offsets: dict[tuple[str, ...], int] = {}
+        block_ids: dict[tuple[str, ...], int] = {}
+        block_ranges: list[tuple[int, int]] = []
+        role_block_ids: list[tuple[int, int]] = []
         cb_cumoffset = 0
         for i, sp in enumerate(shard_prefixes):
             ref = self.quant_config.target_scheme[sp]["codebook_ref"]
@@ -265,6 +393,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 flat = codec.build_flat_codebook(
                     subs, self.prefix, "fp4" if self.is_fp4 else "fp8")
                 block_offsets[names] = cb_cumoffset
+                block_ids[names] = len(blocks)
+                block_ranges.append((cb_cumoffset, flat.numel()))
                 blocks.append(flat)
                 cb_cumoffset += flat.numel()
             w = shard_widths[i]
@@ -273,6 +403,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # which remains correct when blocks differ in size.
             row_offsets.append(torch.full((w,), block_offsets[names],
                                           dtype=torch.int32, device=dev))
+            role_block_ids.append((w, block_ids[names]))
         cb_flat = torch.cat(blocks).contiguous()
         cb_row_offset = torch.cat(row_offsets).contiguous()
 
@@ -284,6 +415,31 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             "every output row (kernels index it by row).")
         layer._cb_flat = cb_flat
         layer._cb_row_offset = cb_row_offset
+        # The native-FP4 decode-in-prologue kernel stages one value LUT per
+        # 128-row N tile.  Preserve the interned block ranges so it can build
+        # one packed LUT per unique reference (rather than re-materializing the
+        # role copies), and derive a tiny tile->block identity tensor without a
+        # CUDA->host synchronization.  A role boundary is harmless when both
+        # sides share the same interned block; a boundary between DIFFERENT
+        # blocks must land on a tile edge.  Otherwise fail closed to the exact
+        # shipping path instead of decoding any row through the wrong LUT.
+        layer._cb_fp4_lut_ranges = tuple(block_ranges)
+        if self.is_fp4:
+            row_block_ids: list[int] = []
+            for width, block_id in role_block_ids:
+                row_block_ids.extend([block_id] * width)
+            tile_ids = []
+            tile_safe = len(row_block_ids) == rows
+            for start in range(0, rows, FP4_FUSED_TILE_N):
+                tile = row_block_ids[start:start + FP4_FUSED_TILE_N]
+                if not tile or any(block_id != tile[0] for block_id in tile):
+                    tile_safe = False
+                    break
+                tile_ids.append(tile[0])
+            layer._cb_fp4_fused_lut_ok = tile_safe
+            layer._cb_fp4_lut_tile_ids = (
+                torch.tensor(tile_ids, dtype=torch.int32, device=dev)
+                if tile_safe else None)
         # The fp8 mid-M fused kernel has no row-offset input: every row uses
         # LUT base zero.  Derive and cache its safety fact without a CUDA->host
         # sync.  One interned block means every role necessarily points at the
@@ -417,28 +573,70 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 and bool(ok))
 
     # -- fp4-MMA fused prefill (opt-in; see the dispatch site below) ---------
-    def _fused_fp4_ok(self, layer, K: int) -> bool:
+    def _fused_fp4_ok(self, layer, K: int, *, rowwise: bool = False,
+                      static_lsq: bool = False) -> bool:
         """Eligibility for the fused fp4 block-scaled prefill (cached per
         layer). Mirrors the kernel's TORCH_CHECKs so a miss is a silent
-        fall-through, never a crash."""
-        ok = getattr(layer, "_cb_fp4_fused_ok", None)
+        fall-through, never a crash. Static, static-LSQ, and rowwise activation
+        families are cached separately so probing one cannot authorize another.
+        """
+        if rowwise and static_lsq:
+            return False
+        cache_attr = (
+            "_cb_fp4_fused_rowwise_ok" if rowwise else
+            "_cb_fp4_fused_static_lsq_ok" if static_lsq else
+            "_cb_fp4_fused_static_ok"
+        )
+        ok = getattr(layer, cache_attr, None)
         if ok is not None:
             return ok
         ok = (self.is_fp4
+              and (rowwise or (
+                  getattr(self, "has_static_fp4_activation", False)
+                  and getattr(layer, "_cb_fp4_input_global_scale", None)
+                  is not None))
               and 12 <= self.k <= 24
               and self.n_sub in (1, 2)
               and K % 256 == 0
               and layer._cb_N % 8 == 0
               and self.type_size == 4 * self.k + (9 if self.is_v2 else 16))
+        if ok and static_lsq:
+            # This host scalar exists only after the producer contract payload
+            # and loaded tensor bits have passed the fail-closed load gate.
+            ok = getattr(
+                layer, "_cb_fp4_input_global_scale_f32", None
+            ) is not None
         if ok:
             ok = (codec.fp4_value_lut_nbytes(self.k, self.n_sub)
                   <= codec.FP4_FUSED_LUT_MAX_BYTES)
         if ok:
-            # Single uniform codebook block (the kernel has no per-row LUT
-            # offset — same constraint as the fp8 fused entries).
-            ro = layer._cb_row_offset
-            ok = bool((ro.max() == ro.min()).item()) and int(ro[0]) == 0
-        if ok:
+            # Every 128-row N tile must resolve to one interned codebook block.
+            # Production layers cache this from shard metadata at load time.
+            # The tensor fallback keeps manually constructed test layers safe;
+            # it is evaluated once and cached, just like the old uniform-LUT
+            # check, and therefore cannot add a sync to steady-state serving.
+            ok = getattr(layer, "_cb_fp4_fused_lut_ok", None)
+            if ok is None:
+                ro = layer._cb_row_offset
+                ok = (ro.numel() == layer._cb_N and ro.numel() > 0)
+                tile_bases = []
+                if ok:
+                    for start in range(0, layer._cb_N, FP4_FUSED_TILE_N):
+                        tile = ro[start:start + FP4_FUSED_TILE_N]
+                        base = int(tile[0])
+                        if not bool((tile == base).all().item()):
+                            ok = False
+                            break
+                        tile_bases.append(base)
+                if ok:
+                    unique_bases = list(dict.fromkeys(tile_bases))
+                    base_to_id = {base: i for i, base in enumerate(unique_bases)}
+                    layer._cb_fp4_lut_tile_ids = torch.tensor(
+                        [base_to_id[base] for base in tile_bases],
+                        dtype=torch.int32, device=ro.device)
+                layer._cb_fp4_fused_lut_ok = bool(ok)
+            ok = bool(ok)
+        if ok and not rowwise and not static_lsq:
             try:
                 import vllm._custom_ops as vops
                 ok = hasattr(vops, "scaled_fp4_quant")
@@ -448,38 +646,105 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             from .cuda_ext import get_fused_fp4_ext
             fext = get_fused_fp4_ext()
             ok = (fext is not None
-                  and hasattr(fext, "cb_fused_fp4_prefill_mm_scaled"))
-        layer._cb_fp4_fused_ok = ok
-        return ok
+                  and hasattr(fext, "cb_fused_fp4_prefill_mm_scaled")
+                  and (not rowwise
+                       or hasattr(fext, "cb_nvfp4_quantize_rows"))
+                  and (not static_lsq or hasattr(
+                      fext, "cb_nvfp4_quantize_static_lsq")))
+        setattr(layer, cache_attr, bool(ok))
+        return bool(ok)
 
-    def _try_fused_fp4(self, layer, x, N: int, K: int, M: int):
+    def _try_fused_fp4(self, layer, x, N: int, K: int, M: int, *,
+                       rowwise: bool = False, static_lsq: bool = False):
         """One fused NVF4 block-scaled GEMM over this layer's packed rows, or
         None if ineligible (the caller then runs the shipping path)."""
-        if not self._fused_fp4_ok(layer, K):
+        if static_lsq:
+            eligible = self._fused_fp4_ok(layer, K, static_lsq=True)
+        else:
+            # Preserve the historical call shape for instrumentation and
+            # compatibility wrappers that know only the rowwise flag.
+            eligible = self._fused_fp4_ok(layer, K, rowwise=rowwise)
+        if not eligible:
             return None
-        import vllm._custom_ops as vops
         from .cuda_ext import get_fused_fp4_ext
         fext = get_fused_fp4_ext()
         lut = getattr(layer, "_cb_fp4_lut", None)
+        ranges = getattr(layer, "_cb_fp4_lut_ranges", None)
+        if not ranges:
+            # Defensive compatibility for manually constructed single-LUT
+            # layers. Production loaders always provide exact ranges.
+            # If the LUT was injected directly (as in compatibility callers
+            # and tests), the packed sidecar need not be present at all.
+            ranges = ((0, (layer._cb_flat.numel() if lut is None
+                           else lut.numel())),)
         if lut is None:
             dev = layer._cb_flat.device
-            lut = codec.build_fp4_value_lut(
-                layer._cb_flat, self.k, self.n_sub).to(dev)
+            lut_bytes = codec.fp4_value_lut_nbytes(self.k, self.n_sub)
+            lut_blocks = []
+            for offset, length in ranges:
+                block = layer._cb_flat.narrow(0, offset, length)
+                block_lut = codec.build_fp4_value_lut(
+                    block, self.k, self.n_sub).to(dev)
+                if block_lut.numel() != lut_bytes:
+                    raise RuntimeError(
+                        f"{self.prefix}: FP4 fused LUT block has "
+                        f"{block_lut.numel()} bytes, expected {lut_bytes}")
+                lut_blocks.append(block_lut)
+            lut = torch.cat(lut_blocks).contiguous()
             layer._cb_fp4_lut = lut
             layer._cb_fp4_compose_u8 = (
                 codec.build_compose_u8(self._sub_table).to(dev) if self.is_v2
                 else torch.zeros(1, dtype=torch.uint8, device=dev))
             layer._cb_fp4_ones = torch.ones(N, dtype=torch.float32, device=dev)
         x2 = x.reshape(-1, K)
-        amax = x2.float().abs().amax()
-        gs = ((448.0 * 6.0) / amax.clamp_min(1e-12)).to(torch.float32)
-        aq, sfa = vops.scaled_fp4_quant(x2, gs)
-        a_scales = (1.0 / gs).reshape(1).expand(M).contiguous()
+        if rowwise:
+            if x2.dtype not in (torch.bfloat16, torch.float16):
+                return None
+            # Full UE4M3 range per row. The extension returns the exact three
+            # operands consumed by the existing fused GEMM; no weight decoder,
+            # GEMM, or artifact representation is duplicated for this mode.
+            aq, sfa, a_scales = fext.cb_nvfp4_quantize_rows(
+                x2.contiguous(), _nvfp4_rowwise_range_multiplier()
+            )
+        elif static_lsq:
+            if x2.dtype not in (torch.bfloat16, torch.float16):
+                return None
+            # Keep the producer-attested G and its native E2M1/SFA payload.
+            # The shared activation kernel changes only the existing per-row
+            # EVT residual to the least-squares optimum for those fixed bytes.
+            gs = layer._cb_fp4_input_global_scale_f32
+            aq, sfa, a_scales = fext.cb_nvfp4_quantize_static_lsq(
+                x2.contiguous(), gs
+            )
+        else:
+            import vllm._custom_ops as vops
+            gs = layer._cb_fp4_input_global_scale
+            aq, sfa = vops.scaled_fp4_quant(x2, gs)
+            a_scales = _nvfp4_reciprocal_vector(
+                layer, which="dense", scale=gs, rows=M
+            )
+        # Preserve the original single-LUT launch contract (and its overlap of
+        # LUT staging with the first A/SFA TMA). Only a genuinely multi-block
+        # projection needs the per-N-tile indirection.
+        lut_tile_ids = (layer._cb_fp4_lut_tile_ids
+                        if len(ranges) > 1 else None)
+        sm_count = _fp4_dense_sm_count(aq.device)
+        tile_m = _fp4_dense_tile_m(M, N, sm_count)
+        # Latest-route telemetry is intentionally tensor-free and sync-free.
+        # Validation and serve logs can attest which concrete kernel ran,
+        # while ordinary calls pay only integer arithmetic after the cached
+        # device-property lookup.
+        layer._cb_fp4_fused_tile_m = tile_m
+        layer._cb_fp4_fused_tile_candidate_ctas = (
+            ((M + FP4_FUSED_TILE_M_WIDE - 1) // FP4_FUSED_TILE_M_WIDE)
+            * ((N + FP4_FUSED_TILE_N - 1) // FP4_FUSED_TILE_N)
+        )
+        layer._cb_fp4_fused_sm_count = sm_count
         y = fext.cb_fused_fp4_prefill_mm_scaled(
             aq, sfa.view(torch.uint8).reshape(-1), layer._cb_qw_padded,
             layer._cb_fp4_lut, layer._cb_fp4_compose_u8, a_scales,
             layer._cb_fp4_ones, N, K, self.k, self.n_sub, self.type_size,
-            self.is_v2)
+            self.is_v2, lut_tile_ids, tile_m)
         return y.reshape(*x.shape[:-1], N)
 
     def apply(self, layer, x, bias=None):
@@ -509,13 +774,20 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # paths' fp32-group-scale QDQ — the hardware SF operand is ue4m3, an
         # fp32 group scale is unrepresentable. The current promotion A/B is red;
         # the audit's reconsideration gates require stronger served quality and
-        # workload evidence. That is why this remains opt-in. "1" = all prefill
-        # M; "midm" = only the fp8
-        # kernel's proven 16<M<=128 niche.
-        if (self.is_fp4 and bias is None and M > PREFILL_M_THRESHOLD
-                and _fp4_fused_mode() in ("1", "midm")
-                and not (_fp4_fused_mode() == "midm" and M > 128)):
-            y = self._try_fused_fp4(layer, x, N, K, M)
+        # workload evidence. That is why this remains opt-in. Static modes use
+        # only producer-attested scalars; rowwise modes derive batch-invariant
+        # runtime scalars and are the sole fused option for legacy artifacts.
+        fused_mode = (_fp4_fused_mode()
+                      if self.is_fp4 and bias is None
+                      and M > PREFILL_M_THRESHOLD else "")
+        if (fused_mode in _FP4_FUSED_MODES
+                and not (fused_mode.endswith("midm") and M > 128)):
+            mode_kwargs = {}
+            if fused_mode in _FP4_FUSED_ROWWISE_MODES:
+                mode_kwargs["rowwise"] = True
+            elif fused_mode in _FP4_FUSED_STATIC_LSQ_MODES:
+                mode_kwargs["static_lsq"] = True
+            y = self._try_fused_fp4(layer, x, N, K, M, **mode_kwargs)
             if y is not None:
                 return y
 

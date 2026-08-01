@@ -15,7 +15,7 @@ authors:
 repository-code: "https://github.com/RobTand/gridbook"
 url: "https://github.com/RobTand/gridbook"
 license: Apache-2.0
-version: "0.4.1"
+version: "0.4.2"
 date-released: 2026-08-01
 keywords:
   - quantization

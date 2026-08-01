@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import inspect
 import json
 import math
 import os
@@ -39,10 +41,160 @@ ab = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = ab
 SPEC.loader.exec_module(ab)
 
+V5_HELP_SHA256 = "c7ac242795ca86dd2afbe88103d6f646780229412eb08b7d6c6f2edf187f2696"
+
 
 class _Logprob:
     def __init__(self, value):
         self.logprob = value
+
+
+def test_v5_schema_and_cli_help_are_compatibility_locked():
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        check=True,
+        capture_output=True,
+    )
+    assert ab.SCHEMA == "gridbook.fused-nvfp4-ab.v5"
+    assert ab.ARMS == ("baseline", "fused")
+    assert ab.DENSE_FUSED_MODES == (
+        "1", "midm", "static_lsq", "static_lsq_midm",
+        "rowwise", "rowwise_midm",
+    )
+    assert hashlib.sha256(completed.stdout).hexdigest() == V5_HELP_SHA256
+
+
+def test_timing_phase_is_executed_before_allocation_heavy_quality():
+    common = ab.validation_common
+    assert common.measurement_phase_order(0) == ("quality",)
+    assert common.measurement_phase_order(1) == ("timing", "quality")
+    assert common.measurement_phase_order(7) == ("timing", "quality")
+    with pytest.raises(ValueError, match="nonnegative"):
+        common.measurement_phase_order(-1)
+    # Both entry points consume this single ordering contract; the v6 test
+    # separately locks its runner to the same helper.
+    assert "validation_common.measurement_phase_order" in inspect.getsource(ab.run)
+
+
+def test_timing_quiescence_collects_host_garbage_before_cuda_sync(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        ab.validation_common.gc,
+        "collect",
+        lambda: events.append("gc") or 17,
+    )
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(synchronize=lambda: events.append("cuda_sync"))
+    )
+    assert ab.validation_common.quiesce_before_timing(torch) == 17
+    assert events == ["gc", "cuda_sync"]
+
+
+def test_shared_engine_bootstrap_preserves_v5_llm_and_sampling_contract():
+    calls = []
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            calls.append(("llm", kwargs))
+            self.llm_engine = SimpleNamespace(
+                vllm_config=SimpleNamespace(
+                    scheduler_config=SimpleNamespace(
+                        enable_chunked_prefill=kwargs["enable_chunked_prefill"]
+                    ),
+                    model_config=SimpleNamespace(
+                        is_chunked_prefill_supported=False,
+                        runner_type="generate",
+                    ),
+                )
+            )
+
+    class FakeSampling:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            calls.append(("sampling", kwargs))
+
+    bootstrap = SimpleNamespace(
+        candidate_load_revision="resolved-commit",
+        quality_logprobs=1024,
+        llm_class=FakeLLM,
+        sampling_params_class=FakeSampling,
+    )
+    args = SimpleNamespace(
+        model="candidate",
+        trust_remote_code=False,
+        dtype="bfloat16",
+        gpu_memory_utilization=0.8,
+        seqlen=128,
+        enable_chunked_prefill=False,
+        seed=7,
+        quantization="gridbook",
+        max_num_batched_tokens=256,
+    )
+    probe = SimpleNamespace(restore=lambda: calls.append(("restore", {})))
+    engine = ab.validation_common.load_candidate_engine(
+        bootstrap, args, probe=probe, attest_chunked_prefill=True
+    )
+    llm_kwargs = calls[0][1]
+    assert llm_kwargs == {
+        "model": "candidate",
+        "trust_remote_code": False,
+        "revision": "resolved-commit",
+        "dtype": "bfloat16",
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.8,
+        "max_model_len": 144,
+        "max_num_seqs": 1,
+        "max_logprobs": 1024,
+        "enforce_eager": True,
+        "disable_log_stats": True,
+        "enable_prefix_caching": False,
+        "enable_chunked_prefill": False,
+        "seed": 7,
+        "quantization": "gridbook",
+        "max_num_batched_tokens": 256,
+    }
+    assert engine.quality_sampling.kwargs == {
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "prompt_logprobs": 1024,
+        "detokenize": False,
+    }
+    assert engine.timing_sampling.kwargs == {
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "detokenize": False,
+    }
+    assert engine.chunked_prefill_contract["requested"] == "disable"
+    assert engine.chunked_prefill_contract["resolved_enabled"] is False
+    assert engine.chunked_prefill_contract["promotion_compatible"] is True
+    assert all(name != "restore" for name, _payload in calls)
+
+
+def test_v5_run_requires_resolved_chunked_prefill_attestation():
+    source = inspect.getsource(ab.run)
+    assert "attest_chunked_prefill=True" in source
+    assert "chunked_prefill_contract" in source
+
+
+def test_shared_chunked_prefill_gate_is_fail_closed_and_schema_shared():
+    compatible = {
+        "requested": "auto",
+        "resolved_enabled": True,
+        "promotion_compatible": True,
+    }
+    incompatible = {
+        **compatible,
+        "promotion_compatible": False,
+    }
+    assert ab.validation_common.chunked_prefill_integrity_gate(
+        compatible
+    )["pass"] is True
+    assert ab.validation_common.chunked_prefill_integrity_gate(
+        incompatible
+    )["pass"] is False
+    assert "validation_common.chunked_prefill_integrity_gate" in inspect.getsource(
+        ab.run
+    )
 
 
 def test_pair_order_is_prompt_paired_and_counterbalanced():
@@ -67,6 +219,16 @@ def test_activate_arm_mutates_env_and_clears_cached_mode():
         "fused", fused_mode="midm", environ=environ, mode_cache=cache
     ) == "midm"
     assert environ[ab.FUSED_ENV] == "midm"
+    assert cache == []
+    assert ab.activate_arm(
+        "fused", fused_mode="rowwise", environ=environ, mode_cache=cache
+    ) == "rowwise"
+    assert environ[ab.FUSED_ENV] == "rowwise"
+    assert cache == []
+    assert ab.activate_arm(
+        "fused", fused_mode="static_lsq", environ=environ, mode_cache=cache
+    ) == "static_lsq"
+    assert environ[ab.FUSED_ENV] == "static_lsq"
     assert cache == []
     with pytest.raises(ValueError, match="unknown arm"):
         ab.activate_arm("other", fused_mode="1", environ=environ, mode_cache=cache)
@@ -100,6 +262,24 @@ def test_activate_execution_arm_keeps_moe_prefill_unset():
         moe_mode_cache=moe_cache,
     ) == "256"
     assert environ[ab.FUSED_MOE_ENV] == "256"
+    assert ab.activate_execution_arm(
+        "fused",
+        execution_mode="moe128",
+        dense_fused_mode="static_lsq",
+        environ=environ,
+        dense_mode_cache=dense_cache,
+        moe_mode_cache=moe_cache,
+    ) == "static_lsq128"
+    assert environ[ab.FUSED_MOE_ENV] == "static_lsq128"
+    assert ab.activate_execution_arm(
+        "fused",
+        execution_mode="moe256",
+        dense_fused_mode="static_lsq_midm",
+        environ=environ,
+        dense_mode_cache=dense_cache,
+        moe_mode_cache=moe_cache,
+    ) == "static_lsq256"
+    assert environ[ab.FUSED_MOE_ENV] == "static_lsq256"
     environ[ab.PREFILL_ENV] = "loop"
     with pytest.raises(RuntimeError, match="must remain unset"):
         ab.activate_execution_arm(
@@ -146,6 +326,7 @@ linear_api.register_weight_loader_v2_supported_method = lambda cls: cls
 parameters = module("vllm.model_executor.parameter")
 parameters.ChannelQuantScaleParameter = type("ChannelQuantScaleParameter", (), {})
 parameters.ModelWeightParameter = type("ModelWeightParameter", (), {})
+parameters.PerTensorScaleParameter = type("PerTensorScaleParameter", (), {})
 fused_moe = module("vllm.model_executor.layers.fused_moe")
 fused_moe.RoutedExperts = type("RoutedExperts", (), {})
 moe_config = module("vllm.model_executor.layers.fused_moe.config")
@@ -199,7 +380,7 @@ assert moe._FUSED_FP4_MOE_STATE == ["256"]
 with ab.scoped_execution_arm(
     "fused",
     execution_mode="moe128",
-    dense_fused_mode="1",
+    dense_fused_mode="static_lsq",
     environ=os.environ,
     dense_mode_cache=linear._FP4_FUSED_MODE,
     moe_mode_cache=moe._FUSED_FP4_MOE_STATE,
@@ -207,7 +388,7 @@ with ab.scoped_execution_arm(
     moe_selector=moe._requested_fused_fp4_moe_mode,
 ):
     assert linear._fp4_fused_mode() == ""
-    assert moe._requested_fused_fp4_moe_mode() == "128"
+    assert moe._requested_fused_fp4_moe_mode() == "static_lsq128"
 
 # Outside the explicit harness scope, the real production selectors still
 # reject a changed execution contract in this same process.
@@ -292,6 +473,43 @@ def test_teacher_pairwise_summary_identifies_better_candidate():
     assert exact["kl_reference_to_candidate"]["mean"] == pytest.approx(0.0)
     assert changed["mean_nll_delta_candidate_minus_reference"] > 0.0
     assert changed["kl_reference_to_candidate"]["mean"] > 0.0
+
+
+def test_v5_quality_and_timing_report_shape_remains_compatible():
+    row = ab.TopKRow((1, 2), (math.log(0.6), math.log(0.3)))
+    score = ab.PromptScore((math.log(0.6),), (row,))
+    quality = ab._quality_summary([{
+        "prompt_index": 0,
+        "pair_order": ["baseline", "fused"],
+        "scores": {"baseline": score, "fused": score},
+        "wall_ms": {"baseline": 2.0, "fused": 1.0},
+    }])
+    assert tuple(quality) == (
+        "arms",
+        "delta",
+        "per_prompt",
+        "kl_mode",
+        "kl_convention",
+    )
+    assert tuple(quality["arms"]) == ("baseline", "fused")
+    assert set(quality["delta"]) == {
+        "mean_nll_fused_minus_baseline",
+        "ppl_fused_over_baseline",
+        "ppl_relative_regression",
+        "target_logprob_abs_delta",
+        "kl_baseline_to_fused",
+        "kl_fused_to_baseline",
+        "kl_baseline_to_fused_confident_positions",
+    }
+    timing = ab._timing_summary({"baseline": [2.0], "fused": [1.0]})
+    assert tuple(timing) == (
+        "metric",
+        "scope",
+        "is_streaming_ttft",
+        "arms",
+        "baseline_over_fused_speedup",
+    )
+    assert timing["baseline_over_fused_speedup"] == pytest.approx(2.0)
 
 
 def test_score_prompt_output_scores_targets_and_drops_position_zero():
@@ -728,6 +946,9 @@ def test_runtime_provenance_hashes_the_actual_imported_package(tmp_path, monkeyp
         )
         assert record["source_sha256"][relative] == ab._sha256(package / relative)
     assert record["harness"]["sha256"] == ab._sha256(harness)
+    shared = record["harness"]["shared_helpers"]["fused_nvfp4_validation"]
+    assert shared["path"] == str(ab._COMMON_PATH)
+    assert shared["sha256"] == ab._sha256(ab._COMMON_PATH)
 
     (package / "moe_toplevel_loader.py").unlink()
     with pytest.raises(RuntimeError, match="moe_toplevel_loader.*unreadable"):
@@ -887,7 +1108,10 @@ def test_dispatch_probe_records_success_fallback_and_pid_without_torch():
         prefix = "model.layers.0.mlp.down_proj"
 
         def _try_fused_fp4(self, layer, x, n, k, m):
-            del layer, x, n, k, m
+            del x, n, k
+            layer._cb_fp4_fused_tile_m = 128
+            layer._cb_fp4_fused_tile_candidate_ctas = m
+            layer._cb_fp4_fused_sm_count = 48
             return object()
 
         def _apply_inline(self, layer, x, bias=None):
@@ -921,6 +1145,123 @@ def test_dispatch_probe_records_success_fallback_and_pid_without_torch():
         assert merged["fused_fallbacks"] == 1
         assert merged["fused_success_fraction"] == pytest.approx(0.5)
         assert len(merged["pids"]) == 1
+        assert merged["success_tile_m"] == {"128": 1}
+        assert merged["success_tile_m_shapes"] == {
+            "M64:N512:K256:tile128": 1
+        }
+        assert merged["success_tile_m_contracts"] == {
+            "tile128:ctas64:sm48": 1
+        }
+        route_gate = ab.dense_tile_route_integrity_gate(merged)
+        assert route_gate["pass"] is True
+        assert route_gate["observed_routes"] == 1
+    finally:
+        probe.restore()
+
+
+def test_dense_tile_route_integrity_gate_fails_closed():
+    dispatch = ab.aggregate_dispatch((
+        ab._empty_dispatch_record("missing", "fused"),
+    ))
+    dispatch["fused_successes"] = 1
+    missing = ab.dense_tile_route_integrity_gate(dispatch)
+    assert missing["pass"] is False
+    assert missing["observed_routes"] == 0
+
+    dispatch["success_tile_m"] = {"192": 1}
+    dispatch["success_tile_m_shapes"] = {
+        "M256:N512:K256:tile192": 1
+    }
+    dispatch["success_tile_m_contracts"] = {
+        "tile192:ctas4:sm48": 1
+    }
+    invalid = ab.dense_tile_route_integrity_gate(dispatch)
+    assert invalid["pass"] is False
+    assert invalid["legal_tile_values"] is False
+
+
+def test_dense_dispatch_probe_forwards_rowwise_family_without_losing_telemetry():
+    observed = []
+
+    class Layer:
+        _cb_N = 512
+        _cb_K = 256
+
+    class X:
+        def numel(self):
+            return 64 * 256
+
+    class Method:
+        is_fp4 = True
+        prefix = "model.layers.0.mlp.down_proj"
+
+        def _try_fused_fp4(self, layer, x, n, k, m, *, rowwise=False):
+            del layer, x, n, k, m
+            observed.append(rowwise)
+            return object()
+
+        def _apply_inline(self, layer, x, bias=None):
+            del bias
+            return self._try_fused_fp4(
+                layer, x, layer._cb_N, layer._cb_K,
+                x.numel() // layer._cb_K, rowwise=True,
+            )
+
+    probe = ab.DenseDispatchProbe(
+        Method, prefill_threshold=16, fused_mode="rowwise"
+    )
+    probe.install()
+    try:
+        with probe.measurement("fused", "rowwise") as record:
+            assert Method()._apply_inline(Layer(), X()) is not None
+        assert observed == [True]
+        assert record["candidate_gate_opportunities"] == 1
+        assert record["fused_attempts"] == 1
+        assert record["fused_successes"] == 1
+    finally:
+        probe.restore()
+
+
+def test_dense_dispatch_probe_forwards_static_lsq_without_losing_telemetry():
+    observed = []
+
+    class Layer:
+        _cb_N = 512
+        _cb_K = 256
+
+    class X:
+        def numel(self):
+            return 64 * 256
+
+    class Method:
+        is_fp4 = True
+        prefix = "model.layers.0.mlp.down_proj"
+
+        def _try_fused_fp4(
+            self, layer, x, n, k, m, *, rowwise=False, static_lsq=False,
+        ):
+            del layer, x, n, k, m
+            observed.append((rowwise, static_lsq))
+            return object()
+
+        def _apply_inline(self, layer, x, bias=None):
+            del bias
+            return self._try_fused_fp4(
+                layer, x, layer._cb_N, layer._cb_K,
+                x.numel() // layer._cb_K, static_lsq=True,
+            )
+
+    probe = ab.DenseDispatchProbe(
+        Method, prefill_threshold=16, fused_mode="static_lsq"
+    )
+    probe.install()
+    try:
+        with probe.measurement("fused", "static_lsq") as record:
+            assert Method()._apply_inline(Layer(), X()) is not None
+        assert observed == [(False, True)]
+        assert record["candidate_gate_opportunities"] == 1
+        assert record["fused_attempts"] == 1
+        assert record["fused_successes"] == 1
     finally:
         probe.restore()
 
@@ -969,6 +1310,143 @@ def test_moe_probe_proves_loop_and_grouped_fused_routes_without_torch():
         assert list(fused["success_shapes"]) == [
             "T128:E256:H1024:I512:topk8:tile256"
         ]
+    finally:
+        probe.restore()
+
+
+def test_moe_dispatch_probe_forwards_rowwise_family_without_losing_telemetry():
+    observed = []
+
+    class X:
+        shape = (128, 1024)
+
+    class TopK:
+        shape = (128, 8)
+
+    class Layer:
+        _cb_E = 256
+        _cb_hidden = 1024
+        _cb_inter = 512
+
+    class Method:
+        prefix = "model.layers.0.mlp.experts"
+
+        def _apply_prefill_grouped_fused_fp4(
+            self, layer, x, topk_weights, topk_ids, act, *, tile_m=128,
+            rowwise=False,
+        ):
+            del layer, x, topk_weights, topk_ids, act
+            observed.append((rowwise, tile_m))
+            return object()
+
+        def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
+            del layer, x, topk_weights, topk_ids, act
+            return object()
+
+    method = Method()
+    probe = ab.MoEDispatchProbe(Method)
+    probe.install()
+    try:
+        with probe.measurement("fused", "rowwise") as record:
+            assert method._apply_prefill_grouped_fused_fp4(
+                Layer(), X(), None, TopK(), None,
+                tile_m=256, rowwise=True,
+            )
+        assert observed == [(True, 256)]
+        assert record["fused_attempts"] == 1
+        assert record["fused_successes"] == 1
+    finally:
+        probe.restore()
+
+
+def test_moe_dispatch_probe_forwards_static_lsq_without_losing_telemetry():
+    observed = []
+
+    class X:
+        shape = (128, 1024)
+
+    class TopK:
+        shape = (128, 8)
+
+    class Layer:
+        _cb_E = 256
+        _cb_hidden = 1024
+        _cb_inter = 512
+
+    class Method:
+        prefix = "model.layers.0.mlp.experts"
+
+        def _apply_prefill_grouped_fused_fp4(
+            self, layer, x, topk_weights, topk_ids, act, *, tile_m=128,
+            rowwise=False, static_lsq=False,
+        ):
+            del layer, x, topk_weights, topk_ids, act
+            observed.append((rowwise, static_lsq, tile_m))
+            return object()
+
+        def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
+            del layer, x, topk_weights, topk_ids, act
+            return object()
+
+    method = Method()
+    probe = ab.MoEDispatchProbe(Method)
+    probe.install()
+    try:
+        with probe.measurement("fused", "static_lsq") as record:
+            assert method._apply_prefill_grouped_fused_fp4(
+                Layer(), X(), None, TopK(), None,
+                tile_m=256, static_lsq=True,
+            )
+        assert observed == [(False, True, 256)]
+        assert record["fused_attempts"] == 1
+        assert record["fused_successes"] == 1
+    finally:
+        probe.restore()
+
+
+def test_moe_dispatch_probe_records_fail_closed_reason():
+    class X:
+        shape = (64, 1024)
+
+    class TopK:
+        shape = (64, 4)
+
+    class Layer:
+        _cb_E = 32
+        _cb_hidden = 1024
+        _cb_inter = 512
+        _cb_gf4_static_lsq_ok_reason = (
+            "artifact has no attested static activation contract"
+        )
+
+    class Method:
+        prefix = "model.layers.0.mlp.experts"
+
+        def _apply_prefill_grouped_fused_fp4(
+            self, layer, x, topk_weights, topk_ids, act, *, tile_m=128,
+            rowwise=False, static_lsq=False,
+        ):
+            del layer, x, topk_weights, topk_ids, act, tile_m, rowwise
+            assert static_lsq is True
+            return None
+
+        def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
+            del layer, x, topk_weights, topk_ids, act
+            return object()
+
+    method = Method()
+    probe = ab.MoEDispatchProbe(Method)
+    probe.install()
+    try:
+        with probe.measurement("fused", "static_lsq") as record:
+            assert method._apply_prefill_grouped_fused_fp4(
+                Layer(), X(), None, TopK(), None,
+                tile_m=128, static_lsq=True,
+            ) is None
+        assert record["fused_fallbacks"] == 1
+        assert record["fallback_reasons"] == {
+            "artifact has no attested static activation contract": 1
+        }
     finally:
         probe.restore()
 
@@ -1081,6 +1559,9 @@ def test_gate_finalization_distinguishes_measurement_screen_and_promotion():
 
     promotion = {
         "quality": {"delta": {"kl_baseline_to_fused": {"mean": 0.1}}},
+        "settings": {
+            "chunked_prefill_contract": {"promotion_compatible": True}
+        },
         "teacher_quality": {
             "baseline": {
                 "kl_mode": ab.KL_FULL_VOCAB,
@@ -1110,6 +1591,30 @@ def test_gate_finalization_distinguishes_measurement_screen_and_promotion():
     ]
     assert promotion["promotion_recommendation"] == (
         "candidate_only_requires_served_validation"
+    )
+
+    incompatible = {
+        **promotion,
+        "settings": {
+            "chunked_prefill_contract": {"promotion_compatible": False}
+        },
+    }
+    ab._finalize_gate_report(
+        SimpleNamespace(**{
+            **screening_args,
+            "teacher_full_vocab_kl": True,
+            "max_teacher_fused_mean_kl": 0.20,
+            "max_teacher_fused_kl_regression": 0.03,
+        }),
+        incompatible,
+        core_gates,
+    )
+    assert incompatible["promotion_contract"]["complete"] is False
+    assert incompatible["promotion_contract"][
+        "chunked_prefill_promotion_compatible"
+    ] is False
+    assert incompatible["promotion_recommendation"] == (
+        "screening_only_chunked_prefill_contract_incompatible"
     )
 
 

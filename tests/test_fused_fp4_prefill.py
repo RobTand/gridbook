@@ -28,7 +28,9 @@ Contracts pinned:
     the audit's full reconsideration gates.
   * grouped (MoE) == per-expert dense BIT-IDENTICAL at tile_m 128 and 256.
   * vLLM's scaled_fp4_quant swizzled-SF layout == the codec reference the
-    kernels' SFA TMA descriptor assumes (guards the serving dispatch).
+    kernels' SFA TMA descriptor assumes for a representative random sample
+    (guards serving dispatch, not arbitrary packed-byte equivalence). Exact
+    midpoint/underflow operator oracles live in test_nvfp4_act_quant_ref.py.
 """
 import os
 import re
@@ -102,7 +104,7 @@ def prep_weight(k, N, K, mode, coding, seed):
     w_deq = vals.reshape(N, K).float() * scales.repeat_interleave(16, dim=1)
     return dict(qwp=qwp, lut=lut, compose=compose, ts=ts, n_sub=n_sub,
                 is_v2=is_v2, b_packed=b_packed, sfb_sw=sfb_sw, w_deq=w_deq,
-                cb_flat=cb_flat, k=k, N=N, K=K)
+                cb_flat=cb_flat, scales=scales, k=k, N=N, K=K)
 
 
 def quant_act(x2, gs=None):
@@ -278,6 +280,68 @@ def test_fused_bitexact_ragged(N, K):
     assert torch.equal(y_ref.view(torch.uint16), y_f.view(torch.uint16))
 
 
+@pytest.mark.parametrize("M,N,K", [(256, 320, 1536), (769, 192, 1024)])
+def test_dense_tile_m256_bitexact_vs_tile_m128_and_stock(M, N, K):
+    """The dense selector's wide tile reuses the grouped concrete kernel.
+
+    Cover both its measured M=256 crossover and a ragged-M/ragged-N launch;
+    require identical BF16 bits against the established dense TileM=128 path
+    and stock NVFP4 rather than introducing a second numerical tolerance.
+    """
+    k = 24
+    wctx = prep_weight(k, N=N, K=K, mode="product",
+                       coding=fmt.SCALE_CODING_TWO_TIER, seed=M + N)
+    torch.manual_seed(M + K)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    aq, sfa, _, recip = quant_act(x)
+    a_scales = recip.reshape(1).expand(M).contiguous().float()
+    b_scales = torch.ones(N, dtype=torch.float32, device=DEV)
+    common = (aq, sfa, wctx["qwp"], wctx["lut"], wctx["compose"],
+              a_scales, b_scales, N, K, k, wctx["n_sub"], wctx["ts"],
+              wctx["is_v2"], None)
+    y128 = ext.cb_fused_fp4_prefill_mm_scaled(*common, 128)
+    y256 = ext.cb_fused_fp4_prefill_mm_scaled(*common, 256)
+    y_ref = ext.sm120_nvf4_mm_scaled(
+        aq, sfa, wctx["b_packed"], wctx["sfb_sw"], a_scales, b_scales,
+        N, K)
+    ref_bits = y_ref.view(torch.uint16)
+    assert torch.equal(y128.view(torch.uint16), ref_bits)
+    assert torch.equal(y256.view(torch.uint16), ref_bits)
+
+
+def test_dense_tile_m256_nondefault_stream_and_graph():
+    """The new dense route keeps the existing stream and capture contract."""
+    k, M, N, K = 24, 256, 320, 1024
+    wctx = prep_weight(k, N=N, K=K, mode="product",
+                       coding=fmt.SCALE_CODING_TWO_TIER, seed=1911)
+    torch.manual_seed(1912)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    aq, sfa, _, recip = quant_act(x)
+    a_scales = recip.reshape(1).expand(M).contiguous().float()
+    b_scales = torch.ones(N, dtype=torch.float32, device=DEV)
+    args = (aq, sfa, wctx["qwp"], wctx["lut"], wctx["compose"],
+            a_scales, b_scales, N, K, k, wctx["n_sub"], wctx["ts"],
+            wctx["is_v2"], None, 256)
+    producer = torch.cuda.current_stream()
+    worker = torch.cuda.Stream()
+    worker.wait_stream(producer)
+    with torch.cuda.stream(worker):
+        y = ext.cb_fused_fp4_prefill_mm_scaled(*args)
+        y_ref = ext.sm120_nvf4_mm_scaled(
+            aq, sfa, wctx["b_packed"], wctx["sfb_sw"], a_scales, b_scales,
+            N, K)
+    worker.synchronize()
+    assert torch.equal(y.view(torch.uint16), y_ref.view(torch.uint16))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=worker):
+        y_graph = ext.cb_fused_fp4_prefill_mm_scaled(*args)
+    for _ in range(2):
+        graph.replay()
+        worker.synchronize()
+        assert torch.equal(y_graph.view(torch.uint16), y.view(torch.uint16))
+
+
 def test_padded_row_stride_view():
     """The serving entry receives layer._cb_qw_padded's NARROW view semantics
     (issue #1) — an explicitly-strided view must be bit-identical."""
@@ -289,6 +353,150 @@ def test_padded_row_stride_view():
     wctx2 = dict(wctx, qwp=view)
     _, y_b, _ = run_pair(wctx2, 64, seed=3)
     assert torch.equal(y_a.view(torch.uint16), y_b.view(torch.uint16))
+
+
+@pytest.mark.parametrize("M,tile_m", [(64, 128), (256, 256)])
+def test_fused_multilut_distinct_merged_roles_bitexact_vs_stock(M, tile_m):
+    """Each 128-row N tile must stage the LUT named by its merged role.
+
+    The second block flips every E2M1 value's sign while retaining the exact
+    packed index and scale planes.  A kernel that accidentally reuses LUT zero
+    for both tiles therefore cannot pass this bitwise stock-NVFP4 oracle.
+    """
+    k, role_n, K = 16, 128, 1024
+    wctx = prep_weight(k, N=role_n, K=K, mode="product",
+                       coding=fmt.SCALE_CODING_TWO_TIER, seed=109)
+    packed = torch.cat((wctx["qwp"], wctx["qwp"]), dim=0).contiguous()
+    lut0 = wctx["lut"]
+    # Product LUT entries are u16 nibble quads. XORing bit 3 of every nibble
+    # produces the matching sign-flipped codebook without changing indices.
+    lut1 = torch.bitwise_xor(lut0, torch.tensor(0x88, device=DEV,
+                                                dtype=torch.uint8))
+    luts = torch.cat((lut0, lut1)).contiguous()
+    tile_ids = torch.tensor([0, 1], dtype=torch.int32, device=DEV)
+
+    b_packed = torch.cat((wctx["b_packed"], wctx["b_packed"] ^ 0x88),
+                         dim=0).contiguous()
+    scales = torch.cat((wctx["scales"], wctx["scales"]), dim=0)
+    sfb = codec.swizzle_sf_plane(
+        scales.to(torch.float8_e4m3fn).view(torch.uint8)).contiguous()
+    N = 2 * role_n
+
+    torch.manual_seed(110)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    aq, sfa, _, recip = quant_act(x)
+    a_scales = recip.reshape(1).expand(M).contiguous().float()
+    b_scales = torch.ones(N, dtype=torch.float32, device=DEV)
+    y_ref = ext.sm120_nvf4_mm_scaled(
+        aq, sfa, b_packed, sfb, a_scales, b_scales, N, K)
+    y_fused = ext.cb_fused_fp4_prefill_mm_scaled(
+        aq, sfa, packed, luts, wctx["compose"], a_scales, b_scales,
+        N, K, k, wctx["n_sub"], wctx["ts"], True, tile_ids, tile_m)
+    assert torch.equal(y_fused.view(torch.uint16), y_ref.view(torch.uint16))
+    assert not torch.equal(y_fused[:, :role_n], y_fused[:, role_n:])
+
+
+def test_fused_multilut_persistent_cta_reuse_bitexact_vs_stock():
+    """A persistent CTA must reload the LUT when its next N tile changes.
+
+    Two N tiles are too small to exercise CUTLASS's persistent scheduler:
+    each resident CTA sees at most one role and a lifetime ``lut_resident``
+    boolean appears correct.  Two hundred fifty-six alternating role tiles
+    exceed the one-large-CTA-per-SM residency of every qualified Blackwell
+    target and deterministically expose stale-LUT reuse.
+    """
+    k, role_n, ntiles, K, M = 16, 128, 256, 256, 128
+    wctx = prep_weight(k, N=role_n, K=K, mode="product",
+                       coding=fmt.SCALE_CODING_TWO_TIER, seed=1801)
+    packed = wctx["qwp"].repeat(ntiles, 1).contiguous()
+    lut0 = wctx["lut"]
+    lut1 = torch.bitwise_xor(
+        lut0, torch.tensor(0x88, device=DEV, dtype=torch.uint8))
+    luts = torch.cat((lut0, lut1)).contiguous()
+    tile_ids = (torch.arange(ntiles, dtype=torch.int32, device=DEV) & 1) \
+        .contiguous()
+
+    b_tiles = [wctx["b_packed"] if tile % 2 == 0
+               else wctx["b_packed"] ^ 0x88
+               for tile in range(ntiles)]
+    b_packed = torch.cat(b_tiles, dim=0).contiguous()
+    scales = wctx["scales"].repeat(ntiles, 1)
+    sfb = codec.swizzle_sf_plane(
+        scales.to(torch.float8_e4m3fn).view(torch.uint8)).contiguous()
+    N = role_n * ntiles
+
+    torch.manual_seed(1802)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    aq, sfa, _, recip = quant_act(x)
+    a_scales = recip.reshape(1).expand(M).contiguous().float()
+    b_scales = torch.ones(N, dtype=torch.float32, device=DEV)
+    y_ref = ext.sm120_nvf4_mm_scaled(
+        aq, sfa, b_packed, sfb, a_scales, b_scales, N, K)
+    y_fused = ext.cb_fused_fp4_prefill_mm_scaled(
+        aq, sfa, packed, luts, wctx["compose"], a_scales, b_scales,
+        N, K, k, wctx["n_sub"], wctx["ts"], True, tile_ids)
+    assert torch.equal(y_fused.view(torch.uint16), y_ref.view(torch.uint16))
+
+
+def test_rowwise_quantized_fused_gemm_bitexact_vs_stock():
+    """Per-row activation reciprocals must index the same rows as SFA/A.
+
+    The rowwise quantizer and fused GEMM each have independent live oracles,
+    but a constant ``a_scales`` vector cannot expose an epilogue row-indexing
+    error at their integration boundary.  Exercise a wide range of row
+    amplitudes, feed the quantizer's heterogeneous reciprocals directly into
+    both collectives, and require exact BF16 agreement with stock NVFP4.
+    """
+    k, M, N, K = 16, 128, 256, 1024
+    wctx = prep_weight(k, N=N, K=K, mode="product",
+                       coding=fmt.SCALE_CODING_TWO_TIER, seed=1811)
+    torch.manual_seed(1812)
+    amplitudes = torch.logspace(
+        -3, 3, M, dtype=torch.float32, device=DEV).reshape(M, 1)
+    x = (torch.randn(M, K, dtype=torch.float32, device=DEV)
+         * amplitudes).to(torch.bfloat16).contiguous()
+    aq, sfa, a_scales = ext.cb_nvfp4_quantize_rows(x, 448.0)
+    b_scales = torch.ones(N, dtype=torch.float32, device=DEV)
+
+    # This also makes the test load-bearing: a broadcast scalar would let a
+    # row-indexing bug pass while pretending to cover the rowwise contract.
+    assert torch.unique(a_scales.view(torch.int32)).numel() > M // 2
+    y_ref = ext.sm120_nvf4_mm_scaled(
+        aq, sfa, wctx["b_packed"], wctx["sfb_sw"], a_scales, b_scales,
+        N, K)
+    y_fused = ext.cb_fused_fp4_prefill_mm_scaled(
+        aq, sfa, wctx["qwp"], wctx["lut"], wctx["compose"], a_scales,
+        b_scales, N, K, k, wctx["n_sub"], wctx["ts"], wctx["is_v2"])
+    assert torch.equal(y_fused.view(torch.uint16), y_ref.view(torch.uint16))
+
+
+def test_static_lsq_quantized_fused_gemm_bitexact_vs_stock():
+    """The LSQ residual must flow through the sole existing GEMM exactly.
+
+    A heterogeneous residual vector makes this sensitive to epilogue row
+    indexing; stock and CB collectives consume the exact same activation bytes
+    and residuals, isolating the fused weight decoder at the integration seam.
+    """
+    k, M, N, K = 16, 128, 256, 1024
+    wctx = prep_weight(k, N=N, K=K, mode="product",
+                       coding=fmt.SCALE_CODING_TWO_TIER, seed=1821)
+    torch.manual_seed(1822)
+    amplitudes = torch.logspace(
+        -2, 2, M, dtype=torch.float32, device=DEV).reshape(M, 1)
+    x = (torch.randn(M, K, dtype=torch.float32, device=DEV)
+         * amplitudes).to(torch.bfloat16).contiguous()
+    global_scale = 2.5
+    aq, sfa, a_scales = ext.cb_nvfp4_quantize_static_lsq(x, global_scale)
+    b_scales = torch.ones(N, dtype=torch.float32, device=DEV)
+
+    assert torch.unique(a_scales.view(torch.int32)).numel() > M // 2
+    y_ref = ext.sm120_nvf4_mm_scaled(
+        aq, sfa, wctx["b_packed"], wctx["sfb_sw"], a_scales, b_scales,
+        N, K)
+    y_fused = ext.cb_fused_fp4_prefill_mm_scaled(
+        aq, sfa, wctx["qwp"], wctx["lut"], wctx["compose"], a_scales,
+        b_scales, N, K, k, wctx["n_sub"], wctx["ts"], wctx["is_v2"])
+    assert torch.equal(y_fused.view(torch.uint16), y_ref.view(torch.uint16))
 
 
 def test_fused_vs_triton_bucket_delta_documented():
@@ -383,6 +591,18 @@ def test_bindings_reject_invalid_tensor_contracts():
     with pytest.raises(RuntimeError, match="compose must be contiguous CUDA"):
         ext.cb_fused_fp4_prefill_mm_scaled(
             *dense_args[:4], dense_args[4].cpu(), *dense_args[5:])
+    multi_lut = torch.cat((wctx["lut"], wctx["lut"])).contiguous()
+    with pytest.raises(RuntimeError, match="multiple value LUT blocks require"):
+        ext.cb_fused_fp4_prefill_mm_scaled(
+            *dense_args[:3], multi_lut, *dense_args[4:])
+    with pytest.raises(RuntimeError, match="lut_tile_ids must be contiguous"):
+        ext.cb_fused_fp4_prefill_mm_scaled(
+            *dense_args[:3], multi_lut, *dense_args[4:],
+            torch.zeros(1, dtype=torch.int32))
+    with pytest.raises(RuntimeError, match="lut_tile_ids must be contiguous"):
+        ext.cb_fused_fp4_prefill_mm_scaled(
+            *dense_args[:3], multi_lut, *dense_args[4:],
+            torch.zeros(2, dtype=torch.int32, device=DEV))
     short_visible_row = wctx["qwp"].narrow(1, 0, row_bytes - 1)
     with pytest.raises(RuntimeError, match="packed visible row width"):
         ext.cb_fused_fp4_prefill_mm_scaled(
@@ -402,11 +622,13 @@ def test_bindings_reject_invalid_tensor_contracts():
         ext.cb_fused_fp4_prefill_mm_scaled(
             *dense_args[:2], storage_short_view, *dense_args[3:])
     # The old optional debug pointer had no capacity/device check and allowed a
-    # short tensor to be overwritten by the fixed-size smem dump. It is not a
-    # production argument anymore.
+    # short tensor to be overwritten by the fixed-size smem dump. The checked
+    # LUT tile map and TileM selector occupy the two optional argument slots; a
+    # further tensor is still refused.
     with pytest.raises(TypeError):
         ext.cb_fused_fp4_prefill_mm_scaled(
-            *dense_args, torch.zeros(1, dtype=torch.uint8, device=DEV))
+            *dense_args, torch.zeros(1, dtype=torch.int32, device=DEV), 128,
+            torch.zeros(1, dtype=torch.uint8, device=DEV))
 
     E, tile_m = 2, 128
     stack = torch.empty(E, N, row_bytes, dtype=torch.uint8, device=DEV)
@@ -811,12 +1033,21 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
     method.k = k
     method.n_sub = n_sub
     method.type_size = type_size
+    method.has_static_fp4_activation = True
     method._sub_table = codec.TWO_TIER_SUB_TABLE
+    # This is a routing/grouped-dispatch oracle, so give both the production
+    # method and the independent dense reference the same fixed, artifact-like
+    # activation contract.  Deriving a fresh batch amax here would exercise the
+    # retired dynamic contract and make the test bypass the static safety gate.
+    stage1_scale = torch.tensor([512.0], dtype=torch.float32, device=DEV)
+    stage2_scale = torch.tensor([256.0], dtype=torch.float32, device=DEV)
     layer = types.SimpleNamespace(
         _cb_E=E,
         _cb_hidden=hidden,
         _cb_inter=inter,
         _cb_flat=cb_flat,
+        _cb_fp4_input_global_scale_w13=stage1_scale,
+        _cb_fp4_input_global_scale_w2=stage2_scale,
         w13_cb_qweight=w13,
         w2_cb_qweight=w2,
     )
@@ -850,8 +1081,7 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
                 x_pad = torch.cat((x, x.new_zeros((1, hidden)))) \
                     .index_select(0, dest).contiguous()
 
-                gs1 = ((448.0 * 6.0) /
-                       x_pad.float().abs().amax().clamp_min(1e-12)).float()
+                gs1 = stage1_scale
                 gate_up = _dense_native_role_reference(
                     x_pad, segments, w13, lut, compose, 2 * inter, hidden,
                     k, n_sub, type_size, gs1)
@@ -859,8 +1089,7 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
                     (x_pad.shape[0], inter), dtype=gate_up.dtype, device=DEV)
                 apply_moe_activation(act, intermediate, gate_up)
 
-                gs2 = ((448.0 * 6.0) /
-                       intermediate.float().abs().amax().clamp_min(1e-12)).float()
+                gs2 = stage2_scale
                 dense = _dense_native_role_reference(
                     intermediate, segments, w2, lut, compose, hidden, inter,
                     k, n_sub, type_size, gs2)
@@ -971,7 +1200,9 @@ def test_stagewise_activation_accumulation_decomposition(
 
 
 # ---------------------------------------------------------------------------
-# serving-dispatch guard: vLLM's fp4 quant swizzle == the codec reference
+# Representative serving-dispatch guard: vLLM's fp4 quant swizzle == the
+# codec reference. This is not an exhaustive numerical oracle: vLLM uses
+# hardware approximate reciprocals for arbitrary nonzero scale factors.
 # ---------------------------------------------------------------------------
 def test_vllm_scaled_fp4_quant_layout_matches_codec():
     vops = pytest.importorskip("vllm._custom_ops")

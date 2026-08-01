@@ -199,6 +199,10 @@ struct CollectiveMma<
   // bytes STRAIGHT FROM GMEM during decode (L1/L2-hot; the decode-GEMV
   // pattern). All gmem windows stay inside the row's own superblock (u8
   // loads for the scale plane), so NO tail slack is required of the buffer.
+  // The final u32 carries the dense projection's N-tile -> interned LUT-block
+  // identity.  It is published under the same mbarrier as the packed pointer
+  // and row base, so consumers cannot stage a LUT for the wrong projection
+  // role. MoE/single-LUT calls publish identity zero.
   static constexpr int CbStageDescBytes = 16;
 
   // Fixed smem LUT carve (R6): value LUT sized for the LARGEST fp4 rung
@@ -280,6 +284,9 @@ struct CollectiveMma<
                                           // quads (tbl0 then tbl1); signed ->
                                           // u32 nibble octets (magnitudes)
     int32_t lut_bytes{0};                 // <= CbLutMaxBytes
+    int32_t const* ptr_lut_tile_ids{nullptr}; // dense: [ceil(N/TileN)]
+    int32_t num_lut_blocks{1};            // concatenated fixed-size LUT blocks
+    int32_t num_lut_tiles{0};             // bounds ptr_lut_tile_ids before read
     uint8_t const* ptr_compose{nullptr};  // v2: (256*16) e4m3 bytes; else null
     int32_t k_bits{0};
     int32_t n_sub{2};                     // 2 = product, 1 = signed
@@ -321,6 +328,9 @@ struct CollectiveMma<
     uint8_t const* ptr_lut;
     uint8_t const* ptr_compose;
     int32_t lut_bytes;
+    int32_t const* ptr_lut_tile_ids;
+    int32_t num_lut_blocks;
+    int32_t num_lut_tiles;
     int32_t k_bits;
     int32_t n_sub;
     int32_t type_size;
@@ -357,6 +367,7 @@ struct CollectiveMma<
       tma_load_a, tma_load_sfa, args.layout_SFA,
       args.ptr_packed, args.packed_row_bytes,
       args.ptr_lut, args.ptr_compose, args.lut_bytes,
+      args.ptr_lut_tile_ids, args.num_lut_blocks, args.num_lut_tiles,
       args.k_bits, args.n_sub, args.type_size, args.is_v2,
       static_cast<int32_t>(N), args.ptr_expert_ids,
       args.packed_expert_stride, args.num_experts, args.ptr_debug,
@@ -378,6 +389,9 @@ struct CollectiveMma<
     implementable = implementable && (args.type_size == 4 * args.k_bits + (args.is_v2 ? 9 : 16));
     implementable = implementable && (args.packed_row_bytes >= (K / 256) * args.type_size);
     implementable = implementable && (args.lut_bytes > 0) && (args.lut_bytes <= CbLutMaxBytes);
+    implementable = implementable && (args.num_lut_blocks > 0);
+    implementable = implementable &&
+        (args.ptr_lut_tile_ids == nullptr || args.num_lut_tiles == ceil_div(N, TileN));
     implementable = implementable && (!args.is_v2 || args.ptr_compose != nullptr);
     return implementable;
   }
@@ -541,6 +555,21 @@ struct CollectiveMma<
     // to 0; their outputs are discarded by the caller) + the CTA's first
     // output row. The consumers gather packed bytes from gmem directly.
     const int n_base = int(n_coord) * TileN;
+    int lut_block_id = 0;
+    if (params.ptr_lut_tile_ids != nullptr) {
+      const int tile = int(n_coord);
+      // Keep this fail-closed on device: copying min/max to the host would add
+      // a synchronization to every dense launch and break graph capture.  A
+      // corrupt/mutated map must trap before it can become an out-of-bounds
+      // model-codebook read.
+      if (tile < 0 || tile >= params.num_lut_tiles) {
+        asm volatile("trap;");
+      }
+      lut_block_id = __ldg(params.ptr_lut_tile_ids + tile);
+      if (lut_block_id < 0 || lut_block_id >= params.num_lut_blocks) {
+        asm volatile("trap;");
+      }
+    }
     const uint8_t* __restrict__ gp = params.ptr_packed;
     if (params.ptr_expert_ids != nullptr) {
       int eid = __ldg(params.ptr_expert_ids + int(m_coord));
@@ -571,6 +600,7 @@ struct CollectiveMma<
         *reinterpret_cast<uint64_t*>(slot) =
             reinterpret_cast<uint64_t>(gp);
         *reinterpret_cast<int32_t*>(slot + 8) = n_base;
+        *reinterpret_cast<int32_t*>(slot + 12) = lut_block_id;
       }
       __syncwarp();
 
@@ -599,10 +629,13 @@ struct CollectiveMma<
 
   // --- once-per-CTA LUT staging (R6) --------------------------------------
   CUTLASS_DEVICE void
-  load_lut(TensorStorage& shared_tensors, Params const& params, int thread_idx) const {
+  load_lut(TensorStorage& shared_tensors, Params const& params, int thread_idx,
+           int lut_block_id) const {
     {
       uint32_t* dst = reinterpret_cast<uint32_t*>(shared_tensors.smem_lut.data());
-      const uint32_t* src = reinterpret_cast<const uint32_t*>(params.ptr_lut);
+      const uint8_t* selected = params.ptr_lut +
+          int64_t(lut_block_id) * params.lut_bytes;
+      const uint32_t* src = reinterpret_cast<const uint32_t*>(selected);
       const int nwords = (params.lut_bytes + 3) >> 2;
       for (int w = thread_idx; w < nwords; w += ThreadCount) {
         dst[w] = __ldg(src + w);
@@ -630,6 +663,8 @@ struct CollectiveMma<
   static constexpr int SfPerTile = TileN * (TileK / 16);   // SF bytes / K-tile
   static constexpr int SfPerThread = SfPerTile / ThreadCount;
   static_assert(SfPerTile % ThreadCount == 0, "SF count must divide thread count");
+  static_assert(ThreadCount == 256,
+                "coalesced CB decoder assumes eight 32-thread MMA warps");
 
   template <class SBNoSw, class SBSw, class SFBLayout1>
   CUTLASS_DEVICE void
@@ -661,9 +696,16 @@ struct CollectiveMma<
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < CwPerThread; ++i) {
-      const int linear = thread_idx + i * ThreadCount;
-      const int r = linear & (TileN - 1);
-      const int vl = linear / TileN;                 // 0..15 in this K-tile
+      // Give each warp two complete rows instead of one codeword from 32
+      // different rows.  Lanes 0..15 read all 16 contiguous codewords of one
+      // row and lanes 16..31 do the same for its neighbour; eight iterations
+      // cover the 128-row tile.  The old row-major linearization made every
+      // warp issue 32 unrelated, odd-stride global transactions per loop and
+      // discarded most of each cache sector.
+      const int warp = thread_idx >> 5;
+      const int lane = thread_idx & 31;
+      const int r = (i * 8 + warp) * 2 + (lane >> 4);
+      const int vl = lane & 15;                      // 0..15 in this K-tile
       int n_glob = n_base + r;
       n_glob = n_glob < N_rows ? n_glob : (N_rows - 1);
       const uint8_t* row_g = gp + int64_t(n_glob) * row_stride + sb_off;
@@ -702,13 +744,12 @@ struct CollectiveMma<
       // position-independent tensor apply it to NIBBLE offsets — measured
       // via the smem debug dump as a row-dependent 16/32-nibble block
       // permutation. So: plain (non-swizzle) layout -> nibble offset ->
-      // byte offset -> swizzle functor in byte space.
+      // byte offset -> swizzle functor in byte space. ``lb`` is four-byte
+      // aligned and this swizzle preserves its low two address bits, so the
+      // complete decoded codeword is one aligned shared-memory store.
       const int lnib = sB_nosw(r, vl * 8);
       const int lb = lnib >> 1;
-      CUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < 4; ++j) {
-        sB_base[sB_sw(lb + j)] = uint8_t(out32 >> (8 * j));
-      }
+      *reinterpret_cast<uint32_t*>(sB_base + sB_sw(lb)) = out32;
     }
 
     // SFB: one ue4m3 byte per (row, group-of-16), gathered from the row's
@@ -717,24 +758,43 @@ struct CollectiveMma<
     // byte (already e4m3, positive by construction).
     uint8_t* sfb_smem = reinterpret_cast<uint8_t*>(shared_tensors.smem_SFB.begin());
     const uint8_t* comp = shared_tensors.smem_compose.data();
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < SfPerThread; ++i) {
-      const int linear = thread_idx + i * ThreadCount;
-      const int r = linear & (TileN - 1);
-      const int g = linear / TileN;                  // 0..7 in this K-tile
-      const int gs = half * 8 + g;                   // group in superblock
+    if (params.is_v2) {
+      // Two lanes own one row and each lane composes four adjacent scales.
+      // The old one-lane-per-scale mapping redundantly issued eight exponent
+      // and eight code-byte loads for a row.  This mapping issues two
+      // exponent and four code-byte loads while retaining all 256 decoder
+      // threads and the exact same compose-table/store contract.
+      const int warp = thread_idx >> 5;
+      const int lane = thread_idx & 31;
+      const int r = warp * 16 + (lane >> 1);
+      const int g0 = (lane & 1) * 4;                 // 0 or 4 in K-tile
+      const int gs0 = half * 8 + g0;                 // group in superblock
       int n_glob = n_base + r;
       n_glob = n_glob < N_rows ? n_glob : (N_rows - 1);
       const uint8_t* srow = gp + int64_t(n_glob) * row_stride + sb_off + 4 * kb;
-      uint8_t sf;
-      if (params.is_v2) {
-        const int e = __ldg(srow);
-        const int c = (__ldg(srow + 1 + (gs >> 1)) >> ((gs & 1) * 4)) & 0xF;
-        sf = comp[e * 16 + c];
-      } else {
-        sf = __ldg(srow + gs);
+      const int e = __ldg(srow);
+      const int codes01 = __ldg(srow + 1 + (gs0 >> 1));
+      const int codes23 = __ldg(srow + 2 + (gs0 >> 1));
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < 4; ++j) {
+        const int packed_codes = j < 2 ? codes01 : codes23;
+        const int c = (packed_codes >> ((j & 1) * 4)) & 0xF;
+        const uint8_t sf = comp[e * 16 + c];
+        sfb_smem[sfb_layout(make_coord(r, (g0 + j) * 16))] = sf;
       }
-      sfb_smem[sfb_layout(make_coord(r, g * 16))] = sf;
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < SfPerThread; ++i) {
+        const int warp = thread_idx >> 5;
+        const int lane = thread_idx & 31;
+        const int r = (i * 8 + warp) * 4 + (lane >> 3);
+        const int g = lane & 7;                      // 0..7 in this K-tile
+        const int gs = half * 8 + g;                 // group in superblock
+        int n_glob = n_base + r;
+        n_glob = n_glob < N_rows ? n_glob : (N_rows - 1);
+        const uint8_t* srow = gp + int64_t(n_glob) * row_stride + sb_off + 4 * kb;
+        sfb_smem[sfb_layout(make_coord(r, g * 16))] = __ldg(srow + gs);
+      }
     }
   }
 
@@ -838,18 +898,39 @@ struct CollectiveMma<
                  accum);
     };
 
-    // Once-per-CTA codebook staging (same race-freedom argument as the fp8
-    // fork: only the MMA warpgroups touch these regions, they enter mma() in
-    // lockstep, and the NamedBarrier below orders staging before every read).
-    if (!lut_resident_) {
-      load_lut(shared_tensors, params, thread_idx);
+    // Preserve the original overlap for single-LUT and grouped-MoE calls: their
+    // identity is statically zero, so LUT staging can run while the first A/SFA
+    // TMA transaction is in flight. A multi-LUT dense CTA waits for its first
+    // stage descriptor, which publishes the checked N-tile identity under that
+    // same pipeline barrier.
+    if (resident_lut_block_id_ < 0 &&
+        params.ptr_lut_tile_ids == nullptr) {
+      load_lut(shared_tensors, params, thread_idx, 0);
       cutlass::arch::NamedBarrier::sync(
           thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-      lut_resident_ = true;
+      resident_lut_block_id_ = 0;
     }
 
     int t_abs = 0;
     pipeline.consumer_wait(smem_pipe_read);
+    if (params.ptr_lut_tile_ids != nullptr) {
+      const uint8_t* slot = shared_tensors.smem_BP.data()
+          + read_stage * CbStageDescBytes;
+      const int lut_block_id = *reinterpret_cast<const int32_t*>(slot + 12);
+      // The CUTLASS kernel owns one CollectiveMainloop for the complete
+      // persistent scheduler loop.  A CTA can therefore consume more than
+      // one (M,N) work tile, and those tiles need not share an N-role/LUT.
+      // Track the exact resident identity and refresh it only when the next
+      // work tile names a different block.  The first-stage pipeline wait
+      // makes its descriptor visible; the named barrier completes all LUT
+      // writes before any thread decodes that tile.
+      if (lut_block_id != resident_lut_block_id_) {
+        load_lut(shared_tensors, params, thread_idx, lut_block_id);
+        cutlass::arch::NamedBarrier::sync(
+            thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+        resident_lut_block_id_ = lut_block_id;
+      }
+    }
     decode_stage(shared_tensors, sB_base, sB_nosw, sB_sw, sfb_layout, params,
                  read_stage, t_abs >> 1, t_abs & 1, thread_idx);
     cutlass::arch::NamedBarrier::sync(
@@ -920,9 +1001,10 @@ struct CollectiveMma<
   }
 
 private:
-  // Per-thread, whole-kernel-lifetime flag (the kernel declares ONE
-  // CollectiveMainloop outside the scheduler loop) — see the fp8 fork.
-  bool lut_resident_ = false;
+  // Per-thread, whole-kernel-lifetime identity (the kernel declares ONE
+  // CollectiveMainloop outside the persistent scheduler loop).  ``-1`` is
+  // the not-yet-staged sentinel; all MMA threads update this in lock-step.
+  int resident_lut_block_id_ = -1;
   bool debug_dumped_ = false;
 };
 

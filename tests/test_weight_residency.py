@@ -67,6 +67,7 @@ def _install_vllm_stubs():
 
     parameter.ModelWeightParameter = _StubParam
     parameter.ChannelQuantScaleParameter = _StubParam
+    parameter.PerTensorScaleParameter = _StubParam
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -103,8 +104,10 @@ def _runtime_modules(isolated_gridbook_runtime_imports):
 def _reset_fp4_fused_mode_cache():
     """Keep process-global dispatch policy independent between tests."""
     cb_linear._FP4_FUSED_MODE.clear()
+    cb_linear._FP4_DENSE_SM_COUNTS.clear()
     yield
     cb_linear._FP4_FUSED_MODE.clear()
+    cb_linear._FP4_DENSE_SM_COUNTS.clear()
 
 
 def _write_checkpoint_header(directory, *, rows=7):
@@ -179,7 +182,12 @@ def test_dense_fp4_fused_prefill_is_opt_in(monkeypatch):
     assert cb_linear._fp4_fused_mode() == ""
 
 
-@pytest.mark.parametrize("value", ["1", "midm"])
+@pytest.mark.parametrize(
+    "value", [
+        "1", "midm", "static_lsq", "static_lsq_midm",
+        "rowwise", "rowwise_midm",
+    ]
+)
 def test_dense_fp4_fused_prefill_explicit_modes(monkeypatch, value):
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
     assert cb_linear._fp4_fused_mode() == value
@@ -201,6 +209,133 @@ def test_dense_fp4_fused_prefill_cannot_change_mid_process(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "M,N,sm_count,expected",
+    [
+        (255, 6144, 48, 128),       # TileM=256 is never used below M=256.
+        (256, 3968, 48, 128),       # 31 candidate CTAs: below 2/3 occupancy.
+        (256, 3976, 48, 256),       # 32 candidate CTAs: exact legal crossover.
+        (768, 1024, 48, 128),       # measured narrow long-K loss (24 CTAs).
+        (769, 1024, 48, 256),       # ceil(M/256)=4 -> 32 CTAs.
+        (256, 6144, 0, 128),        # unavailable device metadata fails closed.
+    ],
+)
+def test_dense_fp4_tile_selector_shape_boundaries(M, N, sm_count, expected):
+    assert cb_linear._fp4_dense_tile_m(M, N, sm_count) == expected
+
+
+def test_dense_fp4_sm_count_is_cached_without_synchronizing(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties",
+        lambda index: calls.append(index) or types.SimpleNamespace(
+            multi_processor_count=48),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "synchronize",
+        lambda *_args, **_kwargs: pytest.fail(
+            "SM-count resolution must not synchronize CUDA"),
+    )
+    device = torch.device("cuda:3")
+    assert cb_linear._fp4_dense_sm_count(device) == 48
+    assert cb_linear._fp4_dense_sm_count(device) == 48
+    assert calls == [3]
+
+
+@pytest.mark.parametrize(
+    "M,N,expected_tile",
+    [(256, 6144, 256), (768, 1024, 128), (1024, 1024, 256)],
+)
+def test_dense_fp4_tile_route_reaches_binding_and_telemetry(
+        monkeypatch, M, N, expected_tile):
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    method.is_v2 = True
+    method._sub_table = [1.0] * 16
+    method._fused_fp4_ok = lambda *_args, **_kwargs: True
+    K = 256
+    layer = types.SimpleNamespace(
+        _cb_fp4_lut=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(N),
+        _cb_qw_padded=torch.ones(N, 73, dtype=torch.uint8),
+    )
+    observed = []
+
+    class Ext:
+        @staticmethod
+        def cb_nvfp4_quantize_rows(x, _multiplier):
+            return (torch.zeros(M, K // 2, dtype=torch.uint8),
+                    torch.zeros(M * (K // 16), dtype=torch.uint8),
+                    torch.ones(M, dtype=torch.float32))
+
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(*args):
+            observed.append((args[-2], args[-1]))
+            return torch.zeros(M, N, dtype=torch.bfloat16)
+
+    from gridbook import cuda_ext
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: Ext())
+    monkeypatch.setattr(cb_linear, "_fp4_dense_sm_count", lambda _device: 48)
+    x = torch.zeros(M, K, dtype=torch.bfloat16)
+    out = method._try_fused_fp4(layer, x, N, K, M, rowwise=True)
+    assert out.shape == (M, N)
+    assert observed == [(None, expected_tile)]
+    assert layer._cb_fp4_fused_tile_m == expected_tile
+    assert layer._cb_fp4_fused_sm_count == 48
+    assert layer._cb_fp4_fused_tile_candidate_ctas == (
+        ((M + 255) // 256) * ((N + 127) // 128)
+    )
+
+
+@pytest.mark.parametrize("value", ["rowwise", "rowwise_midm"])
+def test_dense_rowwise_modes_reach_only_the_rowwise_activation_family(
+    monkeypatch, value
+):
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.is_fp4 = True
+    observed = []
+
+    def attempt(layer, x, n, k, m, *, rowwise=False):
+        observed.append(rowwise)
+        return torch.zeros(m, n, dtype=x.dtype)
+
+    method._try_fused_fp4 = attempt
+    layer = types.SimpleNamespace(_cb_N=8, _cb_K=256)
+    out = method._apply_inline(
+        layer, torch.zeros(32, 256, dtype=torch.bfloat16)
+    )
+    assert out.shape == (32, 8)
+    assert observed == [True]
+
+
+@pytest.mark.parametrize("value", ["static_lsq", "static_lsq_midm"])
+def test_dense_static_lsq_modes_reach_only_the_lsq_activation_family(
+    monkeypatch, value
+):
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.is_fp4 = True
+    observed = []
+
+    def attempt(
+        layer, x, n, k, m, *, rowwise=False, static_lsq=False,
+    ):
+        observed.append((rowwise, static_lsq))
+        return torch.zeros(m, n, dtype=x.dtype)
+
+    method._try_fused_fp4 = attempt
+    layer = types.SimpleNamespace(_cb_N=8, _cb_K=256)
+    out = method._apply_inline(
+        layer, torch.zeros(32, 256, dtype=torch.bfloat16)
+    )
+    assert out.shape == (32, 8)
+    assert observed == [(False, True)]
+
+
+@pytest.mark.parametrize(
     "k,n_sub,expected",
     [(24, 2, True), (20, 1, True), (21, 1, False)],
     ids=["product-k24-16k", "signed-s20-16k", "signed-s21-over-16k"],
@@ -218,12 +353,14 @@ def test_dense_fused_fp4_selector_enforces_lut_smem_limit(
     method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
     method.is_fp4 = True
     method.is_v2 = True
+    method.has_static_fp4_activation = True
     method.k = k
     method.n_sub = n_sub
     method.type_size = 4 * k + 9
     layer = types.SimpleNamespace(
         _cb_N=8,
         _cb_row_offset=torch.zeros(8, dtype=torch.int32),
+        _cb_fp4_input_global_scale=torch.ones(1, dtype=torch.float32),
     )
 
     vops = types.ModuleType("vllm._custom_ops")
@@ -238,6 +375,122 @@ def test_dense_fused_fp4_selector_enforces_lut_smem_limit(
 
     monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: FusedExt())
     assert method._fused_fp4_ok(layer, 256) is expected
+
+
+def test_dense_static_and_rowwise_eligibility_are_isolated(monkeypatch):
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.is_fp4 = True
+    method.is_v2 = True
+    method.has_static_fp4_activation = False
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    layer = types.SimpleNamespace(
+        _cb_N=8,
+        _cb_row_offset=torch.zeros(8, dtype=torch.int32),
+    )
+
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = object()
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    from gridbook import cuda_ext
+
+    class FusedExt:
+        cb_fused_fp4_prefill_mm_scaled = object()
+        cb_nvfp4_quantize_rows = object()
+        cb_nvfp4_quantize_static_lsq = object()
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: FusedExt())
+    # A legacy artifact is rejected by the unchanged static family even when
+    # every kernel symbol exists, but the explicit rowwise family may run.
+    assert method._fused_fp4_ok(layer, 256) is False
+    assert method._fused_fp4_ok(layer, 256, rowwise=True) is True
+    assert method._fused_fp4_ok(layer, 256, static_lsq=True) is False
+
+
+def test_dense_rowwise_eligibility_requires_quantizer_and_gemm(monkeypatch):
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.is_fp4 = True
+    method.is_v2 = True
+    method.has_static_fp4_activation = True
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    layer = types.SimpleNamespace(
+        _cb_N=8,
+        _cb_row_offset=torch.zeros(8, dtype=torch.int32),
+        _cb_fp4_input_global_scale=torch.tensor(2.0),
+        _cb_fp4_input_global_scale_f32=2.0,
+    )
+
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = object()
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    from gridbook import cuda_ext
+
+    class StaticOnlyExt:
+        cb_fused_fp4_prefill_mm_scaled = object()
+
+    monkeypatch.setattr(
+        cuda_ext, "get_fused_fp4_ext", lambda: StaticOnlyExt()
+    )
+    assert method._fused_fp4_ok(layer, 256) is True
+    assert method._fused_fp4_ok(layer, 256, rowwise=True) is False
+    assert method._fused_fp4_ok(layer, 256, static_lsq=True) is False
+
+
+def test_dense_static_lsq_eligibility_requires_contract_and_matching_symbol(
+    monkeypatch,
+):
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.is_fp4 = True
+    method.is_v2 = True
+    method.has_static_fp4_activation = True
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    layer = types.SimpleNamespace(
+        _cb_N=8,
+        _cb_row_offset=torch.zeros(8, dtype=torch.int32),
+        _cb_fp4_input_global_scale=torch.tensor(2.0),
+        _cb_fp4_input_global_scale_f32=2.0,
+    )
+
+    from gridbook import cuda_ext
+
+    class LsqExt:
+        cb_fused_fp4_prefill_mm_scaled = object()
+        cb_nvfp4_quantize_static_lsq = object()
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: LsqExt())
+    assert method._fused_fp4_ok(layer, 256, static_lsq=True) is True
+
+    unstamped_layer = types.SimpleNamespace(
+        _cb_N=8,
+        _cb_row_offset=torch.zeros(8, dtype=torch.int32),
+        _cb_fp4_input_global_scale=torch.tensor(2.0),
+    )
+    assert method._fused_fp4_ok(
+        unstamped_layer, 256, static_lsq=True
+    ) is False
+
+    legacy = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    legacy.is_fp4 = True
+    legacy.is_v2 = True
+    legacy.has_static_fp4_activation = False
+    legacy.k = 16
+    legacy.n_sub = 2
+    legacy.type_size = 73
+    legacy_layer = types.SimpleNamespace(
+        _cb_N=8, _cb_row_offset=torch.zeros(8, dtype=torch.int32)
+    )
+    assert legacy._fused_fp4_ok(
+        legacy_layer, 256, static_lsq=True
+    ) is False
 
 
 @pytest.fixture(autouse=True)
@@ -615,3 +868,177 @@ def test_fused_lut_guard_rejects_incompatible_fp8_layout(attr, value):
     method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
     setattr(method, attr, value)
     assert method._fused_fp8_lut_ok(layer) is False
+
+
+# ---------------------------------------------------------------------------
+# 4. native-FP4 fused roles: one unambiguous LUT identity per 128-row N tile
+# ---------------------------------------------------------------------------
+
+_FP4_K = 16
+_FP4_TYPE_SIZE = 4 * _FP4_K + 9
+_FP4_SCHEME = {
+    "grid": "fp4", "mode": "product", "k": _FP4_K, "n_sub": 2,
+    "type_size": _FP4_TYPE_SIZE, "group_size": 16, "vec_dim": 8,
+    "codebook_group": "attn", "codebook_source": "learned",
+    "scale_coding": {"kind": "two_tier"},
+}
+_FP4_REF_A = ("cb.fp4.a0", "cb.fp4.a1")
+_FP4_REF_B = ("cb.fp4.b0", "cb.fp4.b1")
+_FP4_BLOCK_VALUES = 2 * (2 ** (_FP4_K // 2)) * 4
+
+
+def _fp4_fused_loaded_layer(role_refs, widths):
+    target_scheme = {
+        role: {**_FP4_SCHEME, "codebook_ref": list(ref)}
+        for role, ref in zip(_FUSED_ROLES, role_refs)
+    }
+    codebooks = {}
+    for ref in role_refs:
+        # Differently named blocks deliberately decode to different E2M1 values
+        # so the dispatch test below can prove both physical LUTs were built.
+        value = 0.0 if ref == _FP4_REF_A else 1.0
+        for name in ref:
+            codebooks[name] = torch.full(
+                (2 ** (_FP4_K // 2), 4), value, dtype=torch.bfloat16)
+
+    class _FusedFp4Config:
+        def __init__(self):
+            self.target_scheme = target_scheme
+
+        @staticmethod
+        def shard_target_keys(prefix, *, unfused_fallback=False):
+            assert prefix == _FUSED_PREFIX and unfused_fallback
+            return list(_FUSED_ROLES)
+
+        @staticmethod
+        def get_codebooks():
+            return codebooks
+
+    method = PrismaQuantCBLinearMethod(
+        _FusedFp4Config(),
+        {**_FP4_SCHEME, "codebook_ref": list(role_refs[0])},
+        _FUSED_PREFIX,
+    )
+    layer = _Layer()
+    rows = sum(widths)
+    row_bytes = (_K // codec.SUPERBLOCK) * _FP4_TYPE_SIZE
+    layer.cb_qweight = torch.nn.Parameter(
+        torch.randint(0, 256, (rows, row_bytes), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    layer.logical_widths = list(widths)
+    layer._cb_input_size = _K
+    method.process_weights_after_loading(layer)
+    # This helper isolates post-load multi-LUT routing. Production artifacts
+    # reach it only after the activation-contract loader has attested and
+    # installed the static native-FP4 scale; model that completed gate here.
+    method.has_static_fp4_activation = True
+    layer._cb_fp4_input_global_scale = torch.tensor([3.0])
+    return method, layer
+
+
+def test_distinct_fp4_refs_emit_tile_identity_map_without_role_lut_copies():
+    method, layer = _fp4_fused_loaded_layer(
+        (_FP4_REF_A, _FP4_REF_B, _FP4_REF_A), (128, 256, 128))
+    assert method.is_fp4
+    assert layer._cb_fp4_fused_lut_ok is True
+    assert layer._cb_fp4_lut_ranges == (
+        (0, _FP4_BLOCK_VALUES),
+        (_FP4_BLOCK_VALUES, _FP4_BLOCK_VALUES),
+    )
+    assert torch.equal(
+        layer._cb_fp4_lut_tile_ids,
+        torch.tensor([0, 1, 1, 0], dtype=torch.int32),
+    )
+    assert layer._cb_flat.numel() == 2 * _FP4_BLOCK_VALUES
+
+
+def test_fp4_tile_map_fails_closed_when_distinct_role_boundary_is_unaligned(
+        monkeypatch):
+    method, layer = _fp4_fused_loaded_layer(
+        (_FP4_REF_A, _FP4_REF_B, _FP4_REF_A), (64, 128, 64))
+    assert layer._cb_fp4_fused_lut_ok is False
+    assert layer._cb_fp4_lut_tile_ids is None
+
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = object()
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    from gridbook import cuda_ext
+    monkeypatch.setattr(
+        cuda_ext, "get_fused_fp4_ext",
+        lambda: pytest.fail("ambiguous tile map queried fused extension"))
+    assert method._fused_fp4_ok(layer, _K) is False
+
+
+def test_fp4_multilut_dispatch_builds_unique_blocks_and_passes_tile_ids(
+        monkeypatch):
+    method, layer = _fp4_fused_loaded_layer(
+        (_FP4_REF_A, _FP4_REF_B, _FP4_REF_A), (128, 256, 128))
+    M, N, K = 32, layer._cb_N, layer._cb_K
+    vops = types.ModuleType("vllm._custom_ops")
+
+    def _quant(x, _global_scale):
+        return (torch.zeros(x.shape[0], x.shape[1] // 2, dtype=torch.uint8),
+                torch.zeros(1, dtype=torch.uint8))
+
+    vops.scaled_fp4_quant = _quant
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    calls = []
+
+    class _FusedExt:
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(
+                aq, sfa, packed, lut, compose, a_scales, b_scales,
+                n, k, k_bits, n_sub, type_size, is_v2, lut_tile_ids,
+                tile_m):
+            calls.append((lut.clone(), lut_tile_ids.clone(), n, k, k_bits,
+                          n_sub, type_size, is_v2, tile_m))
+            return torch.full((aq.shape[0], n), 13.0, dtype=torch.bfloat16)
+
+    from gridbook import cuda_ext
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: _FusedExt())
+    out = method._try_fused_fp4(
+        layer, torch.ones(M, K, dtype=torch.bfloat16), N, K, M)
+    assert torch.equal(out, torch.full_like(out, 13.0))
+    assert len(calls) == 1
+    lut, tile_ids, *_ = calls[0]
+    block_bytes = codec.fp4_value_lut_nbytes(_FP4_K, 2)
+    assert lut.numel() == 2 * block_bytes
+    assert not torch.equal(lut[:block_bytes], lut[block_bytes:])
+    assert torch.equal(tile_ids, torch.tensor([0, 1, 1, 0], dtype=torch.int32))
+
+
+def test_fp4_single_lut_dispatch_keeps_offset_free_binding(monkeypatch):
+    method, layer = _fp4_fused_loaded_layer(
+        (_FP4_REF_A, _FP4_REF_A, _FP4_REF_A), (128, 128, 128))
+    M, N, K = 32, layer._cb_N, layer._cb_K
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = lambda x, _scale: (
+        torch.zeros(x.shape[0], x.shape[1] // 2, dtype=torch.uint8),
+        torch.zeros(1, dtype=torch.uint8),
+    )
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    tile_maps = []
+
+    class _FusedExt:
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(*args):
+            tile_maps.append(args[-2])
+            assert args[-1] == 128
+            return torch.zeros(M, N, dtype=torch.bfloat16)
+
+    from gridbook import cuda_ext
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: _FusedExt())
+    x = torch.ones(M, K, dtype=torch.bfloat16)
+    assert method._try_fused_fp4(layer, x, N, K, M) is not None
+    # Exercise the cached-LUT call as well: ``ranges`` must remain available and
+    # the optional map must stay absent so the kernel preserves TMA/LUT overlap.
+    assert method._try_fused_fp4(layer, x, N, K, M) is not None
+    assert tile_maps == [None, None]
+    assert layer._cb_fp4_lut.numel() == codec.fp4_value_lut_nbytes(_FP4_K, 2)

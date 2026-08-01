@@ -71,6 +71,12 @@ from .moe_routing import (
     cb_grouped_pad_routing,
 )
 from .ops import dispatch_via_op, fp4_act_qdq_or_codec
+from .nvfp4_activation_contract import (
+    CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
+    reciprocal_vector as _nvfp4_reciprocal_vector,
+    require_identical_loaded_scales,
+    rowwise_range_multiplier as _nvfp4_rowwise_range_multiplier,
+)
 
 
 def _row_bytes(in_features: int, type_size: int) -> int:
@@ -123,6 +129,19 @@ _PREFILL_MODES = frozenset({
 })
 _PREFILL_MODE_STATE: list[str | None] = []
 _FUSED_FP4_MOE_STATE: list[str] = []
+_FUSED_FP4_MOE_STATIC_MODES = frozenset(("1", "128", "256"))
+_FUSED_FP4_MOE_STATIC_LSQ_MODES = frozenset(
+    ("static_lsq", "static_lsq128", "static_lsq256")
+)
+_FUSED_FP4_MOE_ROWWISE_MODES = frozenset(
+    ("rowwise", "rowwise128", "rowwise256")
+)
+_FUSED_FP4_MOE_MODES = (
+    _FUSED_FP4_MOE_STATIC_MODES
+    | _FUSED_FP4_MOE_STATIC_LSQ_MODES
+    | _FUSED_FP4_MOE_ROWWISE_MODES
+)
+_FUSED_FP4_MOE_ALLOWED_MODES = frozenset(("",)) | _FUSED_FP4_MOE_MODES
 
 
 def _requested_prefill_mode() -> str | None:
@@ -152,10 +171,12 @@ def _requested_fused_fp4_moe_mode() -> str:
     supported way to compare the paths.
     """
     current = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "").strip()
-    if current not in ("", "1", "128", "256"):
+    if current not in _FUSED_FP4_MOE_ALLOWED_MODES:
         raise ValueError(
             "invalid PRISMAQUANT_CB_FUSED_FP4_MOE="
-            f"{current!r}; expected '', '1', '128', or '256'"
+            f"{current!r}; expected '', '1', '128', '256', 'static_lsq', "
+            "'static_lsq128', 'static_lsq256', 'rowwise', 'rowwise128', "
+            "or 'rowwise256'"
         )
     if not _FUSED_FP4_MOE_STATE:
         _FUSED_FP4_MOE_STATE.append(current)
@@ -209,6 +230,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         self.k = int(scheme["k"])
         self.n_sub = int(scheme["n_sub"])
         self.type_size = int(scheme["type_size"])
+        self.has_static_fp4_activation = (
+            self.is_fp4
+            and scheme.get("activation_contract")
+            == _NVFP4_ACTIVATION_CONTRACT_KEY
+        )
         sc = scheme.get("scale_coding")
         if isinstance(sc, dict):
             self.is_v2 = sc.get("kind") == codec.SCALE_CODING_TWO_TIER
@@ -268,6 +294,17 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2s, dict(attrs))
             layer.register_parameter("w2_weight_scale", w2s)
 
+        if getattr(self, "has_static_fp4_activation", False):
+            for which in ("w13", "w2"):
+                scale = torch.nn.Parameter(
+                    torch.full((1,), float("nan"), dtype=torch.float32),
+                    requires_grad=False,
+                )
+                set_weight_attrs(scale, dict(attrs))
+                layer.register_parameter(
+                    f"{which}_input_global_scale", scale
+                )
+
         # Instance-level load hook (GGUF-plugin pattern, zero core patches):
         # vLLM's RoutedExperts.load_weights maps checkpoint names by
         # substring-replacing the projection name, which (a) derives DOTTED
@@ -284,6 +321,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 "down_proj.cb_qweight": "w2_cb_qweight",
                 "gate_up_proj.weight_scale": "w13_weight_scale",
                 "down_proj.weight_scale": "w2_weight_scale",
+                "gate_up_proj.input_global_scale": (
+                    "w13_input_global_scale"
+                ),
+                "down_proj.input_global_scale": "w2_input_global_scale",
             }
 
             def _cb_load_weights(weights):
@@ -298,7 +339,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                                 f"{tuple(w.shape)} != param {tuple(p.shape)}"
                                 f" — stacked (E, out, bytes) contract violated")
                         p.data.copy_(w.to(p.dtype))
-                        mark_filled(p)          # fill path 1 of 2 (per-layer)
+                        if pname.endswith("cb_qweight"):
+                            mark_filled(p)      # fill path 1 of 2 (per-layer)
                         yield pname
                     else:
                         deferred.append((name, w))
@@ -320,6 +362,40 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         dev = layer.w13_cb_qweight.device
         E = layer.w13_cb_qweight.shape[0]
         codebooks = self.quant_config.get_codebooks()
+        if getattr(self, "has_static_fp4_activation", False):
+            stage_targets = self.quant_config.moe_activation_stage_targets(
+                self.prefix
+            )
+            for which in ("w13", "w2"):
+                param_name = f"{which}_input_global_scale"
+                if not hasattr(layer, param_name):
+                    raise ValueError(
+                        f"{self.prefix}: contracted FP4-CB MoE has no "
+                        f"{param_name} parameter"
+                    )
+                targets = stage_targets[which]
+                if not targets:
+                    raise ValueError(
+                        f"{self.prefix}: contracted FP4-CB MoE has no "
+                        f"physical activation target for {which}"
+                    )
+                expected = self.quant_config.activation_scales_for_targets(
+                    targets
+                )
+                scale = require_identical_loaded_scales(
+                    getattr(layer, param_name).data,
+                    prefix=f"{self.prefix}.{which}",
+                    expected=expected,
+                )
+                setattr(layer, f"_cb_fp4_input_global_scale_{which}", scale)
+                # The shared static-LSQ quantizer takes the already-attested
+                # F32 by value. Cache it once at load so MoE prefill never
+                # performs a device-to-host scalar read in steady state.
+                setattr(
+                    layer,
+                    f"_cb_fp4_input_global_scale_{which}_f32",
+                    float(expected[0]),
+                )
         ref = self.scheme["codebook_ref"]
         names = ref if isinstance(ref, list) else [ref]
         subs = [codebooks[n].to(dev) for n in names]
@@ -550,11 +626,15 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # fp4-MMA fused MoE prefill. One tile-indexed grouped
         # block-scaled launch per projection stage (OMMA.SF.16864, k=64),
         # the fp8 grouped_fused_v2 mechanism with the packed-CB decode in the
-        # producer/prologue. Values: "1"/"128" tile_m=128, "256" tile_m=256.
-        # NOTE the activation bucket changes on this path (native NVFP4 quant,
-        # not codec.fp4_group16_act_qdq). An explicit PRISMAQUANT_CB_PREFILL
-        # is authoritative and bypasses this opt-in attempt, so stock/loop
-        # remain real bisection controls rather than being silently preempted.
+        # producer/prologue. Static values: "1"/"128" tile_m=128 and "256"
+        # tile_m=256. Runtime per-row values: "rowwise"/"rowwise128" and
+        # "rowwise256". Static modes require the artifact's fully attested,
+        # stage-specific activation scalars; static-LSQ modes keep those same
+        # scalars and packed activation bytes while fitting the existing EVT
+        # residual per row. Only explicit rowwise modes may fuse a legacy
+        # artifact. An explicit PRISMAQUANT_CB_PREFILL remains
+        # authoritative and bypasses this opt-in attempt, so stock/loop remain
+        # real bisection controls rather than being silently preempted.
         # Explicit opt-in until a served quality gate and routing-shape ladder
         # pass. Tile 128 is 5.2-5.6x faster than the per-expert loop on the
         # measured shapes, but its padding cost has a sharp token-count cliff.
@@ -563,10 +643,12 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         requested_mode = _requested_prefill_mode()
         if requested_mode is None and self.is_fp4 and num_tokens > 16:
             gf4 = _requested_fused_fp4_moe_mode()
-            if gf4 in ("1", "128", "256"):
+            if gf4 in _FUSED_FP4_MOE_MODES:
                 out = self._apply_prefill_grouped_fused_fp4(
                     layer, x, topk_weights, topk_ids, act,
-                    tile_m=256 if gf4 == "256" else 128)
+                    tile_m=256 if gf4.endswith("256") else 128,
+                    rowwise=gf4 in _FUSED_FP4_MOE_ROWWISE_MODES,
+                    static_lsq=gf4 in _FUSED_FP4_MOE_STATIC_LSQ_MODES)
                 if out is not None:
                     return out
 
@@ -609,48 +691,138 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         raise AssertionError(f"unhandled validated CB prefill mode: {mode}")
 
     # -- prefill: fp4 grouped FUSED (block-scaled decode-in-prologue) --------
-    def _gf4_ok(self, layer) -> bool:
+    def _gf4_ok(self, layer, *, rowwise: bool = False,
+                static_lsq: bool = False) -> bool:
         """Eligibility for the fp4 grouped fused prefill (cached per layer).
-        Mirrors cb_fused_fp4_moe_grouped's TORCH_CHECKs so a miss is a silent
-        fall-through to the shipping fp4 modes, never a crash."""
-        ok = getattr(layer, "_cb_gf4_ok", None)
+        Mirrors cb_fused_fp4_moe_grouped's TORCH_CHECKs so a miss is a safe
+        fall-through to the shipping fp4 modes with a cached diagnostic. Static,
+        static-LSQ, and rowwise activation symbol families are isolated from
+        each other."""
+        if rowwise and static_lsq:
+            return False
+        cache_attr = (
+            "_cb_gf4_rowwise_ok" if rowwise else
+            "_cb_gf4_static_lsq_ok" if static_lsq else
+            "_cb_gf4_static_ok"
+        )
+        reason_attr = f"{cache_attr}_reason"
+        ok = getattr(layer, cache_attr, None)
         if ok is not None:
             return ok
-        ok = (self.is_fp4 and self.is_v2
-              and 12 <= self.k <= 24
-              and self.n_sub in (1, 2)
-              and self.type_size == 4 * self.k + 9
-              and layer._cb_hidden % codec.SUPERBLOCK == 0
-              and layer._cb_inter % codec.SUPERBLOCK == 0)
-        if ok:
-            ok = (codec.fp4_value_lut_nbytes(self.k, self.n_sub)
-                  <= codec.FP4_FUSED_LUT_MAX_BYTES)
-        if ok:
+        reason = None
+        if not self.is_fp4:
+            reason = "format is not FP4-CB"
+        elif not self.is_v2:
+            reason = "format is not two-tier layout v2"
+        elif not rowwise and not getattr(
+            self, "has_static_fp4_activation", False
+        ):
+            reason = "artifact has no attested static activation contract"
+        elif not rowwise and any(
+            getattr(layer, f"_cb_fp4_input_global_scale_{which}", None)
+            is None
+            for which in ("w13", "w2")
+        ):
+            reason = "artifact has no loaded stage activation scales"
+        elif not 12 <= self.k <= 24:
+            reason = f"k={self.k} is outside the fused range [12, 24]"
+        elif self.n_sub not in (1, 2):
+            reason = f"n_sub={self.n_sub} is not 1 or 2"
+        elif self.type_size != 4 * self.k + 9:
+            reason = "serialized row type_size is not FP4-CB layout v2"
+        elif layer._cb_hidden % codec.SUPERBLOCK != 0:
+            reason = "hidden size is not superblock aligned"
+        elif layer._cb_inter % codec.SUPERBLOCK != 0:
+            reason = "intermediate size is not superblock aligned"
+        if reason is None and static_lsq:
+            have_host_scales = all(
+                getattr(
+                    layer,
+                    f"_cb_fp4_input_global_scale_{which}_f32",
+                    None,
+                ) is not None
+                for which in ("w13", "w2")
+            )
+            if not have_host_scales:
+                reason = "attested stage scales have no cached host values"
+        if (reason is None
+                and codec.fp4_value_lut_nbytes(self.k, self.n_sub)
+                > codec.FP4_FUSED_LUT_MAX_BYTES):
+            reason = "decoded codebook exceeds the fused LUT capacity"
+        if reason is None and not rowwise and not static_lsq:
             try:
                 import vllm._custom_ops as vops
-                ok = hasattr(vops, "scaled_fp4_quant")
+                have_quantizer = hasattr(vops, "scaled_fp4_quant")
             except Exception:  # noqa: BLE001
-                ok = False
-        if ok:
+                have_quantizer = False
+            if not have_quantizer:
+                reason = "vLLM scaled_fp4_quant is unavailable"
+        if reason is None:
             from .cuda_ext import get_fused_fp4_ext
             fext = get_fused_fp4_ext()
-            ok = fext is not None and hasattr(fext, "cb_fused_fp4_moe_grouped")
-        layer._cb_gf4_ok = bool(ok)
-        return layer._cb_gf4_ok
+            if fext is None:
+                reason = "fused FP4 extension is unavailable"
+            elif not hasattr(fext, "cb_fused_fp4_moe_grouped"):
+                reason = "grouped fused FP4 symbol is unavailable"
+            elif rowwise and not hasattr(fext, "cb_nvfp4_quantize_rows"):
+                reason = "rowwise native FP4 quantizer is unavailable"
+            elif static_lsq and not hasattr(
+                fext, "cb_nvfp4_quantize_static_lsq"
+            ):
+                reason = "static-LSQ native FP4 quantizer is unavailable"
+        ok = reason is None
+        setattr(layer, cache_attr, bool(ok))
+        setattr(layer, reason_attr, reason)
+        if not ok:
+            family = "rowwise" if rowwise else (
+                "static_lsq" if static_lsq else "static"
+            )
+            print(
+                f"[prismaquant-cb] fused_fp4_moe {self.prefix} "
+                f"mode={family} -> fallback ({reason})",
+                flush=True,
+            )
+        return bool(ok)
 
-    def _fp4_quant(self, x2: torch.Tensor):
+    def _fp4_quant(self, layer, x2: torch.Tensor, which: str, *,
+                   rowwise: bool = False, static_lsq: bool = False,
+                   fext=None):
         """Native NVFP4 activation quant (packed e2m1 + swizzled ue4m3 SFA +
-        the per-row fp32 residual for the EVT). Per-tensor global scale, so
-        quant-after-gather == gather-after-quant per row."""
+        the per-row fp32 residual for the EVT). Static mode uses the producer-
+        calibrated, stage-specific scalar. Static-LSQ keeps the same scalar and
+        packed payload while fitting the existing per-row residual. Rowwise
+        mode derives each scalar independently at runtime and consumes no
+        artifact metadata."""
+        if rowwise and static_lsq:
+            raise ValueError("rowwise and static_lsq are mutually exclusive")
+        if rowwise:
+            if fext is None:
+                from .cuda_ext import get_fused_fp4_ext
+                fext = get_fused_fp4_ext()
+            return fext.cb_nvfp4_quantize_rows(
+                x2.contiguous(), _nvfp4_rowwise_range_multiplier()
+            )
+        if static_lsq:
+            if fext is None:
+                from .cuda_ext import get_fused_fp4_ext
+                fext = get_fused_fp4_ext()
+            gs = getattr(
+                layer, f"_cb_fp4_input_global_scale_{which}_f32"
+            )
+            return fext.cb_nvfp4_quantize_static_lsq(x2.contiguous(), gs)
+
         import vllm._custom_ops as vops
-        amax = x2.float().abs().amax()
-        gs = ((448.0 * 6.0) / amax.clamp_min(1e-12)).to(torch.float32)
+        gs = getattr(layer, f"_cb_fp4_input_global_scale_{which}")
         aq, sf = vops.scaled_fp4_quant(x2, gs)
-        recip = (1.0 / gs).reshape(1)
+        recip = _nvfp4_reciprocal_vector(
+            layer, which=which, scale=gs, rows=x2.shape[0]
+        )
         return aq, sf.view(torch.uint8).reshape(-1), recip
 
     def _apply_prefill_grouped_fused_fp4(self, layer, x, topk_weights,
-                                         topk_ids, act, *, tile_m=128):
+                                         topk_ids, act, *, tile_m=128,
+                                         rowwise: bool = False,
+                                         static_lsq: bool = False):
         """fp4 counterpart of ``_apply_prefill_grouped_fused_v2``: identical
         padded routing / gather / throwaway-row combine; the projection GEMMs
         are ONE ``cb_fused_fp4_moe_grouped`` each (native NVF4 block-scaled
@@ -659,7 +831,12 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         (the swizzled SFA plane is row-block-interleaved and cannot be
         gathered), which is bit-equivalent per row at a fixed global scale.
         Returns None on any constraint miss."""
-        if not self._gf4_ok(layer):
+        if not self._gf4_ok(
+            layer, rowwise=rowwise, static_lsq=static_lsq
+        ):
+            return None
+        if ((rowwise or static_lsq)
+                and x.dtype not in (torch.bfloat16, torch.float16)):
             return None
         from .cuda_ext import get_fused_fp4_ext
         fext = get_fused_fp4_ext()
@@ -714,11 +891,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         Mp = a_pad.shape[0]
 
         # stage 1: gate_up = a_pad @ W13[expert_of_tile]^T
-        aq1, sfa1, recip1 = self._fp4_quant(a_pad)
+        aq1, sfa1, recip1 = self._fp4_quant(
+            layer, a_pad, "w13", rowwise=rowwise,
+            static_lsq=static_lsq, fext=fext
+        )
         del a_pad
         gate_up = fext.cb_fused_fp4_moe_grouped(
             aq1, sfa1, w13, lut, compose,
-            recip1.expand(Mp).contiguous(), ones_n1, expert_ids,
+            recip1, ones_n1, expert_ids,
             N1, Kh, kb, self.n_sub, self.type_size, True, tile_m)   # [Mp, N1]
         del aq1, sfa1
         a = torch.empty((Mp, d), dtype=gate_up.dtype, device=dev)
@@ -726,11 +906,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         del gate_up
 
         # stage 2: y = act @ W2[expert_of_tile]^T — SAME expert_ids.
-        aq2, sfa2, recip2 = self._fp4_quant(a)
+        aq2, sfa2, recip2 = self._fp4_quant(
+            layer, a, "w2", rowwise=rowwise,
+            static_lsq=static_lsq, fext=fext
+        )
         del a
         y = fext.cb_fused_fp4_moe_grouped(
             aq2, sfa2, w2, lut, compose,
-            recip2.expand(Mp).contiguous(), ones_kh, expert_ids,
+            recip2, ones_kh, expert_ids,
             Kh, inter, kb, self.n_sub, self.type_size, True, tile_m)
         del aq2, sfa2
 

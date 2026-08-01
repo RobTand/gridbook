@@ -38,6 +38,8 @@ Run scopes:
       PYTHONPATH=/gridbook:/prismaquant python3 -m pytest \\
       /gridbook/tests/test_moe_grouped_fused.py -v'
 """
+import sys
+
 import pytest
 import torch
 
@@ -61,6 +63,38 @@ from test_moe_batched_prefill import (  # noqa: E402
     _routing,
     _silu_act,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_process_stable_moe_selectors():
+    """Give every selector test the equivalent of a fresh serving process.
+
+    The production selectors deliberately reject changing an execution
+    contract after their first read.  Several tests below select different
+    contracts, so retaining that cache across pytest cases makes the module
+    depend on collection/execution order instead of testing one process
+    contract at a time.  Preserve any state owned by an outer test suite,
+    clear both selectors for this case, and restore it exactly afterward.
+    """
+
+    moe = sys.modules.get("gridbook.moe")
+    prefill_before = list(moe._PREFILL_MODE_STATE) if moe is not None else None
+    fused_before = list(moe._FUSED_FP4_MOE_STATE) if moe is not None else None
+    if moe is not None:
+        moe._PREFILL_MODE_STATE.clear()
+        moe._FUSED_FP4_MOE_STATE.clear()
+    try:
+        yield
+    finally:
+        active = sys.modules.get("gridbook.moe")
+        if active is moe and moe is not None:
+            moe._PREFILL_MODE_STATE[:] = prefill_before
+            moe._FUSED_FP4_MOE_STATE[:] = fused_before
+        elif moe is None and active is not None:
+            # The test imported Gridbook's MoE module after fixture setup.
+            # Its selector cache belongs to that simulated process only.
+            active._PREFILL_MODE_STATE.clear()
+            active._FUSED_FP4_MOE_STATE.clear()
 
 
 # --------------------------------------------------------------------------- #

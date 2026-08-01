@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.2 — 2026-08-01
+
+- Add a fixed-scale least-squares native-NVFP4 activation policy for dense and
+  grouped-MoE prefill. It preserves the producer-attested global scale and
+  vLLM-identical packed activation payload, changes only the existing per-row
+  output residual, and reuses the same packed weights, decoder, and GEMM.
+- Improve the fused two-tier scale decoder by 7.9–23.4% across the measured
+  production-shape matrix, and select the existing TileM128/256 dense runners
+  by occupancy. Selected cells improve 22.6–50.3% without copying a kernel
+  body or changing output bits.
+- Keep fused NVFP4 default-off while publishing the full evidence boundary.
+  Qwen3-0.6B K24 passed its exact 6×128 quality gates at 1.478× offline speed;
+  exact chunked 2×512 reached 1.741× but failed the PPL point gate, while the
+  32-window point estimate passed without establishing non-inferiority.
+- Extend the same-process A/B harness with exact chunked-prefill attestation,
+  dense TileM route telemetry, MoE LSQ selection, and explicit fail-closed
+  reasons. Legacy MoE artifacts without serialized activation scales are
+  rejected rather than silently presented as fused measurements.
+- Expand CPU/CUDA coverage for packed activation parity, static and LSQ scale
+  contracts, multi-codebook routing, malformed storage, streams, graphs,
+  grouped routing, selector isolation, and current-source provenance.
+
+[Full diff](https://github.com/RobTand/gridbook/compare/v0.4.1...v0.4.2)
+
 ## 0.4.1 — 2026-08-01
 
 - Keep dense and grouped-MoE fused native-NVFP4 prefill default-off after a
