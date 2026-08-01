@@ -326,6 +326,13 @@ def test_static_scale_makes_native_quantization_chunk_invariant(monkeypatch):
 def test_dense_rowwise_quantizer_outputs_feed_the_existing_fused_gemm(
     monkeypatch,
 ):
+    from gridbook import nvfp4_activation_contract as activation_contract
+
+    # A phase screen must touch only the rowwise activation family.  The
+    # weight-side E4M3 ceiling remains fixed in codec.build_compose_u8.
+    monkeypatch.setattr(
+        activation_contract, "ROWWISE_RANGE_MULTIPLIER", 256.0
+    )
     method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
     method.k = 16
     method.n_sub = 2
@@ -386,7 +393,7 @@ def test_dense_rowwise_quantizer_outputs_feed_the_existing_fused_gemm(
 
     assert one.shape == (1, 8)
     assert batch.shape == (3, 8)
-    assert [call[3] for call in quant_calls] == [448.0, 448.0]
+    assert [call[3] for call in quant_calls] == [256.0, 256.0]
     assert torch.equal(quant_calls[0][0][0], quant_calls[1][0][0])
     assert torch.equal(quant_calls[0][1][0], quant_calls[1][1][0])
     assert torch.equal(quant_calls[0][2][0], quant_calls[1][2][0])
@@ -395,3 +402,20 @@ def test_dense_rowwise_quantizer_outputs_feed_the_existing_fused_gemm(
     assert torch.equal(gemm_calls[0][0], quant_calls[0][0])
     assert torch.equal(gemm_calls[0][1], quant_calls[0][1].reshape(-1))
     assert torch.equal(gemm_calls[0][2], quant_calls[0][2])
+
+
+def test_rowwise_phase_override_cannot_change_weight_compose_bytes(
+    monkeypatch,
+):
+    from gridbook import codec
+    from gridbook import nvfp4_activation_contract as activation_contract
+
+    expected = codec.build_compose_u8().clone()
+    assert codec.FP8_ELEMENT_MAX == 448.0
+    monkeypatch.setattr(
+        activation_contract, "ROWWISE_RANGE_MULTIPLIER", 256.0
+    )
+
+    assert activation_contract.rowwise_range_multiplier() == 256.0
+    assert codec.FP8_ELEMENT_MAX == 448.0
+    assert torch.equal(codec.build_compose_u8(), expected)

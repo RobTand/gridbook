@@ -319,6 +319,11 @@ def test_moe_native_quant_uses_distinct_static_stage_scales(
 
 
 def test_moe_rowwise_quant_uses_returned_per_row_operands(moe, monkeypatch):
+    from gridbook import nvfp4_activation_contract as activation_contract
+
+    monkeypatch.setattr(
+        activation_contract, "ROWWISE_RANGE_MULTIPLIER", 256.0
+    )
     method = _fp4(moe)
     method.has_static_fp4_activation = False
     layer = types.SimpleNamespace()
@@ -353,7 +358,7 @@ def test_moe_rowwise_quant_uses_returned_per_row_operands(moe, monkeypatch):
         rowwise=True,
         fext=Ext(),
     )
-    assert [call[3] for call in calls] == [448.0, 448.0]
+    assert [call[3] for call in calls] == [256.0, 256.0]
     assert torch.equal(one[0], calls[0][0])
     assert torch.equal(one[1], calls[0][1])
     assert torch.equal(one[2], calls[0][2])

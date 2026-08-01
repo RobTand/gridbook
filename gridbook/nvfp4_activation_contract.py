@@ -22,6 +22,14 @@ CONTRACT_KEY = "nvfp4_w4a4"
 CONTRACT_SCHEMA = "prismaquant.nvfp4_w4a4_activation.v1"
 EXECUTION_CONTRACT = "e2m1_group16_ue4m3_static"
 GROUP_SIZE = 16
+# Rowwise activation quantization owns a phase/range multiplier that is
+# deliberately separate from ``codec.FP8_ELEMENT_MAX``.  The latter is also
+# the serialized E4M3 ceiling used to compose FP4-CB weight scales; changing it
+# to run an activation experiment would silently change the decoded weights.
+# Keep the production default at the native full-range endpoint.  A dedicated
+# helper gives dense and MoE one shared runtime owner and lets validation
+# override only this activation choice in-process.
+ROWWISE_RANGE_MULTIPLIER = 448.0
 TENSOR_SUFFIX = "input_global_scale"
 VALUE_DTYPE = "float32"
 LEGACY_POLICY = "legacy_6_over_calibration_amax.v1"
@@ -36,6 +44,24 @@ SUPPORTED_POLICIES = frozenset((
 ))
 
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def rowwise_range_multiplier() -> float:
+    """Return the runtime-only UE4M3 phase/range multiplier.
+
+    This value is not an artifact field and cannot modify the producer-owned
+    static activation contract.  Validation may temporarily replace the
+    module constant before serving starts; malformed values fail before the
+    CUDA binding is entered.
+    """
+
+    value = float(ROWWISE_RANGE_MULTIPLIER)
+    if not math.isfinite(value) or not 0.0 < value <= 448.0:
+        raise ValueError(
+            "NVFP4 rowwise range multiplier must be finite and in (0,448], "
+            f"got {value!r}"
+        )
+    return value
 
 
 def parse_contract(config: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -268,11 +294,13 @@ __all__ = [
     "GROUP_SIZE",
     "LEGACY_POLICY",
     "MSE_GRID_POLICY",
+    "ROWWISE_RANGE_MULTIPLIER",
     "SUPPORTED_POLICIES",
     "TENSOR_SUFFIX",
     "VALUE_DTYPE",
     "parse_contract",
     "reciprocal_vector",
+    "rowwise_range_multiplier",
     "require_identical_loaded_scales",
     "scale_f32",
     "target_values_sha256",

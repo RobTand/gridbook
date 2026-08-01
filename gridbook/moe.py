@@ -75,6 +75,7 @@ from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
     reciprocal_vector as _nvfp4_reciprocal_vector,
     require_identical_loaded_scales,
+    rowwise_range_multiplier as _nvfp4_rowwise_range_multiplier,
 )
 
 
@@ -725,7 +726,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 from .cuda_ext import get_fused_fp4_ext
                 fext = get_fused_fp4_ext()
             return fext.cb_nvfp4_quantize_rows(
-                x2.contiguous(), codec.FP8_ELEMENT_MAX
+                x2.contiguous(), _nvfp4_rowwise_range_multiplier()
             )
 
         import vllm._custom_ops as vops

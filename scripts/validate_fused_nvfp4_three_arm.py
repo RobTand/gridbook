@@ -630,6 +630,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     moe = bootstrap.moe
     runtime = bootstrap.runtime
     extension = bootstrap.extension
+    from gridbook import nvfp4_activation_contract
+
     candidate_vocab_size = bootstrap.candidate_vocab_size
     candidate_artifact_provenance = bootstrap.candidate_artifact_provenance
     prompts = bootstrap.prompts
@@ -851,6 +853,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "baseline": "fp32-emulated group-scale FP4 activation QDQ",
             "static": "artifact-attested global FP32 scale + UE4M3 factors",
             "rowwise": "independent runtime row scale + UE4M3 factors",
+            "rowwise_range_multiplier": (
+                nvfp4_activation_contract.rowwise_range_multiplier()
+            ),
             "all_same_contract": False,
         },
         "settings": validation_common.shared_report_settings(

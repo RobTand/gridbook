@@ -32,6 +32,7 @@ from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
     reciprocal_vector as _nvfp4_reciprocal_vector,
     require_identical_loaded_scales,
+    rowwise_range_multiplier as _nvfp4_rowwise_range_multiplier,
 )
 
 # NOTE: the fused-sibling fallback map (qkv_proj, gate_up_proj, in_proj_qkvz,
@@ -622,7 +623,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # operands consumed by the existing fused GEMM; no weight decoder,
             # GEMM, or artifact representation is duplicated for this mode.
             aq, sfa, a_scales = fext.cb_nvfp4_quantize_rows(
-                x2.contiguous(), codec.FP8_ELEMENT_MAX
+                x2.contiguous(), _nvfp4_rowwise_range_multiplier()
             )
         else:
             import vllm._custom_ops as vops
