@@ -129,8 +129,8 @@ prefill expander:
   - **`rowpack`** — round-3 experiment: one block owns `RPB` rows of one pair,
     staging the pair's activation in smem once and running `RPB` independent
     decode streams (targets the low K14/K16 rungs). Further-reassociated (same
-    tolerance contract), pending its own served check. `PRISMAQUANT_CB_W2_ROWS`
-    tunes `RPB ∈ {4,8,16}`.
+    tolerance contract), but measured negative and retained only for
+    reproducibility. `PRISMAQUANT_CB_W2_ROWS` tunes `RPB ∈ {4,8,16}`.
   All schedule/double-buffer switches are read host-side in the launcher
   (CUDA-graph-capture-safe; no device reads, no new syncs).
 - **`cb_expand_fp8`** — transient prefill expander: decodes the packed stream to
@@ -175,7 +175,8 @@ build. **Verdict: measured negative for dense prefill** — parity-green but 2�
 slower than expand-then-GEMM at 27B shapes, because the CUDA expander had already
 cut the dense expand tax to ~10%. Retained as a schedule reference and quarantined
 behind `PRISMAQUANT_ENABLE_PTC=1`; **do not enable it**. The MoE analog of the
-idea is still open — see [`ROADMAP.md`](../ROADMAP.md).
+idea is tracked only in the canonical
+[`kernel TODO`](../ROADMAP.md#kernel-todo-canonical).
 
 ## Environment switches
 

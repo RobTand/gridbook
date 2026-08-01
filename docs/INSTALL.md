@@ -333,8 +333,8 @@ discrete GPU with its own VRAM, ordinary vLLM utilization guidance applies.
   it improved a close-rate 0.6B canary by 20.1%. Keep eager for published
   recipes until that graph setup clears their own streaming gate; see
   [`KERNELS.md`](KERNELS.md#cuda-graph-safety-rules).
-- **This repo serves the format; it does not produce artifacts.** A reference
-  encoder is a [roadmap](../ROADMAP.md) item.
+- **This repo serves the format; it does not produce artifacts.** PrismaQuant is
+  the canonical producer; Gridbook does not maintain a duplicate encoder.
 - **vLLM internals coupling.** gridbook imports fused-MoE and quantization
   internals that are not part of any stability contract. Pin a vLLM version you
   have tested.

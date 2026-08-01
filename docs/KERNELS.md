@@ -2,7 +2,9 @@
 
 This document describes how a `gridbook` artifact is served fast. It is a design and
 status document, not an API reference; the normative decode semantics are in
-[`SPEC.md`](SPEC.md).
+[`SPEC.md`](SPEC.md). The single live implementation checklist is the
+[`ROADMAP.md` kernel TODO](../ROADMAP.md#kernel-todo-canonical); status prose
+here is evidence and design context, not a second backlog.
 
 Terminology used below: **GEMM** = matrix-matrix multiply (prefill / large batch);
 **GEMV** = matrix-vector multiply (decode / batch-1 or small batch); **M** = the
@@ -144,10 +146,12 @@ collective, packed-B TMA load + consumer-side smem decode). Its honest status:
 - It **loses at large M** (≈0.22× at M≈1400). This is *structural, not a bug*:
   every M-tile CTA re-decodes the same weight (B) tiles, so decode work scales with
   `ceil(M / tile)` while the transient path expands each tile exactly once.
-- Large-M parity therefore requires a **weight-stationary / persistent-N schedule**
-  (decode each weight tile once, loop M inside the CTA) — a kernel-layer
-  restructure beyond the collective fork. Until that lands, the serial transient
-  path is the default for large-M prefill.
+- Large-M parity therefore requires some **weight-stationary/no-HBM-
+  materialization design** that amortizes weight decode across M. The first
+  persistent-N implementation landed, passed parity, and measured 2–5.7×
+  slower than transient expand at 27B shapes; it is rejected. Any replacement
+  starts from the fresh roofline in the canonical TODO, while the serial
+  transient path remains the large-M default.
 
 A **baseline-parity gate** precedes all fork work: a plain `sm_120` block-scaled
 GEMM built from vendored CUTLASS headers matches the runtime's native
@@ -228,7 +232,8 @@ bytes were never read (bit-identical output, verified with
 
 The remaining MoE prefill target is an activation-contract-preserving
 persistent/grouped decode-in-mainloop schedule (the expand is ~35% of MoE
-layer time at Laguna scale) — see [`ROADMAP.md`](../ROADMAP.md).
+layer time at Laguna scale) — see
+[`K1.1` in the kernel TODO](../ROADMAP.md#kernel-todo-canonical).
 
 ---
 
@@ -302,7 +307,7 @@ too.
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
 | MoE grouped decode GEMV, smem-resident dictionary | **Opt-in** (`PRISMAQUANT_CB_GEMV=v2`), never a default. Wins 1.13–1.58× on k13/k16/k20 in a 16-cell GB10 sweep; loses on k24 at K≥2048 (occupancy wall), where a compiled predicate routes the cell back to the shipped kernel. Reassociation-class output difference vs the default schedule (9/204 synthetic cells, worst `max_rel` 5.88e-03) — **not** bit-exact. Live GB10 validation on Jason Wong's 117B Laguna release dispatched all 94 expert stacks to v2 with no fallback and measured 24.993 vs 23.585 tok/s (+5.97%); long-prefill, concurrency, and soak requests completed without Gridbook errors |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
-| FP8-CB fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — persistent-N is the answer |
+| FP8-CB fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — the first dense persistent-N replacement was measured negative; a fresh design study remains open |
 | NVFP4-CB fused native-FP4 prefill (dense) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, and p95 served gates remain open |
 | Persistent-N large-M dense prefill | **Built and MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. Quarantined behind `PRISMAQUANT_ENABLE_PTC=1` as a schedule reference; do not enable it. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
 | MoE prefill | **Shipped**: CUDA chunk-expander into vLLM's fused-MoE grouped kernel; fp8-CB default is `auto` (measured per-layer path selection). Laguna-S-2.1 117B: 293 → 1,821 tok/s @8k, 207 → 1,822 @63k. fp4-CB defaults to conservative `loop`; native fused-FP4 and its shared `static_lsq` policy remain explicit A/B opt-ins without MoE quality qualification. Explicit `stock` uses a byte-budgeted expert chunk (1,184 MiB vs 4,736 MiB measured transient on a 192-expert band) and no pad copy |

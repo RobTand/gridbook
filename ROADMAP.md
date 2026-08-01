@@ -1,9 +1,14 @@
 # Roadmap
 
 What is done, what is open, and what was tried and rejected. Nothing here is a
-commitment to a date. Kernel statuses below track the internal kernel/format
-standard; a path is **DEFAULT** (on, no flag), **OPT-IN** (behind an environment
-switch), or **MEASURED NEGATIVE** (built, measured, and kept off).
+commitment to a date. This is the **canonical queue for kernel work and its
+enablement dependencies**;
+[`docs/KERNELS.md`](docs/KERNELS.md) explains the design,
+[`docs/PLUGIN.md`](docs/PLUGIN.md) documents the shipped controls, and dated
+audits preserve evidence rather than maintaining parallel TODO lists. Kernel
+statuses below track the internal kernel/format standard; a path is **DEFAULT**
+(on, no flag), **OPT-IN** (behind an environment switch), or **MEASURED
+NEGATIVE** (built, measured, and kept off).
 
 ---
 
@@ -35,22 +40,142 @@ still describe some of them as future work.
 - **Packaging.** The CUDA sources ship inside the Python package, so a
   non-editable `pip install` produces a working CUDA path. Previously any
   non-editable install silently degraded to the Triton fallback.
+- **FP8-CB hardware floor.** An FP8-CB artifact now fails early with a clear
+  `sm_89+` requirement rather than loading on `sm_80` and failing at its first
+  large-M prefill.
 
 ---
 
 ## Open
 
-### Reference encoder
+### Kernel TODO (canonical)
 
-This repository defines and **serves** the format; it does not yet **produce**
-artifacts. They come from the authors' offline research pipeline
-([PrismaQuant](https://github.com/RobTand/prismaquant)), which is not part of
-this repo. A standalone, documented reference encoder is planned — codebook
-construction, the weighted product-VQ search, the two-tier scale encoder and the
-safetensors exporter — so that anyone can turn a BF16 model into a gridbook
-artifact using only this repository and [`docs/SPEC.md`](docs/SPEC.md). Until it
-lands, the spec is deliberately complete enough to implement an encoder
-independently.
+Priority means dependency order: **P0** blocks a fused-NVFP4 promotion decision,
+**P1** is the next native-parity work, and **P2** is useful but not on the
+critical path. A checked item requires merged code, regression tests, and the
+applicable evidence gate; a fast standalone kernel is not sufficient served
+evidence.
+
+The implementation rule is one payload, one activation quantizer, one weight
+decoder, and one GEMM/grouped-GEMM per execution contract. New policies and
+backends must compose those pieces; they must not introduce a second packer,
+resident weight copy, decoder, or matmul merely to create another route.
+
+#### P0 — decide fused NVFP4 safely
+
+- [ ] **K0.1 — Align the producer and consumer releases.** In PrismaQuant, bump
+  the immutable Gridbook runtime pin from 0.4.1 (`59cebf9`) to 0.4.2
+  (`1634210`), rerun cross-repository contract/provenance CI, and publish the
+  resulting patch release. Do not copy the Gridbook runtime back into the
+  producer.
+- [ ] **K0.2 — Produce a valid routed-MoE validation artifact.** Re-export a
+  manageable representative model with producer-attested, stage-specific
+  `input_global_scale` values for both `w13` and `w2`. The existing partial LFM
+  artifact has no such payload, so all fused attempts correctly fail closed;
+  inventing a runtime scale is not an acceptable workaround.
+- [ ] **K0.3 — Finish shared fused-JIT attestation and fail-fast loading.** The
+  fused-FP4 source/header/ABI identity and strict two-module preload validation
+  shipped in 0.4.2. Extract that facility and apply it to every header-bearing
+  fused extension, including FP8, so packaged sources/headers, target
+  architecture, Python/Torch/CUDA/compiler ABI, and external CUTLASS sentinels
+  key every affected module and cache. Reject non-`sm_120`/`sm_121` targets
+  before either fused build starts, and make required validation fail when the
+  requested call route—not merely its module—does not execute.
+- [ ] **K0.4 — Finish grouped-MoE routing and telemetry.** Replace the manual
+  TileM128/256 choice with a CUDA-graph-safe selector that accounts for routed
+  token counts, padding, both stages' shapes, and occupancy. Emit the requested
+  activation policy, actual kernel symbol, TileM, shape, activation contract,
+  fallback state, and exact fallback reason for dense and MoE calls.
+- [ ] **K0.5 — Profile and close the fused-NVFP4 raw operator gap.** Split
+  activation quantization, packed-B decode, synchronization, MMA, epilogue,
+  and launch costs and compare against the matching stock
+  `sm120_nvf4_mm_scaled` execution contract. Optimize from that profile while
+  retaining the shared quantizer, packed payload, decoder collective, and
+  concrete GEMM runners.
+- [ ] **K0.6 — Run the promotion gate and make an explicit decision.** In one
+  pinned serving session, compare fused and current paths on a dense model of
+  at least 4B plus a representative routed MoE. Cover full-vocabulary teacher
+  KL/PPL/tasks, prompt-length distribution, concurrency, chunked prefill,
+  plain and shipped batched/speculative decode, and routed-token histograms.
+  Keep the flags default-off unless every
+  [fused-NVFP4 reconsideration gate](docs/audits/fused_nvfp4_enablement_2026-07-31.md#reconsideration-gates)
+  passes, including the p95 TTFT win, per-cell regression limit, zero
+  unexplained fallback, and supported-runtime revalidation.
+
+#### P1 — close the remaining native-parity gaps
+
+- [ ] **K1.1 — Build large-M grouped MoE decode-in-mainloop.** Decode an expert
+  weight tile once, stream its routed/padded M rows through it, and time the
+  whole routed operator. It must preserve the selected activation payload,
+  avoid an expanded `[E,N,K]` HBM tile, handle empty/uneven routing, and remain
+  stream- and graph-safe. This is a new MoE schedule, not a revival of the
+  measured-negative dense persistent-N kernel.
+- [ ] **K1.2 — Cover the complete FP8-CB mid-M production rung surface.** The
+  fused kernel currently instantiates only K28/32/36/40/44/48 while production
+  permits every K28 through K48. Either instantiate and test every product rung
+  or encode the concrete route/fallback in the candidate identity and timing
+  surface so the allocator cannot price an unbacked fast path.
+- [ ] **K1.3 — Reassess large-M dense FP8-CB from a fresh roofline.** The
+  transient path remains about 1.44x native, but the existing persistent-N
+  implementation was 2–5.7x slower. Profile current traffic and synchronization
+  first; only build a replacement schedule if the model shows a realizable win.
+  Do not continue or enable the quarantined implementation as unfinished work.
+- [ ] **K1.4 — Complete graph and alternate-schedule qualification.** Run the
+  exact-byte 27B streaming gate for `FULL_DECODE_ONLY` CUDA graphs, and qualify
+  `cb_gemv_v2` on `sm_120` with same-session quality, telemetry, long prefill,
+  concurrency, and soak coverage before considering a default change.
+
+#### P2 — completeness and wider qualification
+
+- [ ] **K2.1 — Resolve FP4-v1 MoE explicitly.** Either implement its transient
+  and grouped path with the existing v1 decoder, or reject v1 expert artifacts
+  at load with a precise support error. Production FP4-CB v2 remains the
+  priority.
+- [ ] **K2.2 — Revisit k24 long-K `cb_gemv_v2` staging only with evidence.** A
+  double-buffered row stage is optional; implement it only if profiling predicts
+  and an interleaved benchmark confirms a win over the safe compiled fallback.
+- [ ] **K2.3 — Automate hardware qualification.** Add self-hosted CUDA compile,
+  SASS, wheel-install, custom-op, non-default-stream, graph, and fail-if-skipped
+  tests. Qualify both `sm_120` and `sm_121`, then extend only the paths that are
+  legal on Ada/Hopper.
+
+#### Blocked or deferred
+
+- [ ] **KB.1 — Add approved W4A16 support when AMD validation hardware is
+  available.** Gridbook should own one exact pack/schema/metadata/profile/loader
+  and delegation path, initially reusing vLLM's upstream
+  `RDNAHybridW4A16` execution backend. Do not author a duplicate W4A16 kernel
+  or packer. The prior Strix Halo results are arithmetic bring-up evidence, not
+  served validation, and no gfx1151/HIP kernel work is active while hardware
+  access is unavailable.
+
+#### Before DSV4 Flash (integration, not new kernels)
+
+- [ ] **D0.1 — Establish the exact serving contract.** Verify the released
+  model's vLLM architecture, tensor-parallel requirement, expert layout, and
+  backend legality before promising support. Gridbook does not currently
+  register `deepseek_v4` and rejects TP greater than one; add only the runtime,
+  sharding, and export support the inspected model actually requires.
+- [ ] **D0.2 — Complete packed-expert native delegation if the assignment needs
+  it.** Reuse Gridbook's existing top-level expert-loader path, canonical
+  producer packers/metadata, and a version-attested upstream vLLM backend for
+  rank-3 stock NVFP4/FP8 experts. Do not create another packer, loader, or
+  native kernel. Fail closed if a selected backend drops activation scales and
+  changes a declared W4A4 unit into W4A16.
+- [ ] **D0.3 — Close the exact-rate evidence gap.** Rerun exact-byte
+  0.6B/4B/27B endpoints and optimized menus over the representative workload
+  matrix. At 4.5 bpp compare native NVFP4 with FP8-CB K36 using exact
+  whole-artifact bytes; below 4.5 bpp evaluate byte-neutral assignments whose
+  NVFP4 promotions are funded by lower CB rungs elsewhere. Record format/rung,
+  layout, activation quantization, concrete backend, GPU/runtime identity, TP,
+  and fallback state. This is an empirical release gate, not a reason to build
+  another byte accountant or unconstrained allocator; follow
+  [`docs/NATIVE-PARITY.md`](docs/NATIVE-PARITY.md).
+
+Do not reopen a measured-negative schedule without new profiling evidence. In
+particular, the dense persistent-N implementation, blanket `grouped_fused` MoE
+default, w2 rowpack, decode-contract-v2 hoist, L2-pinned pipeline, and naive
+inline CUDA-graph capture remain in [Measured and rejected](#measured-and-rejected).
 
 ### Conformance fixtures for independent implementers
 
@@ -83,23 +208,6 @@ practice rather than in principle.
   [`docs/CONTAINER.md`](docs/CONTAINER.md); no image is published to a registry
   yet.
 
-### Widening measured hardware coverage
-
-Every published number is from one GB10 / DGX Spark (`sm_121`, arm64). The
-decode kernel is architecture-generic by construction and *should* run from
-`sm_80` up, but that is inferred, not measured — see the
-[hardware matrix](docs/INSTALL.md#hardware-matrix). Two concrete code items would
-make the wider claim safe:
-
-- **A capability guard on the dense FP8-CB prefill.** It calls a CUTLASS fp8 GEMM
-  that needs `sm_89+` with no guard and no fallback, while the declared
-  capability floor is 8.0 — so an A100 is told it is supported and then expected
-  to fail on the first real prompt. The Triton path is already a correct
-  fallback; it just is not selected.
-- **An architecture precheck before the fused CUTLASS build**, so a non-Blackwell
-  GPU skips a doomed multi-minute compile inside the user's first request instead
-  of failing soft after it.
-
 ### vLLM compatibility preflight
 
 The plugin imports vLLM internals (fused-MoE classes, `_custom_ops`, the
@@ -108,14 +216,6 @@ logs-and-continues when a plugin fails to load — so drift surfaces as an
 unrelated "invalid quantization method" at model load. A symbol canary that fails
 with one actionable sentence naming the missing symbol and the tested vLLM
 version is the intended fix.
-
-### Large-M fused MoE prefill
-
-The remaining kernel target. On a Laguna-class MoE the transient expand is ~35%
-of MoE layer time, so a persistent/grouped decode-in-mainloop schedule — decode
-each expert weight tile once and stream M through it — is where the next real
-prefill win is. This is the MoE analog of the dense experiment below, which
-failed for a reason that does not apply here.
 
 ### Speculative decode throughput
 
@@ -137,8 +237,13 @@ published artifact.
 
 ### Not planned
 
-- **Tensor parallel.** No `tp > 1` support exists and none is planned. Open an
-  issue if you need it.
+- **A second artifact encoder.** PrismaQuant is the canonical producer;
+  Gridbook owns the serving contract, decoder, and conformance fixtures. Copying
+  the producer's search, packer, or exporter here would create two sources of
+  truth.
+- **General tensor parallel.** No `tp > 1` support exists today and broad TP
+  support is not committed. D0.1 must establish whether DSV4 needs a narrowly
+  scoped implementation before that work is accepted.
 - **A vLLM fork or core patches.** Running on stock vLLM is the point.
 
 ---

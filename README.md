@@ -152,7 +152,7 @@ arch-specific — this table separates what was **measured** from what is
 | **GB10 / DGX Spark, `sm_121`** | CUDA GEMV | expand → stock W8A8 GEMM | CUTLASS `sm120` | **MEASURED.** Every published number comes from this box. |
 | **RTX 5090, `sm_120`** | same | same | same | **USER-REPORTED** working (vLLM 0.25.1, 27B artifact, [issue #1](https://github.com/RobTand/gridbook/issues/1)) after that issue's memory patches. No speed numbers published; the exact `nvcc` arch flag (`sm_120` vs the measured `sm_121`) is untested here. |
 | **H100 `sm_90`, RTX 4090 / L40S `sm_89`** | expected to work — the decode kernel contains no arch guards, no inline PTX and no `-arch` flag | expected to work (needs `sm_89+` fp8 support) | **fails, fail-softs** to the expand path with a warning (the fused kernel is `sm_120`-family only) | **INFERRED, UNTESTED.** Also gated by whatever the artifact's non-CB groups need (e.g. the 27B vision tower's NVFP4). |
-| **A100 `sm_80`** | expected to work | **expected to fail**: the dense FP8-CB prefill calls `cutlass_scaled_mm` on fp8 with no capability guard and no fallback | n/a | **NOT RECOMMENDED.** The declared capability floor is 8.0, but a prompt longer than 16 tokens is expected to error. INFERRED from code; no A100 was tested. |
+| **A100 `sm_80`** | expected to work for FP4-CB | **rejected at load**: FP8-CB requires `sm_89+` for its shipping prefill path | n/a | **UNTESTED.** Gridbook fails early with the hardware requirement instead of loading a serve that will fail above 16 tokens; FP4-CB retains its BF16 fallback. |
 | **Supported NVIDIA GPU, no `nvcc`** | Triton fallback | Triton/stock fallback | n/a | **Correct, slow.** Use for numerics verification and CI, not for serving. |
 | **Non-NVIDIA** | unsupported | unsupported | unsupported | **UNSUPPORTED / UNQUALIFIED.** The canceled ROCm prototype is not shipped or dispatched. |
 
@@ -246,12 +246,13 @@ arithmetic band and the single-seed noise band.
   shipped artifact scored 88/100 (130/148) on the ship config, against 87 for the
   GGUF IQ build and 86 for GGUF k-quant, with a measured single-seed churn band of
   ±2–3 points across serving configs.
-- **MoE prefill is solved and on by default.** Measured on Laguna-S-2.1 (117B
-  MoE): 293 → **1,821 tok/s** at 8k and 207 → **1,822 tok/s** at 63k after the
-  CUDA chunk-expander landed (commit `8829c16`); the current default is a
-  measured per-layer path selection. Docs that still describe MoE prefill as a
-  per-expert loop are stale — see [`ROADMAP.md`](ROADMAP.md) for what is actually
-  open.
+- **FP8-CB MoE prefill auto-selection is shipped.** Its transient CUDA
+  candidate measured 293 → **1,821 tok/s** at 8k and 207 → **1,822 tok/s** at
+  63k on Laguna-S-2.1 (117B MoE) after the chunk-expander landed (commit
+  `8829c16`); the default measures candidates per layer rather than always
+  choosing that one. FP4-CB still defaults to its conservative loop, and
+  activation-preserving fused large-M MoE remains open — see the canonical
+  [`kernel TODO`](ROADMAP.md#kernel-todo-canonical).
 - **Large-M dense prefill is the honest remaining gap**: ~1.44× the native GEMM's
   TTFT on the 27B.
 
@@ -269,7 +270,7 @@ arithmetic band and the single-seed noise band.
 | [`docs/PLUGIN.md`](docs/PLUGIN.md) | Operator reference for the plugin itself: dispatch, kernel set, environment switches. |
 | [`docs/DELEGATED-NVFP4-MOE.md`](docs/DELEGATED-NVFP4-MOE.md) | Version-scoped backend selection for a **non-CB** NVFP4 MoE group on GB10 (`sm_121`), including Marlin's generic weight-only warning and a fail/unknown preflight policy. |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | The measured results with full hardware/protocol context and caveats. |
-| [`ROADMAP.md`](ROADMAP.md) | What is done, what is open, and what was measured and rejected. |
+| [`ROADMAP.md`](ROADMAP.md) | Canonical kernel TODO, completed work, and measured-negative experiments. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to run the tests, what a good bug report contains, and what is in scope. |
 
 ---
@@ -304,10 +305,10 @@ separate research pipeline that *produces* gridbook artifacts —
   MTP drafters) whose loaders map MoE experts at the top level and would
   otherwise not recognise stacked codebook expert tensors. That wrap is inert for
   non-CB checkpoints. Nothing in `vllm/` is modified.
-- This repository **serves** the format; it does not yet **produce** artifacts.
-  A reference encoder is a roadmap item — until then, artifacts come from the
-  authors' pipeline, and the [spec](docs/SPEC.md) is published so an encoder can
-  be written independently.
+- This repository **serves** the format; it does not produce artifacts.
+  [PrismaQuant](https://github.com/RobTand/prismaquant) is the one canonical
+  producer, while the [spec](docs/SPEC.md) and conformance fixtures keep the
+  format independently implementable without maintaining a second encoder here.
 - Every number in this repo comes from a measurement on the hardware named beside
   it. Where something is inferred rather than measured, it says so.
 
