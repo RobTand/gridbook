@@ -114,8 +114,19 @@ def test_shared_mlp_collapsed_dispatch_aliases():
     # Collapsed direct + fused dispatch (what hy_v3 hands get_quant_method).
     assert c._scheme_for_prefix("model.layers.1.mlp.down_proj") is not None
     assert c._scheme_for_prefix("model.layers.1.mlp.gate_up_proj") is not None
+    # HYV3 MTP nests the same block under .mtp_block. and still passes the
+    # parent MLP prefix when constructing the shared projections. They must be
+    # CB-owned too; a plain-bf16 compatibility fallback is forbidden.
+    assert c._scheme_for_prefix(
+        "model.layers.1.mtp_block.mlp.down_proj") is not None
+    assert c._scheme_for_prefix(
+        "model.layers.1.mtp_block.mlp.gate_up_proj") is not None
+    # Also cover an architecture that preserves the explicit shared_mlp prefix.
+    assert c._scheme_for_prefix(
+        "model.layers.1.mtp_block.mlp.shared_mlp.down_proj") is not None
     # BF16 shared layer: the collapsed ignore entry matches its serve prefix.
     assert c._is_ignored("model.layers.2.mlp.down_proj")
+    assert c._is_ignored("model.layers.2.mtp_block.mlp.down_proj")
     # Original keys survive (loader/scale paths are checkpoint-name-keyed) and
     # the genuine dense-layer key is untouched by aliasing.
     assert "model.layers.1.mlp.shared_mlp.gate_proj" in c.target_scheme

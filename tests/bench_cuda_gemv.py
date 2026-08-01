@@ -1,5 +1,9 @@
-"""Microbench: CUDA FP8_CB decode-GEMV vs the Triton decode-GEMM on real 27B
-shapes. Run inside the serving container (needs nvcc):
+"""Microbench: native FP8-CB GEMV vs native expand+CUTLASS.
+
+Both arms include activation quantization.  The comparator is Gridbook's
+native transient expander followed by vLLM's CUTLASS scaled GEMM, i.e. the
+fail-closed native fallback for shapes outside the direct decode kernel.
+Run inside the serving container (needs nvcc):
 
   docker run --rm --gpus all -v /home/rob/gridbook:/gridbook \\
     --entrypoint bash vllm-node:latest -c \\
@@ -14,7 +18,7 @@ import torch
 
 from gridbook import codec  # noqa: E402
 from gridbook.cuda_ext import get_ext  # noqa: E402
-from gridbook.kernels import cb_decode_linear  # noqa: E402
+from vllm import _custom_ops as vllm_ops  # noqa: E402
 
 DEV = "cuda"
 # (name, N, K) — Qwen3.6-27B: fused qkv, o_proj (24*256=6144), gate_up, down.
@@ -61,40 +65,45 @@ def main():
     ext = get_ext()
     assert ext is not None, "CUDA extension failed to build"
     print(f"device: {torch.cuda.get_device_name()}")
-    total = {("cuda", m): 0.0 for m in MS} | {("triton", m): 0.0 for m in MS}
+    total = ({("gemv", m): 0.0 for m in MS}
+             | {("expand_cutlass", m): 0.0 for m in MS})
     for k in KS:
         print(f"\n=== FP8_CB_K{k} ===")
-        print(f"{'shape':>10} {'M':>3} {'triton us':>10} {'cuda us':>9} "
+        print(f"{'shape':>10} {'M':>3} {'expand+CL us':>12} {'gemv us':>9} "
               f"{'speedup':>8} {'GB/s':>7}")
         for name, N, K in SHAPES:
             p = synth(k, N, K)
             gbytes = N * (K // 256) * p["ts"] / 1e9
             for M in MS:
                 x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
-                xq = codec.fp8_dynamic_act_qdq(x)
-
-                def cuda_fn():
+                def gemv_fn():
                     ext.cb_gemv_fp8(x, p["qwp"], p["cb8"], p["row_off"],
                                     p["ws"], p["N"], p["K"], p["k"], 4,
                                     p["ts"], True)
 
-                def triton_fn():
-                    cb_decode_linear(xq, p["qwp"], p["cb_flat"], p["row_off"],
-                                     p["ws"], torch.zeros(1, device=DEV),
-                                     N=p["N"], K=p["K"], k_bits=p["k"],
-                                     n_sub=4, type_size=p["ts"], is_fp4=False)
+                def expand_cutlass_fn():
+                    xq, scale_a = vllm_ops.scaled_fp8_quant(
+                        x, use_per_token_if_dynamic=True)
+                    weight = ext.cb_expand_fp8(
+                        p["qwp"], p["cb8"], p["row_off"], p["N"], p["K"],
+                        p["k"], 4, p["ts"])
+                    vllm_ops.cutlass_scaled_mm(
+                        xq, weight.t(), scale_a, p["ws"].reshape(-1, 1),
+                        torch.bfloat16, None)
 
-                tc = timeit(cuda_fn)
-                tt = timeit(triton_fn)
-                total[("cuda", M)] += tc
-                total[("triton", M)] += tt
-                print(f"{name:>10} {M:>3} {tt * 1e6:>10.1f} {tc * 1e6:>9.1f} "
-                      f"{tt / tc:>7.2f}x {gbytes / tc:>7.1f}")
+                tg = timeit(gemv_fn)
+                te = timeit(expand_cutlass_fn)
+                total[("gemv", M)] += tg
+                total[("expand_cutlass", M)] += te
+                print(f"{name:>10} {M:>3} {te * 1e6:>12.1f} {tg * 1e6:>9.1f} "
+                      f"{te / tg:>7.2f}x {gbytes / tg:>7.1f}")
     print("\nper-layer-set totals (sum of the 4 shapes, both rungs):")
     for M in MS:
-        print(f"  M={M:>2}: triton {total[('triton', M)] * 1e6:8.1f} us | "
-              f"cuda {total[('cuda', M)] * 1e6:8.1f} us | "
-              f"{total[('triton', M)] / total[('cuda', M)]:5.2f}x")
+        print(
+            f"  M={M:>2}: expand+CUTLASS "
+            f"{total[('expand_cutlass', M)] * 1e6:8.1f} us | native GEMV "
+            f"{total[('gemv', M)] * 1e6:8.1f} us | "
+            f"{total[('expand_cutlass', M)] / total[('gemv', M)]:5.2f}x")
 
 
 if __name__ == "__main__":

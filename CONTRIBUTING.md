@@ -42,7 +42,7 @@ worth knowing about.
 
 | In scope here | Belongs elsewhere |
 |---|---|
-| The vLLM serving plugin (`gridbook/`) and its CUDA/Triton kernels (`gridbook/csrc/`) | The quantization pipeline that *produces* artifacts — that is [PrismaQuant](https://github.com/RobTand/prismaquant) |
+| The vLLM serving plugin (`gridbook/`) and its native CUDA/CUTLASS kernels (`gridbook/csrc/`) | The quantization pipeline that *produces* artifacts — that is [PrismaQuant](https://github.com/RobTand/prismaquant) |
 | The normative format spec (`docs/SPEC.md`) and independent implementations of it | Model-specific quality tuning / calibration |
 | New model-architecture support (usually a guarded one-liner in `plugin.py`) | Forks of vLLM core — a hard non-goal; gridbook must work on stock vLLM |
 | Documentation, install/packaging, CI | |
@@ -77,7 +77,8 @@ skip guards into spurious failures.
 
 CI additionally gates the packaging surface: that the wheel and sdist really
 contain `gridbook/csrc/*.cu`, that a **non-editable** install resolves them from
-`site-packages`, that `import gridbook` needs no torch/triton/vLLM, and that the
+`site-packages`, that `import gridbook` needs no torch/vLLM and imports no
+Triton module, and that the
 `vllm.general_plugins` entry point is discoverable. It cannot compile the CUDA
 extension — free runners have no `nvcc` — so that stays a manual pre-tag gate.
 
@@ -105,13 +106,14 @@ pushes, pull requests, and manual dispatch): open the PR, or use the
    project's central discipline, and the reason the docs mark untested cells
    instead of filling them in.
 2. **Numerics changes need a parity argument.** The kernels hold a bit-exactness
-   contract against the Triton reference path (≤ 1 bf16 output ULP, plus a norm
-   backstop). A change that reassociates a reduction is allowed, but it must say
+   contract against independent PyTorch/FP64 references (≤ 1 bf16 output ULP,
+   plus a norm backstop). A change that reassociates a reduction is allowed, but it must say
    so and be gated on a served quality check — silent numerics drift is how a
    quantization project loses its ability to A/B anything.
-3. **Fail soft, but never silently wrong.** Missing toolchain → warn and fall
-   back. Missing *data* → raise. The distinction matters: a slow server is
-   recoverable, a wrong one is not.
+3. **Fail closed for serving contracts.** A missing native CUDA/CUTLASS kernel,
+   unsupported format/shape, or missing data raises an actionable error. Do not
+   add a slower kernel-family fallback: it changes the execution arm and makes
+   published performance claims non-reproducible.
 4. **No new vLLM-core patches.** The plugin's value is that it runs on stock
    vLLM. Wrapping a specific model class's own `load_weights` is the existing,
    documented exception; extending it to `vllm/` internals is not.

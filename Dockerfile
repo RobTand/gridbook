@@ -113,8 +113,11 @@ ENV TORCH_CUDA_ARCH_LIST=${GRIDBOOK_CUDA_ARCH} \
 # their headers: /usr/local/cuda/include has no cusparse.h, cublas.h,
 # cusolverDn.h or cufft.h. torch's <ATen/cuda/CUDAContext.h> includes
 # <cusparse.h>, so *every* torch cpp_extension CUDA JIT build fails in the
-# stock image with "fatal error: cusparse.h: No such file or directory" — for
-# gridbook that means a silent fail-soft to the slow Triton path.
+# stock image with "fatal error: cusparse.h: No such file or directory".
+# Older Gridbook releases silently downgraded to a slow Triton fallback after
+# that build failure; the native-only runtime now fails the affected CB
+# operator closed. Either outcome makes the image unusable, so this remains a
+# build-time gate.
 #
 # The matching headers are already inside the image: torch's own nvidia-*-cu13
 # wheels ship a complete include tree under site-packages/nvidia/cu13/include,
@@ -154,10 +157,12 @@ EOF
 # -----------------------------------------------------------------------------
 # Install gridbook
 # -----------------------------------------------------------------------------
-# --no-deps is deliberate: torch, triton and safetensors are already installed
-# in the base image, and letting pip resolve `torch` here could pull a different
-# torch wheel over the one vLLM was compiled against. The verification step
-# below asserts each runtime dependency actually imports, so nothing is assumed.
+# --no-deps is deliberate: torch, safetensors, huggingface-hub and vLLM are
+# already installed in the base image, and letting pip resolve `torch` here
+# could pull a different torch wheel over the one vLLM was compiled against.
+# Triton may exist as a vLLM-owned dependency, but Gridbook neither depends on
+# nor dispatches it for CB operators. The verification step below asserts each
+# Gridbook runtime dependency actually imports, so nothing is assumed.
 COPY . /opt/gridbook/src
 
 RUN pip install --no-deps --no-cache-dir /opt/gridbook/src \
@@ -176,7 +181,7 @@ problems = []
 
 # 1. Runtime dependencies. Installed with --no-deps, so prove they are present
 #    instead of trusting the base image.
-for mod in ("torch", "triton", "safetensors", "vllm"):
+for mod in ("torch", "safetensors", "huggingface_hub", "vllm"):
     try:
         __import__(mod)
     except Exception as exc:
@@ -190,10 +195,22 @@ if "packages" not in loc:
 
 # 3. The packaged CUDA sources must be present. This is the invariant that a
 #    non-editable `pip install` used to break: csrc lived at the repo root, so
-#    only `gridbook/` landed in site-packages, every extension build failed, and
-#    the plugin fail-softed to the slow Triton path with only a warning. Gating
-#    it here converts that silent downgrade into a build failure.
-REQUIRED = ("cb_gemv.cu", "cb_fused_gemm.cu", "cb_persistent_tc.cu")
+#    only `gridbook/` landed in site-packages and every extension build failed.
+#    Older releases then selected a slow Triton fallback; the native-only tree
+#    fails closed. Gating the complete serving floor here makes either defect a
+#    build failure. Retained research-only sources such as cb_persistent_tc.cu
+#    are intentionally not part of this runtime-required list.
+REQUIRED = (
+    "cb_gemv.cu",
+    "cb_gemv_v2.cu",
+    "cb_bf16_grouped_gemm.cu",
+    "cb_fused_gemm.cu",
+    "cb_fused_fp4_gemm.cu",
+    "cutlass_fork/sm120_cb_mma_tma.hpp",
+    "cutlass_fork/sm120_cb_fused_mma.hpp",
+    "cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
+    "cutlass_fork/sm120_expert_row_broadcast.hpp",
+)
 try:
     csrc = files("gridbook") / "csrc"
     missing = [n for n in REQUIRED if not (csrc / n).is_file()]
@@ -267,15 +284,15 @@ if os.environ.get("GRIDBOOK_PREWARM", "1") != "1":
 
 from gridbook import cuda_ext
 
-# Decode GEMV — the production decode path. Hard gate: an image that cannot
-# build this would serve through the Triton prototype, which the kernel header
-# itself labels not production-eligible. Better to fail the build.
+# Decode GEMV — the production decode path. Hard gate: the native-only runtime
+# fails closed when this extension is unavailable, so an image that cannot
+# build it cannot serve CB operators.
 t = time.time()
 if cuda_ext.get_ext() is None:
     print("\n[gridbook] FATAL: the CUDA decode-GEMV extension failed to build "
           "at image build time (reason printed above). This is the production "
-          "decode path — refusing to ship an image that would silently fall "
-          "back to the slow Triton prototype.", file=sys.stderr)
+          "decode path — refusing to ship an image whose native CB execution "
+          "would fail closed.", file=sys.stderr)
     sys.exit(1)
 print(f"[gridbook] prewarmed decode-GEMV extension in {time.time() - t:.1f}s")
 
@@ -299,9 +316,9 @@ else:
           f"which is sm_120-family only. Decode and the other prefill paths "
           f"are unaffected.")
 
-# The persistent-TC prefill extension is deliberately NOT prewarmed: it is
-# quarantined upstream behind PRISMAQUANT_ENABLE_PTC=1 pending a hardware
-# canary. Do not enable it here.
+# The retained persistent-TC source is research-only: its serving selector,
+# custom op and package loader were deleted after it measured negative. It is
+# therefore neither a runtime requirement nor a prewarm target.
 PY
 
 # -----------------------------------------------------------------------------
@@ -316,8 +333,8 @@ PY
 # so *loading* a fully prewarmed cache still requires CREATE permission in the
 # cache directory. Read access is not enough. That makes the cache directory's
 # write permission a correctness property of this image, not a convenience:
-# without it `docker run --user 1000:1000` fail-softs to the slow Triton decode
-# path with only a warning — exactly the failure this image exists to prevent.
+# without it `docker run --user 1000:1000` cannot load the required native
+# decode path and serving fails closed.
 #
 # chgrp 0 + g+rwX (the usual OpenShift-style recipe) only covers `--user <uid>:0`.
 # `--user 1000:1000` is neither root nor in group 0, so the cache directory is
@@ -382,8 +399,8 @@ t_decode = time.time() - t
 if not ok_decode:
     print(f"\n[gridbook] --user GATE FAILED: uid/gid 1000:1000 could not load the "
           f"prewarmed decode-GEMV extension (reason above). Under `docker run "
-          f"--user` this image would silently serve through the slow Triton "
-          f"prototype. Refusing to ship it.", file=sys.stderr)
+          f"--user` native CB execution would fail closed. Refusing to ship "
+          f"it.", file=sys.stderr)
     sys.exit(1)
 
 msg = (f"[gridbook] --user gate OK: uid/gid 1000:1000 HOME=/ getpass={user}, "

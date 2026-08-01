@@ -310,9 +310,8 @@ def test_kernel_source_ships_inside_the_package():
     assert (d / "cb_gemv_v2.cu").is_file(), sorted(p.name for p in d.iterdir())
 
 
-def test_check_dist_requires_the_new_kernel():
-    """``check_dist.py``'s REQUIRED list is the only literal floor that would
-    catch this file missing from a wheel."""
+def test_check_dist_native_floor_tracks_serving_not_retired_research():
+    """The literal floor must cover serving kernels, not retained research."""
     script = (pathlib.Path(__file__).resolve().parents[1]
               / ".github" / "scripts" / "check_dist.py")
     if not script.is_file():
@@ -321,3 +320,6 @@ def test_check_dist_requires_the_new_kernel():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert "gridbook/csrc/cb_gemv_v2.cu" in mod.REQUIRED
+    assert "gridbook/csrc/cb_bf16_grouped_gemm.cu" in mod.REQUIRED
+    assert "gridbook/csrc/cb_persistent_tc.cu" not in mod.REQUIRED
+    assert "gridbook/kernels.py" in mod.FORBIDDEN

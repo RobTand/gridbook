@@ -75,30 +75,30 @@ curl -s http://localhost:8000/v1/chat/completions \
   -d '{"model":"{{REPO_ID}}","messages":[{"role":"user","content":"Say hello in five words."}],"max_tokens":32}'
 ```
 
-**How to tell the fast path is active.** The plugin *fail-softs*: if the CUDA
-extension cannot be built it still serves, through Triton fallback kernels, at a
-fraction of the speed. That is not a crash — it is a line on stderr, tagged
-`[prismaquant-cb]`:
+**How to verify native readiness.** Gridbook has no Triton dependency or serving
+fallback. If a required CUDA/CUTLASS extension cannot be built, the relevant
+load/forward fails closed after a line on stderr tagged `[prismaquant-cb]`:
 
 ```bash
 vllm serve ... 2>&1 | grep '\[prismaquant-cb\]'
 ```
 
-Any `WARNING` or `ERROR` on that tag means the CUDA decode path did **not**
-load, and the numbers on this card are **not** reachable on your box. (The tag
-is also used for a few harmless informational lines; it is the `WARNING` /
-`ERROR` ones that matter.) The exact wording differs between plugin versions —
-**grep the tag, not the sentence.** The two that matter read roughly:
+A `WARNING` or `ERROR` that explicitly says a **required** native operation is
+unavailable means the model cannot be served through Gridbook on that
+environment. A shape-specialized optimization may be unavailable only when the
+same diagnostic names a separately qualified native CUDA/CUTLASS route. The tag
+also carries harmless informational lines, so read the message after grepping
+the stable tag. The two fatal forms read roughly:
 
 ```
-[prismaquant-cb] WARNING: gridbook's CUDA decode-GEMV extension could not be built (<ExcType>: …); falling back to the Triton decode path (slow prototype). To get the CUDA path: …
+[prismaquant-cb] WARNING: gridbook's CUDA decode-GEMV extension could not be built (<ExcType>: …); native Gridbook execution is unavailable and serving will fail closed. To enable the native path: …
 [prismaquant-cb] ERROR: broken gridbook install — gridbook is installed without its CUDA sources: …
 ```
 
 The first is an environment problem (usually no `nvcc` in the serving
 container, or a torch/CUDA version mismatch); the second is a defect in the
 install itself. Both are diagnosed in
-[troubleshooting](https://github.com/RobTand/gridbook/blob/master/docs/TROUBLESHOOTING.md#the-cuda-extension-did-not-load-triton-fallback).
+[troubleshooting](https://github.com/RobTand/gridbook/blob/master/docs/TROUBLESHOOTING.md#the-native-extension-did-not-load).
 Set `PRISMAQUANT_CB_EXT_DIR` to a writable, persistent directory to keep the
 one-time JIT build across restarts (important in containers).
 

@@ -13,7 +13,7 @@ matrix-multiply-accumulate instruction; **QDQ** = quantize-then-dequantize the
 activations; **smem** = GPU shared memory; **TTFT** = time to first token
 (prefill latency).
 
-## The two invariants everything is built around
+## The three invariants everything is built around
 
 - **INV-1 — no resident expansion.** The resident weight is always the packed
   `cb_qweight` (indices + scale plane) plus the small shared codebook. The dense
@@ -22,10 +22,25 @@ activations; **smem** = GPU shared memory; **TTFT** = time to first token
   This is what makes a smaller-on-disk artifact also smaller in memory — the
   reason the format fits large models on one box. A resident-footprint assertion
   is a load-time gate, not a nicety.
-- **INV-2 — native tensor cores for prefill.** The production prefill decodes CB
-  indices into native FP4/FP8 codes and feeds the hardware tensor-core GEMM — the
-  same path a plain NVFP4/FP8 layer uses. A decode-to-BF16-then-`torch`-matmul
-  kernel is a correctness/fallback tool only; it does not meet the prefill goal.
+- **INV-2 — native tensor-core matrix kernels for prefill.** FP8-CB decodes into
+  native E4M3 codes and feeds CUTLASS W8A8. FP4-CB's quality-preserving lane
+  decodes to a bounded BF16 transient and feeds an owned CUTLASS grouped BF16
+  GEMM; it does not claim W4A4 arithmetic. The separate native-W4A4 lane remains
+  gated by served quality, not just kernel speed. A decode-to-BF16-then-plain
+  `torch` matmul implementation is an offline reference only.
+- **INV-3 — native-only, fail-closed serving.** Gridbook defines, compiles, and
+  dispatches no Triton operators. Decode/expansion/QDQ/routing support work is
+  native CUDA; GEMM and grouped GEMM are native CUTLASS. If the native operation
+  required by a format or shape is unavailable, serving raises a diagnostic
+  error instead of changing kernel family or silently accepting lower
+  throughput. A vLLM installation may itself contain Triton for unrelated
+  runtime components; that is outside Gridbook's operator lane.
+
+The same rule covers activation glue. Gridbook does not call vLLM's
+`apply_moe_activation` helper because its SWIGLUSTEP branch imports Triton.
+Supported gated activations resolve at model load to direct registered
+`torch.ops._C.{silu,gelu,gelu_tanh,swigluoai}_and_mul` operators; any other
+activation fails before serving (`gridbook/native_cutlass.py`).
 
 ## Target hardware
 
@@ -62,30 +77,50 @@ activation rows — **never** materializing the full weight (INV-1).
   (−44% scale bytes, −8.75% total stream at k=16) makes v2 decode neutral-to-faster
   than v1. The E4M3 plane is never reconstructed resident (INV-1 for v2).
 
-**Dispatch.** The path is M-gated: a CUDA GEMV for the smallest M, a Triton GEMV
-for a middle band, and the transient-expand prefill path (below) above that. See
-the CUDA-graph section for why this host-side branch matters.
+**Dense dispatch.** Every arm is native and the row boundaries are part of the
+serving contract:
+
+| Format / M | Production kernel |
+|---|---|
+| FP8-CB or FP4-CB, `M ≤ 8` | Native CUDA GEMV |
+| FP8-CB, `9 ≤ M ≤ 128` | Fused CUTLASS decode-in-prologue when the rung/layout/device predicates hold; otherwise native CUDA FP8 expansion + CUTLASS W8A8 GEMM |
+| FP8-CB, `M > 128` | Native CUDA FP8 expansion + CUTLASS W8A8 GEMM |
+| FP4-CB, `M > 8` | Native CUDA BF16 expansion + Gridbook-owned CUTLASS grouped BF16 GEMM with `E=1` |
+
+A missing native extension is an error, not another dispatch arm. See the
+CUDA-graph section for why this host-side branch matters.
 
 ---
 
-## Prefill path (large M): transient expansion
+## Prefill / non-GEMV path (M > 8): native transient expansion
 
 The default prefill **expands one layer's weight tile transiently** into a scratch
 buffer, runs a GEMM, and frees the buffer. Memory stays bounded (INV-1). FP8-CB
 expands **directly to FP8** (the codebook values are already on the E4M3 grid)
-and calls the stock native tensor-core GEMM (INV-2). FP4-CB v2 currently expands
-to BF16 and calls cuBLAS; that is a correctness-first fallback which does not yet
-meet INV-2. The separate native-FP4 decode-in-prologue kernel is opt-in
-because it changes the served activation bucket. The current `static_lsq`
-policy fixes the original dense accuracy and timing defects on the short exact
-screen, but its long-prompt evidence remains statistically unresolved and it
-has no >=4B or MoE served validation. It therefore remains opt-in; see the
+and calls the registered native CUDA per-token quantizer plus CUTLASS scaled
+GEMM directly (INV-2). Gridbook deliberately bypasses
+`vllm._custom_ops`: that Python convenience layer can select a Triton
+implementation for unsupported shapes. Model load attests the registered
+`torch.ops._C.dynamic_per_token_scaled_fp8_quant` and
+`torch.ops._C.cutlass_scaled_mm` operators, and the call site enforces the
+CUTLASS shape contract before launch. A missing ABI or incompatible shape is an
+error, not an implementation switch. The quality-preserving
+FP4-CB v2 path expands with native CUDA to a bounded BF16 transient and consumes
+it with Gridbook's native CUTLASS bridge. It preserves the established
+activation-QDQ contract but does not claim native W4A4 arithmetic. The separate
+native-FP4 decode-in-prologue kernel is opt-in because it changes the served
+activation bucket. The current `static_lsq` policy preserves the
+producer-attested global scale and packed payload while fixing the original
+dense accuracy and timing defects on the short exact screen, but its
+long-prompt evidence remains statistically unresolved and it has no >=4B or
+MoE served validation. It therefore remains opt-in; see the
 [fused-NVFP4 enablement audit](audits/fused_nvfp4_enablement_2026-07-31.md).
 
 The honest limitation of transient-expand is **memory traffic**: the tile is
 written to HBM and then read back by the GEMM, so prefill moves roughly 2× the
-bytes of a resident-weight GEMM. Tuning the expander (a CUDA expander at ~2× the
-Triton one, FP8-direct output) narrowed but cannot remove this — on the 27B
+bytes of a resident-weight GEMM. Tuning the expander (the native CUDA expander
+measured at ~2× the now-retired Triton prototype, with FP8-direct output) narrowed
+but cannot remove this — on the 27B
 artifact prefill went 1.62 s → 1.08 s TTFT versus the native baseline's 0.75 s, a
 residual ~1.44× set by the doubled traffic. Only a kernel that **never
 materializes the tile** closes it fully.
@@ -177,8 +212,9 @@ artifact this took decode from 3.5 tok/s (per-expert loop) to **~33 tok/s** (9.4
 smaller and −43% ALL-KL. For the FP4 two-tier grid there is a dedicated grouped
 GEMV that composes the two-tier scale in-register per the decode rules above.
 
-The **correctness-first per-expert loop is retained** as a fallback path, and its
-numerics are pinned bit-identical to the grouped kernel by a regression test.
+The correctness-first per-expert loop remains useful as a test/reference
+calculation, but it is not a serving fallback. Production grouped decode requires
+the native grouped GEMV and fails closed when that kernel is unavailable.
 
 **Smem-resident dictionary (opt-in, `PRISMAQUANT_CB_GEMV=v2`).** The shipped
 grouped GEMV gathers sub-codebook entries from global/L2 per lane per
@@ -186,14 +222,14 @@ superblock. `csrc/cb_gemv_v2.cu` instead stages the whole product dictionary in
 shared memory once per block and bursts each output row's packed bytes into
 smem before decoding it — the same insight the fused **prefill** mainloop
 already uses (`csrc/cutlass_fork/sm120_cb_fused_mma.hpp`, where it removed the
-k48 L1 cliff), applied to the M≤16 decode regime. It opts in to the sm_121a
+k48 L1 cliff), applied to the MoE M≤16 grouped-decode regime. It opts in to the sm_121a
 99 KB dynamic-smem budget, which the shipped decode GEMV does not (it caps its
 rowpack request at 48 KB), so the k20/k24 staged configurations are only
 expressible in the new kernel. The loader admits only the native Blackwell
 target capabilities (12.0/12.1) with at least 99 KiB opt-in shared memory; this
 PR's execution battery covers cc 12.1, not cc 12.0. It
 is **not** bit-exact against the default
-grouped schedule — reassociation class, same as CUDA-vs-Triton — and it is
+grouped schedule — a native schedule-reassociation class — and it is
 **not** a default: unset means `inherited`. Explicit `auto` or `v2` reaches it
 only where the hardware gate and compiled occupancy predicate both pass;
 `PRISMAQUANT_CB_GEMV=inherited` is the kill switch. The
@@ -202,33 +238,37 @@ the call-site branch is a trace-time constant and FULL-decode cudagraphs are
 unaffected.
 
 MoE **prefill** used to be that per-expert loop, whose launch storm dominated
-TTFT. It no longer is. A **CUDA chunk-expander** now expands expert chunks
-directly into vLLM's own fused-MoE grouped kernel (raw unpadded views,
-byte-identical to the Triton expand on every rung), and the fp8-CB default is
-`auto`: a first-prefill measured selection, per layer, over the candidate paths,
-cached for the process. Measured on Laguna-S-2.1 (117B MoE): **293 → 1,821 tok/s
-at 8k** and **207 → 1,822 tok/s at 63k**. Chunked prefill re-expands per
-microbatch, so `--max-num-batched-tokens 16384` matters for this path.
+TTFT. The production quality lane now expands bounded expert chunks with native
+CUDA and submits their ragged segments to a Gridbook-owned CUTLASS grouped BF16
+GEMM. FP8-CB can additionally use its native E4M3/CUTLASS paths where their
+contract applies. Missing expansion or grouped-GEMM support is fatal; it never
+selects a Python loop or interpreted kernel.
 
-**fp4**-CB MoE prefill can explicitly ride the same chunked `stock` path. The
-unset policy is the conservative per-expert `loop`. The native-FP4 grouped path
-is enabled with `PRISMAQUANT_CB_FUSED_FP4_MOE=1` (or `128`/`256` to select its
-tile), while an explicit `PRISMAQUANT_CB_PREFILL` remains authoritative and is a
-reliable bisection control. This is deliberately an A/B opt-in: its grouped
-routing and native-MMA arithmetic are qualified, but switching from Gridbook's
-fp32-emulated activation QDQ to native UE4M3 activation factors materially
-changes the served distribution. It must not be promoted on kernel parity or
-raw speed alone; see the
+The grouped-BF16 bridge is a generic SM80-compatible
+`DefaultGemmGrouped`, not a Blackwell-optimized collective. On one GB10 it was
+**6–17% slower on warm GPU time** than segmented BF16 matmuls across the recorded
+synthetic DSV4 shapes. It removes an unowned serving dispatch and preserves the
+quality contract, but it is not yet a prefill-speed result; the next optimization
+target is a measured CUTLASS 3.x SM100/SM121 grouped collective.
+
+MoE dispatch is separate from the dense M boundary: `M≤16` uses the owned
+grouped CUDA GEMV. Above 16, FP8-CB first attempts its quality-green fused
+CUTLASS path and otherwise uses exact BF16 expansion plus the owned CUTLASS
+grouped bridge; FP4-CB uses exact BF16 expansion plus that bridge. Only expert
+chunk size / transient-byte-budget overrides remain—there is no stock/loop/
+batched/L2 production selector.
+
+The predecessor native chunk-expander path measured **293 → 1,821 tok/s at 8k**
+and **207 → 1,822 tok/s at 63k** on Laguna-S-2.1 (117B MoE). Those numbers are
+preserved as historical evidence and are not yet a benchmark of the new owned
+CUTLASS grouped bridge. Chunked prefill re-expands per microbatch, so
+`--max-num-batched-tokens 16384` remains workload-relevant.
+
+The native-W4A4 grouped experiment remains excluded from the production quality
+lane: switching from Gridbook's established activation QDQ to native UE4M3
+activation factors materially changed the served distribution. It must not be
+promoted on kernel parity or raw speed alone; see the
 [fused-NVFP4 enablement audit](audits/fused_nvfp4_enablement_2026-07-31.md).
-Stock's transient is a bf16 expand rather than
-the fp8-direct CUDA one, at 2 B/elt, so its chunk is sized from a **byte budget**
-(`PRISMAQUANT_CB_PREFILL_CHUNK_BYTES`, default 1 GiB) instead of the fp8 lane's
-flat 256: on a 192-expert Hy3-class band that is 1,184 MiB of measured
-transient rather than 4,736 MiB, at no measured time cost. The fp4 branch also
-drops the `codec.pad_qweight` copy — `type_size = 4k+9` leaves the expanders'
-8-byte codeword window inside the superblock for every `k`, so the padding
-bytes were never read (bit-identical output, verified with
-`PRISMAQUANT_CB_EXPAND=pad`).
 
 The remaining MoE prefill target is an activation-contract-preserving
 persistent/grouped decode-in-mainloop schedule (the expand is ~35% of MoE
@@ -237,15 +277,19 @@ layer time at Laguna scale) — see
 
 ---
 
-## Triton fallbacks
+## Native-kernel availability and failure policy
 
-Every path has a **Triton fallback** used for correctness and CI, and where a CUDA
-kernel is not available for a particular grid/mode combination. Triton **cannot
-emit the Blackwell block-scaled FP4 MMA**, so a Triton kernel can do the smem
-codebook lookup but only reaches BF16 MMA — it violates INV-2 and is therefore a
-correctness/decode tool, **not** a production prefill target. The package installs
-and its numerics verify on machines without the CUDA extension via these
-fallbacks; do not mistake a working Triton prefill for a production-eligible one.
+Every production Gridbook operation has a native CUDA/CUTLASS implementation.
+Capability probes may return "unavailable" while inspecting an installation,
+but a serving call that needs that operation raises immediately with the source,
+toolchain, cache, or capability problem. There is no interpreted-kernel fallback,
+and Gridbook does not depend on Triton.
+
+The retired Triton prototypes remain relevant only to dated measurements: for
+example, the initial dense decode prototype measured 4.20 tok/s before the CUDA
+GEMV reached 10.28 tok/s. Those results explain the production policy; they do
+not describe a backend that current Gridbook can select. CPU/PyTorch references
+in tests continue to validate format semantics without entering serving.
 
 ---
 
@@ -265,14 +309,13 @@ data-dependent control flow. The kernels follow these rules:
    caught: an activation-QDQ kernel built its FP4/E2M1 grid on the CPU and
    H2D-copied it *every call* — a hidden sync in eager mode and a hard error under
    capture. The grid is now cached per device.
-4. **Hoist the whole M-gated dispatch behind one opaque op.** The historical
-   inline branch was capture-hostile: a prefill-sized trace could bake the
-   expand arm into decode. With the default `PRISMAQUANT_CB_DISPATCH=op`, each
-   Linear/MoE call is one opaque `cb_*_forward` op whose eager implementation
-   resolves M at capture time. A `FULL_DECODE_ONLY` capture records the GEMV arm
-   at each fixed decode size; prefill stays outside that graph and resolves the
-   large-M arm independently. `PRISMAQUANT_CB_DISPATCH=inline` is an A/B escape,
-   not the graph configuration.
+4. **Hoist the whole M-gated dispatch behind one opaque op.** The retired
+   pre-hardening host branch was capture-hostile: a prefill-sized trace could
+   bake the expand arm into decode. Every current Linear/MoE call permanently
+   crosses one opaque `cb_*_forward` op whose eager implementation resolves M at
+   capture time. A `FULL_DECODE_ONLY` capture records the GEMV arm at each fixed
+   decode size; prefill stays outside that graph and resolves the large-M arm
+   independently. There is no environment switch back to the retired branch.
 5. **Use full-decode graphs without compilation over the plugin.** The validated
    shape is `mode=0`, `cudagraph_mode=FULL_DECODE_ONLY`, capture sizes
    `[1,2,4,8]`, and `PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE` unset. On a close-rate
@@ -303,12 +346,12 @@ too.
 | Path | Status |
 |---|---|
 | FP8-CB decode (dense) | **Shipped**, at/above native parity |
-| FP4-CB v2 decode (dense) | **Shipped**: bit-matched CUDA GEMV (13/13 parity vs Triton + expand reference). The decode chain is compute-bound at GEMV shapes (ncu SM 71%/mem 44%) under the bit-exact contract — the measured ceiling, not a staging problem |
+| FP4-CB v2 decode (dense) | **Shipped**: bit-matched CUDA GEMV (13/13 parity against the historical Triton result plus the independent expansion reference). The decode chain is compute-bound at GEMV shapes (ncu SM 71%/mem 44%) under the bit-exact contract — the measured ceiling, not a staging problem |
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
 | MoE grouped decode GEMV, smem-resident dictionary | **Opt-in** (`PRISMAQUANT_CB_GEMV=v2`), never a default. Wins 1.13–1.58× on k13/k16/k20 in a 16-cell GB10 sweep; loses on k24 at K≥2048 (occupancy wall), where a compiled predicate routes the cell back to the shipped kernel. Reassociation-class output difference vs the default schedule (9/204 synthetic cells, worst `max_rel` 5.88e-03) — **not** bit-exact. Live GB10 validation on Jason Wong's 117B Laguna release dispatched all 94 expert stacks to v2 with no fallback and measured 24.993 vs 23.585 tok/s (+5.97%); long-prefill, concurrency, and soak requests completed without Gridbook errors |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
-| FP8-CB fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — the first dense persistent-N replacement was measured negative; a fresh design study remains open |
-| NVFP4-CB fused native-FP4 prefill (dense) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, and p95 served gates remain open |
-| Persistent-N large-M dense prefill | **Built and MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. Quarantined behind `PRISMAQUANT_ENABLE_PTC=1` as a schedule reference; do not enable it. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
-| MoE prefill | **Shipped**: CUDA chunk-expander into vLLM's fused-MoE grouped kernel; fp8-CB default is `auto` (measured per-layer path selection). Laguna-S-2.1 117B: 293 → 1,821 tok/s @8k, 207 → 1,822 @63k. fp4-CB defaults to conservative `loop`; native fused-FP4 and its shared `static_lsq` policy remain explicit A/B opt-ins without MoE quality qualification. Explicit `stock` uses a byte-budgeted expert chunk (1,184 MiB vs 4,736 MiB measured transient on a 192-expert band) and no pad copy |
-| Triton fallbacks | **Shipped** for every path (correctness/CI; not INV-2-eligible) |
+| FP8-CB fused decode-in-prologue prefill | **Bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128**; native transient expansion + CUTLASS serves ineligible and large-M shapes |
+| NVFP4-CB fused native-FP4 prefill (dense and MoE) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, MoE routed-quality, and p95 served gates remain open |
+| Persistent-N large-M dense prefill | **RETIRED FROM SERVING; MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. The serving selector, custom op, package loader, and switch are deleted. The `.cu` remains accessible only to the explicit direct research test. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
+| MoE prefill | **Native-only production lane**: grouped CUDA GEMV at M≤16; above 16, eligible quality-green FP8 fused CUTLASS or exact CUDA expansion + owned CUTLASS grouped GEMM. The current generic SM80-compatible grouped bridge is not Blackwell-optimized and measured 6–17% slower than segmented BF16 matmuls on warm synthetic DSV4 shapes. Historical Laguna-S-2.1 measurements for the predecessor native chunk-expander path were 293 → 1,821 tok/s @8k and 207 → 1,822 @63k; they must not be relabelled as measurements of the new bridge. The v0.4.2 fused native-NVFP4 route remains an explicit A/B opt-in without MoE quality qualification |
+| Missing required native kernel | **Fails closed** with an operation-specific diagnostic; no Triton dependency or serving fallback |

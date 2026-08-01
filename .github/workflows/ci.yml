@@ -5,8 +5,9 @@
 #   * the sdist and the wheel actually contain gridbook/csrc/*.cu | *.hpp
 #   * a NON-EDITABLE install of the wheel resolves those sources from
 #     site-packages (the historical bug was repo-root `os.pardir` arithmetic,
-#     which resolved to <site-packages>/csrc and silently fell back to Triton)
-#   * `import gridbook` needs no torch / triton / vLLM
+#     which resolved to <site-packages>/csrc; old releases then selected a
+#     Triton path, while the current runtime fails closed)
+#   * `import gridbook` needs no torch / vLLM or Triton package
 #   * the `vllm.general_plugins` entry point is discoverable and loadable
 #   * the GPU-free part of the test suite passes on every supported Python
 #
@@ -83,8 +84,7 @@ jobs:
         # requires-python = ">=3.10". Nothing had ever executed this code on
         # 3.10 or 3.11 before this workflow existed -- that floor was an
         # assumption in published metadata, and this matrix is what turns it
-        # into a measurement. 3.14 stays out until torch and triton both ship
-        # wheels for it.
+        # into a measurement. 3.14 stays out until torch ships wheels for it.
         python: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7.0.1
@@ -142,8 +142,8 @@ jobs:
             --index-url https://download.pytorch.org/whl/cpu
 
       # The real `pip install gridbook`: torch is already satisfied by the +cpu
-      # build above, so pip resolves triton / safetensors / the rest from PyPI
-      # and never pulls the CUDA torch.
+      # build above, so pip resolves safetensors / the rest from PyPI and never
+      # pulls the CUDA torch.
       - name: Install the wheel with its dependencies
         run: python -m pip install pytest dist/*.whl
 

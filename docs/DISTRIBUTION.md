@@ -6,7 +6,10 @@ now the sole owner of Gridbook runtime code, CUDA sources, tests, packaging,
 and releases. PrismaQuant consumes a pinned external Gridbook contract and no
 longer vendors the package. [`RELEASING.md`](RELEASING.md) is authoritative for
 current release steps; two-tree passages below are retained only to explain
-the failure mode that motivated single ownership.
+the failure mode that motivated single ownership. The current runtime contract
+also supersedes every fail-soft/Triton passage below: Gridbook has no Triton
+dependency or serving lane, required CUDA/CUTLASS kernels fail closed, and
+[`RELEASING.md`](RELEASING.md) carries the active gate.
 
 **Scope.** `gridbook` is technically finished enough to be used by strangers and
 is not being used by strangers. This document records *why* each distribution
@@ -826,8 +829,8 @@ Still open, and still blocking:
 > that `ROADMAP.md` "no longer list as 'planned' two things that shipped
 > (Persistent-N large-M prefill; batched-expert MoE prefill)". Both halves were
 > wrong. `ROADMAP.md` already records Persistent-N as *"Built, parity-green, and
-> **2–5.7× slower** than expand-then-GEMM at 27B shapes … The kernel is retained,
-> quarantined behind `PRISMAQUANT_ENABLE_PTC=1` … Do not enable it"* — an honest
+> **2–5.7× slower** than expand-then-GEMM at 27B shapes … The serving selector,
+> custom op, loader, and switch are deleted; only direct research source remains"* — an honest
 > negative result, not a plan. And `grep -i batched ROADMAP.md` returns nothing
 > (rc=1), so there was no second item to fix. The box would have read as a live
 > blocker that no one could action.

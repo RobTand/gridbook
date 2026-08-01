@@ -1,5 +1,4 @@
-"""Correctness gate for the CUDA FP8_CB decode-GEMV (prototype ii) against the
-Triton decode-GEMM it replaces and the fp64 reconstruct reference.
+"""Correctness gates for Gridbook's native CUDA CB decode kernels.
 
 Needs nvcc (JIT build) — runs in the serving container, skips in the build
 venv:
@@ -10,9 +9,10 @@ venv:
     'PYTHONPATH=/gridbook python3 -m pytest \\
      /gridbook/tests/test_cuda_gemv.py -v'
 
-The KL-preservation contract: identical weight rounding (bf16(val*scale)),
-bit-exact activation QDQ, fp32 accumulation — only summation order may differ
-from Triton's tl.dot, so CUDA-vs-Triton tolerances are reassociation-level.
+The KL-preservation contract is identical weight rounding
+(``bf16(value*scale)``), bit-exact activation QDQ, and FP32 accumulation.  The
+oracle is an independent pure-Torch packed-format decoder; native-vs-reference
+tolerances allow only reassociation-level differences.
 """
 import json
 import os
@@ -25,8 +25,12 @@ from safetensors.torch import load_file
 codec = pytest.importorskip(
     "gridbook.codec",
     reason="gridbook plugin not importable")
-kernels = pytest.importorskip("gridbook.kernels")
 from gridbook.cuda_ext import get_ext  # noqa: E402
+from cb_torch_reference import (  # noqa: E402
+    cb_linear_reference,
+    decode_cb_values,
+    reconstruct_cb_weight,
+)
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA device unavailable", allow_module_level=True)
@@ -36,7 +40,6 @@ if ext is None:
     pytest.skip("CUDA extension unavailable (no nvcc?)",
                 allow_module_level=True)
 
-cb_decode_linear = kernels.cb_decode_linear
 DEV = "cuda"
 ART = "fp8cb_k44"
 PICK = ["model.layers.5.mlp.down_proj", "model.layers.5.mlp.gate_proj",
@@ -44,13 +47,14 @@ PICK = ["model.layers.5.mlp.down_proj", "model.layers.5.mlp.gate_proj",
 _REF_REL = 1e-2        # vs fp64 reconstruct (matches test_cb_kernels gate)
 
 
-def _assert_triton_close(y_cuda, y_triton, tag):
-    """CUDA vs Triton: identical weights + inputs, fp32 accumulation — only
-    summation ORDER differs, so the bf16 outputs may differ by at most one
+def _assert_reference_close(y_cuda, y_reference, tag):
+    """Native vs reference: identical weights + inputs, FP32 accumulation.
+
+    Only summation order differs, so BF16 outputs may differ by at most one
     output-rounding step (verified live: fp32 truth lands mid-ULP and the two
     round to the adjacent bf16 neighbours). Elementwise: |Δ| <= 1 bf16 ULP
     (7 mantissa bits -> 2^-7 relative) + tiny abs; plus a norm backstop."""
-    a, b = y_cuda.float(), y_triton.float()
+    a, b = y_cuda.float(), y_reference.float()
     d = (a - b).abs()
     tol = torch.maximum(a.abs(), b.abs()) * 2.0 ** -7 + 1e-5
     nbad = int((d > tol).sum())
@@ -122,8 +126,8 @@ def _synth(k, N=96, K=768, seed=0):
                 N=N, K=K, k=k, n_sub=4, ts=ts, ws=ws.float())
 
 
-def _triton_y(p, xq):
-    return cb_decode_linear(
+def _torch_y(p, xq):
+    return cb_linear_reference(
         xq, p["qwp"], p["cb_flat"], p["row_off"], p["ws"],
         torch.zeros(1, device=DEV), N=p["N"], K=p["K"], k_bits=p["k"],
         n_sub=p["n_sub"], type_size=p["ts"], is_fp4=False)
@@ -172,23 +176,24 @@ def test_qdq_min_scale_clamp():
 
 @pytest.mark.parametrize("qname", PICK)
 @pytest.mark.parametrize("M", [1, 3, 16])
-def test_gemv_matches_triton_real_artifact(qname, M):
+def test_gemv_matches_torch_reference_real_artifact(qname, M):
     p = _prep(qname)
     torch.manual_seed(0)
     x = torch.randn(M, p["K"], dtype=torch.bfloat16, device=DEV)
     xq = codec.fp8_dynamic_act_qdq(x)
-    _assert_triton_close(_cuda_y(p, xq), _triton_y(p, xq),
-                         f"{qname} M={M}")
+    _assert_reference_close(_cuda_y(p, xq), _torch_y(p, xq),
+                            f"{qname} M={M}")
 
 
 @pytest.mark.parametrize("k", [29, 33, 36, 40, 42, 44, 47, 48])
 @pytest.mark.parametrize("M", [1, 2, 4, 8, 16])
-def test_gemv_matches_triton_all_rungs(k, M):
+def test_gemv_matches_torch_reference_all_rungs(k, M):
     p = _synth(k, seed=k)
     torch.manual_seed(k)
     x = torch.randn(M, p["K"], dtype=torch.bfloat16, device=DEV)
     xq = codec.fp8_dynamic_act_qdq(x)
-    _assert_triton_close(_cuda_y(p, xq), _triton_y(p, xq), f"k={k} M={M}")
+    _assert_reference_close(_cuda_y(p, xq), _torch_y(p, xq),
+                            f"k={k} M={M}")
 
 
 def test_gemv_matches_reference():
@@ -227,7 +232,7 @@ def test_gemv_matches_reference():
 
 def test_fused_row_offset_two_roles():
     """Two roles, distinct codebooks, concatenated rows (the qkv/gate_up
-    fusion mechanism) — CUDA must honor cb_row_offset exactly as Triton."""
+    fusion mechanism) — CUDA must honor ``cb_row_offset`` exactly."""
     pa, pb = _synth(44, N=64, K=512, seed=1), _synth(44, N=32, K=512, seed=2)
     qwp = codec.pad_qweight(torch.cat(
         [pa["qwp"][:, :-8], pb["qwp"][:, :-8]], dim=0))
@@ -243,46 +248,46 @@ def test_fused_row_offset_two_roles():
     torch.manual_seed(3)
     x = torch.randn(2, 512, dtype=torch.bfloat16, device=DEV)
     xq = codec.fp8_dynamic_act_qdq(x)
-    _assert_triton_close(_cuda_y(p, xq), _triton_y(p, xq), "fused row-offset")
+    _assert_reference_close(_cuda_y(p, xq), _torch_y(p, xq),
+                            "fused row-offset")
 
 
 @pytest.mark.parametrize("k", [29, 33, 36, 40, 42, 44, 47, 48])
-def test_cuda_expand_bitexact_vs_triton(k):
-    """The CUDA transient expander must produce byte-identical tiles to the
-    Triton expand_cb_to_fp8 (which is itself pinned to the bf16-expand+cast
-    reference)."""
-    from gridbook.expand import expand_cb_to_fp8
+def test_cuda_expand_bitexact_vs_torch_reference(k):
+    """The CUDA expander must match an independent packed-byte decode."""
     p = _synth(k, N=96, K=768, seed=100 + k)
-    ref = expand_cb_to_fp8(p["qwp"], p["cb8"], p["row_off"],
-                           p["N"], p["K"], p["k"], 4, p["ts"])
+    ref = decode_cb_values(
+        p["qwp"], p["cb_flat"], p["row_off"], N=p["N"], K=p["K"],
+        k_bits=p["k"], n_sub=4, type_size=p["ts"]
+    ).to(torch.float8_e4m3fn)
     got = ext.cb_expand_fp8(p["qwp"], p["cb8"], p["row_off"],
                             p["N"], p["K"], p["k"], 4, p["ts"])
     assert got.dtype == torch.float8_e4m3fn
     assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8)), (
-        f"k={k}: CUDA expand bytes != Triton expand bytes")
+        f"k={k}: CUDA expand bytes != Torch-reference bytes")
 
 
 def test_cuda_expand_bitexact_real_artifact():
-    from gridbook.expand import expand_cb_to_fp8
     p = _prep(PICK[0])
-    ref = expand_cb_to_fp8(p["qwp"], p["cb8"], p["row_off"],
-                           p["N"], p["K"], p["k"], 4, p["ts"])
+    ref = decode_cb_values(
+        p["qwp"], p["cb_flat"], p["row_off"], N=p["N"], K=p["K"],
+        k_bits=p["k"], n_sub=4, type_size=p["ts"]
+    ).to(torch.float8_e4m3fn)
     got = ext.cb_expand_fp8(p["qwp"], p["cb8"], p["row_off"],
                             p["N"], p["K"], p["k"], 4, p["ts"])
     assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
 
 
-def test_full_op_raw_x_matches_triton_path():
-    """The registered custom op (raw x in, QDQ fused) equals the Triton path
-    (torch QDQ then decode-GEMM) — the exact serving-dispatch equivalence."""
+def test_full_op_raw_x_matches_torch_reference():
+    """The registered raw-X op matches Torch QDQ plus format decode."""
     from gridbook.ops import cb_gemv_fp8 as op
     p = _prep(PICK[1])
     torch.manual_seed(2)
     x = torch.randn(1, p["K"], dtype=torch.bfloat16, device=DEV)
     y_op = op(x, p["qwp"], p["cb8"], p["row_off"], p["ws"],
               p["N"], p["K"], p["k"], p["n_sub"], p["ts"])
-    y_t = _triton_y(p, codec.fp8_dynamic_act_qdq(x))
-    _assert_triton_close(y_op, y_t, "full-op raw-x")
+    y_ref = _torch_y(p, codec.fp8_dynamic_act_qdq(x))
+    _assert_reference_close(y_op, y_ref, "full-op raw-x")
 
 
 def test_moe_grouped_gemv_matches_loop_numerics():
@@ -365,7 +370,7 @@ def test_moe_grouped_gemv_matches_loop_numerics():
                                  k, 4, ts)
     out_got = ext.cb_moe_combine(y_down, pair_w, tok_start, T)
 
-    _assert_triton_close(out_got, out_ref, "moe grouped vs loop")
+    _assert_reference_close(out_got, out_ref, "moe grouped vs loop")
 
 
 # --------------------------------------------------------------------------- #
@@ -393,11 +398,12 @@ def _fp4v2_encode_stack(pq, k, E, out, in_f, cb, seed, mode="product"):
 
 def _run_fp4v2_moe_parity(pq, k, E, hidden, inter, T, topk, seed, tag,
                           cb=None, mode="product"):
-    """Grouped fp4-v2 MoE decode vs the per-expert loop; both decode the SAME
-    real two-tier bytes with the SAME bf16 codebook + compose table, so they
-    agree to reassociation (the loop's bf16 F.linear vs the kernel's warp-sum,
-    both f32-accum). mode='signed' exercises the S-rung layout (n_sub=1)."""
-    from gridbook.expand import expand_fp4_v2_to_weight
+    """Grouped FP4-v2 MoE decode vs a pure-Torch per-expert loop.
+
+    Both consume the same legal two-tier bytes and BF16 codebook.  Product and
+    signed layouts therefore differ only in native-vs-reference reduction
+    order.
+    """
     out13 = 2 * inter
     n_sub = 1 if mode == "signed" else 2
     ts = pq.nvfp4_cb_type_size(k, "fp4", "two_tier")
@@ -410,12 +416,14 @@ def _run_fp4v2_moe_parity(pq, k, E, hidden, inter, T, topk, seed, tag,
     w2, _ = _fp4v2_encode_stack(pq, k, E, hidden, inter, cb, seed + 100,
                                 mode=mode)
 
-    def decode_expert(stack, e, in_f):                        # loop _decode_expert
+    def decode_expert(stack, e, in_f):
         out = stack.shape[1]
         qwp = codec.pad_qweight(stack[e].contiguous())
         row0 = torch.zeros(out, dtype=torch.int32, device=DEV)
-        return expand_fp4_v2_to_weight(qwp, cb_flat, row0, compose,
-                                       out, in_f, k, n_sub, ts)
+        return reconstruct_cb_weight(
+            qwp, cb_flat, row0, torch.zeros(1, device=DEV), compose,
+            N=out, K=in_f, k_bits=k, n_sub=n_sub, type_size=ts,
+            is_fp4=True, is_v2=True)
 
     g = torch.Generator(device="cpu").manual_seed(seed + 7)
     x = torch.randn(T, hidden, dtype=torch.bfloat16, device=DEV)
@@ -461,7 +469,7 @@ def _run_fp4v2_moe_parity(pq, k, E, hidden, inter, T, topk, seed, tag,
     y_down = ext.cb_moe_gemv_fp4_v2(aq, w2, cb_flat, compose,
                                     pair_expert, pair_self, k, n_sub, ts)
     out_got = ext.cb_moe_combine(y_down, pair_w, tok_start, T)
-    _assert_triton_close(out_got, out_ref, tag)
+    _assert_reference_close(out_got, out_ref, tag)
 
 
 def test_moe_grouped_gemv_fp4_v2_matches_loop():
@@ -490,8 +498,9 @@ def test_moe_grouped_gemv_fp4_v2_all_rungs(k):
 # the qkv/gate_up fusion mechanism) + the multi-M accumulator, with the two-tier
 # scale composed in-register. Same real-encoder contract: the (super,sub) plane
 # must be legal, so the bytes come from the prismaquant encoder, never
-# fabricated. Parity is checked against BOTH the Triton fp4-v2 decode path AND an
-# explicit expand_fp4_v2_to_weight + F.linear reference on the SAME QDQ'd xq.
+# fabricated. Parity is checked against an independent pure-Torch packed-format
+# decode and, where the native transient contract applies, the native expander
+# plus F.linear on the SAME QDQ'd xq.
 # --------------------------------------------------------------------------- #
 def _fp4v2_dense_bytes(pq, k, N, K, cb, seed, mode="product"):
     """Dense (N, K) weight -> fp4 two-tier v2 on-disk bytes (N, n_sb*type_size)
@@ -520,18 +529,16 @@ def _cuda_fp4v2_dense_y(p, xq):
                               p["n_sub"], p["ts"])
 
 
-def _triton_fp4v2_dense_y(p, xq):
-    # scale is the fp4-v2 dummy (Triton reads compose, not scale, for v2).
-    return cb_decode_linear(
+def _torch_fp4v2_dense_y(p, xq):
+    return cb_linear_reference(
         xq, p["qwp"], p["cb_flat"], p["row_off"],
         torch.zeros(1, device=DEV), p["compose"], N=p["N"], K=p["K"],
         k_bits=p["k"], n_sub=p["n_sub"], type_size=p["ts"], is_fp4=True,
         is_v2=True)
 
 
-def _ref_fp4v2_dense_y(p, xq):
-    """expand_fp4_v2_to_weight (value × composed scale) + F.linear on the SAME
-    xq — the explicit reconstruct reference (bf16 W, f32-accum GEMM)."""
+def _native_expand_fp4v2_y(p, xq):
+    """Native transient expansion plus F.linear, for its supported contract."""
     from gridbook.expand import expand_fp4_v2_to_weight
     W = expand_fp4_v2_to_weight(p["qwp"], p["cb_flat"], p["row_off"],
                                 p["compose"], p["N"], p["K"], p["k"],
@@ -541,10 +548,8 @@ def _ref_fp4v2_dense_y(p, xq):
 
 @pytest.mark.parametrize("k", [13, 14, 15, 16])
 @pytest.mark.parametrize("M", [1, 2, 8, 16])
-def test_dense_fp4v2_gemv_matches_triton_and_ref(k, M):
-    """Dense fp4-v2 CUDA GEMV == the Triton fp4-v2 decode AND == the explicit
-    expand+F.linear reference, across M in {1,2,8,16} and the k=14/k=16 rungs,
-    for a single superblock (K=256) and two superblocks (K=512)."""
+def test_dense_fp4v2_gemv_matches_torch_and_native_expand(k, M):
+    """Dense FP4-v2 GEMV matches Torch decode and native expand+F.linear."""
     pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
     for K in (256, 512):
         p = _fp4v2_dense_prep(pq, k, N=96, K=K, seed=1000 + k + K)
@@ -552,10 +557,10 @@ def test_dense_fp4v2_gemv_matches_triton_and_ref(k, M):
         x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
         xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
         y = _cuda_fp4v2_dense_y(p, xq)
-        _assert_triton_close(y, _triton_fp4v2_dense_y(p, xq),
-                             f"dense fp4-v2 k={k} K={K} M={M} vs triton")
-        _assert_triton_close(y, _ref_fp4v2_dense_y(p, xq),
-                             f"dense fp4-v2 k={k} K={K} M={M} vs ref")
+        _assert_reference_close(y, _torch_fp4v2_dense_y(p, xq),
+                                f"dense fp4-v2 k={k} K={K} M={M} vs Torch")
+        _assert_reference_close(y, _native_expand_fp4v2_y(p, xq),
+                                f"dense fp4-v2 k={k} K={K} M={M} vs expand")
 
 
 def test_dense_fp4v2_four_warp_path():
@@ -567,10 +572,10 @@ def test_dense_fp4v2_four_warp_path():
     x = torch.randn(8, 1024, dtype=torch.bfloat16, device=DEV)
     xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
     y = _cuda_fp4v2_dense_y(p, xq)
-    _assert_triton_close(y, _triton_fp4v2_dense_y(p, xq),
-                         "dense fp4-v2 4-warp vs triton")
-    _assert_triton_close(y, _ref_fp4v2_dense_y(p, xq),
-                         "dense fp4-v2 4-warp vs ref")
+    _assert_reference_close(y, _torch_fp4v2_dense_y(p, xq),
+                            "dense fp4-v2 4-warp vs Torch")
+    _assert_reference_close(y, _native_expand_fp4v2_y(p, xq),
+                            "dense fp4-v2 4-warp vs expand")
 
 
 @pytest.mark.parametrize("N", [40, 100])
@@ -583,10 +588,10 @@ def test_dense_fp4v2_non_warp_multiple_N(N):
     x = torch.randn(3, 512, dtype=torch.bfloat16, device=DEV)
     xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
     y = _cuda_fp4v2_dense_y(p, xq)
-    _assert_triton_close(y, _triton_fp4v2_dense_y(p, xq),
-                         f"dense fp4-v2 N={N} vs triton")
-    _assert_triton_close(y, _ref_fp4v2_dense_y(p, xq),
-                         f"dense fp4-v2 N={N} vs ref")
+    _assert_reference_close(y, _torch_fp4v2_dense_y(p, xq),
+                            f"dense fp4-v2 N={N} vs Torch")
+    _assert_reference_close(y, _native_expand_fp4v2_y(p, xq),
+                            f"dense fp4-v2 N={N} vs expand")
 
 
 def test_dense_fp4v2_fused_row_offset_two_roles():
@@ -616,10 +621,8 @@ def test_dense_fp4v2_fused_row_offset_two_roles():
     x = torch.randn(4, K, dtype=torch.bfloat16, device=DEV)
     xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
     y = _cuda_fp4v2_dense_y(p, xq)
-    _assert_triton_close(y, _triton_fp4v2_dense_y(p, xq),
-                         "dense fp4-v2 fused row-offset vs triton")
-    _assert_triton_close(y, _ref_fp4v2_dense_y(p, xq),
-                         "dense fp4-v2 fused row-offset vs ref")
+    _assert_reference_close(y, _torch_fp4v2_dense_y(p, xq),
+                            "dense fp4-v2 fused row-offset vs Torch")
 
 
 def test_dense_fp4v2_registered_op_matches_ext():
@@ -643,7 +646,7 @@ def test_dense_fp4v2_registered_op_matches_ext():
 def test_fp8_uneven_split_matches_encoder_reconstruct(k):
     """ENCODER ANCHOR for uneven fp8 splits: prismaquant encodes a dense fp8-CB
     weight at an odd / non-multiple-of-4 rung (ceil-first _bit_split); the
-    gridbook Triton value-expand and the CUDA GEMV must reproduce the
+    Gridbook native value-expand and CUDA GEMV must reproduce the
     encoder's own reconstruct. This pins the (sub0-at-LSB, ceil-first) bit
     convention to the encoder, not merely decoder-vs-decoder agreement."""
     pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
@@ -674,7 +677,7 @@ def test_fp8_uneven_split_matches_encoder_reconstruct(k):
     y_cuda = ext.cb_gemv_fp8(xq, qwp, cb8, row0, ws, N, K, k, 4, ts, False)
     y_ref = torch.nn.functional.linear(xq.to(torch.bfloat16),
                                        W.to(torch.bfloat16))
-    _assert_triton_close(y_cuda, y_ref, f"fp8 uneven k={k} gemv-vs-ref")
+    _assert_reference_close(y_cuda, y_ref, f"fp8 uneven k={k} gemv-vs-ref")
 
 
 # --------------------------------------------------------------------------- #
@@ -686,11 +689,8 @@ def test_fp8_uneven_split_matches_encoder_reconstruct(k):
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("k", [13, 14, 15, 16])
 def test_signed_dense_expand_matches_encoder_reconstruct(k):
-    """Triton v2 expander (SIGNED branch) == pq reconstruct on real signed
-    bytes: sign applied to the magnitude BEFORE the composed scale, bf16
-    rounding identical."""
+    """Pure-Torch signed v2 decode matches the encoder reconstruction."""
     pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
-    from gridbook.expand import expand_fp4_v2_to_weight
     torch.manual_seed(k)
     N, K = 48, 512
     cb = pq._resolve_codebook(k, "fp4", "signed", None, torch.device(DEV))
@@ -707,17 +707,18 @@ def test_signed_dense_expand_matches_encoder_reconstruct(k):
     cb_flat = codec.build_flat_codebook(subs)
     compose = codec.build_compose_table(codec.TWO_TIER_SUB_TABLE).to(DEV)
     row0 = torch.zeros(N, dtype=torch.int32, device=DEV)
-    W = expand_fp4_v2_to_weight(codec.pad_qweight(packed), cb_flat, row0,
-                                compose, N, K, k, 1, ts).float()
+    W = reconstruct_cb_weight(
+        codec.pad_qweight(packed), cb_flat, row0,
+        torch.zeros(1, device=DEV), compose, N=N, K=K, k_bits=k, n_sub=1,
+        type_size=ts, is_fp4=True, is_v2=True).float()
     rel = (W - ref).norm() / ref.norm().clamp_min(1e-6)
     assert rel <= 5e-3, f"S{k}: expand vs reconstruct rel {rel:.4e}"
 
 
 @pytest.mark.parametrize("k", [13, 15, 16])
 @pytest.mark.parametrize("M", [1, 2, 8, 16])
-def test_signed_dense_gemv_matches_triton_and_ref(k, M):
-    """Dense CUDA GEMV signed branch == Triton SIGNED decode == explicit
-    expand+F.linear reference, on real signed-encoder bytes."""
+def test_signed_dense_gemv_matches_torch_reference(k, M):
+    """Dense CUDA GEMV signed branch matches the independent Torch decode."""
     pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
     for K in (256, 512):
         p = _fp4v2_dense_prep(pq, k, 64, K, seed=1000 + k, mode="signed")
@@ -725,10 +726,9 @@ def test_signed_dense_gemv_matches_triton_and_ref(k, M):
         x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
         xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
         y_cuda = _cuda_fp4v2_dense_y(p, xq)
-        y_trit = _triton_fp4v2_dense_y(p, xq)
-        y_ref = _ref_fp4v2_dense_y(p, xq)
-        _assert_triton_close(y_cuda, y_trit, f"S{k} M={M} K={K} cuda-vs-triton")
-        _assert_triton_close(y_cuda, y_ref, f"S{k} M={M} K={K} cuda-vs-ref")
+        y_ref = _torch_fp4v2_dense_y(p, xq)
+        _assert_reference_close(y_cuda, y_ref,
+                                f"S{k} M={M} K={K} cuda-vs-Torch")
 
 
 @pytest.mark.parametrize("k", [13, 16])
@@ -790,7 +790,7 @@ def test_contract_v2_fp8_dense(k):
     y_ref = (xq.float() @ W_ref.T)
     with _with_env("PRISMAQUANT_CB_DECODE_CONTRACT", "v2"):
         y2 = ext.cb_gemv_fp8(xq, qwp, cb8, row0, ws, N, K, k, 4, ts, False)
-    _assert_triton_close(y2, y_ref.to(torch.bfloat16), f"v2 fp8 k={k}")
+    _assert_reference_close(y2, y_ref.to(torch.bfloat16), f"v2 fp8 k={k}")
     y1 = ext.cb_gemv_fp8(xq, qwp, cb8, row0, ws, N, K, k, 4, ts, False)
     rel = (y1.float() - y2.float()).norm() / y2.float().norm().clamp_min(1e-6)
     assert rel < 3e-3, f"v1-vs-v2 fp8 k={k} rel {rel:.2e} (ulp-class expected)"
@@ -824,8 +824,8 @@ def test_contract_v2_fp4_dense(k, mode):
     with _with_env("PRISMAQUANT_CB_DECODE_CONTRACT", "v2"):
         y2 = ext.cb_gemv_fp4_v2(xq, qwp, cb_flat, row0, compose, N, K, k,
                                 n_sub, ts)
-    _assert_triton_close(y2, y_ref.to(torch.bfloat16),
-                         f"v2 fp4 {mode} k={k}")
+    _assert_reference_close(y2, y_ref.to(torch.bfloat16),
+                            f"v2 fp4 {mode} k={k}")
     y1 = ext.cb_gemv_fp4_v2(xq, qwp, cb_flat, row0, compose, N, K, k,
                             n_sub, ts)
     rel = (y1.float() - y2.float()).norm() / y2.float().norm().clamp_min(1e-6)

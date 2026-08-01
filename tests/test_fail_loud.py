@@ -1,16 +1,11 @@
-"""Three silent degrades in the CB MoE path, made loud.
+"""Fail-closed contracts in the native CB MoE path.
 
 CPU-only, no CUDA, no nvcc, no vLLM: the expanders and the JIT-extension probe
 are monkeypatched, so what is pinned here is CONTROL FLOW and DIAGNOSTICS, not
 kernel numerics.
 
-  1. ``_expand_stack_slice``'s fp8 branch must consult ``_cb_expand_ext_ok()``
-     before reaching for ``ops.cb_expand_fp8``. That op dereferences
-     ``cuda_ext.get_ext()`` with no None check of its own, so an unguarded call
-     raises ``AttributeError`` mid-prefill on any host where the JIT build
-     failed -- instead of the Triton fallback ``cuda_ext``'s module docstring
-     advertises. ``test_ops_cb_expand_fp8_without_ext_raises`` pins the raw
-     failure mode; the two tests after it pin the guard.
+  1. FP8 expansion must raise ``NativeKernelUnavailableError`` when its native
+     extension cannot load. There is no interpreted serving fallback.
   2. ``_assert_cast_lossless`` must reject a codebook table that the bf16 /
      e4m3 cast rounds, and must say by how much. The casts are exact only for
      tables already on those grids.
@@ -19,8 +14,8 @@ kernel numerics.
      engages, so a log can prove which decode path a run actually used.
 
 Instances are built with ``__new__`` and explicit attributes, the same
-init-bypass the other MoE test files use (``test_moe_stock_prefill._build``,
-``test_moe_stacked``): nothing here exercises ``__init__``.
+init-bypass used by ``test_moe_grouped_fused`` and ``test_moe_stacked``:
+nothing here exercises ``__init__``.
 
 Run: ``python -m pytest tests/test_fail_loud.py -q``. When vLLM is absent the
 module-scoped runtime fixture installs private stubs and restores the exact
@@ -55,9 +50,6 @@ def _install_vllm_stubs():
     config.FusedMoEQuantConfig = type("FusedMoEQuantConfig", (), {})
     base = _mod("vllm.model_executor.layers.fused_moe.fused_moe_method_base")
     base.FusedMoEMethodBase = type("FusedMoEMethodBase", (), {})
-    activation = _mod("vllm.model_executor.layers.fused_moe.activation")
-    activation.MoEActivation = type("MoEActivation", (), {})
-    activation.apply_moe_activation = lambda *a, **kw: None
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -84,16 +76,14 @@ TYPE_SIZE = 4 * K                      # fp8-CB superblock byte width
 
 @pytest.fixture(autouse=True)
 def _reset_process_state(monkeypatch):
-    """The two fail-loud latches are PROCESS-wide by design (one line per
+    """The two decode latches are PROCESS-wide by design (one line per
     process, not per layer). Reset them around every test so ordering cannot
     make a later test pass on an earlier test's cached probe."""
-    monkeypatch.setattr(moe.PrismaQuantCBMoEMethod, "_EXPAND_EXT_OK", None)
     monkeypatch.setattr(moe.PrismaQuantCBMoEMethod,
                         "_DECODE_ENGAGED_LOGGED", False)
     monkeypatch.setattr(moe.PrismaQuantCBMoEMethod,
                         "_DECODE_DISABLED_LOGGED", False)
     monkeypatch.delenv("PRISMAQUANT_SKIP_CB_CAST_CHECK", raising=False)
-    monkeypatch.delenv("PRISMAQUANT_CB_EXPAND", raising=False)
     monkeypatch.delenv("PRISMAQUANT_CB_DECODE", raising=False)
 
 
@@ -255,111 +245,17 @@ def test_fp8_grid_validation_rejects_malformed_tables_at_load(value):
             "fp8.layer", "fp8")
 
 
-# ------------------------------------------------- (1) the expand fail-soft
+# ------------------------------------------------ (1) native expand fail-closed
 def test_ops_cb_expand_fp8_without_ext_raises(monkeypatch):
-    """THE failure this PR is about: ops.cb_expand_fp8 has no None check --
-    its docstring pushes that onto the caller (gridbook/ops.py:107) -- so an
-    unguarded call on an ext-less host is an AttributeError, not a fallback."""
+    """The raw op reports a native-kernel failure, never AttributeError."""
     ops = pytest.importorskip("gridbook.ops")
     monkeypatch.setattr(cuda_ext, "get_ext", lambda: None)
     qw = torch.zeros(4, TYPE_SIZE, dtype=torch.uint8)
-    with pytest.raises(AttributeError):
+    with pytest.raises(cuda_ext.NativeKernelUnavailableError,
+                       match="FP8-CB transient expansion"):
         ops.cb_expand_fp8(qw, torch.zeros(64, dtype=torch.uint8),
                           torch.zeros(4, dtype=torch.int32),
                           4, 256, K, N_SUB, TYPE_SIZE)
-
-
-def test_expand_ext_probe_is_false_and_loud(monkeypatch, capsys):
-    monkeypatch.setattr(cuda_ext, "get_ext", lambda: None)
-    cls = moe.PrismaQuantCBMoEMethod
-    assert cls._cb_expand_ext_ok() is False
-    err = capsys.readouterr().err
-    assert "CUDA expand extension" in err and "WARNING" in err
-    # cached: probed once per process, no second warning, no second get_ext call
-    monkeypatch.setattr(cuda_ext, "get_ext",
-                        lambda: pytest.fail("probe was not cached"))
-    assert cls._cb_expand_ext_ok() is False
-    assert capsys.readouterr().err == ""
-
-
-def test_expand_ext_probe_requires_the_called_symbol(monkeypatch, capsys):
-    monkeypatch.setattr(cuda_ext, "get_ext", lambda: object())
-    cls = moe.PrismaQuantCBMoEMethod
-    assert cls._cb_expand_ext_ok() is False
-    assert "CUDA expand extension" in capsys.readouterr().err
-
-
-def test_expand_stack_slice_falls_back_to_triton_without_ext(monkeypatch,
-                                                             capsys):
-    """With no extension the fp8 branch must take the padded Triton expander
-    and keep going -- never AttributeError out of the middle of a prefill."""
-    monkeypatch.setattr(cuda_ext, "get_ext", lambda: None)
-    ops = pytest.importorskip("gridbook.ops")
-    monkeypatch.setattr(ops, "cb_expand_fp8", lambda *a, **kw: pytest.fail(
-        "unguarded CUDA expander call on an ext-less host"))
-
-    seen = {}
-
-    def _fake_triton(qwp, lut, row0, N, Kdim, k, n_sub, ts):
-        seen["rows"] = N
-        seen["pad"] = qwp.shape[1] - TYPE_SIZE * (Kdim // codec.SUPERBLOCK)
-        return torch.zeros(N, Kdim, dtype=torch.uint8)
-
-    monkeypatch.setattr(moe, "expand_cb_to_fp8", _fake_triton)
-
-    m = _method()
-    lay = _layer(E=2, hidden=256, inter=256)
-    W = m._expand_stack_slice(lay, "w13", 0, 2, to_fp8=True)
-
-    assert seen["rows"] == 2 * (2 * 256)          # nE * out_f
-    assert seen["pad"] == codec.PAD_BYTES         # the padded Triton contract
-    assert tuple(W.shape) == (2, 2 * 256, 256)
-    assert "CUDA expand extension" in capsys.readouterr().err
-
-
-def test_expand_stack_slice_uses_the_cuda_op_when_the_ext_is_present(
-        monkeypatch):
-    """The guard must not cost the fast path: with an extension loaded the
-    branch still goes to ops.cb_expand_fp8 on the RAW unpadded slice view."""
-    monkeypatch.setattr(
-        cuda_ext, "get_ext", lambda: types.SimpleNamespace(cb_expand_fp8=True))
-    ops = pytest.importorskip("gridbook.ops")
-    monkeypatch.setattr(moe, "expand_cb_to_fp8", lambda *a, **kw: pytest.fail(
-        "fell back to Triton with the extension available"))
-
-    seen = {}
-
-    def _fake_op(qw, lut, row0, N, Kdim, k, n_sub, ts):
-        seen["rows"] = N
-        seen["row_bytes"] = qw.shape[1]
-        return torch.zeros(N, Kdim, dtype=torch.uint8)
-
-    monkeypatch.setattr(ops, "cb_expand_fp8", _fake_op)
-
-    m = _method()
-    lay = _layer(E=2, hidden=256, inter=256)
-    W = m._expand_stack_slice(lay, "w13", 0, 2, to_fp8=True)
-    assert seen["rows"] == 2 * (2 * 256)
-    assert seen["row_bytes"] == moe._row_bytes(256, TYPE_SIZE)   # NOT padded
-    assert tuple(W.shape) == (2, 2 * 256, 256)
-
-
-def test_expand_env_override_still_forces_triton(monkeypatch):
-    """PRISMAQUANT_CB_EXPAND=triton keeps working with the extension loaded
-    (the bisection lever upstream documents)."""
-    monkeypatch.setenv("PRISMAQUANT_CB_EXPAND", "triton")
-    monkeypatch.setattr(
-        cuda_ext, "get_ext", lambda: types.SimpleNamespace(cb_expand_fp8=True))
-    ops = pytest.importorskip("gridbook.ops")
-    monkeypatch.setattr(ops, "cb_expand_fp8", lambda *a, **kw: pytest.fail(
-        "env override ignored"))
-    seen = {}
-    monkeypatch.setattr(moe, "expand_cb_to_fp8",
-                        lambda qwp, lut, row0, N, Kd, *a: (
-                            seen.setdefault("hit", True),
-                            torch.zeros(N, Kd, dtype=torch.uint8))[1])
-    _method()._expand_stack_slice(_layer(), "w13", 0, 2, to_fp8=True)
-    assert seen.get("hit") is True
 
 
 # --------------------------------------------- (3) decode-path disengagement
@@ -370,7 +266,7 @@ def test_decode_disengagement_is_loud(monkeypatch, capsys):
     lay = _layer()
     assert m._cuda_moe_ok(lay) is False
     out = capsys.readouterr()
-    assert "grouped CUDA decode" in out.err and "WARNING" in out.err
+    assert "grouped CUDA decode" in out.err and "ERROR" in out.err
     assert "decode=grouped-cuda" not in out.out       # never claim engagement
 
 
@@ -378,7 +274,7 @@ def test_decode_disengagement_warning_is_process_deduplicated(monkeypatch,
                                                                capsys):
     monkeypatch.setattr(cuda_ext, "get_ext", lambda: None)
     assert _method()._cuda_moe_ok(_layer()) is False
-    assert "WARNING" in capsys.readouterr().err
+    assert "ERROR" in capsys.readouterr().err
     assert _method(prefix="model.layers.1.mlp.experts")._cuda_moe_ok(
         _layer()) is False
     assert capsys.readouterr().err == ""
@@ -393,17 +289,6 @@ def test_decode_engagement_line_is_printed_once(monkeypatch, capsys):
     m2 = _method(prefix="model.layers.1.mlp.experts")
     assert m2._cuda_moe_ok(_layer()) is True
     assert "decode=grouped-cuda" not in capsys.readouterr().out
-
-
-def test_decode_env_disable_is_also_reported(monkeypatch, capsys):
-    """PRISMAQUANT_CB_DECODE=triton is a deliberate override, so it gets no
-    extension WARNING -- but it must still not print the engagement line."""
-    monkeypatch.setenv("PRISMAQUANT_CB_DECODE", "triton")
-    monkeypatch.setattr(cuda_ext, "get_ext",
-                        lambda: pytest.fail("probed despite the env gate"))
-    assert _method()._cuda_moe_ok(_layer()) is False
-    out = capsys.readouterr()
-    assert "decode=grouped-cuda" not in out.out
 
 
 def test_cuda_gate_builds_the_fp8_lut_through_the_checked_helper(monkeypatch):

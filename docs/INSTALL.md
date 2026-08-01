@@ -3,7 +3,7 @@
 gridbook is a **plugin for vLLM**, not a runtime. Install it *into an environment
 that already has vLLM and a compatible PyTorch*. It deliberately declares no
 version pins for torch or vLLM, and vLLM is not a hard dependency. In a fresh
-environment pip may resolve generic torch/triton builds, so use the established
+environment pip may resolve a generic torch build, so use the established
 serving environment and `--no-deps` when its stack is already managed (see
 [Why nothing is pinned](#why-nothing-is-pinned)).
 
@@ -26,7 +26,7 @@ serving environment and `--no-deps` when its stack is already managed (see
 | **OS** | Linux | Only Linux is tested; the package declares `Operating System :: POSIX :: Linux`. |
 | **Python** | ≥ 3.10 | Installed-wheel CPU CI covers 3.10–3.13; GPU serving is measured on 3.12.3. |
 | **GPU** | NVIDIA Blackwell `sm_120` / `sm_121` for the native path | Other NVIDIA cards: see the [hardware matrix](#hardware-matrix). Non-NVIDIA is unsupported. |
-| **CUDA toolchain** | `nvcc` on `PATH` (or `CUDA_HOME` set) **in the serving process** | The kernels are JIT-compiled at runtime, not at install time. Missing `nvcc` is not an install error — it is a silent downgrade to the Triton path. |
+| **CUDA toolchain** | `nvcc` on `PATH` (or `CUDA_HOME` set) **in the serving process** | The kernels are JIT-compiled at runtime, not at install time. Missing `nvcc` may not fail package installation, but a required native serving operation fails closed when its extension cannot build. |
 | **PyTorch** | the build your vLLM uses | Measured: `2.11.0+cu130`. Installing gridbook into a fresh environment can pull a *generic* PyPI torch that does not match your CUDA — install into the vLLM environment instead. |
 | **vLLM** | already installed | Measured against `0.23.1rc1.dev764+g54b16d8a9`. |
 | **Parallelism** | `tp=1` | The plugin has no tensor-parallel handling. |
@@ -37,14 +37,17 @@ serving environment and `--no-deps` when its stack is already managed (see
 
 Read this as a compatibility statement, not a support promise. gridbook depends
 on a handful of vLLM internals (fused-MoE classes, the quantization registry,
-`vllm._custom_ops`) and on CUTLASS headers that ship *inside the vLLM install*,
-so vLLM version drift is the most likely source of breakage.
+the registered `vllm._C` CUDA operator ABI) and on CUTLASS headers that ship
+*inside the vLLM install*, so vLLM version drift is the most likely source of
+breakage. Gridbook calls the registered native FP8 quantizer and CUTLASS
+scaled-matmul operators directly; it deliberately does not use the
+fallback-capable `vllm._custom_ops` convenience wrappers.
 
 | Component | Version | Evidence |
 |---|---|---|
 | vLLM | `0.23.1rc1.dev764+g54b16d8a9` | **MEASURED** — the image every published benchmark ran in, re-verified 2026-07-28. |
 | torch | `2.11.0+cu130` | **MEASURED**, same image. |
-| triton | `3.6.0` | **MEASURED**, same image. |
+| Triton in the surrounding vLLM image | `3.6.0` | **MEASURED**, same image, but not a Gridbook dependency or Gridbook serving backend. |
 | transformers | `5.13.0` | **MEASURED**, same image. |
 | CUDA / `nvcc` | `13.0.88` | **MEASURED**, same image. |
 | CUTLASS | `4.3.4` (bundled by vLLM at `vllm/third_party/fmha_sm100/cutlass`) | **MEASURED**, same image. |
@@ -63,8 +66,9 @@ The mid-M fused prefill extension compiles against CUTLASS headers discovered
 under `vllm/third_party/`, not a vendored copy. That is deliberate — it
 guarantees ABI agreement with vLLM's own kernels — but it means the fused path's
 availability is a property of *your* vLLM build. If those headers are absent or
-in a different layout, the fused extension fails soft and mid-M prefill uses the
-transient-expand path instead (correct, slightly slower).
+in a different layout, Gridbook may use the separately qualified native CUDA
+transient-expand + CUTLASS route for that shape. If no qualified native route is
+available, serving fails closed.
 
 ---
 
@@ -76,14 +80,14 @@ no inline PTX and no `-arch` flag — torch derives the target from the GPU pres
 mid-M fused prefill kernel is genuinely Blackwell-family (`sm_120`) bound, and
 it already fails soft.
 
-| GPU | Decode | Dense FP8-CB prefill | Mid-M fused prefill | Overall |
+| GPU | Dense `M ≤ 8` | FP8-CB `M=9–128` | Native general / FP4 `M>8` | Overall |
 |---|---|---|---|---|
-| **GB10 / DGX Spark `sm_121`** | ✅ CUDA | ✅ | ✅ | **MEASURED** — the reference target for every published number. |
-| **RTX 5090 `sm_120`** | ✅ CUDA | ✅ | ✅ (expected) | **USER-REPORTED** working on the 27B artifact. Note the arch flag differs (`sm_120` vs the measured `sm_121`); no speed numbers exist for this card. |
-| **H100 `sm_90`** | expected ✅ | expected ✅ | ❌ fails soft → expand path | **INFERRED, UNTESTED.** |
-| **RTX 4090 / L40S `sm_89`** | expected ✅ | expected ✅ | ❌ fails soft → expand path | **INFERRED, UNTESTED.** |
-| **A100 `sm_80`** | expected ✅ for FP4-CB | ❌ FP8-CB requires `sm_89+` | n/a | **FAILS EARLY for FP8-CB.** Gridbook rejects the first FP8-CB target during model construction instead of loading a serve that will fail above 16 tokens. FP4-CB retains its BF16 fallback; untested on this card. |
-| **Supported NVIDIA GPU, no `nvcc`** | Triton fallback | Triton/stock fallback | n/a | Correct numerics, prototype speed. Not a serving target. |
+| **GB10 / DGX Spark `sm_121`** | ✅ native CUDA GEMV | fused CUTLASS when eligible, otherwise CUDA expand + CUTLASS | FP8 CUDA expand + CUTLASS; FP4 native BF16 expand + owned CUTLASS grouped (`E=1`) | **MEASURED target.** Published artifact results remain tied to their recorded pre-change commits until the new dispatch is rebenchmarked. |
+| **RTX 5090 `sm_120`** | expected same | expected same | expected same | **USER-REPORTED** working on the 27B artifact before the final native-only dispatch. The arch flag differs (`sm_120` vs measured `sm_121`); no new speed numbers exist. |
+| **H100 `sm_90`** | expected ✅ | Blackwell fused kernel ineligible; native expand + CUTLASS expected | native expansion + CUTLASS expected | **INFERRED, UNTESTED.** |
+| **RTX 4090 / L40S `sm_89`** | expected ✅ | Blackwell fused kernel ineligible; native expand + CUTLASS expected | native expansion + CUTLASS expected | **INFERRED, UNTESTED.** |
+| **A100 `sm_80`** | FP4-CB expected ✅ | ❌ FP8-CB requires `sm_89+` | FP4 quality path is native BF16 expand + CUTLASS | **FAILS EARLY for FP8-CB; FP4 UNTESTED.** No slow fallback is selected. |
+| **Supported NVIDIA GPU, no `nvcc`** | unavailable unless compatible extensions were prebuilt | unavailable unless compatible extensions were prebuilt | unavailable | **FAILS CLOSED.** There is no Triton serving fallback. |
 | **Non-NVIDIA** | unsupported | unsupported | unsupported | **UNSUPPORTED / UNQUALIFIED.** No ROCm backend or dispatch hook ships in this release. |
 
 Per-artifact caveat: an artifact may contain non-CB groups served by stock
@@ -119,7 +123,7 @@ pip install gridbook
 ```
 
 For an already-pinned serving environment, this avoids asking pip to resolve
-torch, triton, or other runtime packages again:
+torch or other runtime packages again:
 
 ```bash
 pip install --no-deps gridbook
@@ -150,8 +154,8 @@ install.)
 
 ### Why nothing is pinned
 
-`torch` and `triton` are declared as bare requirements with no version bounds.
-This is deliberate: vLLM environments run local-version wheels
+`torch` is declared as a bare requirement with no version bound. Triton is not a
+Gridbook dependency. This is deliberate: vLLM environments run local-version wheels
 (`2.11.0+cu130`) that no PyPI pin can satisfy, and the reference vLLM build is a
 source build that is not on PyPI at all. vLLM itself is an **optional** extra
 (`pip install gridbook[serve]`), never a hard dependency, so `import gridbook`
@@ -173,8 +177,9 @@ Nothing is compiled at `pip install` time. The extensions are built lazily by
 |---|---|---|---|
 | `prismaquant_cb_ext` (decode GEMV, MoE grouped GEMV, prefill expander) | `gridbook/csrc/cb_gemv.cu` | **at weight load**, deliberately warmed there so it does not poison the first request | **~30 s** once — see below |
 | `prismaquant_cb_v2_ext` (experimental smem-resident-dictionary MoE decode GEMV) | `gridbook/csrc/cb_gemv_v2.cu` | at weight load only for an **fp4**-CB two-tier MoE layer with `PRISMAQUANT_CB_GEMV=auto` or `v2`; unset stays on the inherited kernel and does not build this extension | comparable to `prismaquant_cb_ext`; unsupported devices and failed builds degrade to the shipped kernel with one stderr warning |
-| `pq_cb_fused` (mid-M CUTLASS fused prefill) | `gridbook/csrc/cb_fused_gemm.cu` + `csrc/cutlass_fork/*.hpp` | first prefill with 16 < tokens ≤ 128 | longer (a CUTLASS collective); not separately timed |
-| `pq_cb_ptc` (persistent-N prefill) | `gridbook/csrc/cb_persistent_tc.cu` | only when `PRISMAQUANT_ENABLE_PTC=1` | **quarantined, off by default** — measured negative for performance and under an open stability quarantine. Do not enable it. |
+| `pq_cb_bf16_grouped` (quality-preserving grouped/dense bridge) | `gridbook/csrc/cb_bf16_grouped_gemm.cu` | before FP4-CB `M>8` or MoE quality-path execution; dense uses grouped count `E=1` | CUTLASS JIT cost not yet separately measured; required by those paths and fail-closed. Its generic SM80-compatible schedule is not Blackwell-optimized and measured 6–17% slower than segmented BF16 matmuls on warm synthetic DSV4 shapes. |
+| `pq_cb_fused` (mid-M CUTLASS fused prefill) | `gridbook/csrc/cb_fused_gemm.cu` + `csrc/cutlass_fork/*.hpp` | first eligible FP8-CB call with 9 ≤ M ≤ 128 | longer (a CUTLASS collective); not separately timed |
+| persistent-N research source | `gridbook/csrc/cb_persistent_tc.cu` | never built by serving; direct research tests only | Measured negative for performance. The serving selector, custom op, and JIT loader are deleted. |
 
 **Where "~30 s" comes from.** Cold `get_ext()` in the reference container
 (`vllm-node:latest`, compile-only, **no** `--gpus`, `PRISMAQUANT_CB_EXT_DIR`
@@ -184,10 +189,11 @@ empty): **28.7 s** at `TORCH_CUDA_ARCH_LIST=12.1` and **32.3 s** at `12.0`
 your `nvcc` and your host — treat ~30 s as the order of magnitude, not a
 specification.
 
-Both of the first two **fail soft**: if the build fails, the plugin prints a
-warning and continues on a slower path, rather than refusing to serve. That is
-why an install problem shows up as *low throughput*, not as an error — and why
-the verification step below matters.
+The main extension is **required** and serving fails closed if it cannot build.
+An optional shape-specialized extension may be skipped only when dispatch has a
+separately qualified native CUDA/CUTLASS path; it never selects Triton. The
+verification step below distinguishes native readiness from a package that
+merely imports.
 
 ---
 
@@ -226,9 +232,9 @@ vLLM server** — it resolves the packaged sources, performs the same JIT build 
 plugin does, and reports the environment switches that can route around the
 result.
 
-**What it can and cannot tell you.** It proves the two things that fail
-*silently*: that the packaged `.cu` sources resolve from your install, and that
-they compile here. It does **not** prove a kernel ever runs on your GPU — the
+**What it can and cannot tell you.** It proves that the packaged `.cu` sources
+resolve from your install and that they compile here. It does **not** prove a
+kernel ever runs on your GPU — the
 build needs `nvcc`, not a device, so it prints `LOADED` on a machine with no GPU
 at all. The last block below covers the third silent failure (dispatch gated off
 by environment), but the only end-to-end proof is serving a model and seeing no
@@ -254,37 +260,32 @@ print("cb_gemv.cu found:", os.path.isfile(os.path.join(src, "cb_gemv.cu")))
 
 ext = cuda_ext.get_ext()       # JIT-compiles on first run (~30 s), then cached
 if ext is None:
-    print("BUILD           : CUDA extension UNAVAILABLE -> fallback path (slow).")
-    print("                  See docs/TROUBLESHOOTING.md")
+    print("BUILD           : REQUIRED CUDA extension UNAVAILABLE -> CANNOT SERVE.")
+    print("                  Gridbook has no Triton fallback; see docs/TROUBLESHOOTING.md")
 else:
     print("BUILD           : CUDA extension LOADED ->", getattr(ext, "__file__", "?"))
-    have = [s for s in ("cb_gemv_fp8", "cb_gemv_fp4_v2", "cb_expand_fp8_into",
+    have = [s for s in ("cb_gemv_fp8", "cb_gemv_fp4_v2", "cb_expand_fp8",
                         "cb_moe_gemv_fp8") if hasattr(ext, s)]
     print("                  symbols:", have)
 
-# A built extension is still not a used extension: these route around it.
-decode = os.environ.get("PRISMAQUANT_CB_DECODE", "cuda")
-print("CB_DECODE       :", decode,
-      "(default 'cuda')" if decode == "cuda"
-      else "*** NOT 'cuda' -> CUDA decode is DISABLED, you are on Triton ***")
 env = {k: v for k, v in os.environ.items() if k.startswith("PRISMAQUANT_")}
-print("other switches  :", {k: v for k, v in env.items()
-                            if k != "PRISMAQUANT_CB_DECODE"} or "none set")
-print("RESULT          :", "CUDA decode path"
-      if (ext is not None and decode == "cuda") else "FALLBACK path (slow)")
+retired = {k: v for k, v in env.items()
+           if v.lower() == "triton" or "TRITON" in k}
+print("retired switches:", retired or "none set")
+print("RESULT          :", "main native extension ready"
+      if ext is not None else "NOT READY TO SERVE")
 PY
 ```
 
-A healthy install prints `BUILD : CUDA extension LOADED`, four symbols,
-`CB_DECODE : cuda`, and `RESULT : CUDA decode path`.
+A healthy install prints `BUILD : CUDA extension LOADED`, the listed symbols,
+no retired switches, and `RESULT : main native extension ready`.
 
-The `symbols:` line above is informational. The loader itself asserts the
-symbols its callers dereference unconditionally, so `BUILD : CUDA extension
-LOADED` already means those are present; a build that lacks one reports
-*"incompatible CUDA decode-GEMV extension"* and returns `UNAVAILABLE` instead of
-loading. Symbols listed there but **not** required — `cb_expand_fp8_into` is
-one — are optional bindings that older extensions may not have; their absence
-costs a fast path, not correctness.
+The `symbols:` line above is informational. The loader itself asserts the full
+native symbol family its callers dereference, so `BUILD : CUDA extension
+LOADED` already means that ABI is present; a build that lacks one reports an
+incompatible CUDA decode-GEMV extension and returns `UNAVAILABLE` instead of
+loading. Artifact-specific paths additionally attest the direct registered FP8
+CUDA/CUTLASS ABI and any grouped/fused extension they require during model load.
 
 Four distinct failures are reported differently, on purpose:
 
@@ -296,9 +297,9 @@ Four distinct failures are reported differently, on purpose:
   extension"* error naming missing symbols — the loaded binary does not match
   the current Python call contract. Use the named cache diagnostics and see
   [TROUBLESHOOTING.md](TROUBLESHOOTING.md#incompatible-jit-extension-the-module-loaded-but-has-the-wrong-api).
-- **`BUILD : ... LOADED` but `RESULT : FALLBACK path`** — nothing is broken; an
-  environment variable is forcing the slow path. `PRISMAQUANT_CB_DECODE=triton`
-  is a bisection switch that some scripts and model cards set. Unset it.
+- **A non-empty `retired switches:` line** — an old script or model card still
+  requests a removed Triton lane. Unset it; current Gridbook has no equivalent
+  serving switch.
 
 All four are covered in [TROUBLESHOOTING](TROUBLESHOOTING.md).
 
@@ -328,7 +329,7 @@ discrete GPU with its own VRAM, ordinary vLLM utilization guidance applies.
 
 - **`tp=1` only.** No tensor-parallel support; `--tensor-parallel-size > 1` is
   untested and unimplemented for CB weights.
-- **`--enforce-eager` is the published-model configuration.** The default
+- **`--enforce-eager` is the published-model configuration.** The permanent
   opaque dispatch has since made mode-0 `FULL_DECODE_ONLY` capture-correct and
   it improved a close-rate 0.6B canary by 20.1%. Keep eager for published
   recipes until that graph setup clears their own streaming gate; see

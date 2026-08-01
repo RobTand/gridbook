@@ -1,7 +1,7 @@
 """Self-contained (no `prismaquant` import at serve time) CB codec helpers:
 
 * load-time preprocessing that turns the shipped layout (LAYOUT.md) into the
-  small resident tensors the Triton kernel consumes — the flat codebook, the
+  small resident tensors the native CUDA/CUTLASS kernels consume — the flat codebook, the
   pre-decoded fp4 scale plane, and an 8-byte-padded index stream. None of these
   is a dense [N,K] weight (INV-1 holds);
 * activation QDQ that reproduces the emulation gate's served-activation buckets
@@ -170,7 +170,7 @@ def pad_qweight(qw: torch.Tensor) -> torch.Tensor:
        output rows).
     2. **The padded row stride stays a 16-byte multiple** whenever the UNPADDED
        one was. The fp8 CUTLASS entries (``cb_fused_prefill_mm_scaled``, the
-       persistent-TC prefill) take the row stride explicitly and TORCH_CHECK
+       fused prefill) take the row stride explicitly and TORCH_CHECK
        ``stride(0) % 16 == 0`` — TMA needs 16-byte-aligned row starts. Every fp8
        rung has ``type_size = 4k`` in {112,128,144,160,176,192}, so
        ``row_bytes`` is 16-aligned and ``row_bytes + 16`` still is; the old

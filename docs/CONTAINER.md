@@ -61,7 +61,7 @@ upstream vLLM flag works unchanged.
 | Base | `vllm/vllm-openai:v0.24.0` (`linux/arm64` + `linux/amd64`) |
 | vLLM | 0.24.0 |
 | PyTorch | 2.11.0+cu130 |
-| Triton | 3.6.0 |
+| Triton (ambient vLLM component; not used by Gridbook) | 3.6.0 |
 | CUDA / `nvcc` | 13.0 |
 | CUTLASS | 4.3.4, bundled by vLLM at `vllm/third_party/fmha_sm100/cutlass` |
 | gridbook | installed from the build context, non-editable |
@@ -85,7 +85,7 @@ gridbook's only *measured* serving stack is a vLLM **source build**
 reproduces that build, so no tag is a perfect match. `v0.24.0` (tagged
 2026-06-30) is the official release nearest in time, and it was checked to agree
 with the measured stack on everything the kernels touch — torch 2.11.0+cu130,
-Triton 3.6.0, `nvcc` 13.0, CUTLASS 4.3.4 at the same path — and to export every
+`nvcc` 13.0, CUTLASS 4.3.4 at the same path — and to export every
 vLLM symbol the plugin imports, including the private fused-MoE internals
 (`RoutedExperts`, `FusedMoEMethodBase`, `MoEActivation`,
 `dispatch_fused_moe_kernel`, `_get_config_dtype_str`, `moe_align_block_size`).
@@ -108,8 +108,8 @@ cpp_extension` CUDA JIT build fails there:
 fatal error: cusparse.h: No such file or directory
 ```
 
-For gridbook that would be a silent downgrade to the Triton fallback path, not a
-visible error. The matching headers are, however, already inside the image:
+For Gridbook that makes required native extensions unavailable and serving fails
+closed. The matching headers are, however, already inside the image:
 torch's own `nvidia-*-cu13` wheels ship a complete include tree that is
 version-matched to the torch build by construction. The Dockerfile links in
 **only the headers that are missing** — a computed rule, not a hardcoded list,
@@ -180,8 +180,8 @@ docker build --build-arg GRIDBOOK_CUDA_ARCH=12.0 -t gridbook:5090 .  # RTX 5090
 ```
 
 The CUTLASS mid-M fused prefill kernel is `sm_120`-family only; on a non-Blackwell
-arch the build prints a note and skips prewarming it, and at runtime that path
-falls back to the transient-expand path by design. Decode is unaffected — the
+arch the build prints a note and skips prewarming it, and at runtime that shape
+uses the native CUDA transient-expand + CUTLASS path by design. Decode is unaffected — the
 decode GEMV is architecture-generic CUDA and compiles for every arch above.
 
 You can also override the arch at *run* time (`-e TORCH_CUDA_ARCH_LIST=9.0`),
@@ -204,11 +204,11 @@ list, restore it at run time with `-e TORCH_CUDA_ARCH_LIST="8.0 8.7 8.9 9.0 10.0
 
 The build **fails** rather than producing a quietly broken image if:
 
-- a runtime dependency (`torch`, `triton`, `safetensors`, `vllm`) does not import;
+- a runtime dependency (`torch`, `safetensors`, `vllm`) does not import;
 - gridbook did not install into `site-packages`;
 - the packaged CUDA sources (`gridbook/csrc/*.cu`) are missing from the install —
-  this is the exact defect that used to make a non-editable `pip install`
-  fail-soft to the slow Triton path;
+  this is the exact defect that made a non-editable `pip install` fail-soft to
+  the slow Triton path in retired releases;
 - the `vllm.general_plugins` entry point is not registered;
 - `gridbook.register()` raises against the chosen vLLM (an API-drift canary —
   vLLM's plugin loader swallows load exceptions and continues, so without this
@@ -216,9 +216,9 @@ The build **fails** rather than producing a quietly broken image if:
 - the decode-GEMV kernel fails to compile;
 - a non-root, non-group-0 UID (1000:1000, `HOME=/` — what `docker run --user`
   actually gives you) cannot `import vllm`, register the plugin, or load the
-  prewarmed kernels. All three of those failures are silent at run time: the
-  first two crash inside vLLM's swallow-and-continue plugin loader, the third
-  downgrades decode to the Triton prototype with a warning.
+  prewarmed kernels. The first two can still be obscured by vLLM's
+  swallow-and-continue plugin loader; the third now makes native execution
+  unavailable and Gridbook fails closed.
 
 ---
 
@@ -286,8 +286,8 @@ Why each piece:
   before it even checks whether anything needs building, so merely *loading* the
   prewarmed cache needs create permission there. The image opens
   `/opt/gridbook/ext-cache` to all UIDs for exactly this reason. If it were only
-  group-0-writable (the usual recipe), `--user 1000:1000` would fall back to the
-  slow Triton decode path with nothing but a warning.
+  group-0-writable (the usual recipe), `--user 1000:1000` would be unable to load
+  the required native extension and serving would fail closed.
 - **`HF_HOME` must point somewhere your UID can write.** `HF_HOME` defaults to
   `~/.cache/huggingface`; under `--user` docker sets `HOME=/` for a UID with no
   passwd entry, and `/root` is mode 0700 and unreadable anyway. The image ships a
@@ -305,9 +305,10 @@ docker run --rm --gpus all --read-only --tmpfs /tmp \
   -v gridbook-ext:/opt/gridbook/ext-cache ... gridbook:local <model>
 ```
 
-Without `--tmpfs /tmp` a bare `--read-only` container fail-softs to the Triton
-path (`FileNotFoundError: No usable temporary directory found`) — torch and vLLM
-both need a writable temp directory.
+Without `--tmpfs /tmp` a bare `--read-only` container cannot initialize the
+native build/cache path (`FileNotFoundError: No usable temporary directory
+found`) and serving fails closed — torch and vLLM both need a writable temp
+directory.
 
 ---
 
@@ -482,9 +483,9 @@ You are building on a base image whose CUDA headers are incomplete and whose
 `nvidia/cu*/include` wheels are absent. Install the dev packages
 (`libcusparse-dev-13-0`, `libcublas-dev-13-0`) in a derived layer.
 
-**`[prismaquant-cb] WARNING: ... falling back to the Triton decode path`**
-The kernel build failed at runtime. The Triton path is correct but is not a
-production serving target. The message names the exception; the usual causes are:
+**`[prismaquant-cb] WARNING: ... native Gridbook execution is unavailable and serving will fail closed`**
+The native kernel build failed at runtime. There is no Gridbook Triton fallback.
+The message names the exception; the usual causes are:
 
 | In the message | Cause |
 |---|---|

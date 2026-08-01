@@ -1,16 +1,17 @@
 """JIT build/load of the CUDA decode-GEMV extension (``gridbook/csrc/cb_gemv.cu``).
 
-Loaded lazily on first use. Needs nvcc (present in the serving container;
-absent in the build venv) — if the build fails the caller falls back to the
-Triton decode path with a loud one-time warning, so the plugin keeps serving
-everywhere the Triton prototype did.
+Loaded lazily on first use. It needs nvcc (present in the serving container;
+often absent in build-only environments). Capability probes may receive
+``None`` when a build is unavailable, but production call sites use
+:func:`require_ext` / :func:`require_ext_v2` and fail closed. Gridbook has no
+interpreted-kernel runtime fallback.
 
 The ``.cu``/``.hpp`` sources ship *inside* the package (``gridbook/csrc``) and
 are located with :func:`csrc_dir`, so an in-repo checkout, ``pip install -e``
 and a wheel install all resolve identically. Do not reintroduce ``os.pardir``
 repo-root arithmetic here: under a non-editable install only the package lands
-in site-packages, so a repo-root-relative path does not exist and every
-extension build fails silently into the slow Triton path.
+in site-packages, so a repo-root-relative path does not exist and every native
+extension build fails.
 
 Build cache: ``PRISMAQUANT_CB_EXT_DIR`` if set, else ``~/.cache/prismaquant-
 cb-ext`` (inside the container that is ephemeral — one ~30 s build per
@@ -67,6 +68,15 @@ class StaleExtensionError(RuntimeError):
     loading succeeded, but the resulting Python module is incompatible. A
     stale/corrupt cache entry is one possible cause; so is an unexpected module
     on the import path. The diagnostic names both the module and build cache.
+    """
+
+
+class NativeKernelUnavailableError(RuntimeError):
+    """A required Gridbook native CUDA/CUTLASS kernel cannot be called.
+
+    Loader functions retain ``None`` as a useful capability-probe result, but
+    serving code must raise this error instead of selecting an unoptimized or
+    numerically different implementation.
     """
 
 
@@ -227,8 +237,8 @@ def _require_any_symbol_family(mod, families, *, build_dir: str, source: str):
 
     ``families`` is an iterable of ``(label, required_symbols)`` pairs. A
     fused module may legitimately carry dense-prefill bindings, grouped-MoE
-    bindings, or both. Missing an entire family preserves its call-site
-    fallback; a module with no complete useful family is refused.
+    bindings, or both. Missing an entire family preserves its separate exact
+    native route; a module with no complete useful family is refused.
     """
     normalized = tuple((label, tuple(names)) for label, names in families)
     if not normalized or any(not names for _label, names in normalized):
@@ -247,9 +257,9 @@ def _require_any_symbol_family(mod, families, *, build_dir: str, source: str):
 
 # Symbols ``get_ext()``'s module must export, asserted on EVERY load rather
 # than only at build time. Most are dereferenced unconditionally by a custom op
-# in ``ops.py``. ``fp4_act_qdq`` does have a correct codec fallback, but keeping
-# it in the same revision contract prevents a pre-QDQ cache from being accepted
-# as the current main extension and silently losing the single-launch path.
+# in ``ops.py``. Keeping ``fp4_act_qdq`` in the same revision contract prevents
+# a pre-QDQ cache from being accepted as the current main extension and
+# silently losing a required native serving operation.
 _EXT_SYMBOLS = (
     "fp8_act_qdq",          # ops.fp8_act_qdq
     "fp4_act_qdq",          # ops.fp4_act_qdq
@@ -270,6 +280,17 @@ def get_ext():
         if _tried:
             return _ext
         return _load_ext_locked()
+
+
+def require_ext(operation: str = "this operation"):
+    """Return the main native extension or raise a production-facing error."""
+    ext = get_ext()
+    if ext is None:
+        raise NativeKernelUnavailableError(
+            f"{operation} requires Gridbook's native CUDA extension "
+            f"(cb_gemv.cu), but it is unavailable. Gridbook does not fall "
+            f"back to Triton. To enable the native path: {_NVCC_HINT}.")
+    return ext
 
 
 def _load_ext_locked():
@@ -294,29 +315,22 @@ def _load_ext_locked():
         # Loading succeeded, so distinguish an incompatible module from source
         # packaging and compiler/toolchain failures.
         print(f"[prismaquant-cb] ERROR: incompatible CUDA decode-GEMV "
-              f"extension — "
-              f"{exc} Falling back to the Triton decode path until the cache "
-              f"is cleared: correct, but not production-eligible "
-              f"(docs/BENCHMARKS.md).",
+              f"extension — {exc} Native Gridbook execution is unavailable "
+              f"until the extension cache is cleared; serving will fail "
+              f"closed.",
               file=sys.stderr, flush=True)
         _ext = None
     except IncompleteInstallError as exc:
-        # The speed figure is sourced, not asserted: docs/BENCHMARKS.md records
-        # the CUDA grouped-GEMV decode path taking the reference 35B MoE
-        # artifact from 3.5 to ~33 served tok/s. Do not restate it as a
-        # round number without re-measuring.
         print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
-              f"Falling back to the Triton decode path: correct, but not "
-              f"production-eligible — the CUDA decode path measured ~9x higher "
-              f"served decode throughput on the reference MoE artifact "
-              f"(3.5 -> 33 tok/s; docs/BENCHMARKS.md).",
+              f"Native Gridbook execution is unavailable and serving will "
+              f"fail closed.",
               file=sys.stderr, flush=True)
         _ext = None
-    except Exception as exc:  # noqa: BLE001 — any build/env failure -> fallback
+    except Exception as exc:  # noqa: BLE001 — loader reports unavailable
         print(f"[prismaquant-cb] WARNING: gridbook's CUDA decode-GEMV "
               f"extension could not be built ({type(exc).__name__}: {exc}); "
-              f"falling back to the Triton decode path (slow prototype). To "
-              f"get the CUDA path: {_NVCC_HINT}.",
+              f"native Gridbook execution is unavailable and serving will "
+              f"fail closed. To enable the native path: {_NVCC_HINT}.",
               file=sys.stderr, flush=True)
         _ext = None
     finally:
@@ -404,6 +418,17 @@ def get_ext_v2():
     return _ext_v2
 
 
+def require_ext_v2(operation: str = "this operation"):
+    """Return the native FP4-v2 extension or fail closed."""
+    ext = get_ext_v2()
+    if ext is None:
+        raise NativeKernelUnavailableError(
+            f"{operation} requires Gridbook's native FP4-v2 CUDA extension "
+            f"(cb_gemv_v2.cu), but it is unavailable. Gridbook does not fall "
+            f"back to Triton. To enable the native path: {_NVCC_HINT}.")
+    return ext
+
+
 _fused = None
 _fused_tried = False
 _fused_lock = threading.Lock()
@@ -411,12 +436,26 @@ _fused_lock = threading.Lock()
 
 def _find_cutlass_include() -> str:
     """Locate the vLLM-bundled CUTLASS include dir (same discovery the
-    fused ext uses)."""
+    fused ext uses), without importing vLLM's runtime package.
+
+    Importing ``vllm`` merely to locate its files eagerly initializes optional
+    compiler backends, including Triton on some releases. Gridbook does not
+    need any of that state to compile an owned CUTLASS translation unit; module
+    discovery gives us the package directory without executing ``__init__``.
+    """
     import glob
+    import importlib.util
 
-    import vllm
-
-    vroot = os.path.dirname(os.path.abspath(vllm.__file__))
+    spec = importlib.util.find_spec("vllm")
+    if spec is None:
+        raise FileNotFoundError("vLLM package not found; cannot locate CUTLASS")
+    if spec.submodule_search_locations:
+        vroot = os.path.abspath(next(iter(spec.submodule_search_locations)))
+    elif spec.origin:
+        vroot = os.path.dirname(os.path.abspath(spec.origin))
+    else:
+        raise FileNotFoundError(
+            "vLLM package has no filesystem location; cannot locate CUTLASS")
     for pat in ("third_party/fmha_sm100/cutlass", "third_party/cutlass"):
         cand = os.path.join(vroot, pat)
         if os.path.isdir(os.path.join(cand, "include")):
@@ -428,72 +467,95 @@ def _find_cutlass_include() -> str:
     raise FileNotFoundError("no bundled CUTLASS under vllm/third_party")
 
 
-_ptc = None
-_ptc_tried = False
-_ptc_lock = threading.Lock()
-
-# ops.cb_prefill_persistent_tc dereferences this straight after the None check
-# (it has no probe), and it is the only binding cb_persistent_tc.cu exports.
-_PTC_SYMBOLS = ("cb_prefill_persistent_tc",)
-
-
-def get_persistent_ext():
-    """JIT build/load of the persistent-N tensor-core prefill kernel
-    (gridbook/csrc/cb_persistent_tc.cu, #4b v1). Fail-soft like the fused ext."""
-    if _ptc_tried:
-        return _ptc
-    with _ptc_lock:
-        if _ptc_tried:
-            return _ptc
-        return _load_persistent_ext_locked()
+_bf16_grouped = None
+_bf16_grouped_tried = False
+_bf16_grouped_lock = threading.Lock()
+_BF16_GROUPED_SYMBOLS = (
+    "cb_bf16_grouped_mm",
+    "cb_bf16_grouped_mm_out",
+)
 
 
-def _load_persistent_ext_locked():
-    """Build and publish the persistent extension with ``_ptc_lock`` held."""
-    global _ptc, _ptc_tried
-    # QUARANTINE (2026-07-23): a boot wedged minutes after this kernel's
-    # bench container exited; until the canary ladder clears it, the ext
-    # builds only on explicit opt-in.
-    if os.environ.get("PRISMAQUANT_ENABLE_PTC") != "1":
-        _ptc = None
-        _ptc_tried = True
-        return None
+def get_bf16_grouped_ext():
+    """Load Gridbook's native CUTLASS grouped BF16 bridge.
+
+    This is the quality-preserving prefill backend for a BF16 activation QDQ
+    and a bit-exact BF16 FP4-CB-v2 weight expansion. Capability probes may
+    inspect the ``None`` result; production calls use
+    :func:`require_bf16_grouped_ext` and fail closed.
+    """
+    if _bf16_grouped_tried:
+        return _bf16_grouped
+    with _bf16_grouped_lock:
+        if _bf16_grouped_tried:
+            return _bf16_grouped
+        return _load_bf16_grouped_ext_locked()
+
+
+def require_bf16_grouped_ext(operation: str = "this operation"):
+    """Return the native CUTLASS BF16 grouped extension or fail closed."""
+    ext = get_bf16_grouped_ext()
+    if ext is None:
+        raise NativeKernelUnavailableError(
+            f"{operation} requires Gridbook's native CUTLASS grouped BF16 "
+            "extension (cb_bf16_grouped_gemm.cu), but it is unavailable. "
+            "Gridbook does not fall back to Triton, torch._grouped_mm, "
+            f"F.linear, or cuBLAS. To enable the native path: {_NVCC_HINT}.")
+    return ext
+
+
+def _load_bf16_grouped_ext_locked():
+    """Build and publish grouped BF16 with ``_bf16_grouped_lock`` held."""
+    global _bf16_grouped, _bf16_grouped_tried
+    build_dir = "<unresolved>"
     try:
-        import torch  # noqa: F401
+        import torch
         from torch.utils.cpp_extension import load
 
-        src_dir = _require_csrc("cb_persistent_tc.cu")
-        build_dir = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+        cc = torch.cuda.get_device_capability()
+        if cc < (8, 0):
+            raise RuntimeError(
+                f"CUTLASS grouped BF16 requires compute capability >= 8.0, "
+                f"got {cc[0]}.{cc[1]}")
+        src_dir = _require_csrc("cb_bf16_grouped_gemm.cu")
+        cut_inc = _find_cutlass_include()
+        build_root = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
-        build_dir = os.path.join(build_dir, "ptc")
+        build_dir = os.path.join(build_root, "bf16_grouped")
         os.makedirs(build_dir, exist_ok=True)
-        cut = _find_cutlass_include()
-        mod = load(name="pq_cb_ptc",
-                   sources=[os.path.join(src_dir, "cb_persistent_tc.cu")],
-                   extra_include_paths=[cut, src_dir],
-                   extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
-                   build_directory=build_dir, verbose=False)
-        _ptc = _require_symbols(mod, _PTC_SYMBOLS, build_dir=build_dir,
-                                source="cb_persistent_tc.cu")
+        arch = f"compute_{cc[0]}{cc[1]}"
+        code = f"sm_{cc[0]}{cc[1]}"
+        mod = load(
+            name="pq_cb_bf16_grouped",
+            sources=[os.path.join(src_dir, "cb_bf16_grouped_gemm.cu")],
+            extra_include_paths=[cut_inc],
+            extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr",
+                               f"-gencode=arch={arch},code={code}"],
+            build_directory=build_dir,
+            verbose=False)
+        _bf16_grouped = _require_symbols(
+            mod, _BF16_GROUPED_SYMBOLS, build_dir=build_dir,
+            source="cb_bf16_grouped_gemm.cu")
     except StaleExtensionError as exc:
-        # Worth a warning even though this ext is opt-in: without it the None
-        # return makes ops.cb_prefill_persistent_tc report "ext not enabled
-        # (PRISMAQUANT_ENABLE_PTC=1)", which is the wrong diagnosis for someone
-        # who has just set that variable.
-        import warnings
-        warnings.warn(f"incompatible persistent-TC ext — {exc}")
-        _ptc = None
+        print("[prismaquant-cb] ERROR: incompatible CUTLASS grouped BF16 "
+              f"extension — {exc} Native quality prefill is unavailable and "
+              "serving will fail closed.", file=sys.stderr, flush=True)
+        _bf16_grouped = None
     except IncompleteInstallError as exc:
-        import warnings
-        warnings.warn(f"broken gridbook install — {exc}")
-        _ptc = None
-    except Exception as exc:  # noqa: BLE001
-        import warnings
-        warnings.warn(f"persistent-TC ext unavailable: {exc}")
-        _ptc = None
+        print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
+              "Native quality prefill is unavailable and serving will fail "
+              "closed.", file=sys.stderr, flush=True)
+        _bf16_grouped = None
+    except Exception as exc:  # noqa: BLE001 — capability probe is fail-soft
+        print("[prismaquant-cb] WARNING: CUTLASS grouped BF16 extension "
+              f"unavailable ({type(exc).__name__}: {exc}); native quality "
+              "prefill is unavailable and serving will fail closed. To "
+              f"enable the native path: {_NVCC_HINT}.",
+              file=sys.stderr, flush=True)
+        _bf16_grouped = None
     finally:
-        _ptc_tried = True
-    return _ptc
+        _bf16_grouped_tried = True
+    return _bf16_grouped
 
 
 _fused_fp4 = None
@@ -648,8 +710,9 @@ def get_fused_fp4_ext():
     the fp4 module alone. Needs the CUTLASS headers (vLLM's bundled copy, or
     PRISMAQUANT_CUTLASS_INCLUDE for venv builds) and the sm_121a/sm_120a
     arch-specific target — the block-scaled MMA is an arch-'a' instruction,
-    so the build pins the current device's compute_XYa. Fail-soft: serving
-    falls back to the Triton/transient fp4 paths."""
+    so the build pins the current device's compute_XYa. Fail-soft: this
+    research specialization may be absent while production stays on exact
+    native BF16 expansion plus the owned grouped CUTLASS bridge."""
     if _fused_fp4_tried:
         return _fused_fp4
     with _fused_fp4_lock:
@@ -732,18 +795,18 @@ def _load_fused_fp4_ext_locked():
             build_dir=build_dir, source="cb_fused_fp4_gemm.cu")
     except StaleExtensionError as exc:
         print(f"[prismaquant-cb] ERROR: incompatible fused fp4 prefill "
-              f"extension — {exc} fp4 prefill stays on the Triton/transient "
-              f"paths.", file=sys.stderr, flush=True)
+              f"extension — {exc} fp4 prefill stays on the exact native "
+              f"BF16/CUTLASS bridge.", file=sys.stderr, flush=True)
         _fused_fp4 = None
     except IncompleteInstallError as exc:
         print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
-              f"fp4 prefill stays on the Triton/transient paths.",
+              f"fp4 prefill stays on the exact native BF16/CUTLASS bridge.",
               file=sys.stderr, flush=True)
         _fused_fp4 = None
     except Exception as exc:  # noqa: BLE001
         print(f"[prismaquant-cb] WARNING: fused fp4 prefill extension "
               f"unavailable ({type(exc).__name__}: {exc}); fp4 prefill stays "
-              f"on the Triton/transient paths (expected off Blackwell or "
+              f"on the exact native BF16/CUTLASS bridge (expected off Blackwell or "
               f"without nvcc).", file=sys.stderr, flush=True)
         _fused_fp4 = None
     finally:
@@ -799,18 +862,18 @@ def _load_fused_ext_locked():
     except StaleExtensionError as exc:
         print(f"[prismaquant-cb] ERROR: incompatible fused prefill "
               f"extension — {exc} Fused dense and grouped prefill stay on "
-              f"their fallback paths.",
+              f"their exact native routes.",
               file=sys.stderr, flush=True)
         _fused = None
     except IncompleteInstallError as exc:
         print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
-              f"Fused dense and grouped prefill stay on their fallback paths.",
+              f"Fused dense and grouped prefill stay on their exact native routes.",
               file=sys.stderr, flush=True)
         _fused = None
     except Exception as exc:  # noqa: BLE001
         print(f"[prismaquant-cb] WARNING: fused prefill extension unavailable "
               f"({type(exc).__name__}: {exc}); fused dense and grouped "
-              f"prefill stay on their fallback paths (this is expected on "
+              f"prefill stay on their exact native routes (this is expected on "
               f"non-sm_120 GPUs and without nvcc).",
               file=sys.stderr, flush=True)
         _fused = None

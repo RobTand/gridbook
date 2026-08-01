@@ -1,4 +1,4 @@
-"""Parity + bench for the §4b persistent-N tensor-core prefill kernel.
+"""Direct research-only parity/bench for the retired persistent-N kernel.
 
 Parity contract: D_unscaled from cb_prefill_persistent_tc must match
   ref = (A_f32 @ expand_cb_to_fp8(packed).f32.T)   (fp32 reference)
@@ -6,18 +6,60 @@ within fp8-MMA reassociation tolerance, and the DECODED resident tile is
 bit-exact by construction (same decode as cb_expand_fp8 — cross-checked
 here via the expander).
 
-Run (GPU): PYTHONPATH=. pytest tests/test_persistent_tc.py -v
-Bench:     python tests/test_persistent_tc.py bench
+The serving selector, custom op, and package loader were deleted after this
+kernel measured negative. This file deliberately compiles the retained source
+itself and only when the research-specific opt-in is set.
+
+Run (GPU): GRIDBOOK_RESEARCH_PERSISTENT_TC=1 PYTHONPATH=. pytest tests/test_persistent_tc.py -v
+Bench:     GRIDBOOK_RESEARCH_PERSISTENT_TC=1 python tests/test_persistent_tc.py bench
 """
+import os
 import sys
+from pathlib import Path
+import warnings
 
 import pytest
 import torch
 
 try:
-    from gridbook.cuda_ext import get_ext, get_persistent_ext
+    from gridbook.cuda_ext import _find_cutlass_include, csrc_dir, get_ext
 except Exception:  # pragma: no cover
-    get_ext = get_persistent_ext = lambda: None
+    _find_cutlass_include = csrc_dir = get_ext = lambda: None
+
+
+_research_ptc = None
+_research_ptc_tried = False
+
+
+def _get_research_persistent_ext():
+    """Compile the retired source directly; never expose it through Gridbook."""
+    global _research_ptc, _research_ptc_tried
+    if os.environ.get("GRIDBOOK_RESEARCH_PERSISTENT_TC") != "1":
+        return None
+    if _research_ptc_tried:
+        return _research_ptc
+    try:
+        from torch.utils.cpp_extension import load
+
+        source_dir = Path(csrc_dir())
+        build_root = Path(os.environ.get("PRISMAQUANT_CB_EXT_DIR") or
+                          Path.home() / ".cache" / "prismaquant-cb-ext")
+        build_dir = build_root / "research-ptc"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        _research_ptc = load(
+            name="pq_cb_research_ptc",
+            sources=[str(source_dir / "cb_persistent_tc.cu")],
+            extra_include_paths=[_find_cutlass_include(), str(source_dir)],
+            extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+            build_directory=str(build_dir),
+            verbose=False,
+        )
+    except Exception as exc:  # pragma: no cover - research capability probe
+        warnings.warn(f"research persistent-TC extension unavailable: {exc}")
+        _research_ptc = None
+    finally:
+        _research_ptc_tried = True
+    return _research_ptc
 
 cuda_ok = torch.cuda.is_available()
 
@@ -46,9 +88,9 @@ def _mk(N, K, kbits, M, seed=0):
                                    (192, 3072, 300)])
 def test_persistent_tc_parity(kbits, shape, variant):
     N, K, M = shape
-    ext, ptc = get_ext(), get_persistent_ext()
+    ext, ptc = get_ext(), _get_research_persistent_ext()
     if ext is None or ptc is None:
-        pytest.skip("extensions unavailable")
+        pytest.skip("research extension unavailable or opt-in not set")
     a, packed, cb, tsize = _mk(N, K, kbits, M)
     offs = torch.zeros(N, dtype=torch.int32, device="cuda")
 
@@ -74,9 +116,9 @@ def test_persistent_tc_accepts_a_padded_row_stride(kbits):
     view must give the identical result."""
     from gridbook import codec
     N, K, M = 256, 1024, 512
-    ptc = get_persistent_ext()
+    ptc = _get_research_persistent_ext()
     if ptc is None:
-        pytest.skip("extensions unavailable")
+        pytest.skip("research extension unavailable or opt-in not set")
     a, packed, cb, tsize = _mk(N, K, kbits, M, seed=5)
     view = codec.pad_qweight(packed).narrow(1, 0, packed.shape[1])
     assert view.stride(0) == packed.shape[1] + codec.PAD_BYTES
@@ -89,7 +131,7 @@ def test_persistent_tc_accepts_a_padded_row_stride(kbits):
 
 
 def bench():  # pragma: no cover
-    ext, ptc = get_ext(), get_persistent_ext()
+    ext, ptc = get_ext(), _get_research_persistent_ext()
     assert ext is not None and ptc is not None
     import time
     for (N, K, kbits, M) in [(2048, 3072, 48, 1400), (2048, 3072, 48, 8192),

@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- Remove Gridbook's Triton dependency and every Gridbook-defined Triton
+  operator/dispatch/fallback path. Required CB operators now use native
+  CUDA/CUTLASS and fail closed when the selected native extension is
+  unavailable. Ambient vLLM may still import Triton for unrelated components.
+- Route dense FP8-CB through CUDA GEMV at M≤8, fused CUTLASS at M=9–128 when
+  eligible, and CUDA expansion + CUTLASS otherwise. Route dense FP4-CB M>8
+  through exact BF16 expansion + the owned CUTLASS grouped bridge (`E=1`).
+- Replace selectable MoE stock/loop/auto/L2 prefill modes with fixed native
+  dispatch: grouped CUDA GEMV at M≤16, then eligible quality-green FP8 fused
+  CUTLASS or exact BF16 expansion + the owned CUTLASS grouped bridge. Prior
+  Triton and Laguna chunk-expander results remain historical until this path is
+  rebenchmarked.
+- Make the whole-Layer/MoE opaque custom op the permanent dispatch boundary;
+  remove the former inline-dispatch environment escape.
+- Bind FP8 activation quantization and scaled matrix multiplication directly to
+  vLLM's registered native CUDA operators after ABI/shape attestation. Gridbook
+  no longer calls the fallback-capable `vllm._custom_ops` convenience wrappers.
+- Alias HunYuan-V3 shared-CB projections, including their MTP-nested forms, to
+  native CB Linears. If a CB tensor instead resolves to a plain BF16 parameter,
+  model load now fails rather than decoding the weight into an upstream Linear.
+- Keep the new grouped-BF16 bridge's performance status explicit: its generic
+  SM80-compatible CUTLASS schedule is a quality/ownership baseline, not a
+  Blackwell-optimized kernel, and measured 6–17% slower than segmented BF16
+  matmuls on warm synthetic DSV4 shapes.
+
 ## 0.4.2 — 2026-08-01
 
 - Add a fixed-scale least-squares native-NVFP4 activation policy for dense and
@@ -82,7 +109,8 @@
   phase-specific latency, activation/backend/fallback contracts, and paired
   quality evidence. A successful single-arm report is measurement evidence,
   not by itself a parity or release claim.
-- Revalidate `FULL_DECODE_ONLY` CUDA graphs with the opaque default dispatch:
+- Revalidate `FULL_DECODE_ONLY` CUDA graphs with that release's then-default
+  opaque dispatch:
   changed inputs replay exactly against eager at capture sizes 1 and 4, and a
   close-rate 0.6B canary narrows Gridbook decode to 5.9% of native. This remains
   approximate evidence: the CB artifact is 0.154% larger and compares W8A8

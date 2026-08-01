@@ -26,7 +26,7 @@ import os
 
 from vllm.model_executor.layers.quantization import register_quantization_config
 
-from . import ops  # noqa: F401  (registers the prismaquant::cb_gemm custom op)
+from . import ops  # noqa: F401  (registers Gridbook's native custom ops)
 from .config import PrismaQuantConfig
 from .moe_toplevel_loader import install_toplevel_cb_expert_loader
 from .runtime_contract import load_runtime_contract

@@ -3,7 +3,9 @@
 Load-time (LAYOUT.md §3): a byte-shaped uint8 ``cb_qweight`` per Linear, an
 fp8-only per-output-channel ``weight_scale``, and the model-level shared
 ``cb_codebook.*`` sidecars (loaded once by the config). Apply: emulate the
-served W4A4/W8A8 activation bucket, then the Triton decode-GEMM custom op.
+served W4A4/W8A8 activation bucket, then dispatch to the native CUDA/CUTLASS
+kernel for the format and activation-row count. FP8-CB has no Triton serving
+fallback: an unavailable native extension is a load/runtime error.
 
 Fused vLLM modules (qkv_proj, gate_up_proj) hold several roles' output rows in
 one weight; per-role shared codebooks are concatenated and addressed by a
@@ -25,8 +27,11 @@ from vllm.model_executor.parameter import (
 )
 
 from . import codec
-from .expand import expand_cb_to_fp8, expand_fp4_v2_to_weight
-from .ops import (cb_gemm, cb_gemv_fp4_v2, cb_gemv_fp8, dispatch_via_op,
+from .expand import expand_fp4_v2_to_weight
+from .native_cutlass import (native_cutlass_scaled_mm, native_fp4_quant,
+                             native_fp8_quant, require_native_fp4_quant,
+                             require_native_fp8_cutlass)
+from .ops import (cb_bf16_grouped_mm, cb_gemv_fp4_v2, cb_gemv_fp8,
                   fp4_act_qdq_or_codec)
 from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
@@ -42,25 +47,21 @@ from .nvfp4_activation_contract import (
 # config's copy answered "which shards does this fused module have?" separately
 # and drifted (issue #1).
 
-# M-gate for the CB dispatch (GGUF's mmvq_safe pattern, quantization/linear.py
-# :34-57): M<=threshold is the decode regime -> keep the bf16-MMA Triton
-# decode-GEMM; M>threshold is prefill -> transiently expand FP8_CB to a native
-# fp8 tile and hit vLLM's stock W8A8 fp8 GEMM (native tensor cores). NVFP4_CB
-# stays on the Triton path either way (transient FP4 needs FP4-MMA, out of
-# scope). 16 mirrors the decode/prefill split the decode kernel already tiles at.
-# Env-overridable so the prefill A/B (old Triton path vs transient native GEMM)
-# is a serve-flag toggle: set PRISMAQUANT_PREFILL_M_THRESHOLD huge to force the
-# Triton decode path at prefill (isolates the transient-expansion lever).
-PREFILL_M_THRESHOLD = int(os.environ.get("PRISMAQUANT_PREFILL_M_THRESHOLD", "16"))
+# Native decode/prefill boundary. Both CB grids use their owned CUDA GEMV
+# through eight activation rows. FP4-v2 product mode uses exact BF16 expansion
+# plus Gridbook's owned CUTLASS grouped GEMM (with E=1) above the boundary.
+# This is deliberately fixed rather than environment-selectable: an artifact's
+# serving kernel family must not change underneath a throughput/quality run.
+CUDA_GEMV_M_MAX = 8
 
 # fp4-MMA fused prefill gate (OPT-IN, default OFF): "" = off (the shipping
-# fp4 dispatch is byte-identical); "1"/"midm" use the artifact's attested
-# static activation scalar; ``static_lsq`` keeps that exact scalar and payload
-# but fits the existing EVT residual independently per row; "rowwise" derives
-# an independent native-NVFP4 scalar for every runtime row and therefore needs
-# no serialized activation metadata. The ``*_midm`` modes cover only
+# exact quality route remains the default); "1"/"midm" use the artifact's
+# attested static activation scalar; ``static_lsq`` keeps that exact scalar and
+# payload but fits the existing EVT residual independently per row; "rowwise"
+# derives an independent native-NVFP4 scalar for every runtime row and therefore
+# needs no serialized activation metadata. The ``*_midm`` modes cover only
 # 16 < M <= 128. Every mode remains an explicit experiment until its served
-# quality/performance gate passes; old artifacts can enter only a rowwise mode.
+# quality/performance gate passes.
 _FP4_FUSED_MODE: list = []
 
 _FP4_FUSED_STATIC_MODES = frozenset(("1", "midm"))
@@ -78,14 +79,13 @@ _FP4_FUSED_ALLOWED_MODES = frozenset(("",)) | _FP4_FUSED_MODES
 
 def _fp4_fused_mode() -> str:
     # Explicit opt-in: what this changes for a served artifact is the fp4
-    # activation bucket moving
-    # from the Triton path's fp32 emulation scales to the format's native
-    # ue4m3 scale factors — measured ~7.5e-2 relative against Triton. The fused
-    # kernel is bit-exact against the stock NVF4 collective, so this is
-    # arguably the *more* faithful rendering of what NVFP4 hardware serving
-    # does; but it is a change in served numerics. The same-process A/B failed
-    # the equivalence and dense-timing promotion screens, while representative
-    # teacher/task/served-SLO evidence remains incomplete. See
+# activation bucket moving from the exact BF16 quality route's fp32 emulation
+# scales to the format's native ue4m3 scale factors. The fused kernel is
+# bit-exact against the stock NVF4 collective, so this is arguably the *more*
+# faithful rendering of what NVFP4 hardware serving does; but it is a change
+# in served numerics. The same-process A/B failed the equivalence and
+# dense-timing promotion screens, while representative teacher/task/served-SLO
+# evidence remains incomplete. See
     # docs/audits/fused_nvfp4_enablement_2026-07-31.md.
     current = os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "").strip()
     if current not in _FP4_FUSED_ALLOWED_MODES:
@@ -104,12 +104,12 @@ def _fp4_fused_mode() -> str:
     return _FP4_FUSED_MODE[0]
 
 
-# Within the decode regime, the CUDA GEMV handles M<=this and the Triton
-# decode-GEMM the rest. 8 is measured on GB10 (bench_cuda_gemv.py): the
-# weight-stationary GEMV re-reads x per row-block, so it wins 3.2x at M=1-2,
-# 2.7x at M=4, 1.2x at M=8, and LOSES (0.66x) at M=16 where Triton's tl.dot
-# amortizes x across the row tile.
-CUDA_GEMV_M_MAX = int(os.environ.get("PRISMAQUANT_CB_CUDA_M_MAX", "8"))
+# FP8-CB's native CUDA GEMV handles M<=8. The boundary is measured on GB10
+# (bench_cuda_gemv.py) and is part of the native dispatch contract, not a
+# runtime selector: the weight-stationary GEMV wins through M=8 but loses at
+# M=16. Larger M goes to native CUTLASS (fused when eligible, otherwise CUDA
+# expand + direct CUTLASS W8A8).
+FP8_CUDA_GEMV_M_MAX = 8
 
 # The dense native-NVFP4 collective owns one 128-row N tile per CTA.  A fused
 # projection may therefore use more than one interned codebook block as long as
@@ -444,7 +444,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # LUT base zero.  Derive and cache its safety fact without a CUDA->host
         # sync.  One interned block means every role necessarily points at the
         # first (zero-based) block; two or more blocks must use the offset-aware
-        # fallback paths.
+        # exact native route.
         layer._cb_fp8_fused_lut_ok = len(blocks) == 1
         dummy = torch.zeros(1, dtype=torch.float32, device=dev)
         if self.is_fp4 and self.is_v2:
@@ -488,7 +488,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # bounded per-forward transients, never the resident expert stack.
         #
         # The fix is a narrow VIEW, not a ``del``: ``cb_qweight.data`` is still
-        # read by the fp8 mid-M fused prefill entry and the persistent-TC path,
+        # read by the fp8 mid-M fused prefill entry,
         # both of which take the row stride explicitly and only require
         # ``stride(1) == 1`` and a 16-byte-multiple ``stride(0)`` — which the
         # 16-byte pad preserves (see ``codec.pad_qweight``). Dropping the local
@@ -498,55 +498,94 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         del qw
         layer._cb_N = rows
         layer._cb_K = layer._cb_input_size
+
+        # Production construction attests every native kernel that this layer
+        # can reach. This intentionally builds/loads outside first forward and
+        # outside CUDA-graph capture; an incomplete serving image fails while
+        # the model is loading rather than silently changing kernel family.
+        from .cuda_ext import get_fused_ext, require_ext
+        require_ext(f"{self.prefix} dense CB decode/QDQ/expansion")
+        if self.is_fp4:
+            self._require_fp4_v2_product("model load")
+            from .cuda_ext import (require_bf16_grouped_ext,
+                                   require_ext_v2)
+            require_ext_v2(f"{self.prefix} dense FP4-v2 expansion")
+            require_bf16_grouped_ext(
+                f"{self.prefix} dense FP4-v2 quality prefill")
+        else:
+            self._require_fp8_cuda_ext("model-load attestation")
+            require_native_fp8_cutlass(
+                f"{self.prefix} dense FP8 quality prefill")
+            # Optional fused decode-in-prologue is resolved now even when it
+            # misses. get_fused_ext memoizes that result, so first prefill can
+            # neither JIT-compile nor silently discover a different path.
+            get_fused_ext()
         from .ops import register_cb_layer
         layer._cb_layer_id = register_cb_layer(self, layer)
 
     def _cuda_gemv_ok(self) -> bool:
         """CUDA decode-GEMV eligibility (fp8 n_sub=4 rungs, or fp4 two-tier v2
-        n_sub=2 rungs; env-gated; ext built). Cached — the answer never changes
+        n_sub=2 rungs; native extension built). Cached — the answer never changes
         within a process."""
         ok = getattr(self, "_cuda_gemv_cached", None)
         if ok is None:
-            gate = os.environ.get("PRISMAQUANT_CB_DECODE", "cuda") == "cuda"
             fp8_ok = not self.is_fp4 and self.n_sub == 4
             # n_sub==2 product, n_sub==1 signed (S-rungs) — both CUDA-served
             fp4v2_ok = self.is_fp4 and self.is_v2 and self.n_sub in (1, 2)
-            ok = gate and (fp8_ok or fp4v2_ok)
+            ok = fp8_ok or fp4v2_ok
             if ok:
                 from .cuda_ext import get_ext
                 ok = get_ext() is not None
             self._cuda_gemv_cached = ok
         return ok
 
-    def _ptc_ok(self, layer, K: int) -> bool:
-        """Persistent-TC prefill eligibility for THIS layer (cached; the answer
-        never changes after load). Mirrors the kernel's own TORCH_CHECKs so a
-        miss is a silent fall-through, never a crash."""
-        ok = getattr(layer, "_cb_ptc_ok", None)
-        if ok is not None:
-            return ok
-        ok = (not self.is_fp4                      # fp8-CB only
-              and self.n_sub == 4                  # kernel LUT = 4 sub-tables
-              and K % 256 == 0 and K % 64 == 0
-              and self.k % 4 == 0
-              and self.type_size == 4 * self.k and self.type_size <= 192
-              and 16 * K + 16384 <= 99 * 1024      # smem plan
-              and getattr(layer, "_cb_flat_fp8", None) is not None
-              and layer.cb_qweight.data.dim() == 2
-              and layer.cb_qweight.data.stride(1) == 1)
-        if ok:
-            # Single uniform rung: one codebook block for every output row (the
-            # kernel has no per-row codebook offset). One host sync, once.
-            ro = layer._cb_row_offset
-            ok = bool((ro.max() == ro.min()).item()) and int(ro[0]) == 0
-        if ok:
-            from .cuda_ext import get_persistent_ext
-            ok = get_persistent_ext() is not None
-        if not ok and os.environ.get("PRISMAQUANT_DEBUG_PREFIXES") == "1":
-            print(f"[cb] persistent-TC ineligible: {self.prefix} "
-                  f"(K={K} k={self.k} ts={self.type_size} n_sub={self.n_sub})")
-        layer._cb_ptc_ok = ok
-        return ok
+    def _require_fp8_cuda_ext(self, operation: str) -> None:
+        """Fail closed when an FP8-CB CUDA operation cannot be served.
+
+        FP8-CB used to fall through to the Triton decode/expand kernels when
+        ``get_ext()`` failed (or when the legacy decode selector disabled it).
+        That made a nominal Gridbook serve silently run a different kernel
+        family. Native CUDA is now part of the FP8-CB runtime contract, so a
+        missing/disabled extension is an explicit error instead.
+        """
+        if self._cuda_gemv_ok():
+            return
+        from .cuda_ext import NativeKernelUnavailableError
+        raise NativeKernelUnavailableError(
+            f"{self.prefix}: FP8-CB {operation} requires Gridbook's native "
+            "CUDA extension (n_sub=4), but it is unavailable "
+            f"(n_sub={self.n_sub}). An alternate fallback is forbidden; fix the CUDA "
+            "extension build before serving this artifact."
+        )
+
+    def _require_fp4_v2_product(self, operation: str) -> None:
+        """Pin dense quality serving to the native FP4-v2 product layout.
+
+        The signed (``n_sub=1``) and legacy v1 layouts have decode support in
+        older kernels, but no exact native BF16 expansion contract. Selecting
+        a numerically different implementation for larger M would make one
+        layer change format with batch size, so the entire dense serving lane
+        rejects those layouts until their native expansion is implemented.
+        """
+        if (self.is_fp4 and self.is_v2 and self.n_sub == 2
+                and self.type_size == 4 * self.k + 9):
+            return
+        from .cuda_ext import NativeKernelUnavailableError
+        raise NativeKernelUnavailableError(
+            f"{self.prefix}: {operation} requires FP4-CB-v2 product layout "
+            "(n_sub=2, type_size=4*k+9); legacy v1 and signed n_sub=1 "
+            "layouts have no native quality-preserving dense prefill kernel")
+
+    def _require_fp4_cuda_gemv(self) -> None:
+        """Require the owned FP4-v2 product GEMV for M<=8."""
+        self._require_fp4_v2_product("dense execution")
+        if self._cuda_gemv_ok():
+            return
+        from .cuda_ext import NativeKernelUnavailableError
+        raise NativeKernelUnavailableError(
+            f"{self.prefix}: FP4-CB-v2 decode requires Gridbook's native "
+            "CUDA GEMV, but it is unavailable; no alternate kernel is "
+            "permitted")
 
     def _fused_fp8_lut_ok(self, layer) -> bool:
         """Whether the offset-free fp8 fused kernel can decode every row.
@@ -637,10 +676,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 layer._cb_fp4_fused_lut_ok = bool(ok)
             ok = bool(ok)
         if ok and not rowwise and not static_lsq:
+            from .cuda_ext import NativeKernelUnavailableError
             try:
-                import vllm._custom_ops as vops
-                ok = hasattr(vops, "scaled_fp4_quant")
-            except Exception:  # noqa: BLE001 - venv without vllm
+                require_native_fp4_quant(
+                    f"{self.prefix} dense static NVFP4 quantization")
+            except NativeKernelUnavailableError:
                 ok = False
         if ok:
             from .cuda_ext import get_fused_fp4_ext
@@ -717,9 +757,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 x2.contiguous(), gs
             )
         else:
-            import vllm._custom_ops as vops
             gs = layer._cb_fp4_input_global_scale
-            aq, sfa = vops.scaled_fp4_quant(x2, gs)
+            aq, sfa = native_fp4_quant(x2, gs)
             a_scales = _nvfp4_reciprocal_vector(
                 layer, which="dense", scale=gs, rows=M
             )
@@ -752,102 +791,91 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # so torch.compile never traces the M-branch (which otherwise bakes
         # the prefill expand path into the decode graph — see ops.py). Eager
         # serving behavior is identical: the op impl calls _apply_inline.
-        # PRISMAQUANT_CB_DISPATCH=inline restores in-graph branching (A/B).
-        # bias falls back to inline (no served model carries one; the cutlass
-        # path fuses bias and we keep that numerics contract untouched).
+        # This is mandatory: exposing the Python/ATen body to Inductor could
+        # generate Triton, violating the native-only serving contract.
+        from .cuda_ext import NativeKernelUnavailableError
+        if bias is not None:
+            raise NativeKernelUnavailableError(
+                f"{self.prefix}: biased CB Linear has no opaque native "
+                "Gridbook serving operator")
         lid = getattr(layer, "_cb_layer_id", None)
-        if bias is None and lid is not None and dispatch_via_op():
-            from .ops import cb_linear_forward
-            return cb_linear_forward(x, lid)
-        return self._apply_inline(layer, x, bias)
+        if lid is None:
+            raise NativeKernelUnavailableError(
+                f"{self.prefix}: CB Linear was not registered during "
+                "process_weights_after_loading")
+        from .ops import cb_linear_forward
+        return cb_linear_forward(x, lid)
 
     def _apply_inline(self, layer, x, bias=None):
         N, K = layer._cb_N, layer._cb_K
         M = x.reshape(-1, K).shape[0]
 
-        # fp4-MMA fused prefill (OPT-IN, default OFF — the shipping path below
-        # is byte-identical until PRISMAQUANT_CB_FUSED_FP4 is set). Decodes the
-        # packed CB rows inside the CUTLASS block-scaled prologue and runs the
-        # native NVF4 MMA (OMMA.SF.16864, k=64). NOTE the activation bucket
-        # CHANGES on this path: native NVFP4 quantization (per-tensor fp32
-        # global x per-group-16 ue4m3 SF) instead of the Triton/transient
-        # paths' fp32-group-scale QDQ — the hardware SF operand is ue4m3, an
-        # fp32 group scale is unrepresentable. The current promotion A/B is red;
-        # the audit's reconsideration gates require stronger served quality and
-        # workload evidence. That is why this remains opt-in. Static modes use
-        # only producer-attested scalars; rowwise modes derive batch-invariant
-        # runtime scalars and are the sole fused option for legacy artifacts.
-        fused_mode = (_fp4_fused_mode()
-                      if self.is_fp4 and bias is None
-                      and M > PREFILL_M_THRESHOLD else "")
-        if (fused_mode in _FP4_FUSED_MODES
-                and not (fused_mode.endswith("midm") and M > 128)):
-            mode_kwargs = {}
-            if fused_mode in _FP4_FUSED_ROWWISE_MODES:
-                mode_kwargs["rowwise"] = True
-            elif fused_mode in _FP4_FUSED_STATIC_LSQ_MODES:
-                mode_kwargs["static_lsq"] = True
-            y = self._try_fused_fp4(layer, x, N, K, M, **mode_kwargs)
-            if y is not None:
-                return y
+        if self.is_fp4:
+            # Opt-in native NVFP4 prefill decodes packed CB rows in the CUTLASS
+            # block-scaled prologue. Static, static-LSQ, and rowwise modes keep
+            # the v0.4.2 activation contracts; the static quantizer now calls
+            # the registered CUDA op directly. An eligibility miss continues
+            # to the exact native quality route below.
+            fused_mode = (_fp4_fused_mode()
+                          if bias is None and M > 16 else "")
+            if (fused_mode in _FP4_FUSED_MODES
+                    and not (fused_mode.endswith("midm") and M > 128)):
+                mode_kwargs = {}
+                if fused_mode in _FP4_FUSED_ROWWISE_MODES:
+                    mode_kwargs["rowwise"] = True
+                elif fused_mode in _FP4_FUSED_STATIC_LSQ_MODES:
+                    mode_kwargs["static_lsq"] = True
+                y = self._try_fused_fp4(
+                    layer, x, N, K, M, **mode_kwargs)
+                if y is not None:
+                    return y
 
-        # Decode regime (M small), plus fp4-v1 which has no transient path yet
-        # (its v1 e4m3 plane is not composed during expansion) — Triton decode.
-        if M <= PREFILL_M_THRESHOLD or (self.is_fp4 and not self.is_v2):
-            if M <= CUDA_GEMV_M_MAX and self._cuda_gemv_ok():
-                if self.is_fp4:
-                    # fp4-v2 CUDA GEMV: act-QDQ (fp4 group-16 RTN) runs OUTSIDE
-                    # the kernel — exactly as the Triton fp4 path — so
-                    # CUDA-vs-Triton numerics stay aligned. The resolver picks
-                    # the fused CUDA op when the ext has it and the eager codec
-                    # otherwise; the two are bit-identical (tests/
-                    # test_fp4_act_qdq.py asserts torch.equal). The kernel
-                    # gathers the bf16 codebook and composes the two-tier scale
-                    # in-register from the packed 9-byte plane.
-                    xq = fp4_act_qdq_or_codec(x)
-                    y = cb_gemv_fp4_v2(xq, layer._cb_qw_padded, layer._cb_flat,
-                                       layer._cb_row_offset, layer._cb_compose,
-                                       N, K, self.k, self.n_sub, self.type_size)
-                else:
-                    # CUDA bandwidth-bound GEMV, act-QDQ fused (raw x in);
-                    # gathers the E4M3-byte codebook (same values as _cb_flat,
-                    # 4x smaller).
-                    y = cb_gemv_fp8(x, layer._cb_qw_padded, layer._cb_flat_fp8,
-                                    layer._cb_row_offset, layer._cb_scale,
-                                    N, K, self.k, self.n_sub, self.type_size)
-                if bias is not None:
-                    y = y + bias
-                return y
-            xq = (codec.fp4_group16_act_qdq(x) if self.is_fp4
-                  else codec.fp8_dynamic_act_qdq(x))
-            y = cb_gemm(xq, layer._cb_qw_padded, layer._cb_flat,
-                        layer._cb_row_offset, layer._cb_scale,
-                        layer._cb_compose, N, K, self.k, self.n_sub,
-                        self.type_size, self.is_fp4, self.is_v2)
+            self._require_fp4_v2_product("dense execution")
+            xq = fp4_act_qdq_or_codec(x)
+            if M <= CUDA_GEMV_M_MAX:
+                self._require_fp4_cuda_gemv()
+                y = cb_gemv_fp4_v2(
+                    xq, layer._cb_qw_padded, layer._cb_flat,
+                    layer._cb_row_offset, layer._cb_compose,
+                    N, K, self.k, self.n_sub, self.type_size)
+            else:
+                # Exact FP4-CB-v2 -> BF16 expansion followed by the same owned
+                # device-scheduled CUTLASS grouped kernel as MoE quality
+                # prefill. E=1 gives a dense GEMM without routing metadata or
+                # a cuBLAS/F.linear fallback. The QDQ and expanded weight are
+                # bit-identical to the established quality reference; only
+                # FP32 accumulation order may differ.
+                W = expand_fp4_v2_to_weight(
+                    layer._cb_qw_padded, layer._cb_flat,
+                    layer._cb_row_offset, layer._cb_compose,
+                    N, K, self.k, self.n_sub, self.type_size)
+                xq2 = xq.reshape(M, K).contiguous()
+                expert_ends = torch.full(
+                    (1,), M, dtype=torch.int32, device=x.device)
+                y = cb_bf16_grouped_mm(
+                    xq2, W.unsqueeze(0), expert_ends, 0)
+                del W
+                y = y.reshape(*x.shape[:-1], N)
             if bias is not None:
                 y = y + bias
             return y
 
-        if self.is_fp4:
-            # fp4 v2 prefill: transiently expand to a bf16 weight (value ×
-            # composed E4M3 v2 scale) and run one cuBLAS GEMM, amortising the
-            # decode over M — the fp4 counterpart of the fp8 transient. INV-1:
-            # the [N,K] tile is bounded to one layer, freed per forward. (bf16
-            # MMA — INV-2 waived; the FP4-MMA CUTLASS prefill is prototype iii.)
-            import torch.nn.functional as F
-            xq = fp4_act_qdq_or_codec(x)
-            W = expand_fp4_v2_to_weight(
-                layer._cb_qw_padded, layer._cb_flat, layer._cb_row_offset,
-                layer._cb_compose, N, K, self.k, self.n_sub, self.type_size)
-            y = F.linear(xq, W)
-            del W
+        # FP8-CB decode: the bandwidth-bound native CUDA GEMV owns M<=8. It
+        # takes raw activations and fuses the dynamic FP8 QDQ. There is no
+        # Triton fallback: running a different kernel family silently would
+        # invalidate both the serving contract and any throughput comparison.
+        if not self.is_fp4 and M <= FP8_CUDA_GEMV_M_MAX:
+            self._require_fp8_cuda_ext("decode GEMV")
+            y = cb_gemv_fp8(x, layer._cb_qw_padded, layer._cb_flat_fp8,
+                            layer._cb_row_offset, layer._cb_scale,
+                            N, K, self.k, self.n_sub, self.type_size)
             if bias is not None:
                 y = y + bias
             return y
 
         # FP8_CB prefill (M large): transiently expand THIS layer's packed
-        # weight into a native fp8 tile and call vLLM's stock per-channel W8A8
-        # fp8 GEMM (native tensor cores), then free the tile. An expanded
+        # weight into a native fp8 tile and call the directly registered
+        # CUTLASS per-channel W8A8 op, then free the tile. An expanded
         # FP8_CB weight IS a standard per-channel fp8 checkpoint (codebook
         # values on the e4m3 grid; layer.weight_scale per output channel).
         # The expand writes the fp8 bytes directly (no bf16 intermediate, no
@@ -856,26 +884,25 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # INV-1: the [N,K] tile is bounded to one layer (expand -> GEMM ->
         # free), never resident/model-wide (the NVINT2 OOM trap). `ops` is
         # imported lazily so the module still imports without vLLM (venv tests).
-        import vllm._custom_ops as ops
         x2 = x.reshape(-1, K)
-        xq, sa = ops.scaled_fp8_quant(x2, use_per_token_if_dynamic=True)
+        xq, sa = native_fp8_quant(x2)
         # scale_b is the per-output-channel weight scale as [N, 1] (matches
-        # vLLM's stock per-channel fp8 scheme; verified against a fp32 dequant
+        # the standard per-channel fp8 contract; verified against a fp32 dequant
         # reference in tests/test_transient_fp8.py::test_transient_gemm_*).
         ws = layer._cb_scale.reshape(N, 1)
 
-        # Mid-M fused decode-in-prologue (task 7's measured WIN niche): at
-        # M in (16, 128] ONE M-tile covers the batch, so decoding B inside
-        # the CUTLASS prologue has no redundancy and beats expand+GEMM by
-        # 1.04-1.45x (M=32/64/128, GB10). DEFAULT; set
-        # PRISMAQUANT_CB_FUSED_MIDM=0 to opt out.
+        # Mid-M fused decode-in-prologue: at M in [9, 128] ONE M-tile covers
+        # the batch, so decoding B inside the CUTLASS prologue has no redundant
+        # M-tile work. This native route now owns M=9..16 as well.
+        # OPT-OUT with PRISMAQUANT_CB_FUSED_MIDM=0 for a native-vs-native A/B;
+        # the exact route remains CUDA expand + direct CUTLASS.
         # Numerics: the _scaled entry applies BOTH the per-token activation
         # scale and the per-channel weight scale inside its fp32 EVT epilogue
         # and rounds once to bf16 — the same rounding ORDER as
         # cutlass_scaled_mm (the older unscaled entry rounded first and scaled
         # in python, which moved served prompt logprobs by up to 0.86 nats).
         # Step-4 rungs only (the kernel's KBits template dispatch).
-        if (bias is None and 16 < x2.shape[0] <= 128
+        if (bias is None and FP8_CUDA_GEMV_M_MAX < x2.shape[0] <= 128
                 and self.k in (28, 32, 36, 40, 44, 48)
                 and os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0"
                 and self._fused_fp8_lut_ok(layer)):
@@ -889,46 +916,20 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                     N, K, self.k)
                 return y.reshape(*x.shape[:-1], N)
 
-        # Persistent-N tensor-core prefill (#4b, OPT-IN and quarantined):
-        # PRISMAQUANT_CB_PREFILL_DENSE=persistent routes large-M fp8-CB prefill
-        # into the fused decode+TC-GEMM kernel, skipping the [N,K] e4m3
-        # transient entirely. Any constraint miss falls through SILENTLY to the
-        # shipping expand+cutlass path below (no behaviour change when off).
-        if (os.environ.get("PRISMAQUANT_CB_PREFILL_DENSE") == "persistent"
-                and x2.shape[0] > 128
-                and self._ptc_ok(layer, K)):
-            from .ops import cb_prefill_persistent_tc
-            d = cb_prefill_persistent_tc(
-                xq, layer.cb_qweight.data, layer._cb_flat_fp8, N, K,
-                self.k, self.type_size,
-                int(os.environ.get("PRISMAQUANT_PTC_VARIANT", "1")))
-            # Scale convention: the kernel returns the UNSCALED accumulation,
-            # so the per-token activation scale `sa` [M,1] and the
-            # per-output-channel weight scale _cb_scale [N] are applied
-            # outside. NOTE: this is the OLD convention — the mid-M fused path
-            # above has since moved to an in-epilogue fp32 scale
-            # (cb_fused_prefill_mm_scaled) to match cutlass_scaled_mm's
-            # rounding order; this route still rounds to bf16 first, which is
-            # a rounding-ORDER difference vs the shipping path (hence the
-            # opt-in gate). Behaviour deliberately unchanged here.
-            y = (d.float() * sa.reshape(-1, 1)
-                 * layer._cb_scale.reshape(1, -1).float()).to(x.dtype)
-            if bias is not None:
-                y = y + bias
-            return y.reshape(*x.shape[:-1], N)
-
-        if self._cuda_gemv_ok():
-            # CUDA expander (stream-bandwidth-bound; the Triton byte-gather
-            # ran at 61-86 GB/s and serialized ~half the prefill).
-            from .ops import cb_expand_fp8
-            W_e4m3 = cb_expand_fp8(
-                layer._cb_qw_padded, layer._cb_flat_fp8,
-                layer._cb_row_offset, N, K, self.k, self.n_sub,
-                self.type_size)
-        else:
-            W_e4m3 = expand_cb_to_fp8(
-                layer._cb_qw_padded, layer._cb_flat_fp8, layer._cb_row_offset,
-                N, K, self.k, self.n_sub, self.type_size)  # [N,K] e4m3
-        out = ops.cutlass_scaled_mm(xq, W_e4m3.t(), sa, ws, torch.bfloat16, bias)
+        # Native exact route for every FP8-CB shape the fused kernel cannot
+        # take (including offset-bearing fused roles, bias, unsupported rungs,
+        # a disabled/unavailable fused extension, and M>128). Gridbook's CUDA
+        # extension expands the packed rows; the directly registered CUTLASS
+        # op consumes the resulting [N,K] e4m3 tile. Missing CUDA support is
+        # fatal, never a
+        # hidden Triton byte-gather.
+        self._require_fp8_cuda_ext("weight expansion")
+        from .ops import cb_expand_fp8
+        W_e4m3 = cb_expand_fp8(
+            layer._cb_qw_padded, layer._cb_flat_fp8,
+            layer._cb_row_offset, N, K, self.k, self.n_sub,
+            self.type_size)
+        out = native_cutlass_scaled_mm(
+            xq, W_e4m3.t(), sa, ws, torch.bfloat16)
         del W_e4m3
         return out.reshape(*x.shape[:-1], N)

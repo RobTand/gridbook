@@ -10,14 +10,13 @@ Why this exists
 ---------------
 `gridbook` ships pure-Python wheels and JIT-compiles its CUDA extensions on
 first use via ``torch.utils.cpp_extension.load()``.  That only works if the
-``.cu``/``.hpp`` sources are *inside the installed package*.  A wheel that omits
-them still installs, still imports, still registers with vLLM and still serves
-**correct** output -- on the slow Triton fallback path, with one stderr warning
-as the only clue.  For scale, a 35B MoE artifact served 3.52 tok/s on the
-fallback path and ~33 tok/s once the CUDA decode kernels landed (~9.4x; see
-docs/TROUBLESHOOTING.md and docs/BENCHMARKS.md).  A silent regression of that
-size is exactly the class of defect CI has to make loud, so every check here is
-fatal.
+``.cu``/``.hpp`` sources are *inside the installed package*.  Older Gridbook
+releases could turn an omitted source into a warning plus a slow Triton
+fallback (3.52 tok/s versus ~33 tok/s for one measured 35B MoE artifact; see
+docs/TROUBLESHOOTING.md and docs/BENCHMARKS.md).  The native-only serving tree
+now fails closed instead: an artifact missing a serving source installs and
+imports, but cannot execute the affected CB operator.  Both failure modes make
+the artifact unshippable, so every check here is fatal.
 
 Checks
 ------
@@ -61,27 +60,38 @@ PKG = "gridbook"
 #   cb_gemv.cu          -> cuda_ext.get_ext()            (decode GEMV; the hot one)
 #   cb_gemv_v2.cu       -> cuda_ext.get_ext_v2()         (smem-resident-dict
 #                                                         decode GEMV, opt-in)
+#   cb_bf16_grouped_gemm.cu -> cuda_ext.get_bf16_grouped_ext()
+#                            (exact native quality bridge for dense/MoE)
 #   cb_fused_gemm.cu    -> cuda_ext.get_fused_ext()      (fused prefill)
 #   cb_fused_fp4_gemm.cu -> cuda_ext.get_fused_fp4_ext() (fused NVFP4 prefill)
-#   cb_persistent_tc.cu -> cuda_ext.get_persistent_ext() (opt-in, still shipped)
 # cb_fused_gemm.cu #includes the three cutlass_fork headers listed below.
 # cb_fused_fp4_gemm.cu #includes sm120_cb_fused_fp4_mma.hpp; both are also
 # JIT-identity inputs and therefore belong on this non-vacuous floor.
-# An opt-in kernel still belongs on this floor: check 3 (drift) would also
-# notice it missing, but only while the file exists in the checkout the CI job
-# happens to be run against. This list is the literal floor that cannot be
-# satisfied vacuously, and a wheel that silently lacks the v2 source degrades
-# to the inherited kernel with one stderr line as the only clue.
+# A serving-reachable opt-in specialization still belongs on this floor: check
+# 3 (drift) would also notice it missing, but only while the file exists in the
+# checkout the CI job happens to be run against. Source-only research kernels
+# do not belong on the runtime floor. They are nevertheless packaged while
+# present because check 3 covers every native checkout source; in particular,
+# retained ``cb_persistent_tc.cu`` is not reachable from the package runtime.
 REQUIRED = [
     f"{PKG}/csrc/cb_gemv.cu",
     f"{PKG}/csrc/cb_gemv_v2.cu",
+    f"{PKG}/csrc/cb_bf16_grouped_gemm.cu",
     f"{PKG}/csrc/cb_fused_gemm.cu",
     f"{PKG}/csrc/cb_fused_fp4_gemm.cu",
-    f"{PKG}/csrc/cb_persistent_tc.cu",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_mma_tma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_fused_mma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_expert_row_broadcast.hpp",
+]
+
+# A deleted serving module can survive in setuptools' reusable ``build/lib``
+# and be copied into a later wheel even though it no longer exists in the
+# checkout.  This happened to the retired Triton implementation, so absence is
+# a first-class artifact invariant rather than an assumption about a clean
+# staging directory.
+FORBIDDEN = [
+    f"{PKG}/kernels.py",
 ]
 
 NATIVE_SUFFIXES = (".cu", ".cuh", ".hpp", ".h")
@@ -130,6 +140,13 @@ def wheel_metadata(path: pathlib.Path) -> email.message.Message:
 
 def check_artifact(label: str, members: list[str], expected: set[str]) -> None:
     present = set(members)
+
+    forbidden = [path for path in FORBIDDEN if path in present]
+    if forbidden:
+        err(f"{label}: retired runtime modules present: {forbidden}. Remove "
+            "build/ and rebuild; these modules must never ship.")
+    else:
+        ok(f"{label}: no retired runtime modules")
 
     missing = [r for r in REQUIRED if r not in present]
     if missing:
@@ -224,8 +241,9 @@ def check_publishable(wheel: pathlib.Path) -> None:
              if s in body]
     if stale:
         err(f"wheel long description contains retired framing {stale} -- the "
-            f"Triton prototype/INV-2 language was superseded by the CUDA "
-            f"kernels and must not ship as the PyPI page.")
+            f"Triton prototype/INV-2 language was superseded by the "
+            f"native-only CUDA/CUTLASS serving contract and must not ship as "
+            f"the PyPI page.")
     else:
         ok("long description carries no retired prototype/INV-2 framing")
 
