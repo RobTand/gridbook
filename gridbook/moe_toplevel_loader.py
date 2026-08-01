@@ -35,8 +35,10 @@ intercepts exactly those stacked-CB expert tensors, copies each into its
 registered fused param, and delegates *every other* tensor (dense CB,
 router.gate, expert_bias, norms, embeddings, lm_head, attention) unchanged to
 the original loader. One line per arch registers it
-(``install_toplevel_cb_expert_loader(SomeForCausalLM)``); DSv4 and any other
-top-level-expert-mapping MoE arch reuse it as-is.
+(``install_toplevel_cb_expert_loader(SomeForCausalLM)``). A future architecture
+with the same top-level expert mapping can reuse the wrapper, but it is not
+supported until its model class is explicitly registered and tested. In
+particular, the paused DSv4 lane is not registered in Gridbook 0.5.
 
 **Shared-expert (``shared_mlp``) CB tensors.** ``config.py`` aliases the
 architecture's collapsed parent prefix (and its MTP ``.mtp_block`` form) so a

@@ -5,8 +5,12 @@ toolchain: vLLM, a matching PyTorch, `nvcc`, and the CUDA headers those two
 agree on. The [`Dockerfile`](../Dockerfile) at the repo root collapses that into
 one build, layered on an official `vllm/vllm-openai` image.
 
-The image also **compiles gridbook's CUDA kernels at image-build time**, so the
-first request a user makes is not stalled behind a kernel build.
+The image also **compiles Gridbook's required CUDA/CUTLASS extensions at
+image-build time**, so model load is not stalled behind kernel builds. The
+default cache contains the main decode/support module, the required FP4-v2
+expander module, the required grouped-BF16 quality bridge, and the optional
+FP8 fused specialization on Blackwell. Experimental fused FP4 remains an
+explicit, default-off build option.
 
 ---
 
@@ -68,15 +72,10 @@ upstream vLLM flag works unchanged.
 | Kernel cache | prebuilt at `/opt/gridbook/ext-cache` |
 | Endpoint | OpenAI-compatible, `0.0.0.0:8000` |
 
-Size added over the base image, measured two ways because they disagree and both
-get quoted: **+31.8 MB** by `docker image inspect -f '{{.Size}}'`
-(10 617 665 238 → 10 649 446 254 B), which sums the layer contents; **+0.2 GB**
-by `docker images` disk-usage accounting (32.2 → 32.4 GB), which rounds. Of that
-31.8 MB only **3.2 MB** is the prewarmed kernel cache — the same build with
-`--build-arg GRIDBOOK_PREWARM=0` measures 10 646 242 057 B — and the rest is the
-gridbook package plus the build context kept at `/opt/gridbook/src`, so the exact
-figure tracks the repo's own size. The header repair below adds zero bytes: it is
-symlinks.
+Image size depends on the selected architecture and whether optional fused FP4
+is prewarmed. Inspect it with `docker image inspect -f '{{.Size}}'
+gridbook:local`; do not reuse the retired two-extension image's size numbers for
+0.5. The header repair below adds no copied payload because it uses symlinks.
 
 ### Why `v0.24.0`
 
@@ -150,6 +149,7 @@ docker build \
   --build-arg VLLM_TAG=v0.24.0 \
   --build-arg GRIDBOOK_CUDA_ARCH=12.1a \
   --build-arg GRIDBOOK_PREWARM=1 \
+  --build-arg GRIDBOOK_PREWARM_FUSED_FP4=0 \
   -t gridbook:local .
 ```
 
@@ -157,7 +157,8 @@ docker build \
 |---|---|---|
 | `VLLM_TAG` | `v0.24.0` | Base image tag. |
 | `GRIDBOOK_CUDA_ARCH` | `12.1a` | `TORCH_CUDA_ARCH_LIST` used to compile the kernels. |
-| `GRIDBOOK_PREWARM` | `1` | `0` skips kernel compilation; the user pays a one-time build inside their first request instead. Both values are build-tested. |
+| `GRIDBOOK_PREWARM` | `1` | `1` compiles the three required modules (main, FP4-v2, grouped BF16) and the optional FP8 fused module when eligible. `0` skips all prewarming; model load then pays the builds. |
+| `GRIDBOOK_PREWARM_FUSED_FP4` | `0` | `1` additionally compiles the experimental fused-FP4 module for a Blackwell target and treats failure as a broken explicitly requested image. It does not enable the runtime experiment. |
 
 ### `GRIDBOOK_CUDA_ARCH` is important — read this
 
@@ -174,15 +175,18 @@ match, and the value is baked into the image's environment so build time and run
 time agree. To target other hardware, rebuild:
 
 ```bash
-docker build --build-arg GRIDBOOK_CUDA_ARCH=9.0 -t gridbook:h100 .   # H100
-docker build --build-arg GRIDBOOK_CUDA_ARCH=8.9 -t gridbook:ada  .   # RTX 4090
+docker build --build-arg GRIDBOOK_CUDA_ARCH=9.0 -t gridbook:h100 .   # H100, FP8-only
+docker build --build-arg GRIDBOOK_CUDA_ARCH=8.9 -t gridbook:ada  .   # RTX 4090, FP8-only
 docker build --build-arg GRIDBOOK_CUDA_ARCH=12.0 -t gridbook:5090 .  # RTX 5090
 ```
 
-The CUTLASS mid-M fused prefill kernel is `sm_120`-family only; on a non-Blackwell
-arch the build prints a note and skips prewarming it, and at runtime that shape
-uses the native CUDA transient-expand + CUTLASS path by design. Decode is unaffected — the
-decode GEMV is architecture-generic CUDA and compiles for every arch above.
+The optional CUTLASS mid-M FP8 fused kernel is `sm_120`-family only. On a
+non-Blackwell arch the build skips that optional module and FP8 uses its exact
+native transient-expand + CUTLASS path. The main decode extension remains
+architecture-generic. FP4-CB is different: every FP4-v2 quality path needs the
+v2 exact expander, whose **device prepare** accepts only cc 12.0/12.1. The image
+can compile that module without a GPU for any requested arch, but an FP4 model
+load on H100/Ada/A100 fails its device attestation; those images are FP8-only.
 
 You can also override the arch at *run* time (`-e TORCH_CUDA_ARCH_LIST=9.0`),
 which invalidates the baked cache and triggers a one-time rebuild inside the
@@ -213,7 +217,12 @@ The build **fails** rather than producing a quietly broken image if:
 - `gridbook.register()` raises against the chosen vLLM (an API-drift canary —
   vLLM's plugin loader swallows load exceptions and continues, so without this
   check drift surfaces much later as a confusing "unknown quantization method");
-- the decode-GEMV kernel fails to compile;
+- any required module fails to compile or load: main decode/support, FP4-v2
+  exact expansion, or the owned grouped-BF16 quality bridge. Docker build has
+  no GPU, so it deliberately does not call the v2 device prepare; FP4 model
+  load performs that cc 12.0/12.1 attestation on the serving device;
+- `GRIDBOOK_PREWARM_FUSED_FP4=1` was requested but the optional fused-FP4
+  module cannot be built for the selected Blackwell target;
 - a non-root, non-group-0 UID (1000:1000, `HOME=/` — what `docker run --user`
   actually gives you) cannot `import vllm`, register the plugin, or load the
   prewarmed kernels. The first two can still be obscured by vLLM's
@@ -328,7 +337,10 @@ It builds the Dockerfile from the repo root and then checks, on the built image:
 root, `--user 1000:1000`, `--user 1000:0`, `--user 65534:65534`, a named volume
 over the kernel cache under `--user`, `--read-only --tmpfs /tmp` under `--user`,
 three entrypoint argument shapes, and that `HF_HOME=/opt/gridbook/hf` is
-writable. Exit status is 0 only if all pass. It needs no GPU.
+writable. Every kernel-cache probe loads the three required compiled modules;
+if either optional fused module was prewarmed, it must load too. Exit status is
+0 only if all pass. It needs no GPU and therefore does **not** call
+`cb_gemv_v2_prepare`; FP4 model load owns that device-specific check.
 
 Run it: before tagging a release, after changing `VLLM_TAG`, and after any
 Dockerfile change. The build-time gates (below) run inside `docker build` and so
@@ -392,78 +404,43 @@ expect to tune `--max-model-len` down substantially.
 
 ## Verified vs untested
 
-Everything below was run on this repo's Dockerfile against
-`vllm/vllm-openai:v0.24.0` (`linux/arm64`, GB10 host), **with no GPU attached** —
-`docker build` never has one. Last run **2026-07-28**, from a clean
-`git clone`-equivalent tree, i.e. the Quick Start command exactly as written.
-Re-run it yourself with `bash scripts/verify-image.sh`; the run-time half of this
-list *is* that script, so the two cannot drift.
+The last fully recorded container run was **2026-07-28** on
+`vllm/vllm-openai:v0.24.0` (`linux/arm64`, GB10 host) with no GPU attached. It
+verified the base-image repairs, plugin registration, arbitrary-UID cache
+permissions, read-only-rootfs recipe, named-volume behavior, entrypoint, and
+the then-current main/fused compile cache. Those exact compile times and image
+sizes are intentionally not carried forward: 0.5 expands the required cache to
+main + FP4-v2 + grouped BF16, so the retired two-module measurements do not
+describe this Dockerfile.
 
-**Verified**
+The 0.5 manual gate is:
 
-- The image builds end to end; `docker build --check` reports no warnings.
-- 59 missing CUDA headers are linked; `cusparse.h` resolves afterwards.
-- Install verification passes: gridbook 0.1.0, vLLM 0.24.0, torch 2.11.0+cu130,
-  entry point registered, packaged `csrc` present.
-- `gridbook.register()` succeeds against **released vLLM 0.24.0** — the API
-  canary passes.
-- Kernels compile without a GPU: decode GEMV **28.7–29.8 s**, CUTLASS mid-M
-  fused prefill **71.0–75.9 s**, **101.4–105.3 s** for the build step as a whole
-  (three uncached builds; `torch.cuda.is_available() == False` throughout). Only
-  `nvcc` and an explicit `TORCH_CUDA_ARCH_LIST` are required. These are the
-  current Dockerfile's own build-log numbers on the host above and move with the
-  host's CPU.
-- Loading the prewarmed extensions instead of compiling them, measured two ways
-  because the difference is a factor of ~20 and both get quoted:
-  - **inside a process that has already imported torch/vLLM** — the serving
-    condition — decode **0.04–0.05 s**, fused **0.02 s** (3 runs);
-  - **from a cold `python3 -c`**, where the timing also contains torch's own
-    import, decode **0.59–0.66 s**, fused **0.80 s**, both **1.40–1.46 s**
-    (3 runs).
-- `--user` is genuinely supported, not asserted: `--user 1000:1000`,
-  `--user 1000:0` and `--user 65534:65534` each import vLLM, register the plugin,
-  and load **both** prewarmed extensions. A build-time gate re-checks this at
-  uid/gid 1000:1000 with `HOME=/`, so the image cannot ship without it.
-  (Both halves of this were broken before: `getpass.getuser()` on import, and a
-  kernel cache only writable by group 0.)
-- Read-only rootfs: `--read-only --tmpfs /tmp` plus a named volume for the kernel
-  cache works, including combined with `--user 1000:1000`.
-- Named volumes preserve the prewarmed cache; bind mounts shadow it.
-- `-e HF_HOME=/opt/gridbook/hf` is writable under `--user 1000:1000`.
-- The entrypoint's host/port defaulting behaves correctly across the bare,
-  `--port=9000` and `--host 127.0.0.1` shapes.
-- The build **fails** when the packaged CUDA sources are removed (the gate is
-  real, not decorative).
-- `--build-arg GRIDBOOK_CUDA_ARCH=9.0` builds successfully, compiles the decode
-  GEMV for `sm_90` (28.4 s), and correctly skips the Blackwell-only fused
-  prefill prewarm.
-- `--build-arg GRIDBOOK_PREWARM=0` builds successfully: the prewarm step is
-  skipped, the kernel-cache directory is still created world-writable so the
-  first-use build works under `--user`, and the image is 3 MB smaller.
-- The run-time checks are known to *fail* on an image without these fixes: run
-  `scripts/verify-image.sh --no-build` against a pre-fix image and 5 of 10 fail.
+```bash
+bash scripts/verify-image.sh --tag gridbook:local --log /tmp/gridbook-image.log
+```
 
-**Untested — do not read these as working**
+It must pass before a container is called release-verified. The build hard-gates
+all three required extension loads; the runtime matrix repeats those loads as
+root, arbitrary UIDs, named-volume, and read-only-rootfs cases. A prewarmed
+optional FP8 or FP4 fused module is checked only when its cache directory is
+present. This is compile/load evidence, not device evidence: no-GPU image checks
+never call the FP4-v2 device prepare.
 
-- **No GPU run of any kind.** No model was loaded from this image, no token was
-  generated, and no throughput was measured from it.
-- **vLLM 0.24.0 has never served a gridbook artifact end to end.** The only
-  measured serving stack remains the `0.23.1rc1.dev764+g54b16d8a9` source build.
-  What is established here is toolchain parity, symbol presence, install
-  integrity and kernel compilation — not served correctness.
-- **`linux/amd64` is unbuilt.** Only `arm64` was built. The base image is
-  multi-arch, but nothing about gridbook on x86 has been exercised.
-- **Execution on `sm_90` / `sm_89` / `sm_80` is untested.** `sm_90` was shown to
-  *compile*; it was not run. See the
-  [hardware matrix](INSTALL.md#hardware-matrix) for the per-path breakdown and
-  the known `sm_89` floor on the dense FP8-CB prefill path — an A100 in
-  particular is expected to fail on the first prompt longer than 16 tokens.
-- **No image has been published** to any registry.
-- **Nothing builds this image automatically.** CI cannot: GitHub-hosted runners
-  have no `nvcc`, and the base image alone is ~32 GB on disk. `scripts/verify-
-  image.sh` is therefore a **manual** gate — run it before tagging a release,
-  after bumping `VLLM_TAG`, and after any Dockerfile change. Until someone runs
-  it, this section is a claim about the last time it was run, not about HEAD.
+**Still untested unless a dated release record says otherwise**
+
+- A GPU model load or generated token from the `v0.24.0`-based image. The only
+  measured serving stack remains the
+  `0.23.1rc1.dev764+g54b16d8a9` source build.
+- `linux/amd64`; the prior container run was arm64.
+- FP8 execution on `sm_90` / `sm_89`. FP4 execution there is not merely
+  untested: 0.5 rejects it because the required v2 expander prepare admits only
+  cc 12.0/12.1. A100 has no complete production CB lane in 0.5.
+- A published registry image. This repository currently publishes the wheel,
+  not a container image.
+
+Nothing builds this image automatically: hosted runners lack `nvcc`, and the
+base image alone is about 32 GB. `scripts/verify-image.sh` is therefore a manual
+release gate after Dockerfile or `VLLM_TAG` changes.
 
 If you want the exact stack the published benchmarks were measured on, that is
 the third-party arm64 image `eugr/spark-vllm@sha256:d0840ff0e0ba1899a51bf4cb473f

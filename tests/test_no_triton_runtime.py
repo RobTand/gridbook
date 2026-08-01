@@ -112,10 +112,16 @@ def _runtime_violations(path: Path) -> list[str]:
 
 
 def test_packaged_runtime_contains_no_triton_code():
-    legacy = PACKAGE / "kernels.py"
-    assert not legacy.exists(), (
-        "gridbook/kernels.py was the interpreted decode implementation; "
-        "native-only serving requires deleting it")
+    retired = [
+        PACKAGE / "kernels.py",
+        PACKAGE / "moe_autotune.py",
+        PACKAGE / "moe_l2.py",
+    ]
+    present = [str(path.relative_to(ROOT)) for path in retired if path.exists()]
+    assert not present, (
+        "retired interpreted/selectable serving modules remain: "
+        + ", ".join(present)
+    )
 
     violations = [
         violation

@@ -3,8 +3,9 @@
 Registers a ``QuantizationConfig`` (``"gridbook"``, with ``"prismaquant"`` kept
 as a legacy alias) plus the linear and fused-MoE methods that serve
 codebook-quantized weights. Native CUDA/CUTLASS kernel sources ship under
-``gridbook/csrc`` and are JIT-compiled on first use. Serving fails closed when
-a required native kernel is unavailable; Gridbook has no Triton runtime lane.
+``gridbook/csrc`` and are JIT-compiled during production model load (or lazily
+for direct low-level callers). Serving fails closed when a required native
+kernel is unavailable; Gridbook has no Triton runtime lane.
 
 ``register`` is lazy so format and native-kernel contract tests can import the
 package without vLLM installed.
@@ -13,7 +14,7 @@ package without vLLM installed.
 # Single source of truth for package and release metadata. Gridbook is the sole
 # owner of its runtime; producer repositories consume a released version or an
 # immutable commit and never mirror this package tree.
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 
 def register() -> None:

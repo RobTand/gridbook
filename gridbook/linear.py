@@ -79,13 +79,12 @@ _FP4_FUSED_ALLOWED_MODES = frozenset(("",)) | _FP4_FUSED_MODES
 
 def _fp4_fused_mode() -> str:
     # Explicit opt-in: what this changes for a served artifact is the fp4
-# activation bucket moving from the exact BF16 quality route's fp32 emulation
-# scales to the format's native ue4m3 scale factors. The fused kernel is
-# bit-exact against the stock NVF4 collective, so this is arguably the *more*
-# faithful rendering of what NVFP4 hardware serving does; but it is a change
-# in served numerics. The same-process A/B failed the equivalence and
-# dense-timing promotion screens, while representative teacher/task/served-SLO
-# evidence remains incomplete. See
+    # activation bucket moving from the exact BF16 quality route's fp32
+    # emulation scales to the format's native ue4m3 scale factors. The fused
+    # kernel is bit-exact against the native NVFP4 collective, but it is a
+    # change in served numerics. The same-process A/B failed the equivalence
+    # and dense-timing promotion screens, while representative
+    # teacher/task/served-SLO evidence remains incomplete. See
     # docs/audits/fused_nvfp4_enablement_2026-07-31.md.
     current = os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "").strip()
     if current not in _FP4_FUSED_ALLOWED_MODES:
@@ -425,6 +424,27 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # shipping path instead of decoding any row through the wrong LUT.
         layer._cb_fp4_lut_ranges = tuple(block_ranges)
         if self.is_fp4:
+            # The exact BF16 quality bridge expands one physical codebook at a
+            # time.  Preserve a coalesced host-side row plan so fused modules
+            # with distinct role codebooks (for example A/B/A qkv shards) can
+            # launch the native expander against the matching dictionary for
+            # every contiguous row segment.  This metadata is derived entirely
+            # from the loader contract; steady-state dispatch never reads a
+            # device offset back to the host.
+            quality_segments: list[tuple[int, int, int]] = []
+            row_start = 0
+            for width, block_id in role_block_ids:
+                if (quality_segments
+                        and quality_segments[-1][2] == block_id):
+                    start, previous_width, _ = quality_segments[-1]
+                    quality_segments[-1] = (
+                        start, previous_width + width, block_id)
+                else:
+                    quality_segments.append((row_start, width, block_id))
+                row_start += width
+            assert row_start == rows
+            layer._cb_fp4_quality_segments = tuple(quality_segments)
+
             row_block_ids: list[int] = []
             for width, block_id in role_block_ids:
                 row_block_ids.extend([block_id] * width)
@@ -455,7 +475,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             layer._cb_scale = dummy
             # Warm the CUDA-GEMV JIT build at LOAD time — otherwise the ~30 s
             # in-container build fires on the first decode step and poisons the
-            # first request's latency (same reason as the fp8 branch below).
+            # first served request's latency (same reason as the fp8 branch
+            # below).
             self._cuda_gemv_ok()
         elif self.is_fp4:
             layer._cb_scale = codec.decode_fp4_scale_plane(qw, self.k).to(dev)
@@ -471,7 +492,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 cb_flat, self.prefix)
             # Warm the CUDA-GEMV JIT build at LOAD time — otherwise the ~30 s
             # in-container build fires on the first decode step and poisons
-            # the first request's latency (seen live: 1.89 tok/s rep 1).
+            # the first served request's latency (seen live: 1.89 tok/s rep 1).
             self._cuda_gemv_ok()
 
         # ONE resident copy of the packed weight (issue #1, 2026-07-25).
@@ -503,15 +524,39 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # can reach. This intentionally builds/loads outside first forward and
         # outside CUDA-graph capture; an incomplete serving image fails while
         # the model is loading rather than silently changing kernel family.
-        from .cuda_ext import get_fused_ext, require_ext
+        from .cuda_ext import (NativeKernelUnavailableError, get_fused_ext,
+                               require_ext)
+        required_n_alignment = 8 if self.is_fp4 else 16
+        if rows % required_n_alignment:
+            family = "BF16 grouped" if self.is_fp4 else "FP8 CUTLASS"
+            raise NativeKernelUnavailableError(
+                f"{self.prefix}: native {family} quality prefill requires "
+                f"N divisible by {required_n_alignment}, got N={rows}")
         require_ext(f"{self.prefix} dense CB decode/QDQ/expansion")
         if self.is_fp4:
+            fused_mode = _fp4_fused_mode()
+            layer._cb_fused_fp4_mode = fused_mode
             self._require_fp4_v2_product("model load")
             from .cuda_ext import (require_bf16_grouped_ext,
-                                   require_ext_v2)
-            require_ext_v2(f"{self.prefix} dense FP4-v2 expansion")
+                                   require_fp4_v2_expander)
+            require_fp4_v2_expander(
+                f"{self.prefix} dense FP4-v2 expansion", device=dev)
             require_bf16_grouped_ext(
                 f"{self.prefix} dense FP4-v2 quality prefill")
+            if fused_mode:
+                rowwise = fused_mode in _FP4_FUSED_ROWWISE_MODES
+                static_lsq = fused_mode in _FP4_FUSED_STATIC_LSQ_MODES
+                if not self._fused_fp4_ok(
+                    layer, layer._cb_K, rowwise=rowwise,
+                    static_lsq=static_lsq,
+                ):
+                    from .cuda_ext import NativeKernelUnavailableError
+                    raise NativeKernelUnavailableError(
+                        f"{self.prefix}: requested native fused dense FP4 "
+                        f"mode {fused_mode!r} is unavailable; changing to "
+                        "the exact BF16 bridge would violate the explicit "
+                        "activation contract"
+                    )
         else:
             self._require_fp8_cuda_ext("model-load attestation")
             require_native_fp8_cutlass(
@@ -519,7 +564,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # Optional fused decode-in-prologue is resolved now even when it
             # misses. get_fused_ext memoizes that result, so first prefill can
             # neither JIT-compile nor silently discover a different path.
-            get_fused_ext()
+            fused_midm = (
+                os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0")
+            layer._cb_fp8_fused_midm = fused_midm
+            if fused_midm:
+                get_fused_ext()
         from .ops import register_cb_layer
         layer._cb_layer_id = register_cb_layer(self, layer)
 
@@ -530,7 +579,9 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         ok = getattr(self, "_cuda_gemv_cached", None)
         if ok is None:
             fp8_ok = not self.is_fp4 and self.n_sub == 4
-            # n_sub==2 product, n_sub==1 signed (S-rungs) — both CUDA-served
+            # The main extension can decode n_sub=1 signed rungs, but the
+            # native-only dense lane rejects them at model load because no
+            # quality-preserving native prefill covers every M.
             fp4v2_ok = self.is_fp4 and self.is_v2 and self.n_sub in (1, 2)
             ok = fp8_ok or fp4v2_ok
             if ok:
@@ -786,6 +837,48 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             self.is_v2, lut_tile_ids, tile_m)
         return y.reshape(*x.shape[:-1], N)
 
+    def _expand_fp4_quality_weight(self, layer, N: int,
+                                   K: int) -> torch.Tensor:
+        """Expand every dense FP4 role through its matching native LUT.
+
+        ``cb_expand_v2`` accepts one zero-based physical product dictionary.
+        Fused vLLM modules may concatenate roles backed by different shared
+        dictionaries, so the loader records contiguous row segments and this
+        bridge expands each segment against the corresponding interned block.
+        Concatenation stays on-device and produces the same contiguous BF16
+        ``[N, K]`` transient consumed by the owned CUTLASS quality GEMM.
+        """
+        segments = getattr(layer, "_cb_fp4_quality_segments", None)
+        ranges = getattr(layer, "_cb_fp4_lut_ranges", None)
+        if not segments or not ranges:
+            # Compatibility for manually constructed single-LUT layers. Every
+            # production layer receives both metadata tuples at model load.
+            return expand_fp4_v2_to_weight(
+                layer._cb_qw_padded, layer._cb_flat,
+                layer._cb_row_offset, layer._cb_compose,
+                N, K, self.k, self.n_sub, self.type_size)
+
+        expanded = []
+        covered = 0
+        for row_start, nrows, block_id in segments:
+            if row_start != covered or nrows <= 0 or block_id >= len(ranges):
+                raise RuntimeError(
+                    f"{self.prefix}: invalid FP4 quality segment "
+                    f"{(row_start, nrows, block_id)!r}")
+            cb_start, cb_length = ranges[block_id]
+            expanded.append(expand_fp4_v2_to_weight(
+                layer._cb_qw_padded.narrow(0, row_start, nrows),
+                layer._cb_flat.narrow(0, cb_start, cb_length),
+                layer._cb_row_offset.narrow(0, row_start, nrows),
+                layer._cb_compose,
+                nrows, K, self.k, self.n_sub, self.type_size))
+            covered += nrows
+        if covered != N:
+            raise RuntimeError(
+                f"{self.prefix}: FP4 quality segments cover {covered} rows, "
+                f"expected N={N}")
+        return expanded[0] if len(expanded) == 1 else torch.cat(expanded, dim=0)
+
     def apply(self, layer, x, bias=None):
         # M-branch hoist (compile lane): dispatch through ONE opaque custom op
         # so torch.compile never traces the M-branch (which otherwise bakes
@@ -814,10 +907,13 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # Opt-in native NVFP4 prefill decodes packed CB rows in the CUTLASS
             # block-scaled prologue. Static, static-LSQ, and rowwise modes keep
             # the v0.4.2 activation contracts; the static quantizer now calls
-            # the registered CUDA op directly. An eligibility miss continues
-            # to the exact native quality route below.
-            fused_mode = (_fp4_fused_mode()
-                          if bias is None and M > 16 else "")
+            # the registered CUDA op directly. Explicit modes are attested at
+            # model load; the selector call here only enforces the existing
+            # same-process environment immutability contract.
+            requested_mode = _fp4_fused_mode()
+            fused_mode = getattr(
+                layer, "_cb_fused_fp4_mode", requested_mode
+            ) if bias is None and M > 16 else ""
             if (fused_mode in _FP4_FUSED_MODES
                     and not (fused_mode.endswith("midm") and M > 128)):
                 mode_kwargs = {}
@@ -845,10 +941,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 # a cuBLAS/F.linear fallback. The QDQ and expanded weight are
                 # bit-identical to the established quality reference; only
                 # FP32 accumulation order may differ.
-                W = expand_fp4_v2_to_weight(
-                    layer._cb_qw_padded, layer._cb_flat,
-                    layer._cb_row_offset, layer._cb_compose,
-                    N, K, self.k, self.n_sub, self.type_size)
+                W = self._expand_fp4_quality_weight(layer, N, K)
                 xq2 = xq.reshape(M, K).contiguous()
                 expert_ends = torch.full(
                     (1,), M, dtype=torch.int32, device=x.device)
@@ -902,9 +995,19 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # cutlass_scaled_mm (the older unscaled entry rounded first and scaled
         # in python, which moved served prompt logprobs by up to 0.86 nats).
         # Step-4 rungs only (the kernel's KBits template dispatch).
+        fused_midm = getattr(
+            layer, "_cb_fp8_fused_midm",
+            os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0")
+        live_fused_midm = (
+            os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0")
+        if live_fused_midm != fused_midm:
+            raise RuntimeError(
+                "PRISMAQUANT_CB_FUSED_MIDM changed after this CB layer was "
+                "loaded; restart the process instead of changing the native "
+                "kernel set during serving")
         if (bias is None and FP8_CUDA_GEMV_M_MAX < x2.shape[0] <= 128
                 and self.k in (28, 32, 36, 40, 44, 48)
-                and os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0"
+                and fused_midm
                 and self._fused_fp8_lut_ok(layer)):
             from .cuda_ext import get_fused_ext
             fext = get_fused_ext()

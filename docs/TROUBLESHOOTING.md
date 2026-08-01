@@ -29,7 +29,7 @@ for "gridbook" will find nothing. Search for **`[prismaquant-cb]`**.
 - [Tensor parallel (`tp > 1`)](#tensor-parallel-tp--1)
 - [The model loads but generates garbage](#the-model-loads-but-generates-garbage)
 - [Other exceptions you may hit](#other-exceptions-you-may-hit)
-- [The first request stalls for ~30 seconds](#the-first-request-stalls-for-30-seconds)
+- [The first model load stalls for kernel compilation](#the-first-model-load-stalls-for-kernel-compilation)
 - [Benchmark numbers move between runs](#benchmark-numbers-move-between-runs)
 
 ---
@@ -427,21 +427,24 @@ The rules and evidence limits are in
 
 ## Non-Blackwell GPU: what breaks
 
-The base FP4-CB path declares compute capability **8.0**, while FP8-CB's native
-prefill path requires **8.9** and is now checked during model construction. See
-the [hardware matrix](INSTALL.md#hardware-matrix) for the per-path breakdown.
+The grouped-BF16 CUTLASS kernel used by FP4-CB can compile for compute
+capability 8.0, but that is not the full FP4 serving floor. Every FP4-v2 quality
+path also needs the exact v2 expander, whose device prepare currently accepts
+only cc 12.0/12.1. FP8-CB native prefill requires cc 8.9 and is checked during
+model construction. See the [hardware matrix](INSTALL.md#hardware-matrix).
 
-- **`sm_89` / `sm_90` (RTX 4090, L40S, H100)** — decode and dense prefill are
-  *expected* to work (the decode kernel has no architecture guards); when the
-  Blackwell-only fused mid-M kernel is ineligible, the native CUDA-expand +
-  CUTLASS route is used. **Inferred from code, untested by the author.**
+- **`sm_89` / `sm_90` (RTX 4090, L40S, H100)** — FP8-only decode and dense
+  prefill are expected to work; when the optional Blackwell fused kernel is
+  ineligible, FP8 uses native CUDA expansion + CUTLASS. FP4-CB is rejected at
+  weight load because v2 expander prepare rejects these devices. The FP8 claim
+  is inferred from code and untested by the author.
 - **`sm_80` (A100)** — an FP8-CB artifact is rejected early with a clear
   `sm_89+` error. The former behavior loaded successfully and then failed at
   the FP8 quantizer/scaled-matmul boundary on the first prompt longer than 16
   tokens. Current Gridbook attests the registered native `torch.ops._C`
   operators directly and never enters vLLM's fallback-capable Python wrapper.
-  FP4-CB's quality-preserving BF16-transient + CUTLASS route is native, but
-  untested on this card.
+  FP4-CB is also rejected: the grouped-BF16 kernel can target SM80, but the
+  required v2 expander cannot prepare on this card.
 - Per-artifact groups matter too. The 27B's vision tower is stock NVFP4 W4A16 and
   needs a vLLM NVFP4 backend independently of gridbook.
 
@@ -494,14 +497,17 @@ predates its architecture support, and confirm the artifact is complete (see
 
 ---
 
-## The first request stalls for ~30 seconds
+## The first model load stalls for kernel compilation
 
-Expected once per build cache: the CUDA extension JIT-compiles on first use.
+Expected once per build cache outside a prewarmed image: required CUDA/CUTLASS
+extensions JIT-compile while the model is loading. Production Gridbook resolves
+every reachable module before the model becomes serve-ready; compilation is not
+deferred to the first forward.
 Measured cold in the reference container (`vllm-node:latest`, compile-only, no
 GPU): **28.7 s** and **32.3 s** at `TORCH_CUDA_ARCH_LIST` 12.1 and 12.0, matching
 the 29.4 s / 29.7 s recorded in `gridbook/cuda_ext.py`. Call it ~30 s; it varies
 with the arch list and the host. The plugin deliberately warms it at *weight
-load* so the first request is not the one that pays — but in a container with an
+load* so no served request pays — but in a container with an
 ephemeral home directory you pay it on every start.
 
 Fix: [persist the build cache](INSTALL.md#persisting-the-jit-build-cache) with

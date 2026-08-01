@@ -364,18 +364,24 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # substitute. FP8 uses the main extension for decode/QDQ/expansion;
         # FP4 also needs the exact v2 expander. Both use the grouped CUTLASS
         # quality bridge whenever the fused shape gate misses.
-        from .cuda_ext import (require_bf16_grouped_ext, require_ext,
-                               require_ext_v2)
+        from .cuda_ext import (NativeKernelUnavailableError,
+                               require_bf16_grouped_ext, require_ext,
+                               require_fp4_v2_expander)
+        if layer._cb_hidden % 8 or layer._cb_inter % 8:
+            raise NativeKernelUnavailableError(
+                f"{self.prefix}: native BF16 grouped quality prefill requires "
+                "hidden and intermediate dimensions divisible by 8, got "
+                f"hidden={layer._cb_hidden}, intermediate={layer._cb_inter}")
         require_ext(f"{self.prefix} routed CB decode/QDQ/expansion")
         if self.is_fp4:
-            require_ext_v2(f"{self.prefix} routed FP4-v2 expansion")
+            require_fp4_v2_expander(
+                f"{self.prefix} routed FP4-v2 expansion", device=dev)
         else:
             require_native_fp8_cutlass(
                 f"{self.prefix} routed FP8 quality prefill")
         require_bf16_grouped_ext(
             f"{self.prefix} routed quality prefill")
         if not self._cuda_moe_ok(layer):
-            from .cuda_ext import NativeKernelUnavailableError
             raise NativeKernelUnavailableError(
                 f"{self.prefix}: routed decode layout has no native grouped "
                 "CUDA kernel")
@@ -435,7 +441,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             raise NotImplementedError(
                 "apply_router_weight_on_input unsupported for CB MoE")
         # M-branch hoist (see ops.py/linear.py): the token-count branch AND
-        # the prefill loop's host syncs live inside ONE opaque custom op, so
+        # the prefill path's host routing/dispatch logic lives inside ONE
+        # opaque custom op, so
         # compile/capture at decode sizes record the grouped decode kernels
         # and dynamo never traces the loop. Opaque dispatch is mandatory:
         # exposing routing/pointwise ATen code to Inductor could generate
@@ -912,10 +919,12 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
     def _apply_prefill_grouped_fused(self, layer, x, topk_weights, topk_ids,
                                      act):
-        """ROUND 1 of the MoE grouped fused prefill
-        (``PRISMAQUANT_CB_PREFILL=grouped_fused``). Returns ``None`` on any
-        constraint miss so the caller falls through to the owned native BF16
-        quality bridge.
+        """ROUND 1 of the native FP8-CB grouped fused prefill.
+
+        Returns ``None`` on any constraint miss so the caller falls through to
+        the owned native BF16 quality bridge. Eligibility is resolved by the
+        fixed native dispatch; the retired ``PRISMAQUANT_CB_PREFILL`` selector
+        is not part of the serving contract.
 
         WHAT IT REMOVES. The native quality bridge expands each expert chunk's
         packed CB rows into a bounded BF16 tile and runs Gridbook's owned
@@ -1096,10 +1105,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
     def _apply_prefill_grouped_fused_v2(self, layer, x, topk_weights, topk_ids,
                                         act, *, tile_m=None):
-        """ROUND 2 of the MoE grouped fused prefill (selected by
-        ``PRISMAQUANT_CB_PREFILL=grouped_fused`` when the grouped binding
-        exists). Returns ``None`` on any constraint miss so the caller falls
-        back to R1 and then to the owned native BF16 quality bridge.
+        """ROUND 2 of the native FP8-CB grouped fused prefill.
+
+        The fixed native dispatch tries this grouped binding when eligible.
+        Any constraint miss falls back to R1 and then to the owned native BF16
+        quality bridge; no retired runtime prefill selector is consulted.
 
         WHAT IT REMOVES. R1 already decodes CB rows inside the CUTLASS prologue,
         so the only structural cost it left is the HOST LOOP: 2*E dense kernel

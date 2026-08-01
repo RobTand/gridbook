@@ -53,16 +53,52 @@ check() {  # check <name> <expected-substring> <docker-run-args...>
 # The probe is passed on stdin so it needs no bind mount (a bind mount would
 # itself be a permission variable in a test about permissions).
 PROBE='
-import getpass, os, sys, time
+import getpass, os, re, sys, time
 import vllm, gridbook
 gridbook.register()
 from gridbook import cuda_ext
-t = time.time(); d = cuda_ext.get_ext(); td = time.time() - t
-t = time.time(); f = cuda_ext.get_fused_ext(); tf = time.time() - t
-print("PROBE uid=%d gid=%d user=%s HOME=%s vllm=%s register=OK decode=%s (%.2fs) "
-      "fused=%s (%.2fs)" % (os.getuid(), os.getgid(), getpass.getuser(),
-      os.environ.get("HOME"), vllm.__version__, d is not None, td, f is not None, tf))
-sys.exit(0 if d is not None else 1)
+import torch
+
+arch = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
+match = re.search(r"(?:^|\s)(\d+)\.(\d+)", arch)
+if match is None:
+    print("PROBE cannot derive capability from TORCH_CUDA_ARCH_LIST=%r" % arch)
+    raise SystemExit(1)
+capability = int(match.group(1)), int(match.group(2))
+original_get_device_capability = torch.cuda.get_device_capability
+torch.cuda.get_device_capability = lambda *args, **kwargs: capability
+
+def timed(load):
+    start = time.time()
+    value = load()
+    return value, time.time() - start
+
+d, td = timed(cuda_ext.get_ext)
+v2, tv2 = timed(cuda_ext.get_ext_v2)
+grouped, tg = timed(cuda_ext.get_bf16_grouped_ext)
+required = d is not None and v2 is not None and grouped is not None
+
+cache = os.environ["PRISMAQUANT_CB_EXT_DIR"]
+f8_cached = os.path.isdir(os.path.join(cache, "fused"))
+f8, tf8 = timed(cuda_ext.get_fused_ext) if f8_cached else (None, 0.0)
+f8_ok = not f8_cached or f8 is not None
+
+f4_cached = os.path.isdir(os.path.join(cache, "fused_fp4"))
+f4, tf4 = timed(cuda_ext.get_fused_fp4_ext) if f4_cached else (None, 0.0)
+f4_ok = not f4_cached or f4 is not None
+torch.cuda.get_device_capability = original_get_device_capability
+
+print("PROBE uid=%d gid=%d user=%s HOME=%s vllm=%s register=OK required=%s "
+      "main=%s (%.2fs) v2=%s (%.2fs) grouped_bf16=%s (%.2fs) "
+      "optional_fp8=%s (%.2fs) optional_fp4=%s (%.2fs)" % (
+      os.getuid(), os.getgid(), getpass.getuser(), os.environ.get("HOME"),
+      vllm.__version__, required, d is not None, td, v2 is not None, tv2,
+      grouped is not None, tg,
+      ("loaded" if f8 is not None else "FAILED") if f8_cached
+      else "not-prewarmed", tf8,
+      ("loaded" if f4 is not None else "FAILED") if f4_cached
+      else "not-prewarmed", tf4))
+sys.exit(0 if required and f8_ok and f4_ok else 1)
 '
 
 if [ "$BUILD" = 1 ]; then
@@ -82,21 +118,21 @@ echo
 echo "== run-time checks against $TAG =="
 
 # 1. root: the ordinary path.
-check "root" "decode=True" --entrypoint python3 "$TAG" -c "$PROBE"
+check "root" "required=True" --entrypoint python3 "$TAG" -c "$PROBE"
 
 # 2. `docker run --user` with a non-zero GID. This is the case the image used to
 #    fail two ways: getpass.getuser() (no passwd entry) and a non-writable
-#    kernel-cache directory. Both are silent — the second one downgrades decode
-#    to the slow Triton path with only a warning.
-check "--user 1000:1000" "decode=True" --user 1000:1000 --entrypoint python3 "$TAG" -c "$PROBE"
-check "--user 1000:0" "decode=True" --user 1000:0 --entrypoint python3 "$TAG" -c "$PROBE"
-check "--user 65534:65534 (nobody)" "decode=True" --user 65534:65534 --entrypoint python3 "$TAG" -c "$PROBE"
+#    kernel-cache directory. The second makes required native operations
+#    unavailable, and current Gridbook then fails closed.
+check "--user 1000:1000" "required=True" --user 1000:1000 --entrypoint python3 "$TAG" -c "$PROBE"
+check "--user 1000:0" "required=True" --user 1000:0 --entrypoint python3 "$TAG" -c "$PROBE"
+check "--user 65534:65534 (nobody)" "required=True" --user 65534:65534 --entrypoint python3 "$TAG" -c "$PROBE"
 
 # 3. Named volume over the kernel cache: docker seeds it from the image, so the
 #    prewarmed build must survive, under --user too.
 VOL="gbverify-$$"
 docker volume create "$VOL" >/dev/null
-check "named volume + --user 1000:1000" "decode=True" \
+check "named volume + --user 1000:1000" "required=True" \
   --user 1000:1000 -v "$VOL":/opt/gridbook/ext-cache --entrypoint python3 "$TAG" -c "$PROBE"
 docker volume rm "$VOL" >/dev/null
 
@@ -104,7 +140,7 @@ docker volume rm "$VOL" >/dev/null
 #    documented recipe is exactly this pair of flags.
 VOL2="gbverify-ro-$$"
 docker volume create "$VOL2" >/dev/null
-check "--read-only + tmpfs + volume + --user" "decode=True" \
+check "--read-only + tmpfs + volume + --user" "required=True" \
   --read-only --tmpfs /tmp --user 1000:1000 -v "$VOL2":/opt/gridbook/ext-cache \
   --entrypoint python3 "$TAG" -c "$PROBE"
 docker volume rm "$VOL2" >/dev/null

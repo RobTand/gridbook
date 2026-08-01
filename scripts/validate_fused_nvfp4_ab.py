@@ -8,9 +8,13 @@ between synchronous requests.  Loading once removes model/session drift; the
 fused extension is loaded before the model so extension residency is also
 identical in both arms.
 
-The two arms intentionally do not have the same activation contract:
+The two arms intentionally do not have the same activation contract.  Dense
+mode retains the established baseline, while MoE uses Gridbook's owned native
+quality path:
 
-* baseline: Gridbook's fp32-emulated group-scale activation QDQ;
+* dense baseline: Gridbook's fp32-emulated group-scale activation QDQ;
+* MoE baseline: exact CB weight expansion to BF16, native activation QDQ, and
+  owned CUTLASS grouped BF16 GEMMs;
 * fused static modes: native NVFP4 attested per-tensor global scale + UE4M3
   group factors;
 * fused rowwise modes: native NVFP4 independent runtime scale per row + UE4M3
@@ -34,9 +38,11 @@ full-vocabulary teacher contract and both teacher-quality limits.
 
 ``--mode dense`` instruments Gridbook's dense linear fused path.
 ``--mode moe128`` and ``--mode moe256`` instrument the real grouped-MoE
-routing, two-stage GEMMs, activation, and combine path.  The MoE baseline keeps
-``PRISMAQUANT_CB_PREFILL`` unset and proves that the normal FP4 loop ran; the
-candidate also keeps it unset and selects only ``PRISMAQUANT_CB_FUSED_FP4_MOE``.
+routing, two-stage GEMMs, activation, and combine path.  The MoE baseline
+proves that ``_apply_prefill_native_bf16`` ran; the candidate selects only
+``PRISMAQUANT_CB_FUSED_FP4_MOE`` and proves that it never entered that quality
+baseline.  The removed ``PRISMAQUANT_CB_PREFILL`` selector is sanitized if it
+is inherited; it does not select a serving path.
 
 Example (inside the pinned vLLM/CUDA container)::
 
@@ -244,7 +250,8 @@ def activate_execution_arm(
         )
     if PREFILL_ENV in environ:
         raise RuntimeError(
-            f"{PREFILL_ENV} must remain unset for the grouped-MoE A/B"
+            f"removed legacy selector {PREFILL_ENV} is set; grouped-MoE "
+            "validation requires a native-only environment"
         )
     environ[FUSED_ENV] = ""
     tile_m = execution_mode.removeprefix("moe")
@@ -662,9 +669,9 @@ _COUNT_FIELDS = (
     "fused_successes",
     "fused_fallbacks",
     "fused_errors",
-    "loop_calls",
-    "loop_successes",
-    "loop_errors",
+    "native_bf16_calls",
+    "native_bf16_successes",
+    "native_bf16_errors",
     "probe_errors",
 )
 
@@ -673,10 +680,10 @@ _COUNTER_MAP_FIELDS = (
     "success_shapes",
     "fallback_shapes",
     "fallback_reasons",
-    "loop_shapes",
+    "native_bf16_shapes",
     "success_prefixes",
     "fallback_prefixes",
-    "loop_prefixes",
+    "native_bf16_prefixes",
     "success_tile_m",
     "success_tile_m_shapes",
     "success_tile_m_contracts",
@@ -899,14 +906,14 @@ class DenseDispatchProbe:
 
 
 class MoEDispatchProbe:
-    """Temporary wrappers proving loop-vs-grouped-fused MoE dispatch."""
+    """Prove native-BF16-quality-vs-fused native MoE dispatch."""
 
     def __init__(self, method_class: type):
         self.method_class = method_class
         self.current: dict[str, Any] | None = None
         self.unscoped = _empty_dispatch_record("unscoped", None)
         self._original_fused = None
-        self._original_loop = None
+        self._original_native_bf16 = None
 
     def _record(self) -> dict[str, Any]:
         return self.current if self.current is not None else self.unscoped
@@ -927,9 +934,11 @@ class MoEDispatchProbe:
         self._original_fused = (
             self.method_class._apply_prefill_grouped_fused_fp4
         )
-        self._original_loop = self.method_class._apply_prefill_loop
+        self._original_native_bf16 = (
+            self.method_class._apply_prefill_native_bf16
+        )
         original_fused = self._original_fused
-        original_loop = self._original_loop
+        original_native_bf16 = self._original_native_bf16
 
         def wrapped_fused(
             method, layer, x, topk_weights, topk_ids, act, *, tile_m=128,
@@ -975,10 +984,12 @@ class MoEDispatchProbe:
                 record["success_prefixes"][prefix] += 1
             return output
 
-        def wrapped_loop(method, layer, x, topk_weights, topk_ids, act):
+        def wrapped_native_bf16(
+            method, layer, x, topk_weights, topk_ids, act
+        ):
             record = probe._record()
             record["pids"].add(os.getpid())
-            record["loop_calls"] += 1
+            record["native_bf16_calls"] += 1
             try:
                 shape = probe._shape(layer, x, topk_ids, None)
             except Exception:  # noqa: BLE001 - telemetry must not alter serving
@@ -986,27 +997,29 @@ class MoEDispatchProbe:
                 record["probe_errors"] += 1
             prefix = str(getattr(method, "prefix", "<unknown>"))
             try:
-                output = original_loop(
+                output = original_native_bf16(
                     method, layer, x, topk_weights, topk_ids, act
                 )
             except Exception:
-                record["loop_errors"] += 1
+                record["native_bf16_errors"] += 1
                 raise
-            record["loop_successes"] += 1
-            record["loop_shapes"][shape] += 1
-            record["loop_prefixes"][prefix] += 1
+            record["native_bf16_successes"] += 1
+            record["native_bf16_shapes"][shape] += 1
+            record["native_bf16_prefixes"][prefix] += 1
             return output
 
         self.method_class._apply_prefill_grouped_fused_fp4 = wrapped_fused
-        self.method_class._apply_prefill_loop = wrapped_loop
+        self.method_class._apply_prefill_native_bf16 = wrapped_native_bf16
 
     def restore(self) -> None:
         if self._original_fused is None:
             return
         self.method_class._apply_prefill_grouped_fused_fp4 = self._original_fused
-        self.method_class._apply_prefill_loop = self._original_loop
+        self.method_class._apply_prefill_native_bf16 = (
+            self._original_native_bf16
+        )
         self._original_fused = None
-        self._original_loop = None
+        self._original_native_bf16 = None
 
     @contextlib.contextmanager
     def measurement(self, arm: str, label: str):
@@ -2103,8 +2116,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     os.environ[FUSED_MOE_ENV] = ""
     inherited_prefill = os.environ.get(PREFILL_ENV)
     if args.mode != "dense":
-        # Unset is the production FP4 policy entry point. Setting "loop" would
-        # bypass the candidate before it can be measured.
+        # This selector no longer controls serving. Remove an inherited value
+        # so evidence cannot be mistaken for a legacy-path comparison.
         os.environ.pop(PREFILL_ENV, None)
 
     started = time.monotonic()
@@ -2318,21 +2331,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     if args.mode != "dense":
         core_gates.update({
-            "baseline_positive_loop_dispatch": {
-                "observed_loop_calls": baseline_dispatch["loop_calls"],
-                "pass": baseline_dispatch["loop_calls"] > 0,
+            "baseline_positive_native_bf16_dispatch": {
+                "observed_native_bf16_calls": (
+                    baseline_dispatch["native_bf16_calls"]
+                ),
+                "pass": baseline_dispatch["native_bf16_calls"] > 0,
             },
-            "baseline_loop_no_errors": {
-                "observed_errors": baseline_dispatch["loop_errors"],
-                "pass": baseline_dispatch["loop_errors"] == 0,
+            "baseline_native_bf16_no_errors": {
+                "observed_errors": baseline_dispatch["native_bf16_errors"],
+                "pass": baseline_dispatch["native_bf16_errors"] == 0,
             },
             "candidate_zero_fallbacks": {
                 "observed_fallbacks": fused_dispatch["fused_fallbacks"],
                 "pass": fused_dispatch["fused_fallbacks"] == 0,
             },
-            "candidate_never_entered_loop": {
-                "observed_loop_calls": fused_dispatch["loop_calls"],
-                "pass": fused_dispatch["loop_calls"] == 0,
+            "candidate_never_entered_native_bf16_baseline": {
+                "observed_native_bf16_calls": (
+                    fused_dispatch["native_bf16_calls"]
+                ),
+                "pass": fused_dispatch["native_bf16_calls"] == 0,
             },
         })
     else:
@@ -2394,7 +2411,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"{args.mode} NVFP4-CB prefill; TP=1; one in-process vLLM engine"
         ),
         "activation_contract": {
-            "baseline": "fp32-emulated group-scale FP4 activation QDQ",
+            "baseline": (
+                "fp32-emulated group-scale FP4 activation QDQ"
+                if args.mode == "dense"
+                else "exact native FP4 activation QDQ + exact CB-to-BF16 "
+                "weight expansion + owned CUTLASS grouped BF16 GEMMs"
+            ),
             "fused": (
                 "native NVFP4 attested fixed-G payload + per-row least-squares "
                 "EVT residual"
@@ -2402,6 +2424,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 else "native NVFP4 global FP32 scale + per-group UE4M3 factors"
             ),
             "same_contract": False,
+        },
+        "dispatch_telemetry_contract": {
+            "dense_baseline_unchanged": True,
+            "moe_baseline": "_apply_prefill_native_bf16",
+            "legacy_prefill_selector_supported": False,
+            "native_only": True,
         },
         "settings": validation_common.shared_report_settings(
             bootstrap,

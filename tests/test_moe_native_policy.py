@@ -494,6 +494,9 @@ def test_moe_post_load_caches_distinct_attested_stage_scales(monkeypatch):
     monkeypatch.setattr(moe, "require_native_moe_activation", lambda *_args: "silu")
     monkeypatch.setattr(cuda_ext, "require_ext", lambda *_args: None)
     monkeypatch.setattr(cuda_ext, "require_ext_v2", lambda *_args: None)
+    monkeypatch.setattr(
+        cuda_ext, "require_fp4_v2_expander",
+        lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cuda_ext, "require_bf16_grouped_ext", lambda *_args: None)
     monkeypatch.setattr(ops, "register_cb_layer", lambda *_args: 7)
 

@@ -242,6 +242,36 @@ def test_extra_symbols_do_not_matter(tmp_path):
         source="cb_gemv.cu") is mod
 
 
+def test_required_fp4_v2_expander_is_device_attested_at_load(monkeypatch):
+    calls = []
+
+    class PreparedExt:
+        @staticmethod
+        def cb_gemv_v2_prepare():
+            calls.append("prepare")
+
+    ext = PreparedExt()
+    monkeypatch.setattr(cuda_ext, "require_ext_v2", lambda operation: ext)
+    assert cuda_ext.require_fp4_v2_expander("dense FP4 quality") is ext
+    assert calls == ["prepare"]
+
+
+def test_required_fp4_v2_expander_normalizes_device_prepare_failure(
+        monkeypatch):
+    class UnsupportedExt:
+        @staticmethod
+        def cb_gemv_v2_prepare():
+            raise RuntimeError("compute capability 8.0 is unsupported")
+
+    monkeypatch.setattr(
+        cuda_ext, "require_ext_v2", lambda operation: UnsupportedExt())
+    with pytest.raises(
+        cuda_ext.NativeKernelUnavailableError,
+        match=r"compute capability 12\.0 or 12\.1.*load-time device",
+    ):
+        cuda_ext.require_fp4_v2_expander("routed FP4 quality")
+
+
 def test_require_symbols_accepts_a_one_shot_iterable(tmp_path):
     names = (name for name in ("first", "second"))
     mod = _stub("generated", ("first",))

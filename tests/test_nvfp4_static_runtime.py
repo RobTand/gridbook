@@ -70,13 +70,10 @@ def _install_vllm_stubs():
 @pytest.fixture(scope="module", autouse=True)
 def runtime_modules(isolated_gridbook_runtime_imports):
     del isolated_gridbook_runtime_imports
-    try:
-        from vllm.model_executor.parameter import PerTensorScaleParameter  # noqa:F401
-    except Exception:
-        for name in list(sys.modules):
-            if name == "vllm" or name.startswith("vllm."):
-                sys.modules.pop(name, None)
-        _install_vllm_stubs()
+    # This CPU contract needs only vLLM's class surface. Importing the real
+    # package registers process-global Torch opaque types that cannot be undone
+    # when the isolation fixture restores sys.modules, so always use stubs.
+    _install_vllm_stubs()
     from gridbook.config import PrismaQuantConfig
     from gridbook.linear import PrismaQuantCBLinearMethod
 
@@ -315,16 +312,12 @@ def test_static_scale_makes_native_quantization_chunk_invariant(monkeypatch):
     )
     calls = []
 
-    vops = types.ModuleType("vllm._custom_ops")
-
     def quantize(x, scale):
         calls.append((x.clone(), scale.clone()))
         return x * scale, torch.zeros(x.shape[0], 1)
 
-    vops.scaled_fp4_quant = quantize
-    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
-    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
-                        raising=False)
+    from gridbook import linear as cb_linear
+    monkeypatch.setattr(cb_linear, "native_fp4_quant", quantize)
     from gridbook import cuda_ext
 
     class Ext:
@@ -362,13 +355,14 @@ def test_dense_static_lsq_uses_attested_g_and_existing_fused_gemm(monkeypatch):
         _cb_qw_padded=torch.ones(8, 73, dtype=torch.uint8),
     )
 
-    vops = types.ModuleType("vllm._custom_ops")
-    vops.scaled_fp4_quant = lambda *_args: pytest.fail(
-        "static_lsq must use the shared Gridbook activation primitive"
+    from gridbook import linear as cb_linear
+    monkeypatch.setattr(
+        cb_linear,
+        "native_fp4_quant",
+        lambda *_args: pytest.fail(
+            "static_lsq must use the shared Gridbook activation primitive"
+        ),
     )
-    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
-    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
-                        raising=False)
     from gridbook import cuda_ext
 
     calls = []
@@ -437,13 +431,14 @@ def test_dense_rowwise_quantizer_outputs_feed_the_existing_fused_gemm(
     quant_calls = []
     gemm_calls = []
 
-    vops = types.ModuleType("vllm._custom_ops")
-    vops.scaled_fp4_quant = lambda *_args: pytest.fail(
-        "rowwise mode must not enter the static vLLM quantizer"
+    from gridbook import linear as cb_linear
+    monkeypatch.setattr(
+        cb_linear,
+        "native_fp4_quant",
+        lambda *_args: pytest.fail(
+            "rowwise mode must not enter the static quantizer"
+        ),
     )
-    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
-    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
-                        raising=False)
     from gridbook import cuda_ext
 
     class Ext:

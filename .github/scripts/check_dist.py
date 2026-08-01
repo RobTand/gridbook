@@ -92,6 +92,8 @@ REQUIRED = [
 # staging directory.
 FORBIDDEN = [
     f"{PKG}/kernels.py",
+    f"{PKG}/moe_autotune.py",
+    f"{PKG}/moe_l2.py",
 ]
 
 NATIVE_SUFFIXES = (".cu", ".cuh", ".hpp", ".h")

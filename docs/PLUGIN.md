@@ -62,14 +62,20 @@ second runtime tree or maintain a parallel loader table.
   `bit_split` (K13 → (7,6); FP8 K30 → (8,8,7,7)) — encoder-anchored tests.
   Production availability is also gated by a native kernel contract for the
   concrete grid/mode/shape; a format-valid but unimplemented combination fails
-  closed. **Signed** mode (S-rungs, n_sub=1: 8 sign bits + magnitude index into
+  closed. Native dense FP4 serving in 0.5 accepts only unsigned product mode
+  with v2 scale coding. A format-valid FP4-v1 product layer is rejected at
+  model load because its exact every-M native quality expander is not
+  implemented. **Signed** mode (S-rungs, n_sub=1: 8 sign bits + magnitude index into
   one half-grid table) was validated by a historical 18-test GPU battery on
   2026-07-22. It is **closed as research-only** by the K-vs-S head-to-head
   the same day: over 776 matched-rate per-(Linear, rung) comparisons the
   unsigned rungs won 79% of the time and the allocator placed 6 signed units
   against 147 unsigned, so S-rungs stay **off production menus**. The format
   stays in the spec for exotic weight geometries; no published artifact uses
-  one. Full mode: spec-reserved, unimplemented.
+  one. In 0.5, native dense serving also rejects a signed S-rung at model load:
+  the format is valid and remains available for research codecs, but the exact
+  every-M native prefill contract is not implemented for it. Full mode:
+  spec-reserved, unimplemented.
 - **Mixed containers are supported and shipping.** A config group carrying a
   `"scheme"` key is a CB group and is served by this plugin; a group without one
   uses the stock `compressed-tensors` vocabulary and is delegated to a real
@@ -88,6 +94,11 @@ second runtime tree or maintain a parallel loader table.
   require BF16. Gridbook no longer advertises FP16 to vLLM and therefore fails
   at dtype validation instead of crashing or changing dtype at a dispatch
   crossover.
+- **Biasless public CB dense Linear only** — a non-`None` bias passed to the
+  public dense CB method is rejected. The permanent opaque native operation
+  does not expose a Gridbook-owned biased kernel, so 0.5 does not hide a
+  framework bias add behind the serving boundary. Delegated non-CB groups keep
+  their upstream method's contract.
 
 ## Layout / registration
 
@@ -162,6 +173,23 @@ M≤16, plus native expansion/support operators:
 - `fp8_act_qdq`, `cb_moe_combine` — fused per-token fp8 QDQ and the deterministic
   expert-ascending bf16 combine.
 
+**`gridbook/csrc/cb_gemv_v2.cu`** (`cuda_ext.get_ext_v2()`) — required FP4-v2
+quality expansion plus an optional alternate decode GEMV:
+
+- **`cb_expand_v2`** is the exact BF16 expander used by every dense and routed
+  FP4-v2 quality path. It is required independently of
+  `PRISMAQUANT_CB_GEMV`; the selector changes decode GEMV scheduling, not this
+  quality bridge.
+- **`cb_gemv_v2_prepare`** performs the device-specific shared-memory
+  attestation. The current implementation accepts only CUDA compute capability
+  12.0 or 12.1, so 0.5 FP4-CB quality serving is Blackwell-only and fails at
+  weight load elsewhere. The extension can be compiled and cached without a
+  GPU; device preparation is intentionally deferred until model load.
+- **`cb_gemv_v2`** is the optional smem-resident-dictionary decode schedule
+  selected by `PRISMAQUANT_CB_GEMV=auto|v2`. The default `inherited` decode
+  schedule still loads and prepares this extension because it needs
+  `cb_expand_v2` for quality prefill.
+
 **`gridbook/csrc/cb_fused_gemm.cu`** (CUTLASS, separate JIT ext) — prefill:
 
 - **`cb_fused_prefill_mm`** — decode-in-prologue fused GEMM (CUTLASS sm120
@@ -169,7 +197,10 @@ M≤16, plus native expansion/support operators:
   MMA — INV-1 **and** INV-2, bit-exact vs the passthrough `fork64`). Wins the
   measured mid-M points (1.04–1.45× at M=32/64/128). Production FP8-CB dispatch
   considers it for **M=9–128** when its rung/layout/device predicates hold; at
-  large M every M-tile CTA re-decodes B, so transient-expand is preferred.
+  large M every M-tile CTA re-decodes B, so transient-expand is preferred. Its
+  extension availability and selector mode are resolved during model load, not
+  on the first eligible forward; changing the relevant environment value after
+  load raises instead of silently changing residency or dispatch.
 
 **`gridbook/csrc/cb_bf16_grouped_gemm.cu`** (CUTLASS, separate JIT ext) — the
 quality-preserving BF16 bridge:
@@ -183,6 +214,8 @@ quality-preserving BF16 bridge:
   the recorded synthetic DSV4 shapes it measured 6–17% slower than segmented
   BF16 matmuls at warm steady state. It is a native-ownership/quality baseline,
   not yet a prefill-speed result.
+  Its kernel schedule supports SM80+, but the FP4-v2 serving path as a whole
+  still has the cc 12.0/12.1 floor imposed by `cb_expand_v2` device prepare.
 
 **`gridbook/csrc/cb_fused_fp4_gemm.cu`** (CUTLASS, separate JIT ext) —
 experimental native-FP4 prefill, **off by default**:
@@ -227,10 +260,10 @@ tooling and model cards — see the README's naming section.)
 | Variable | Default | Effect |
 |---|---|---|
 | `PRISMAQUANT_CB_EXT_DIR` | `~/.cache/prismaquant-cb-ext` | Where the JIT extensions are built and cached. Point it at a persistent, writable directory in containers to avoid a ~30 s rebuild per start. |
-| `PRISMAQUANT_CB_GEMV` | `inherited` | Which grouped fp4-CB decode GEMV serves a layer: `inherited` \| `auto` \| `v2`. Unset/`inherited` reproduces the shipped dispatch and never attempts the experimental JIT build. Explicit `auto` or `v2` may use `cb_gemv_v2.cu` only on native Blackwell cc 12.0/12.1 devices with the required opt-in shared memory and where the compiled occupancy predicate says it wins; this PR's execution battery covers cc 12.1. FP8-only serves never build it. **Not** bit-exact against `inherited` (reassociation class). An unknown spelling raises; changing it mid-process raises. |
+| `PRISMAQUANT_CB_GEMV` | `inherited` | Which grouped FP4-CB **decode GEMV** serves a layer: `inherited` \| `auto` \| `v2`. All FP4-v2 quality paths build/load `cb_gemv_v2.cu` and run its cc 12.0/12.1 device prepare because that module also owns the required exact expander. Unset/`inherited` keeps the shipped decode schedule; `auto` or `v2` may additionally use the module's smem-resident decode GEMV where its occupancy predicate says it wins. That alternate decode is **not** bit-exact against `inherited` (reassociation class). FP8-only serves do not need the v2 module. An unknown spelling raises; changing it mid-process raises. |
 | `PRISMAQUANT_CB_FUSED_FP4` | off | Dense fp4-CB native-FP4 prefill opt-in. `1`/`midm` use a fully attested artifact scalar for all prefill shapes / `16 < M <= 128`. `static_lsq`/`static_lsq_midm` keep that exact `G` and the native E2M1/SFA payload, but fit the existing per-row EVT residual by least squares; they add no model metadata, weight copy, decoder, or GEMM. `rowwise`/`rowwise_midm` instead derive an independent full-range scalar per runtime row and are the only fused choices accepted for legacy artifacts. All dense modes use one occupancy selector: TileM256 is chosen only for `M >= 256` and `ceil(M/256) * ceil(N/128) >= ceil(2*SM_count/3)`; otherwise TileM128 runs. The `*_midm` modes therefore always remain TileM128. All values are experimental and default-off; unknown spellings and mid-process changes fail. The K24 short exact gate passed, but long-context evidence is mixed and no >=4B/MoE served validation exists; see the [dated audit](audits/fused_nvfp4_enablement_2026-07-31.md). |
 | `PRISMAQUANT_CB_FUSED_FP4_MOE` | off | Grouped-MoE fp4-CB native-FP4 prefill opt-in. Static `1`/`128` and `256` select TileM 128 and 256 and require both attested stage scalars. `static_lsq`/`static_lsq128` and `static_lsq256` select those same tiles while reusing the shared fixed-`G` LSQ quantizer. `rowwise`/`rowwise128` and `rowwise256` use independent runtime row scales and may serve legacy artifacts. An ineligible attempt records its cached reason and returns to the exact native BF16 quality bridge; unknown spellings and mid-process changes fail. Keep this off pending the dated audit's routed-quality, workload, and routing-policy gates. |
-| `PRISMAQUANT_CB_FUSED_MIDM` | `1` | `0` skips the CUTLASS mid-M fused prefill kernel — including its JIT build, which is worth doing on non-`sm_120` GPUs where the build is doomed anyway. |
+| `PRISMAQUANT_CB_FUSED_MIDM` | `1` | Resolved during model load. `0` skips the CUTLASS mid-M FP8 fused specialization and its JIT build; the exact native expansion/CUTLASS route remains. Any other supported setting is loaded/probed before the model becomes serve-ready. Changing the value later raises. |
 | `PRISMAQUANT_CB_DECODE_CONTRACT` | `v1` | `v2` selects the scale-epilogue-hoist decode contract. Measured **null** on the served 27B; kept for reproducibility. |
 | `PRISMAQUANT_CB_EXPAND` | native CUDA (fp8-CB) / raw view (fp4-CB) | `pad` restores the historical padded-copy input on the fp4-CB branch for a native-vs-native bisection. No value selects Triton. |
 | `PRISMAQUANT_DEBUG_PREFIXES` | off | `1` prints, per Linear, whether it resolved to a CB scheme or to a config-declared non-CB group — the first tool to reach for when memory use is higher than expected. |

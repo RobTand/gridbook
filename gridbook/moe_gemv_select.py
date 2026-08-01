@@ -5,8 +5,8 @@ WHY ITS OWN MODULE. ``moe.py`` imports vLLM at module scope, so nothing in it is
 importable in the build venv. The part with the contract — the env whitelist,
 the once-per-process resolution, the availability probe and the per-(layer,
 stack) fallback decision — lives here, vLLM-free and importable with nothing
-but the standard library, exactly as ``moe_routing.py`` / ``moe_autotune.py`` /
-``moe_l2.py`` do for the prefill policies. ``moe.py`` is a thin adapter that
+but the standard library, exactly as ``moe_routing.py`` does for grouped
+routing policy. ``moe.py`` is a thin adapter that
 calls :func:`cb_gemv_choice` once per stack at load and stores the answer on
 the layer.
 

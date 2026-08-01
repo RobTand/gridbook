@@ -7,9 +7,9 @@
 # a real test of the new action versions because the packaging gates run there.
 #
 # Deliberately NOT enabled: a `pip` ecosystem entry. gridbook's runtime deps are
-# intentionally unpinned (torch/triton must match whatever CUDA build the user's
-# vLLM environment already has), so there is nothing for Dependabot to bump and
-# it would only generate noise.
+# intentionally unpinned (torch must match whatever CUDA build the user's vLLM
+# environment already has), so there is nothing for Dependabot to bump and it
+# would only generate noise.
 version: 2
 updates:
   - package-ecosystem: "github-actions"

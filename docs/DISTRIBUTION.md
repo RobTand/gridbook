@@ -741,9 +741,9 @@ else silently changes what is being gated.
       `[prismaquant-cb] WARNING: CUDA decode-GEMV extension unavailable` does
       **not** appear.
 - [ ] Confirm decode throughput matches the measured figure for that artifact in
-      `docs/BENCHMARKS.md` (e.g. 27B: ~10.3 tok/s). A silent Triton fallback is
-      the exact failure this gate exists to catch, and it is invisible without a
-      speed check.
+      `docs/BENCHMARKS.md` (e.g. 27B: ~10.3 tok/s). Missing required Gridbook
+      kernels now fail closed; this speed check catches a stale runtime or an
+      unintended native dispatch regression that symbol/load gates cannot.
 - [ ] Confirm on the wheel-installed path that both artifact registry keys
       resolve to the same implementation: canonical `"gridbook"` and the
       read-only legacy alias `"prismaquant"`. Published artifacts use the

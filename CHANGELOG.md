@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.0 — 2026-08-01
+
 - Remove Gridbook's Triton dependency and every Gridbook-defined Triton
   operator/dispatch/fallback path. Required CB operators now use native
   CUDA/CUTLASS and fail closed when the selected native extension is
@@ -9,11 +11,22 @@
 - Route dense FP8-CB through CUDA GEMV at M≤8, fused CUTLASS at M=9–128 when
   eligible, and CUDA expansion + CUTLASS otherwise. Route dense FP4-CB M>8
   through exact BF16 expansion + the owned CUTLASS grouped bridge (`E=1`).
+- Make the exact FP4-v2 quality path correct for fused projections with
+  distinct per-role codebooks by coalescing contiguous row segments and
+  expanding each segment against its matching native LUT before the CUTLASS
+  bridge. Device-prepare the required v2 expander at model load; the 0.5 FP4
+  serving floor is therefore CUDA cc 12.0/12.1, not the grouped GEMM's
+  standalone SM80 floor.
 - Replace selectable MoE stock/loop/auto/L2 prefill modes with fixed native
   dispatch: grouped CUDA GEMV at M≤16, then eligible quality-green FP8 fused
   CUTLASS or exact BF16 expansion + the owned CUTLASS grouped bridge. Prior
   Triton and Laguna chunk-expander results remain historical until this path is
   rebenchmarked.
+- Resolve every serving-reachable extension and optional-kernel mode during
+  model load, reject native shape-alignment misses before first forward, and
+  reject mid-process FP8 fused-mode changes. Native dense 0.5 is intentionally
+  biasless and accepts FP4 product-v2 only; signed S-rungs and FP4-v1 remain
+  format-valid research inputs but fail the serving load gate.
 - Make the whole-Layer/MoE opaque custom op the permanent dispatch boundary;
   remove the former inline-dispatch environment escape.
 - Bind FP8 activation quantization and scaled matrix multiplication directly to
@@ -25,7 +38,13 @@
 - Keep the new grouped-BF16 bridge's performance status explicit: its generic
   SM80-compatible CUTLASS schedule is a quality/ownership baseline, not a
   Blackwell-optimized kernel, and measured 6–17% slower than segmented BF16
-  matmuls on warm synthetic DSV4 shapes.
+  matmuls on warm synthetic DSV4 shapes. This informational microbenchmark is
+  not a DSV4 artifact qualification or a release promotion gate.
+- Prewarm and verify the main, FP4-v2, and grouped-BF16 required extensions in
+  the container image. FP8 fused prewarm remains a native optional
+  specialization; experimental fused FP4 prewarm is an explicit build option.
+
+[Full diff](https://github.com/RobTand/gridbook/compare/v0.4.2...v0.5.0)
 
 ## 0.4.2 — 2026-08-01
 

@@ -135,10 +135,13 @@ def expand_fp4_v2_to_weight(
 ) -> torch.Tensor:
     """Expand native FP4-v2 product mode to a composed BF16 transient.
 
-    ``cb_expand_v2`` implements one global two-subcodebook product dictionary.
-    Per-role concatenated dictionaries and signed ``n_sub=1`` encoding do not
-    have a native expansion contract yet and are rejected. A padded row input
-    is compacted to the raw byte plane expected by the existing extension.
+    One invocation of ``cb_expand_v2`` implements one zero-based physical
+    two-subcodebook product dictionary. The dense loader handles fused modules
+    with multiple dictionaries by invoking this wrapper once per contiguous
+    role segment and concatenating the native BF16 results. Passing a raw
+    concatenation to one invocation, and signed ``n_sub=1`` encoding, remain
+    unsupported and are rejected. A padded row input is compacted to the raw
+    byte plane expected by the existing extension.
     """
     row_bytes = _validate_packed_rows(
         cb_qweight_padded, N, K, type_size)
@@ -173,10 +176,12 @@ def expand_fp4_v2_to_weight(
             "packed weights, codebook, offsets, and compose table must share "
             "a device")
 
-    # A one-block codebook has base zero by construction in valid artifacts.
-    # A larger concatenated codebook is rejected above. Keeping the offset
-    # tensor in the signature preserves the loader contract while avoiding a
-    # CUDA-to-host sync in the hot/capture path.
+    # The selected one-block codebook is zero-based for this invocation. A
+    # larger concatenated codebook is rejected above. Offset *values* are not
+    # consumed by cb_expand_v2; the tensor remains in this wrapper's signature
+    # to validate that the loader supplied exactly one routing entry per row.
+    # This also lets the segmented dense caller reuse its resident offset slice
+    # without allocating a zero vector or synchronizing CUDA back to the host.
     raw_rows = cb_qweight_padded[:, :row_bytes]
     qw_flat = raw_rows.contiguous().view(-1)
 

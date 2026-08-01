@@ -74,19 +74,23 @@ available, serving fails closed.
 
 ## Hardware matrix
 
-The decode kernel (`gridbook/csrc/cb_gemv.cu`) contains no architecture guards,
-no inline PTX and no `-arch` flag — torch derives the target from the GPU present
-— so it is *expected* to compile and run anywhere from `sm_80` up. Only the
-mid-M fused prefill kernel is genuinely Blackwell-family (`sm_120`) bound, and
-it already fails soft.
+The main decode kernel (`gridbook/csrc/cb_gemv.cu`) contains no architecture
+guards, inline PTX, or fixed `-arch` flag, so that translation unit is expected
+to compile from `sm_80` up. That fact is **not** an FP4-CB support claim. Every
+FP4-v2 quality path also needs `cb_expand_v2` from `cb_gemv_v2.cu`; its
+device-prepare contract currently admits only CUDA compute capability 12.0 or
+12.1. Gridbook attests that floor during weight load and rejects the FP4-CB
+layer if it is not met. The owned grouped-BF16 CUTLASS GEMM used after expansion
+is independently SM80-compatible, but it cannot make an FP4 serve viable
+without the Blackwell-only expander.
 
 | GPU | Dense `M ≤ 8` | FP8-CB `M=9–128` | Native general / FP4 `M>8` | Overall |
 |---|---|---|---|---|
 | **GB10 / DGX Spark `sm_121`** | ✅ native CUDA GEMV | fused CUTLASS when eligible, otherwise CUDA expand + CUTLASS | FP8 CUDA expand + CUTLASS; FP4 native BF16 expand + owned CUTLASS grouped (`E=1`) | **MEASURED target.** Published artifact results remain tied to their recorded pre-change commits until the new dispatch is rebenchmarked. |
 | **RTX 5090 `sm_120`** | expected same | expected same | expected same | **USER-REPORTED** working on the 27B artifact before the final native-only dispatch. The arch flag differs (`sm_120` vs measured `sm_121`); no new speed numbers exist. |
-| **H100 `sm_90`** | expected ✅ | Blackwell fused kernel ineligible; native expand + CUTLASS expected | native expansion + CUTLASS expected | **INFERRED, UNTESTED.** |
-| **RTX 4090 / L40S `sm_89`** | expected ✅ | Blackwell fused kernel ineligible; native expand + CUTLASS expected | native expansion + CUTLASS expected | **INFERRED, UNTESTED.** |
-| **A100 `sm_80`** | FP4-CB expected ✅ | ❌ FP8-CB requires `sm_89+` | FP4 quality path is native BF16 expand + CUTLASS | **FAILS EARLY for FP8-CB; FP4 UNTESTED.** No slow fallback is selected. |
+| **H100 `sm_90`** | FP8-CB decode expected; FP4-CB is rejected at weight load | Blackwell fused kernel ineligible; native FP8 expand + CUTLASS expected | FP8 native expansion + CUTLASS expected; FP4 unavailable because v2 expander prepare rejects this device | **FP8-ONLY IS INFERRED / UNTESTED. FP4-CB IS UNSUPPORTED IN 0.5.** |
+| **RTX 4090 / L40S `sm_89`** | FP8-CB decode expected; FP4-CB is rejected at weight load | Blackwell fused kernel ineligible; native FP8 expand + CUTLASS expected | FP8 native expansion + CUTLASS expected; FP4 unavailable because v2 expander prepare rejects this device | **FP8-ONLY IS INFERRED / UNTESTED. FP4-CB IS UNSUPPORTED IN 0.5.** |
+| **A100 `sm_80`** | no production artifact lane: FP8 prefill needs `sm_89+`, and FP4 load requires cc 12.0/12.1 | ❌ FP8-CB requires `sm_89+` | grouped BF16 GEMM can compile, but the required FP4-v2 expander rejects this device | **UNSUPPORTED FOR PRODUCTION CB SERVING IN 0.5.** No slow fallback is selected. |
 | **Supported NVIDIA GPU, no `nvcc`** | unavailable unless compatible extensions were prebuilt | unavailable unless compatible extensions were prebuilt | unavailable | **FAILS CLOSED.** There is no Triton serving fallback. |
 | **Non-NVIDIA** | unsupported | unsupported | unsupported | **UNSUPPORTED / UNQUALIFIED.** No ROCm backend or dispatch hook ships in this release. |
 
@@ -175,11 +179,14 @@ Nothing is compiled at `pip install` time. The extensions are built lazily by
 
 | Extension | Sources | Built when | Cost |
 |---|---|---|---|
-| `prismaquant_cb_ext` (decode GEMV, MoE grouped GEMV, prefill expander) | `gridbook/csrc/cb_gemv.cu` | **at weight load**, deliberately warmed there so it does not poison the first request | **~30 s** once — see below |
-| `prismaquant_cb_v2_ext` (experimental smem-resident-dictionary MoE decode GEMV) | `gridbook/csrc/cb_gemv_v2.cu` | at weight load only for an **fp4**-CB two-tier MoE layer with `PRISMAQUANT_CB_GEMV=auto` or `v2`; unset stays on the inherited kernel and does not build this extension | comparable to `prismaquant_cb_ext`; unsupported devices and failed builds degrade to the shipped kernel with one stderr warning |
-| `pq_cb_bf16_grouped` (quality-preserving grouped/dense bridge) | `gridbook/csrc/cb_bf16_grouped_gemm.cu` | before FP4-CB `M>8` or MoE quality-path execution; dense uses grouped count `E=1` | CUTLASS JIT cost not yet separately measured; required by those paths and fail-closed. Its generic SM80-compatible schedule is not Blackwell-optimized and measured 6–17% slower than segmented BF16 matmuls on warm synthetic DSV4 shapes. |
-| `pq_cb_fused` (mid-M CUTLASS fused prefill) | `gridbook/csrc/cb_fused_gemm.cu` + `csrc/cutlass_fork/*.hpp` | first eligible FP8-CB call with 9 ≤ M ≤ 128 | longer (a CUTLASS collective); not separately timed |
-| persistent-N research source | `gridbook/csrc/cb_persistent_tc.cu` | never built by serving; direct research tests only | Measured negative for performance. The serving selector, custom op, and JIT loader are deleted. |
+| `prismaquant_cb_ext` (decode GEMV, grouped-MoE decode GEMV, FP8 prefill expander, activation QDQ/combine) | `gridbook/csrc/cb_gemv.cu` | **at weight load** for every CB artifact | **Required.** About 30 s once for the recorded main-extension build — see below. |
+| `prismaquant_cb_v2_ext` (FP4-v2 quality expander plus optional alternate FP4 decode GEMV) | `gridbook/csrc/cb_gemv_v2.cu` | **at weight load for every FP4-v2 layer**, regardless of `PRISMAQUANT_CB_GEMV`; device prepare immediately attests cc 12.0/12.1. The selector controls only which decode GEMV runs. | **Required for every FP4-v2 quality path; fail-closed.** Compilation itself needs no GPU, but the device prepare does. |
+| `pq_cb_bf16_grouped` (quality-preserving grouped/dense bridge) | `gridbook/csrc/cb_bf16_grouped_gemm.cu` | **at weight load** for routed quality prefill and dense FP4-CB quality prefill; dense uses grouped count `E=1` | **Required by those paths; fail-closed.** The generic SM80-compatible schedule is not Blackwell-optimized and measured 6–17% slower than segmented BF16 matmuls on warm synthetic DSV4 shapes. |
+| `pq_cb_fused` (FP8-CB mid-M fused CUTLASS prefill) | `gridbook/csrc/cb_fused_gemm.cu` + `csrc/cutlass_fork/*.hpp` | **at weight load** when `PRISMAQUANT_CB_FUSED_MIDM` is enabled; availability and mode are fixed before serving, and later environment mutation raises | **Optional specialization.** An unavailable specialization stays on the exact native FP8 expansion/CUTLASS route; it is never first-built inside an eligible forward. |
+| `pq_cb_fused_fp4_<identity>` (native-NVFP4 fused CUTLASS prefill) | `gridbook/csrc/cb_fused_fp4_gemm.cu` + `csrc/cutlass_fork/*.hpp` | only when the explicit fused-FP4 experiment is preloaded or selected | **Optional, experimental, and default-off.** An unavailable specialization stays on the exact native FP4-v2 expansion/grouped-BF16 route. |
+
+The retained persistent-N `.cu` files are research sources, not a sixth serving
+extension: their selector, custom op, and package loader are deleted.
 
 **Where "~30 s" comes from.** Cold `get_ext()` in the reference container
 (`vllm-node:latest`, compile-only, **no** `--gpus`, `PRISMAQUANT_CB_EXT_DIR`
@@ -189,11 +196,15 @@ empty): **28.7 s** at `TORCH_CUDA_ARCH_LIST=12.1` and **32.3 s** at `12.0`
 your `nvcc` and your host — treat ~30 s as the order of magnitude, not a
 specification.
 
-The main extension is **required** and serving fails closed if it cannot build.
-An optional shape-specialized extension may be skipped only when dispatch has a
+The main extension is always required. FP4-v2 additionally requires the v2
+extension and its device prepare; routed/native quality prefill and dense FP4
+quality prefill require the grouped-BF16 extension. Serving fails closed if a
+required extension cannot build, load, or attest its device contract. An
+optional fused specialization may be skipped only because dispatch has a
 separately qualified native CUDA/CUTLASS path; it never selects Triton. The
-verification step below distinguishes native readiness from a package that
-merely imports.
+verification step below distinguishes main-extension readiness from a package
+that merely imports; artifact-specific required extensions are attested during
+weight load.
 
 ---
 
@@ -329,6 +340,12 @@ discrete GPU with its own VRAM, ordinary vLLM utilization guidance applies.
 
 - **`tp=1` only.** No tensor-parallel support; `--tensor-parallel-size > 1` is
   untested and unimplemented for CB weights.
+- **Dense CB Linears are biasless.** A public dense CB call with non-`None`
+  bias is rejected because the opaque native operation has no owned biased
+  kernel in 0.5.
+- **Dense FP4 0.5 serves unsigned product-v2 only.** Signed S-rungs and FP4-v1
+  product layers remain format-valid research inputs, but model load rejects
+  them until an exact every-M native quality path exists.
 - **`--enforce-eager` is the published-model configuration.** The permanent
   opaque dispatch has since made mode-0 `FULL_DECODE_ONLY` capture-correct and
   it improved a close-rate 0.6B canary by 20.1%. Keep eager for published

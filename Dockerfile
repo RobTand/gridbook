@@ -25,8 +25,9 @@
 # dispatch_fused_moe_kernel, _get_config_dtype_str, moe_align_block_size).
 #
 # HONEST LIMIT: v0.24.0 itself has NOT been served end-to-end with gridbook.
-# What is verified is toolchain parity, symbol presence, install, and that both
-# CUDA extensions compile inside this image. v0.25.1 and v0.26.0 were checked
+# What was verified for the base stack is toolchain parity, symbol presence,
+# install, and native extension compilation. The 0.5 Dockerfile hard-gates its
+# expanded required extension set below. v0.25.1 and v0.26.0 were checked
 # to carry the same gridbook-facing symbols and can be selected with
 # --build-arg VLLM_TAG=..., but they are further from the measured stack.
 ARG VLLM_TAG=v0.24.0
@@ -48,7 +49,7 @@ ARG VLLM_TAG
 # 1. The image's prebuilt kernel cache becomes architecture-locked. torch only
 #    reuses a cached build when the arch flags match, so this value MUST be
 #    identical at build time and run time or every kernel is silently
-#    recompiled on first use. To target other hardware, rebuild with e.g.
+#    recompiled during model load. To target other hardware, rebuild with e.g.
 #    --build-arg GRIDBOOK_CUDA_ARCH=9.0 (H100) or 8.9 (RTX 4090).
 #
 # 2. TORCH_CUDA_ARCH_LIST is a PROCESS-WIDE torch setting, not a gridbook one.
@@ -67,8 +68,15 @@ ARG VLLM_TAG
 ARG GRIDBOOK_CUDA_ARCH=12.1a
 
 # Set to 0 to skip compiling the kernels into the image (smaller/faster build,
-# but the user pays a one-time ~30 s build inside their first request).
+# but the user pays the one-time builds during model load).
 ARG GRIDBOOK_PREWARM=1
+
+# The experimental native-NVFP4 fused specialization is runtime-default-off,
+# so its substantially larger CUTLASS build is not baked by default. Set this
+# to 1 only for an image intended to run the explicit fused-FP4 experiment.
+# This does not enable the runtime selector; it only makes that optional module
+# resident in the image cache.
+ARG GRIDBOOK_PREWARM_FUSED_FP4=0
 
 LABEL org.opencontainers.image.title="gridbook" \
       org.opencontainers.image.description="Out-of-tree vLLM quantization plugin serving NVFP4-CB / FP8-CB product-codebook weight formats on Blackwell tensor cores" \
@@ -268,7 +276,10 @@ PY
 # Measured: torch.utils.cpp_extension.load() needs nvcc and an explicit
 # TORCH_CUDA_ARCH_LIST, but NOT a GPU — so the kernels compile during
 # `docker build`, which never has a GPU attached (torch.cuda.is_available() is
-# False throughout; it only warns). Both extensions compile here.
+# False throughout; it only warns). The main, FP4-v2, and grouped-BF16
+# extensions are the required serving floor and all compile here. Crucially,
+# this build does NOT call cb_gemv_v2_prepare(): that is a device attestation
+# and runs during FP4 model load on the actual serving GPU.
 #
 # The per-kernel wall-clock numbers this step prints are recorded in
 # docs/CONTAINER.md, "Verified vs untested". They are deliberately NOT restated
@@ -279,10 +290,34 @@ import os, sys, time
 
 if os.environ.get("GRIDBOOK_PREWARM", "1") != "1":
     print("[gridbook] prewarm disabled (GRIDBOOK_PREWARM != 1); kernels will "
-          "build on first use inside the first request.")
+          "build during the first model load.")
     raise SystemExit(0)
 
 from gridbook import cuda_ext
+
+arch = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
+
+
+def build_capability():
+    """Capability encoded by the single-arch image build argument."""
+    import re
+    match = re.search(r"(?:^|\s)(\d+)\.(\d+)", arch)
+    if match is None:
+        print(f"\n[gridbook] FATAL: cannot derive a CUDA capability from "
+              f"TORCH_CUDA_ARCH_LIST={arch!r}.", file=sys.stderr)
+        raise SystemExit(1)
+    return int(match.group(1)), int(match.group(2))
+
+
+def load_for_build(load):
+    """Let a compile-only loader derive its target with no build-time GPU."""
+    import torch
+    original = torch.cuda.get_device_capability
+    torch.cuda.get_device_capability = lambda *args, **kwargs: build_capability()
+    try:
+        return load()
+    finally:
+        torch.cuda.get_device_capability = original
 
 # Decode GEMV — the production decode path. Hard gate: the native-only runtime
 # fails closed when this extension is unavailable, so an image that cannot
@@ -296,11 +331,36 @@ if cuda_ext.get_ext() is None:
     sys.exit(1)
 print(f"[gridbook] prewarmed decode-GEMV extension in {time.time() - t:.1f}s")
 
+# FP4-v2 exact expander. Hard compile/load gate because every FP4 quality path
+# needs this module even when PRISMAQUANT_CB_GEMV=inherited. Do not call its
+# device prepare here: docker build has no GPU, and model load owns that check.
+t = time.time()
+if cuda_ext.get_ext_v2() is None:
+    print("\n[gridbook] FATAL: the required FP4-v2 expansion extension failed "
+          "to build at image build time (reason printed above). Refusing to "
+          "ship an image missing a required quality-path module.",
+          file=sys.stderr)
+    sys.exit(1)
+print(f"[gridbook] prewarmed FP4-v2 expansion extension in "
+      f"{time.time() - t:.1f}s (device prepare deferred to model load)")
+
+# Owned grouped-BF16 CUTLASS quality bridge. Its loader normally derives the
+# target from the live GPU; docker build has none, so derive the same tuple from
+# the image's explicit single-arch build argument for this compile/load only.
+t = time.time()
+if load_for_build(cuda_ext.get_bf16_grouped_ext) is None:
+    print("\n[gridbook] FATAL: the required CUTLASS grouped-BF16 extension "
+          "failed to build at image build time (reason printed above). "
+          "Refusing to ship an image missing the native quality bridge.",
+          file=sys.stderr)
+    sys.exit(1)
+print(f"[gridbook] prewarmed grouped-BF16 quality extension in "
+      f"{time.time() - t:.1f}s")
+
 # Mid-M fused prefill (CUTLASS). Genuinely sm_120-family only, and default-ON at
 # runtime — without this prewarm a non-prewarmed image burns a multi-minute
-# CUTLASS compile inside the user's first request. Soft: the runtime already
+# CUTLASS compile during model load. Soft: the runtime already
 # falls back to the transient-expand path by design.
-arch = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
 if "12.0" in arch or "12.1" in arch:
     t = time.time()
     if cuda_ext.get_fused_ext() is None:
@@ -313,8 +373,33 @@ if "12.0" in arch or "12.1" in arch:
 else:
     print(f"[gridbook] NOTE: TORCH_CUDA_ARCH_LIST={arch!r} is not Blackwell "
           f"sm_120/sm_121 — skipping the CUTLASS mid-M fused prefill prewarm, "
-          f"which is sm_120-family only. Decode and the other prefill paths "
-          f"are unaffected.")
+          f"which is sm_120-family only. The exact native FP8 expansion path "
+          f"is unaffected; FP4 model load remains gated by v2 device prepare.")
+
+# Native-NVFP4 fused prefill is experimental and runtime-default-off. Build it
+# only when explicitly requested; unlike the soft FP8 specialization, an
+# explicit prewarm request is a build contract and therefore fails closed.
+if os.environ.get("GRIDBOOK_PREWARM_FUSED_FP4", "0") == "1":
+    if "12.0" not in arch and "12.1" not in arch:
+        print(f"\n[gridbook] FATAL: GRIDBOOK_PREWARM_FUSED_FP4=1 requires a "
+              f"Blackwell sm_120/sm_121 target, got {arch!r}.",
+              file=sys.stderr)
+        sys.exit(1)
+    t = time.time()
+    if load_for_build(cuda_ext.get_fused_fp4_ext) is None:
+        print("\n[gridbook] FATAL: explicitly requested fused-FP4 extension "
+              "did not prewarm (reason printed above).", file=sys.stderr)
+        sys.exit(1)
+    print(f"[gridbook] prewarmed optional fused-FP4 extension in "
+          f"{time.time() - t:.1f}s")
+elif os.environ.get("GRIDBOOK_PREWARM_FUSED_FP4", "0") != "0":
+    print("\n[gridbook] FATAL: GRIDBOOK_PREWARM_FUSED_FP4 must be 0 or 1.",
+          file=sys.stderr)
+    sys.exit(1)
+else:
+    print("[gridbook] optional fused-FP4 prewarm disabled; runtime remains on "
+          "the exact FP4-v2 expansion + grouped-BF16 quality path unless its "
+          "explicit experimental selector is enabled.")
 
 # The retained persistent-TC source is research-only: its serving selector,
 # custom op and package loader were deleted after it measured negative. It is
@@ -387,24 +472,47 @@ gridbook.register()    # and the actual registration the plugin loader performs
 if os.environ.get("GRIDBOOK_PREWARM", "1") != "1":
     print(f"[gridbook] --user gate OK (getpass={user}, import vllm, register); "
           f"kernel-cache load not checked because prewarm is disabled. The cache "
-          f"directory is world-writable, so the first-use build works too.")
+          f"directory is world-writable, so the model-load build works too.")
     raise SystemExit(0)
 
 from gridbook import cuda_ext
+import re
+import torch
+
+arch = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
+match = re.search(r"(?:^|\s)(\d+)\.(\d+)", arch)
+if match is None:
+    print(f"\n[gridbook] --user GATE FAILED: cannot derive a CUDA capability "
+          f"from TORCH_CUDA_ARCH_LIST={arch!r}.", file=sys.stderr)
+    sys.exit(1)
+capability = int(match.group(1)), int(match.group(2))
+original_get_device_capability = torch.cuda.get_device_capability
+torch.cuda.get_device_capability = lambda *args, **kwargs: capability
 
 t = time.time()
 ok_decode = cuda_ext.get_ext() is not None
 t_decode = time.time() - t
 
-if not ok_decode:
+t = time.time()
+ok_v2 = cuda_ext.get_ext_v2() is not None
+t_v2 = time.time() - t
+
+t = time.time()
+ok_grouped = cuda_ext.get_bf16_grouped_ext() is not None
+t_grouped = time.time() - t
+
+if not (ok_decode and ok_v2 and ok_grouped):
     print(f"\n[gridbook] --user GATE FAILED: uid/gid 1000:1000 could not load the "
-          f"prewarmed decode-GEMV extension (reason above). Under `docker run "
+          f"prewarmed required extensions (main={ok_decode}, v2={ok_v2}, "
+          f"grouped_bf16={ok_grouped}; reason above). Under `docker run "
           f"--user` native CB execution would fail closed. Refusing to ship "
-          f"it.", file=sys.stderr)
+          f"the image.", file=sys.stderr)
     sys.exit(1)
 
 msg = (f"[gridbook] --user gate OK: uid/gid 1000:1000 HOME=/ getpass={user}, "
-       f"import vllm + register OK, decode loaded in {t_decode:.2f}s")
+       f"import vllm + register OK, required extensions loaded "
+       f"(main={t_decode:.2f}s, v2={t_v2:.2f}s, "
+       f"grouped_bf16={t_grouped:.2f}s)")
 
 # The fused prefill extension is only prewarmed on the sm_120 family; check it
 # only when it was actually built.
@@ -415,6 +523,20 @@ if os.path.isdir(os.path.join(os.environ["PRISMAQUANT_CB_EXT_DIR"], "fused")):
               "the prewarmed mid-M fused prefill extension.", file=sys.stderr)
         sys.exit(1)
     msg += f", fused in {time.time() - t:.2f}s"
+
+# Fused FP4 is optional and default-off; require cache-load integrity only when
+# an explicit image build actually populated that module family.
+fused_fp4_root = os.path.join(
+    os.environ["PRISMAQUANT_CB_EXT_DIR"], "fused_fp4")
+if os.path.isdir(fused_fp4_root):
+    t = time.time()
+    if cuda_ext.get_fused_fp4_ext() is None:
+        print("\n[gridbook] --user GATE FAILED: uid/gid 1000:1000 could not "
+              "load the explicitly prewarmed fused-FP4 extension.",
+              file=sys.stderr)
+        sys.exit(1)
+    msg += f", fused_fp4 in {time.time() - t:.2f}s"
+torch.cuda.get_device_capability = original_get_device_capability
 print(msg)
 PY
 EOF

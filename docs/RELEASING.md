@@ -143,6 +143,7 @@ v2 = get_ext_v2()
 assert v2 is not None, \"FP4-v2 extension failed to build\"
 for symbol in (\"cb_gemv_v2\", \"cb_expand_v2\"):
     assert hasattr(v2, symbol), f\"built v2 module is missing {symbol}\"
+v2.cb_gemv_v2_prepare()  # actual cc12.0/12.1 + 99 KiB device attestation
 grouped = get_bf16_grouped_ext()
 assert grouped is not None, \"grouped BF16 CUTLASS extension failed to build\"
 for symbol in (\"cb_bf16_grouped_mm\", \"cb_bf16_grouped_mm_out\"):

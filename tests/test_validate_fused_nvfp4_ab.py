@@ -8,6 +8,7 @@ import inspect
 import json
 import math
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,7 +41,7 @@ ab = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = ab
 SPEC.loader.exec_module(ab)
 
-V5_HELP_SHA256 = "c7ac242795ca86dd2afbe88103d6f646780229412eb08b7d6c6f2edf187f2696"
+V5_HELP_SHA256 = "c8a59313679ccc9ce743368484d5f2b479d85e5162d5793d530ea56633905b4e"
 
 
 class _Logprob:
@@ -280,7 +281,7 @@ def test_activate_execution_arm_keeps_moe_prefill_unset():
     ) == "static_lsq256"
     assert environ[ab.FUSED_MOE_ENV] == "static_lsq256"
     environ[ab.PREFILL_ENV] = "loop"
-    with pytest.raises(RuntimeError, match="must remain unset"):
+    with pytest.raises(RuntimeError, match="removed legacy selector"):
         ab.activate_execution_arm(
             "fused",
             execution_mode="moe128",
@@ -1265,7 +1266,7 @@ def test_dense_dispatch_probe_forwards_static_lsq_without_losing_telemetry():
         probe.restore()
 
 
-def test_moe_probe_proves_loop_and_grouped_fused_routes_without_torch():
+def test_moe_probe_proves_native_bf16_and_grouped_fused_routes_without_torch():
     class X:
         shape = (128, 1024)
 
@@ -1286,7 +1287,9 @@ def test_moe_probe_proves_loop_and_grouped_fused_routes_without_torch():
             del layer, x, topk_weights, topk_ids, act, tile_m
             return object()
 
-        def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
+        def _apply_prefill_native_bf16(
+            self, layer, x, topk_weights, topk_ids, act
+        ):
             del layer, x, topk_weights, topk_ids, act
             return object()
 
@@ -1294,14 +1297,16 @@ def test_moe_probe_proves_loop_and_grouped_fused_routes_without_torch():
     probe = ab.MoEDispatchProbe(Method)
     probe.install()
     try:
-        with probe.measurement("baseline", "loop") as baseline:
-            assert method._apply_prefill_loop(Layer(), X(), None, TopK(), None)
+        with probe.measurement("baseline", "native-bf16") as baseline:
+            assert method._apply_prefill_native_bf16(
+                Layer(), X(), None, TopK(), None
+            )
         with probe.measurement("fused", "grouped") as fused:
             assert method._apply_prefill_grouped_fused_fp4(
                 Layer(), X(), None, TopK(), None, tile_m=256
             )
-        assert baseline["loop_calls"] == 1
-        assert baseline["loop_successes"] == 1
+        assert baseline["native_bf16_calls"] == 1
+        assert baseline["native_bf16_successes"] == 1
         assert baseline["fused_attempts"] == 0
         assert fused["fused_attempts"] == 1
         assert fused["fused_successes"] == 1
@@ -1338,7 +1343,9 @@ def test_moe_dispatch_probe_forwards_rowwise_family_without_losing_telemetry():
             observed.append((rowwise, tile_m))
             return object()
 
-        def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
+        def _apply_prefill_native_bf16(
+            self, layer, x, topk_weights, topk_ids, act
+        ):
             del layer, x, topk_weights, topk_ids, act
             return object()
 
@@ -1383,7 +1390,9 @@ def test_moe_dispatch_probe_forwards_static_lsq_without_losing_telemetry():
             observed.append((rowwise, static_lsq, tile_m))
             return object()
 
-        def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
+        def _apply_prefill_native_bf16(
+            self, layer, x, topk_weights, topk_ids, act
+        ):
             del layer, x, topk_weights, topk_ids, act
             return object()
 
@@ -1429,7 +1438,9 @@ def test_moe_dispatch_probe_records_fail_closed_reason():
             assert static_lsq is True
             return None
 
-        def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
+        def _apply_prefill_native_bf16(
+            self, layer, x, topk_weights, topk_ids, act
+        ):
             del layer, x, topk_weights, topk_ids, act
             return object()
 

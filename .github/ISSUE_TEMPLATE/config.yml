@@ -5,9 +5,9 @@ contact_links:
   - name: Serving problem — read this first
     url: https://github.com/RobTand/gridbook/blob/master/docs/TROUBLESHOOTING.md
     about: >-
-      Symptom-indexed. The common ones (Triton fallback / "Invalid quantization
-      method: gridbook" / OOM / garbage generation / slower than the published
-      numbers) each have a section with the exact diagnostic command.
+      Symptom-indexed. Native-extension load failures, "Invalid quantization
+      method: gridbook", OOM, garbage generation, and slower-than-published
+      reports each have a section with the exact diagnostic command.
   - name: Installation and tested software stack
     url: https://github.com/RobTand/gridbook/blob/master/docs/INSTALL.md
     about: >-

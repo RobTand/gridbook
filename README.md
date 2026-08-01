@@ -20,7 +20,7 @@ list](#published-artifacts).
 
 | | Requirement |
 |---|---|
-| **GPU** | NVIDIA **Blackwell `sm_120` / `sm_121`** for the native-speed path (GB10 / DGX Spark is the reference; RTX 5090 is user-reported). Older NVIDIA cards partly work — read the [compatibility table](#compatibility) before assuming. |
+| **GPU** | NVIDIA **Blackwell `sm_120` / `sm_121`** for the complete native path (GB10 / DGX Spark is the reference; RTX 5090 is user-reported). Some FP8-only paths may work on older NVIDIA cards; FP4-CB 0.5 serving does not — read the [compatibility table](#compatibility). |
 | **CUDA toolchain** | `nvcc` on `PATH` **in the process that serves**, matching your torch build. Kernels are **JIT-compiled on first model load** (~30 s once, then cached), *not* at `pip install` time. `nvcc` 13.0 is the tested toolchain. A required extension that cannot be built is a serving error. |
 | **PyTorch** | whatever build your vLLM uses (measured: `2.11.0+cu130`). |
 | **vLLM** | already installed — gridbook is a plugin, not a runtime. Measured against `0.23.1rc1.dev764+g54b16d8a9`; see [compatibility](#compatibility). |
@@ -152,16 +152,20 @@ activation headroom; see [`docs/INSTALL.md`](docs/INSTALL.md#per-artifact-requir
 
 ## Compatibility
 
-The native path is Blackwell-targeted, but the decode kernel is *not*
-arch-specific — this table separates what was **measured** from what is
-**inferred from the code and untested**. Nothing here is inferred silently.
+The native path is Blackwell-targeted. The main decode translation unit is not
+arch-specific, but that alone does not make an FP4-CB artifact portable:
+every FP4-v2 quality path uses the v2 exact expander, whose device prepare
+currently admits only CUDA cc 12.0/12.1. The owned grouped-BF16 CUTLASS GEMM is
+SM80-compatible in isolation; the required expander sets the full FP4 serving
+floor. This table separates what was **measured** from what is **inferred from
+the code and untested**.
 
 | GPU class | Dense small-M (M ≤ 8) | FP8-CB M = 9–128 | Native general / FP4 quality path | Verdict |
 |---|---|---|---|---|
 | **GB10 / DGX Spark, `sm_121`** | native CUDA GEMV | fused CUTLASS when eligible; otherwise CUDA expand → CUTLASS W8A8 | FP8: CUDA expand → CUTLASS; FP4 M>8: native BF16 expand → Gridbook CUTLASS grouped GEMM (`E=1`); fused native-NVFP4 remains opt-in | **MEASURED target.** Published results below predate the final native-only dispatch and remain tied to their recorded commits. |
 | **RTX 5090, `sm_120`** | same dispatch | same dispatch | same dispatch | **USER-REPORTED** working (vLLM 0.25.1, 27B artifact, [issue #1](https://github.com/RobTand/gridbook/issues/1)) before the final native-only dispatch. No new speed numbers are published; the exact `nvcc` arch flag (`sm_120` vs measured `sm_121`) is untested here. |
-| **H100 `sm_90`, RTX 4090 / L40S `sm_89`** | expected to work — the GEMV contains no arch guards, inline PTX, or fixed `-arch` flag | Blackwell fused kernel ineligible; CUDA expand → CUTLASS expected for FP8 (`sm_89+`) | native expansion + CUTLASS expected; fused native-NVFP4 is Blackwell-only and unqualified here | **INFERRED, UNTESTED.** Also gated by any non-CB groups (for example the 27B vision tower's NVFP4). |
-| **A100 `sm_80`** | FP4-CB expected to work | FP8-CB rejected: native FP8 prefill needs `sm_89+` | FP4 quality path is native BF16 expand + CUTLASS but untested | **NOT RECOMMENDED / UNTESTED.** No slow fallback is selected. |
+| **H100 `sm_90`, RTX 4090 / L40S `sm_89`** | FP8-CB decode is expected to work; an FP4-CB layer is rejected at weight load | Blackwell fused kernel ineligible; CUDA expand → CUTLASS expected for FP8 (`sm_89+`) | FP8 native expansion + CUTLASS expected; FP4 unavailable because v2 expander prepare rejects the device | **FP8-ONLY IS INFERRED / UNTESTED. FP4-CB IS UNSUPPORTED IN 0.5.** Also gated by non-CB groups in the artifact. |
+| **A100 `sm_80`** | no complete production lane: FP8 prefill needs `sm_89+`, and FP4 load requires cc 12.0/12.1 | FP8-CB rejected | grouped BF16 GEMM supports SM80, but the required FP4-v2 expander rejects the device | **UNSUPPORTED FOR PRODUCTION CB SERVING IN 0.5.** No slow fallback is selected. |
 | **Supported NVIDIA GPU, no `nvcc`** | unavailable | unavailable | unavailable | **FAILS CLOSED.** Prebuild and package compatible native extensions, or provide `nvcc` in the serving environment. |
 | **Non-NVIDIA** | unsupported | unsupported | unsupported | **UNSUPPORTED / UNQUALIFIED.** The canceled ROCm prototype is not shipped or dispatched. |
 
@@ -211,7 +215,12 @@ tile *is* an NVFP4/FP8 tile:
    bridge.
 
 Formats mix per-Linear with plain NVFP4, FP8 and BF16 inside one standard
-`safetensors` checkpoint. See [`docs/MOTIVATION.md`](docs/MOTIVATION.md) for the
+`safetensors` checkpoint. The 0.5 native dense serving gate is deliberately
+narrower than the format spec: CB Linears must be biasless, and FP4 must be an
+unsigned product rung with v2 scale coding. A non-`None` bias, signed S-rung,
+or FP4-v1 dense layer is never routed through an unowned framework operation:
+the public dense method rejects bias, and model load rejects the two unsupported
+FP4 families. See [`docs/MOTIVATION.md`](docs/MOTIVATION.md) for the
 full argument and [`docs/KERNELS.md`](docs/KERNELS.md) for the kernel design.
 
 ---

@@ -1,8 +1,10 @@
 """JIT build/load of the CUDA decode-GEMV extension (``gridbook/csrc/cb_gemv.cu``).
 
-Loaded lazily on first use. It needs nvcc (present in the serving container;
-often absent in build-only environments). Capability probes may receive
-``None`` when a build is unavailable, but production call sites use
+The low-level loader is lazy. Production model construction resolves every
+reachable module before serving, outside first forward and CUDA-graph capture.
+Compilation needs nvcc (present in the serving container; often absent in
+build-only environments). Capability probes may receive ``None`` when a build
+is unavailable, but production call sites use
 :func:`require_ext` / :func:`require_ext_v2` and fail closed. Gridbook has no
 interpreted-kernel runtime fallback.
 
@@ -367,11 +369,13 @@ def get_ext_v2():
     link. Separate name, separate build subdirectory, same cache root — so the
     one-time build persists exactly as the inherited ext's does.
 
-    Fail-soft, same contract as :func:`get_ext`: any build/env failure returns
-    None and the caller (``moe_gemv_select.cb_gemv_v2_available``) routes every
-    CB layer to the INHERITED kernel — correct, unchanged serving, just without
-    the v2 delta. The warning is loud because a silent degrade would turn a
-    v2-vs-inherited A/B into two identical arms and read as "v2 buys nothing".
+    This low-level probe is fail-soft: any build/environment failure returns
+    ``None``. The optional decode selector may then keep its inherited GEMV,
+    but production FP4-v2 loaders separately call
+    :func:`require_fp4_v2_expander` and fail closed because this module also
+    owns the exact quality expander. The warning is loud because a silent
+    decode-selector miss would turn a v2-vs-inherited A/B into two identical
+    arms and read as "v2 buys nothing".
     """
     global _ext_v2, _tried_v2
     if _tried_v2:
@@ -398,20 +402,22 @@ def get_ext_v2():
                 source="cb_gemv_v2.cu")
         except StaleExtensionError as exc:
             print(f"[prismaquant-cb] ERROR: incompatible CB-GEMV-v2 "
-                  f"extension — {exc} Every CB layer decodes on the inherited "
-                  f"GEMV kernel.", file=sys.stderr, flush=True)
+                  f"extension — {exc} The optional decode selector stays on "
+                  f"the inherited GEMV; FP4-v2 quality serving fails closed.",
+                  file=sys.stderr, flush=True)
             _ext_v2 = None
         except IncompleteInstallError as exc:
             print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
-                  f"Every CB layer decodes on the inherited GEMV kernel.",
+                  f"The optional decode selector stays inherited; FP4-v2 "
+                  f"quality serving fails closed.",
                   file=sys.stderr, flush=True)
             _ext_v2 = None
         except Exception as exc:  # noqa: BLE001 — build/env failure -> fallback
             print(f"[prismaquant-cb] WARNING: the CB-GEMV-v2 extension could "
-                  f"not be built ({type(exc).__name__}: {exc}); every CB layer "
-                  f"decodes on the inherited GEMV kernel (this is expected on "
-                  f"non-sm_120/sm_121 GPUs and without nvcc). To get the v2 "
-                  f"path: {_NVCC_HINT}.", file=sys.stderr, flush=True)
+                  f"not be built ({type(exc).__name__}: {exc}); the optional "
+                  f"decode selector stays on the inherited GEMV, while any "
+                  f"FP4-v2 quality-serving load fails closed. To enable the "
+                  f"native module: {_NVCC_HINT}.", file=sys.stderr, flush=True)
             _ext_v2 = None
         finally:
             _tried_v2 = True
@@ -426,6 +432,34 @@ def require_ext_v2(operation: str = "this operation"):
             f"{operation} requires Gridbook's native FP4-v2 CUDA extension "
             f"(cb_gemv_v2.cu), but it is unavailable. Gridbook does not fall "
             f"back to Triton. To enable the native path: {_NVCC_HINT}.")
+    return ext
+
+
+def require_fp4_v2_expander(operation: str = "this operation", *, device=None):
+    """Return and device-attest the required FP4-v2 quality expander.
+
+    Building ``cb_gemv_v2.cu`` proves that the symbols exist, but the current
+    expander shares the v2 module's 99 KiB dynamic-shared-memory preparation
+    contract.  That contract is qualified only for CUDA compute capability
+    12.0/12.1 and is device-specific, so production loaders call this function
+    before first forward or graph capture.
+    """
+    ext = require_ext_v2(operation)
+    try:
+        if device is None:
+            ext.cb_gemv_v2_prepare()
+        else:
+            import torch
+
+            with torch.cuda.device(device):
+                ext.cb_gemv_v2_prepare()
+    except Exception as exc:  # noqa: BLE001 — normalize the load-time gate
+        raise NativeKernelUnavailableError(
+            f"{operation} requires Gridbook's native FP4-v2 quality expander "
+            "on CUDA compute capability 12.0 or 12.1 with at least 99 KiB "
+            "of opt-in shared memory, but load-time device attestation failed "
+            f"({type(exc).__name__}: {exc}). Gridbook does not defer this "
+            "failure to first prefill or fall back to Triton.") from exc
     return ext
 
 

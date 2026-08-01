@@ -10,14 +10,13 @@ body:
 
         Two things worth knowing up front:
 
-        * **The plugin fail-softs.** If the CUDA extension does not build, gridbook
-          still serves *correct* output on the Triton reference path, several times
-          slower, with one stderr warning as the only clue. "Much slower than the
-          published numbers" is almost always this. The env block below is what
-          distinguishes it.
-        * **Blackwell only for the fast path.** The CUDA kernels target sm_120 /
-          sm_121 (GB10 DGX Spark, RTX 5090 class). Elsewhere the Triton path is
-          the only path.
+        * **The plugin fails closed.** If a required native CUDA/CUTLASS
+          extension cannot build or load, Gridbook refuses the affected model or
+          operation. It never continues on a Triton or framework fallback.
+        * **Check the supported GPU contract.** Decode support begins at the
+          architecture floor documented in INSTALL; fused tensor-core
+          specializations target their listed Blackwell shapes. An unsupported
+          device is a load error, not a slower implementation switch.
   - type: textarea
     id: what
     attributes:
@@ -69,7 +68,7 @@ body:
         try:
             from gridbook.cuda_ext import csrc_dir, get_ext
             print("csrc    ", csrc_dir())
-            print("cuda_ext", "LOADED" if get_ext() is not None else "None (TRITON FALLBACK)")
+            print("cuda_ext", "LOADED" if get_ext() is not None else "UNAVAILABLE (SERVING BLOCKED)")
         except Exception as e:
             print("cuda_ext PROBE FAILED:", e)
         import os
@@ -94,5 +93,5 @@ body:
         - label: I read the section of `docs/TROUBLESHOOTING.md` matching my symptom, or none matched.
           required: true
         - label: >-
-            If this is a speed report: the `cuda_ext` line above says LOADED. (If it
-            says TRITON FALLBACK, that is the cause — the fix is in TROUBLESHOOTING.)
+            If this is a speed report: the `cuda_ext` line above says LOADED. If
+            it says UNAVAILABLE, serving is blocked; follow TROUBLESHOOTING.
