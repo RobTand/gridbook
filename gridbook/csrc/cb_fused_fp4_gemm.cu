@@ -640,6 +640,20 @@ struct SwapToFusedFp4<NewStages, cutlass::gemm::collective::CollectiveMma<
       cutlass::gemm::MainloopSm120CbFusedFp4TmaWarpSpecialized<NewStages, SP, CS, KS>, Rest...>;
 };
 
+// Dense TileM=256 reuses the concrete kernel runner compiled for grouped
+// serving.  Keep this a non-template declaration: nvcc 13 otherwise preserves
+// unsigned layout aliases in the host pass and emits an unregistered duplicate
+// device stub (the reason the two concrete runners below exist).
+torch::Tensor run_fp4_fused_m256(
+    torch::Tensor a, torch::Tensor sfa, torch::Tensor packed,
+    torch::Tensor lut, torch::Tensor compose, torch::Tensor a_scales,
+    torch::Tensor b_scales, int32_t const* lut_tile_ids,
+    int32_t num_lut_blocks, int32_t num_lut_tiles,
+    int const* expert_ids, int64_t N, int64_t K, int64_t k_bits,
+    int64_t n_sub, int64_t type_size, bool is_v2,
+    int64_t packed_row_bytes, int64_t packed_expert_stride,
+    int32_t num_experts);
+
 // ---------------------------------------------------------------------------
 // Reference: STOCK block-scaled NVF4 GEMM at the fused kernel's exact config.
 // ---------------------------------------------------------------------------
@@ -737,7 +751,7 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
     torch::Tensor lut, torch::Tensor compose, torch::Tensor a_scales,
     torch::Tensor b_scales, int64_t N, int64_t K, int64_t k_bits,
     int64_t n_sub, int64_t type_size, bool is_v2,
-    std::optional<torch::Tensor> lut_tile_ids) {
+    std::optional<torch::Tensor> lut_tile_ids, int64_t tile_m) {
   using TileShape = TileShapeFp4;
   using Mainloop = typename SwapToFusedFp4<
       2, typename CfgFp4<TileShape>::BuilderMainloop>::type;
@@ -755,6 +769,8 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
   TORCH_CHECK(N > 0 && N % 8 == 0,
               "N must be a positive multiple of 8 (bf16 TMA epilogue "
               "alignment; every exported CB Linear satisfies this)");
+  TORCH_CHECK(tile_m == 128 || tile_m == 256,
+              "dense fused fp4 tile_m must be 128 or 256");
   TORCH_CHECK(k_bits >= 9 && k_bits <= 24, "fp4 rung k_bits out of range");
   TORCH_CHECK(n_sub == 1 || n_sub == 2, "fp4 n_sub must be 1 (signed) or 2");
   TORCH_CHECK(type_size == 4 * k_bits + (is_v2 ? 9 : 16),
@@ -823,6 +839,14 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
   check_same_cuda_device(a, compose, "compose");
   check_same_cuda_device(a, a_scales, "a_scales");
   check_same_cuda_device(a, b_scales, "b_scales");
+
+  if (tile_m == 256) {
+    return run_fp4_fused_m256(
+        a, sfa, packed, lut, compose, a_scales, b_scales,
+        lut_tile_ids_ptr, num_lut_blocks, num_lut_tiles,
+        nullptr, N, K, k_bits, n_sub, type_size, is_v2,
+        packed.stride(0), 0, 0);
+  }
 
   const c10::cuda::OptionalCUDAGuard guard(a.device());
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -945,11 +969,15 @@ torch::Tensor run_fp4_moe_grouped_m128(
   return d;
 }
 
-torch::Tensor run_fp4_moe_grouped_m256(
+torch::Tensor run_fp4_fused_m256(
     torch::Tensor a, torch::Tensor sfa, torch::Tensor packed,
     torch::Tensor lut, torch::Tensor compose, torch::Tensor a_scales,
-    torch::Tensor b_scales, torch::Tensor expert_ids, int64_t N, int64_t K,
-    int64_t k_bits, int64_t n_sub, int64_t type_size, bool is_v2) {
+    torch::Tensor b_scales, int32_t const* lut_tile_ids,
+    int32_t num_lut_blocks, int32_t num_lut_tiles,
+    int const* expert_ids, int64_t N, int64_t K, int64_t k_bits,
+    int64_t n_sub, int64_t type_size, bool is_v2,
+    int64_t packed_row_bytes, int64_t packed_expert_stride,
+    int32_t num_experts) {
   // See the M128 runner: the kernel config must remain concrete at this host
   // call site so nvcc emits and registers the matching TileM=256 host stub.
   using TileShape = TileShapeFp4M256;
@@ -962,7 +990,6 @@ torch::Tensor run_fp4_moe_grouped_m256(
   static_assert(AssertSmemFits<GemmKernel>::value);
 
   const int Mp = (int)a.size(0);
-  const int64_t row_bytes = packed.size(2);
   const c10::cuda::OptionalCUDAGuard guard(a.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   auto d = torch::empty({Mp, N}, a.options().dtype(torch::kBFloat16));
@@ -979,13 +1006,13 @@ torch::Tensor run_fp4_moe_grouped_m256(
       {Mp, (int)N, (int)K, 1},
       {reinterpret_cast<const cutlass::float_e2m1_t*>(a.data_ptr()), sa,
        reinterpret_cast<const ElementSF*>(sfa.data_ptr()), layout_sfa,
-       packed.data_ptr<uint8_t>(), row_bytes,
-       lut.data_ptr<uint8_t>(), (int32_t)lut.numel(),
-       nullptr, 1, 0,
+       packed.data_ptr<uint8_t>(), packed_row_bytes,
+       lut.data_ptr<uint8_t>(), (int32_t)(lut.numel() / num_lut_blocks),
+       lut_tile_ids, num_lut_blocks, num_lut_tiles,
        is_v2 ? compose.data_ptr<uint8_t>() : nullptr,
        (int32_t)k_bits, (int32_t)n_sub, (int32_t)type_size,
        (int32_t)(is_v2 ? 1 : 0),
-       expert_ids.data_ptr<int>(), N * row_bytes, (int32_t)packed.size(0),
+       expert_ids, packed_expert_stride, num_experts,
        nullptr},
       {{{b_scales.data_ptr<float>(), 0.0f, Stride<_0, _1, _0>{}},
         {{a_scales.data_ptr<float>(), 0.0f, Stride<_1, _0, _0>{}}, {}, {}},
@@ -1075,9 +1102,11 @@ torch::Tensor cb_fused_fp4_moe_grouped(
   check_same_cuda_device(a, b_scales, "b_scales");
   check_same_cuda_device(a, expert_ids, "expert_ids");
   if (tile_m == 256) {
-    return run_fp4_moe_grouped_m256(
-        a, sfa, packed, lut, compose, a_scales, b_scales, expert_ids, N, K,
-        k_bits, n_sub, type_size, is_v2);
+    return run_fp4_fused_m256(
+        a, sfa, packed, lut, compose, a_scales, b_scales,
+        nullptr, 1, 0, expert_ids.data_ptr<int>(), N, K,
+        k_bits, n_sub, type_size, is_v2, packed.size(2),
+        N * packed.size(2), (int32_t)packed.size(0));
   }
   return run_fp4_moe_grouped_m128(
       a, sfa, packed, lut, compose, a_scales, b_scales, expert_ids, N, K,
@@ -1140,12 +1169,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("N"), py::arg("K"), py::arg("k_bits"), py::arg("n_sub"),
         py::arg("type_size"), py::arg("is_v2"),
         py::arg("lut_tile_ids") = py::none(),
+        py::arg("tile_m") = 128,
         "NVFP4_CB decode-in-prologue fused BLOCK-SCALED GEMM: packed CB rows "
         "+ smem value/compose LUTs decoded straight into the e2m1/SFB smem "
         "operands of the NVF4 MMA; per-token activation scale x per-channel "
         "scale applied in the fp32 EVT epilogue (cutlass_scaled_mm rounding "
-        "order). Runtime k_bits/n_sub/type_size/is_v2 — one kernel for "
-        "K12..K24, S13..S16, v1+v2.");
+        "order). Runtime k_bits/n_sub/type_size/is_v2 and dense tile_m in "
+        "{128,256} — one kernel for K12..K24, S13..S16, v1+v2.");
   m.def("cb_fused_fp4_moe_grouped", &cb_fused_fp4_moe_grouped,
         "NVFP4_CB grouped (MoE) fused BLOCK-SCALED GEMM: ONE launch over "
         "row-padded A [Mp,K/2] where each TileM block's B rows are staged "

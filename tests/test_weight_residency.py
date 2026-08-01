@@ -104,8 +104,10 @@ def _runtime_modules(isolated_gridbook_runtime_imports):
 def _reset_fp4_fused_mode_cache():
     """Keep process-global dispatch policy independent between tests."""
     cb_linear._FP4_FUSED_MODE.clear()
+    cb_linear._FP4_DENSE_SM_COUNTS.clear()
     yield
     cb_linear._FP4_FUSED_MODE.clear()
+    cb_linear._FP4_DENSE_SM_COUNTS.clear()
 
 
 def _write_checkpoint_header(directory, *, rows=7):
@@ -204,6 +206,87 @@ def test_dense_fp4_fused_prefill_cannot_change_mid_process(monkeypatch):
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", "midm")
     with pytest.raises(RuntimeError, match="changed after Gridbook dispatch"):
         cb_linear._fp4_fused_mode()
+
+
+@pytest.mark.parametrize(
+    "M,N,sm_count,expected",
+    [
+        (255, 6144, 48, 128),       # TileM=256 is never used below M=256.
+        (256, 3968, 48, 128),       # 31 candidate CTAs: below 2/3 occupancy.
+        (256, 3976, 48, 256),       # 32 candidate CTAs: exact legal crossover.
+        (768, 1024, 48, 128),       # measured narrow long-K loss (24 CTAs).
+        (769, 1024, 48, 256),       # ceil(M/256)=4 -> 32 CTAs.
+        (256, 6144, 0, 128),        # unavailable device metadata fails closed.
+    ],
+)
+def test_dense_fp4_tile_selector_shape_boundaries(M, N, sm_count, expected):
+    assert cb_linear._fp4_dense_tile_m(M, N, sm_count) == expected
+
+
+def test_dense_fp4_sm_count_is_cached_without_synchronizing(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties",
+        lambda index: calls.append(index) or types.SimpleNamespace(
+            multi_processor_count=48),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "synchronize",
+        lambda *_args, **_kwargs: pytest.fail(
+            "SM-count resolution must not synchronize CUDA"),
+    )
+    device = torch.device("cuda:3")
+    assert cb_linear._fp4_dense_sm_count(device) == 48
+    assert cb_linear._fp4_dense_sm_count(device) == 48
+    assert calls == [3]
+
+
+@pytest.mark.parametrize(
+    "M,N,expected_tile",
+    [(256, 6144, 256), (768, 1024, 128), (1024, 1024, 256)],
+)
+def test_dense_fp4_tile_route_reaches_binding_and_telemetry(
+        monkeypatch, M, N, expected_tile):
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    method.is_v2 = True
+    method._sub_table = [1.0] * 16
+    method._fused_fp4_ok = lambda *_args, **_kwargs: True
+    K = 256
+    layer = types.SimpleNamespace(
+        _cb_fp4_lut=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(N),
+        _cb_qw_padded=torch.ones(N, 73, dtype=torch.uint8),
+    )
+    observed = []
+
+    class Ext:
+        @staticmethod
+        def cb_nvfp4_quantize_rows(x, _multiplier):
+            return (torch.zeros(M, K // 2, dtype=torch.uint8),
+                    torch.zeros(M * (K // 16), dtype=torch.uint8),
+                    torch.ones(M, dtype=torch.float32))
+
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(*args):
+            observed.append((args[-2], args[-1]))
+            return torch.zeros(M, N, dtype=torch.bfloat16)
+
+    from gridbook import cuda_ext
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: Ext())
+    monkeypatch.setattr(cb_linear, "_fp4_dense_sm_count", lambda _device: 48)
+    x = torch.zeros(M, K, dtype=torch.bfloat16)
+    out = method._try_fused_fp4(layer, x, N, K, M, rowwise=True)
+    assert out.shape == (M, N)
+    assert observed == [(None, expected_tile)]
+    assert layer._cb_fp4_fused_tile_m == expected_tile
+    assert layer._cb_fp4_fused_sm_count == 48
+    assert layer._cb_fp4_fused_tile_candidate_ctas == (
+        ((M + 255) // 256) * ((N + 127) // 128)
+    )
 
 
 @pytest.mark.parametrize("value", ["rowwise", "rowwise_midm"])
@@ -910,9 +993,10 @@ def test_fp4_multilut_dispatch_builds_unique_blocks_and_passes_tile_ids(
         @staticmethod
         def cb_fused_fp4_prefill_mm_scaled(
                 aq, sfa, packed, lut, compose, a_scales, b_scales,
-                n, k, k_bits, n_sub, type_size, is_v2, lut_tile_ids):
+                n, k, k_bits, n_sub, type_size, is_v2, lut_tile_ids,
+                tile_m):
             calls.append((lut.clone(), lut_tile_ids.clone(), n, k, k_bits,
-                          n_sub, type_size, is_v2))
+                          n_sub, type_size, is_v2, tile_m))
             return torch.full((aq.shape[0], n), 13.0, dtype=torch.bfloat16)
 
     from gridbook import cuda_ext
@@ -945,7 +1029,8 @@ def test_fp4_single_lut_dispatch_keeps_offset_free_binding(monkeypatch):
     class _FusedExt:
         @staticmethod
         def cb_fused_fp4_prefill_mm_scaled(*args):
-            tile_maps.append(args[-1])
+            tile_maps.append(args[-2])
+            assert args[-1] == 128
             return torch.zeros(M, N, dtype=torch.bfloat16)
 
     from gridbook import cuda_ext

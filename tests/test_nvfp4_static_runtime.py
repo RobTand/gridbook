@@ -368,9 +368,11 @@ def test_dense_static_lsq_uses_attested_g_and_existing_fused_gemm(monkeypatch):
         @staticmethod
         def cb_fused_fp4_prefill_mm_scaled(
             aq, sfa, packed_weight, lut, compose, a_scales, b_scales,
-            n, k, k_bits, n_sub, type_size, is_v2, lut_tile_ids,
+            n, k, k_bits, n_sub, type_size, is_v2, lut_tile_ids, tile_m,
         ):
-            calls.append(("gemm", aq, sfa, a_scales.clone(), packed_weight))
+            calls.append((
+                "gemm", aq, sfa, a_scales.clone(), packed_weight, tile_m,
+            ))
             return torch.zeros(aq.shape[0], n, dtype=torch.bfloat16)
 
     monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: Ext())
@@ -385,6 +387,7 @@ def test_dense_static_lsq_uses_attested_g_and_existing_fused_gemm(monkeypatch):
     assert calls[1][0] == "gemm"
     assert torch.equal(calls[1][3], calls[0][3])
     assert calls[1][4] is layer._cb_qw_padded
+    assert calls[1][5] == 128
 
 
 def test_dense_rowwise_quantizer_outputs_feed_the_existing_fused_gemm(
@@ -439,10 +442,10 @@ def test_dense_rowwise_quantizer_outputs_feed_the_existing_fused_gemm(
         @staticmethod
         def cb_fused_fp4_prefill_mm_scaled(
             aq, sfa, packed_weight, lut, compose, a_scales, b_scales,
-            n, k, k_bits, n_sub, type_size, is_v2, lut_tile_ids,
+            n, k, k_bits, n_sub, type_size, is_v2, lut_tile_ids, tile_m,
         ):
             gemm_calls.append((aq.clone(), sfa.clone(), a_scales.clone(),
-                               packed_weight, lut_tile_ids))
+                               packed_weight, lut_tile_ids, tile_m))
             return torch.zeros(aq.shape[0], n, dtype=torch.bfloat16)
 
     monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: Ext())
@@ -466,6 +469,7 @@ def test_dense_rowwise_quantizer_outputs_feed_the_existing_fused_gemm(
     assert torch.equal(gemm_calls[0][0], quant_calls[0][0])
     assert torch.equal(gemm_calls[0][1], quant_calls[0][1].reshape(-1))
     assert torch.equal(gemm_calls[0][2], quant_calls[0][2])
+    assert gemm_calls[0][5] == gemm_calls[1][5] == 128
 
 
 def test_rowwise_phase_override_cannot_change_weight_compose_bytes(

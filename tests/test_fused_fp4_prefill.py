@@ -280,6 +280,68 @@ def test_fused_bitexact_ragged(N, K):
     assert torch.equal(y_ref.view(torch.uint16), y_f.view(torch.uint16))
 
 
+@pytest.mark.parametrize("M,N,K", [(256, 320, 1536), (769, 192, 1024)])
+def test_dense_tile_m256_bitexact_vs_tile_m128_and_stock(M, N, K):
+    """The dense selector's wide tile reuses the grouped concrete kernel.
+
+    Cover both its measured M=256 crossover and a ragged-M/ragged-N launch;
+    require identical BF16 bits against the established dense TileM=128 path
+    and stock NVFP4 rather than introducing a second numerical tolerance.
+    """
+    k = 24
+    wctx = prep_weight(k, N=N, K=K, mode="product",
+                       coding=fmt.SCALE_CODING_TWO_TIER, seed=M + N)
+    torch.manual_seed(M + K)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    aq, sfa, _, recip = quant_act(x)
+    a_scales = recip.reshape(1).expand(M).contiguous().float()
+    b_scales = torch.ones(N, dtype=torch.float32, device=DEV)
+    common = (aq, sfa, wctx["qwp"], wctx["lut"], wctx["compose"],
+              a_scales, b_scales, N, K, k, wctx["n_sub"], wctx["ts"],
+              wctx["is_v2"], None)
+    y128 = ext.cb_fused_fp4_prefill_mm_scaled(*common, 128)
+    y256 = ext.cb_fused_fp4_prefill_mm_scaled(*common, 256)
+    y_ref = ext.sm120_nvf4_mm_scaled(
+        aq, sfa, wctx["b_packed"], wctx["sfb_sw"], a_scales, b_scales,
+        N, K)
+    ref_bits = y_ref.view(torch.uint16)
+    assert torch.equal(y128.view(torch.uint16), ref_bits)
+    assert torch.equal(y256.view(torch.uint16), ref_bits)
+
+
+def test_dense_tile_m256_nondefault_stream_and_graph():
+    """The new dense route keeps the existing stream and capture contract."""
+    k, M, N, K = 24, 256, 320, 1024
+    wctx = prep_weight(k, N=N, K=K, mode="product",
+                       coding=fmt.SCALE_CODING_TWO_TIER, seed=1911)
+    torch.manual_seed(1912)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    aq, sfa, _, recip = quant_act(x)
+    a_scales = recip.reshape(1).expand(M).contiguous().float()
+    b_scales = torch.ones(N, dtype=torch.float32, device=DEV)
+    args = (aq, sfa, wctx["qwp"], wctx["lut"], wctx["compose"],
+            a_scales, b_scales, N, K, k, wctx["n_sub"], wctx["ts"],
+            wctx["is_v2"], None, 256)
+    producer = torch.cuda.current_stream()
+    worker = torch.cuda.Stream()
+    worker.wait_stream(producer)
+    with torch.cuda.stream(worker):
+        y = ext.cb_fused_fp4_prefill_mm_scaled(*args)
+        y_ref = ext.sm120_nvf4_mm_scaled(
+            aq, sfa, wctx["b_packed"], wctx["sfb_sw"], a_scales, b_scales,
+            N, K)
+    worker.synchronize()
+    assert torch.equal(y.view(torch.uint16), y_ref.view(torch.uint16))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=worker):
+        y_graph = ext.cb_fused_fp4_prefill_mm_scaled(*args)
+    for _ in range(2):
+        graph.replay()
+        worker.synchronize()
+        assert torch.equal(y_graph.view(torch.uint16), y.view(torch.uint16))
+
+
 def test_padded_row_stride_view():
     """The serving entry receives layer._cb_qw_padded's NARROW view semantics
     (issue #1) — an explicitly-strided view must be bit-identical."""
@@ -293,14 +355,15 @@ def test_padded_row_stride_view():
     assert torch.equal(y_a.view(torch.uint16), y_b.view(torch.uint16))
 
 
-def test_fused_multilut_distinct_merged_roles_bitexact_vs_stock():
+@pytest.mark.parametrize("M,tile_m", [(64, 128), (256, 256)])
+def test_fused_multilut_distinct_merged_roles_bitexact_vs_stock(M, tile_m):
     """Each 128-row N tile must stage the LUT named by its merged role.
 
     The second block flips every E2M1 value's sign while retaining the exact
     packed index and scale planes.  A kernel that accidentally reuses LUT zero
     for both tiles therefore cannot pass this bitwise stock-NVFP4 oracle.
     """
-    k, role_n, K, M = 16, 128, 1024, 64
+    k, role_n, K = 16, 128, 1024
     wctx = prep_weight(k, N=role_n, K=K, mode="product",
                        coding=fmt.SCALE_CODING_TWO_TIER, seed=109)
     packed = torch.cat((wctx["qwp"], wctx["qwp"]), dim=0).contiguous()
@@ -328,7 +391,7 @@ def test_fused_multilut_distinct_merged_roles_bitexact_vs_stock():
         aq, sfa, b_packed, sfb, a_scales, b_scales, N, K)
     y_fused = ext.cb_fused_fp4_prefill_mm_scaled(
         aq, sfa, packed, luts, wctx["compose"], a_scales, b_scales,
-        N, K, k, wctx["n_sub"], wctx["ts"], True, tile_ids)
+        N, K, k, wctx["n_sub"], wctx["ts"], True, tile_ids, tile_m)
     assert torch.equal(y_fused.view(torch.uint16), y_ref.view(torch.uint16))
     assert not torch.equal(y_fused[:, :role_n], y_fused[:, role_n:])
 
@@ -559,11 +622,12 @@ def test_bindings_reject_invalid_tensor_contracts():
         ext.cb_fused_fp4_prefill_mm_scaled(
             *dense_args[:2], storage_short_view, *dense_args[3:])
     # The old optional debug pointer had no capacity/device check and allowed a
-    # short tensor to be overwritten by the fixed-size smem dump. The new final
-    # argument is the checked LUT tile map; a further tensor is still refused.
+    # short tensor to be overwritten by the fixed-size smem dump. The checked
+    # LUT tile map and TileM selector occupy the two optional argument slots; a
+    # further tensor is still refused.
     with pytest.raises(TypeError):
         ext.cb_fused_fp4_prefill_mm_scaled(
-            *dense_args, torch.zeros(1, dtype=torch.int32, device=DEV),
+            *dense_args, torch.zeros(1, dtype=torch.int32, device=DEV), 128,
             torch.zeros(1, dtype=torch.uint8, device=DEV))
 
     E, tile_m = 2, 128

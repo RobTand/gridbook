@@ -117,6 +117,53 @@ CUDA_GEMV_M_MAX = int(os.environ.get("PRISMAQUANT_CB_CUDA_M_MAX", "8"))
 # ``TileShapeFp4`` in csrc/cb_fused_fp4_gemm.cu; the extension independently
 # validates the resulting tile map at its public boundary.
 FP4_FUSED_TILE_N = 128
+FP4_FUSED_TILE_M_WIDE = 256
+
+# One entry per CUDA device. ``get_device_properties`` queries cached runtime
+# metadata and does not synchronize the device; keeping the result here also
+# removes that query from steady-state dispatch.  A failed query is cached as
+# zero so shape selection fails closed to the long-standing TileM=128 kernel.
+_FP4_DENSE_SM_COUNTS: dict[int, int] = {}
+
+
+def _fp4_dense_sm_count(device: torch.device) -> int:
+    if device.type != "cuda":
+        return 0
+    try:
+        index = device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        index = int(index)
+    except Exception:  # noqa: BLE001 - optional optimization, fail closed
+        return 0
+    cached = _FP4_DENSE_SM_COUNTS.get(index)
+    if cached is not None:
+        return cached
+    try:
+        count = int(torch.cuda.get_device_properties(index).multi_processor_count)
+        if count <= 0:
+            count = 0
+    except Exception:  # noqa: BLE001 - optional optimization, fail closed
+        count = 0
+    _FP4_DENSE_SM_COUNTS[index] = count
+    return count
+
+
+def _fp4_dense_tile_m(M: int, N: int, sm_count: int) -> int:
+    """Select the measured dense fused tile without under-filling the GPU.
+
+    TileM=256 halves weight decode work per output row, but loses by about 20%
+    when its grid has at most half of GB10's SM count.  Interleaved K24 A/Bs
+    crossed over once the grid reached two thirds of the device: 32 CTAs on a
+    48-SM GB10.  Keep that occupancy floor explicit and device-relative.
+    """
+    if M < FP4_FUSED_TILE_M_WIDE or sm_count <= 0:
+        return 128
+    grid_ctas = ((M + FP4_FUSED_TILE_M_WIDE - 1)
+                 // FP4_FUSED_TILE_M_WIDE) * ((N + FP4_FUSED_TILE_N - 1)
+                                               // FP4_FUSED_TILE_N)
+    occupancy_floor = (2 * sm_count + 2) // 3
+    return FP4_FUSED_TILE_M_WIDE if grid_ctas >= occupancy_floor else 128
 
 # NOTE on a rejected variant (2026-07-18): N-chunking the transient expand +
 # GEMM with side-stream overlap measured 0.46x (small-N GEMMs lose more than
@@ -681,11 +728,23 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # projection needs the per-N-tile indirection.
         lut_tile_ids = (layer._cb_fp4_lut_tile_ids
                         if len(ranges) > 1 else None)
+        sm_count = _fp4_dense_sm_count(aq.device)
+        tile_m = _fp4_dense_tile_m(M, N, sm_count)
+        # Latest-route telemetry is intentionally tensor-free and sync-free.
+        # Validation and serve logs can attest which concrete kernel ran,
+        # while ordinary calls pay only integer arithmetic after the cached
+        # device-property lookup.
+        layer._cb_fp4_fused_tile_m = tile_m
+        layer._cb_fp4_fused_tile_candidate_ctas = (
+            ((M + FP4_FUSED_TILE_M_WIDE - 1) // FP4_FUSED_TILE_M_WIDE)
+            * ((N + FP4_FUSED_TILE_N - 1) // FP4_FUSED_TILE_N)
+        )
+        layer._cb_fp4_fused_sm_count = sm_count
         y = fext.cb_fused_fp4_prefill_mm_scaled(
             aq, sfa.view(torch.uint8).reshape(-1), layer._cb_qw_padded,
             layer._cb_fp4_lut, layer._cb_fp4_compose_u8, a_scales,
             layer._cb_fp4_ones, N, K, self.k, self.n_sub, self.type_size,
-            self.is_v2, lut_tile_ids)
+            self.is_v2, lut_tile_ids, tile_m)
         return y.reshape(*x.shape[:-1], N)
 
     def apply(self, layer, x, bias=None):
