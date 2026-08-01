@@ -16,66 +16,87 @@ CPU-only; vLLM symbols are stubbed when unavailable (same idiom as
 ``test_target_namespace_compat``). No CUDA is touched: ``PRISMAQUANT_CB_DECODE``
 is forced off the ``cuda`` default so the load-time JIT warm never fires.
 """
-import os
+import json
+import struct
 import sys
 import types
 
 import pytest
 
-os.environ.setdefault("PRISMAQUANT_CB_DECODE", "triton")
-
 torch = pytest.importorskip("torch")
 
-if "vllm" not in sys.modules:
+def _install_vllm_stubs():
+    """Install the vLLM surface imported by Gridbook's dense CB runtime."""
+    def _mod(name):
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        return module
+
+    _mod("vllm")
+    _mod("vllm.model_executor")
+    _mod("vllm.model_executor.layers")
+    _mod("vllm.model_executor.layers.quantization")
+    linear = _mod("vllm.model_executor.layers.linear")
+    linear.LinearBase = type("LinearBase", (), {})
+    linear.UnquantizedLinearMethod = type("UnquantizedLinearMethod", (), {})
+    linear.LinearMethodBase = type("LinearMethodBase", (), {})
+    linear.register_weight_loader_v2_supported_method = lambda cls: cls
+    base = _mod("vllm.model_executor.layers.quantization.base_config")
+
+    class QuantizationConfig:
+        def __init__(self):
+            pass
+
+    base.QuantizationConfig = QuantizationConfig
+    base.QuantizeMethodBase = object
+    embedding = _mod("vllm.model_executor.layers.vocab_parallel_embedding")
+    embedding.UnquantizedEmbeddingMethod = type("UEM", (), {})
+    embedding.VocabParallelEmbedding = type("VPE", (), {})
+    fused_moe = _mod("vllm.model_executor.layers.fused_moe")
+    fused_moe.RoutedExperts = type("RoutedExperts", (), {})
+    parameter = _mod("vllm.model_executor.parameter")
+
+    class _StubParam(torch.nn.Parameter):
+        """Minimal vLLM parameter with the real ``.data`` behaviour."""
+
+        def __new__(cls, data, **kw):
+            return super().__new__(cls, data, requires_grad=False)
+
+        def __init__(self, data, **kw):
+            pass
+
+    parameter.ModelWeightParameter = _StubParam
+    parameter.ChannelQuantScaleParameter = _StubParam
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _runtime_modules(isolated_gridbook_runtime_imports):
+    """Import Gridbook against a private real-or-stubbed vLLM graph."""
+    del isolated_gridbook_runtime_imports
+    env = pytest.MonkeyPatch()
+    env.setenv("PRISMAQUANT_CB_DECODE", "triton")
     try:
-        import vllm  # noqa: F401
-    except Exception:
-        def _mod(name):
-            m = types.ModuleType(name)
-            sys.modules[name] = m
-            return m
+        try:
+            from vllm.model_executor.parameter import ModelWeightParameter  # noqa: F401
+            from vllm.model_executor.layers.linear import LinearMethodBase  # noqa: F401
+        except Exception:
+            for name in list(sys.modules):
+                if name == "vllm" or name.startswith("vllm."):
+                    sys.modules.pop(name, None)
+            _install_vllm_stubs()
 
-        _mod("vllm")
-        _mod("vllm.model_executor")
-        _mod("vllm.model_executor.layers")
-        _mod("vllm.model_executor.layers.quantization")
-        lin = _mod("vllm.model_executor.layers.linear")
-        lin.LinearBase = type("LinearBase", (), {})
-        lin.UnquantizedLinearMethod = type("UnquantizedLinearMethod", (), {})
-        lin.LinearMethodBase = type("LinearMethodBase", (), {})
-        lin.register_weight_loader_v2_supported_method = lambda cls: cls
-        bc = _mod("vllm.model_executor.layers.quantization.base_config")
+        from gridbook import codec as codec_module
+        from gridbook.config import PrismaQuantConfig as config_class
+        from gridbook import linear as linear_module
+        from gridbook.linear import PrismaQuantCBLinearMethod as method_class
 
-        class QuantizationConfig:
-            def __init__(self):
-                pass
-
-        bc.QuantizationConfig = QuantizationConfig
-        bc.QuantizeMethodBase = object
-        vpe = _mod("vllm.model_executor.layers.vocab_parallel_embedding")
-        vpe.UnquantizedEmbeddingMethod = type("UEM", (), {})
-        vpe.VocabParallelEmbedding = type("VPE", (), {})
-        fm = _mod("vllm.model_executor.layers.fused_moe")
-        fm.RoutedExperts = type("RoutedExperts", (), {})
-        par = _mod("vllm.model_executor.parameter")
-
-        class _StubParam(torch.nn.Parameter):
-            """vLLM's ModelWeightParameter/ChannelQuantScaleParameter stand-in:
-            only the ``.data`` / ``register_parameter`` behaviour matters here."""
-
-            def __new__(cls, data, **kw):
-                return super().__new__(cls, data, requires_grad=False)
-
-            def __init__(self, data, **kw):
-                pass
-
-        par.ModelWeightParameter = _StubParam
-        par.ChannelQuantScaleParameter = _StubParam
-
-from gridbook import codec                                        # noqa: E402
-from gridbook.config import PrismaQuantConfig                      # noqa: E402
-from gridbook import linear as cb_linear                           # noqa: E402
-from gridbook.linear import PrismaQuantCBLinearMethod              # noqa: E402
+        globals()["codec"] = codec_module
+        globals()["PrismaQuantConfig"] = config_class
+        globals()["cb_linear"] = linear_module
+        globals()["PrismaQuantCBLinearMethod"] = method_class
+        yield
+    finally:
+        env.undo()
 
 
 @pytest.fixture(autouse=True)
@@ -84,6 +105,73 @@ def _reset_fp4_fused_mode_cache():
     cb_linear._FP4_FUSED_MODE.clear()
     yield
     cb_linear._FP4_FUSED_MODE.clear()
+
+
+def _write_checkpoint_header(directory, *, rows=7):
+    directory.mkdir(parents=True, exist_ok=True)
+    header = json.dumps({
+        "model.layers.0.mlp.down_proj.cb_qweight": {
+            "dtype": "U8",
+            "shape": [rows, 16],
+            "data_offsets": [0, rows * 16],
+        },
+    }, separators=(",", ":")).encode("utf-8")
+    path = directory / "model.safetensors"
+    path.write_bytes(struct.pack("<Q", len(header)) + header)
+    return path
+
+
+def _checkpoint_header_method(source):
+    quant_config = types.SimpleNamespace(_get_sidecar_source=lambda: source)
+    method = object.__new__(PrismaQuantCBLinearMethod)
+    method.quant_config = quant_config
+    return method, quant_config
+
+
+def test_checkpoint_header_snapshot_uses_cached_artifact_revision(
+    tmp_path, monkeypatch
+):
+    snapshot = tmp_path / "snapshot"
+    _write_checkpoint_header(snapshot, rows=11)
+    revision = "c" * 40
+    method, _quant_config = _checkpoint_header_method(
+        ("owner/model", revision)
+    )
+
+    import huggingface_hub
+    calls = []
+
+    def fake_snapshot_download(repo_id, *, revision, allow_patterns):
+        calls.append((repo_id, revision, allow_patterns))
+        return str(snapshot)
+
+    monkeypatch.setattr(
+        huggingface_hub, "snapshot_download", fake_snapshot_download
+    )
+    expected = {"model.layers.0.mlp.down_proj.cb_qweight": 11}
+    assert method._ckpt_cb_rows() == expected
+    assert method._ckpt_cb_rows() == expected
+    assert calls == [("owner/model", revision, ["*.safetensors"])]
+
+
+def test_checkpoint_header_local_source_never_calls_hub(tmp_path, monkeypatch):
+    model_dir = tmp_path / "local-model"
+    _write_checkpoint_header(model_dir, rows=13)
+    method, _quant_config = _checkpoint_header_method(
+        (str(model_dir), None)
+    )
+
+    import huggingface_hub
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda *_args, **_kwargs: pytest.fail(
+            "local checkpoint headers must not use the Hub"
+        ),
+    )
+    assert method._ckpt_cb_rows() == {
+        "model.layers.0.mlp.down_proj.cb_qweight": 13
+    }
 
 
 def test_dense_fp4_fused_prefill_is_opt_in(monkeypatch):
@@ -95,6 +183,61 @@ def test_dense_fp4_fused_prefill_is_opt_in(monkeypatch):
 def test_dense_fp4_fused_prefill_explicit_modes(monkeypatch, value):
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
     assert cb_linear._fp4_fused_mode() == value
+
+
+@pytest.mark.parametrize("value", ["yes", "MIDM", "128"])
+def test_dense_fp4_fused_prefill_rejects_unknown_modes(monkeypatch, value):
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
+    with pytest.raises(ValueError, match="invalid PRISMAQUANT_CB_FUSED_FP4"):
+        cb_linear._fp4_fused_mode()
+
+
+def test_dense_fp4_fused_prefill_cannot_change_mid_process(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", "1")
+    assert cb_linear._fp4_fused_mode() == "1"
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", "midm")
+    with pytest.raises(RuntimeError, match="changed after Gridbook dispatch"):
+        cb_linear._fp4_fused_mode()
+
+
+@pytest.mark.parametrize(
+    "k,n_sub,expected",
+    [(24, 2, True), (20, 1, True), (21, 1, False)],
+    ids=["product-k24-16k", "signed-s20-16k", "signed-s21-over-16k"],
+)
+def test_dense_fused_fp4_selector_enforces_lut_smem_limit(
+    monkeypatch, k, n_sub, expected
+):
+    """The Python selector must reject an oversized signed LUT before JIT.
+
+    Product K24 and signed S20 sit exactly on the 16-KiB boundary; signed S21
+    needs 32 KiB and must fall through without constructing/calling the fused
+    kernel.  This drives the real dense eligibility method on CPU.
+    """
+
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.is_fp4 = True
+    method.is_v2 = True
+    method.k = k
+    method.n_sub = n_sub
+    method.type_size = 4 * k + 9
+    layer = types.SimpleNamespace(
+        _cb_N=8,
+        _cb_row_offset=torch.zeros(8, dtype=torch.int32),
+    )
+
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    from gridbook import cuda_ext
+
+    class FusedExt:
+        cb_fused_fp4_prefill_mm_scaled = object()
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: FusedExt())
+    assert method._fused_fp4_ok(layer, 256) is expected
 
 
 @pytest.fixture(autouse=True)

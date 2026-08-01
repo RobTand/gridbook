@@ -184,7 +184,9 @@ The opt-in fused native-FP4 prefill path is another contract-changing cell, not
 a transparent acceleration switch: it moves activation scaling from the
 FP32-emulated group-scale bucket to native UE4M3 factors. Keep it explicitly
 labelled and opt-in until its own same-session served KL/PPL/task and routing/
-shape gates pass; arithmetic or latency parity alone cannot promote it.
+shape gates pass; arithmetic or latency parity alone cannot promote it. The
+current promotion screen is red; see the
+[dated enablement audit](audits/fused_nvfp4_enablement_2026-07-31.md).
 
 ## Approximate 0.6B smoke matrix
 

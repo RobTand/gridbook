@@ -2,11 +2,11 @@
 
 Container-only (JIT-builds two extensions; needs nvcc + /artifacts):
 
-  docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
+  docker run --rm --gpus all -v /home/rob/gridbook:/gridbook \\
     -v /home/rob/dq-runs/nvfp4-cb-phase0/serve:/artifacts \\
     --entrypoint bash vllm-node:latest -c \\
-    'pip install -q pytest; PYTHONPATH=/repo:/repo/plugins/gridbook \\
-     python3 -m pytest /repo/plugins/gridbook/tests/test_fused_prefill.py -v'
+    'pip install -q pytest; PYTHONPATH=/gridbook \\
+     python3 -m pytest /gridbook/tests/test_fused_prefill.py -v'
 
 Contracts pinned:
   * cb_fused_prefill_mm == (cb_expand_fp8 tile -> fork64 passthrough GEMM)

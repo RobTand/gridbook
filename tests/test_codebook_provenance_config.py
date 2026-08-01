@@ -49,15 +49,28 @@ def _install_vllm_stubs() -> None:
     config_module.get_current_vllm_config = lambda: None
 
 
-try:
-    import vllm  # noqa: F401
-except Exception:
-    _install_vllm_stubs()
+@pytest.fixture(scope="module", autouse=True)
+def _runtime_modules(isolated_gridbook_runtime_imports):
+    """Import Gridbook against a private real-or-stubbed vLLM graph."""
+    del isolated_gridbook_runtime_imports
+    try:
+        import vllm.config as config_module
+        from vllm.model_executor.layers.quantization.base_config import (
+            QuantizationConfig,  # noqa: F401
+        )
+    except Exception:
+        for name in list(sys.modules):
+            if name == "vllm" or name.startswith("vllm."):
+                sys.modules.pop(name, None)
+        _install_vllm_stubs()
+        import vllm.config as config_module
 
-import vllm.config as vllm_config  # noqa: E402
+    from gridbook.cb_digest import codebook_tensor_sha256 as digest
+    from gridbook.config import PrismaQuantConfig as config_class
 
-from gridbook.cb_digest import codebook_tensor_sha256  # noqa: E402
-from gridbook.config import PrismaQuantConfig  # noqa: E402
+    globals()["vllm_config"] = config_module
+    globals()["codebook_tensor_sha256"] = digest
+    globals()["PrismaQuantConfig"] = config_class
 
 _NAME = "cb_codebook.lattice.NVFP4_CB_K16.sub0"
 
@@ -100,11 +113,22 @@ def _full_config(expected: str | None, *, codebook_file="cb_codebooks.pqcb"):
     return config
 
 
-def _set_model(monkeypatch, model: str) -> None:
-    current = types.SimpleNamespace(
-        model_config=types.SimpleNamespace(model=model))
+def _set_model(
+    monkeypatch,
+    model: str,
+    *,
+    resolved_commit: str | None = None,
+    revision: str | None = None,
+):
+    model_config = types.SimpleNamespace(
+        model=model,
+        hf_config=types.SimpleNamespace(_commit_hash=resolved_commit),
+        revision=revision,
+    )
+    current = types.SimpleNamespace(model_config=model_config)
     monkeypatch.setattr(
         vllm_config, "get_current_vllm_config", lambda: current)
+    return model_config
 
 
 def test_inline_config_verifies_then_memoizes(tmp_path, monkeypatch):
@@ -132,27 +156,63 @@ def test_pointer_config_resolves_hashes_and_sidecar_path(tmp_path, monkeypatch):
     (tmp_path / "quant_config.json").write_text(json.dumps(
         _full_config(codebook_tensor_sha256(table),
                      codebook_file=relative_sidecar)), encoding="utf-8")
-    _set_model(monkeypatch, str(tmp_path))
+    _set_model(
+        monkeypatch,
+        str(tmp_path),
+        resolved_commit="ignored-for-local-model",
+        revision="also-ignored-for-local-model",
+    )
+
+    import huggingface_hub
+    monkeypatch.setattr(
+        huggingface_hub,
+        "hf_hub_download",
+        lambda **_kwargs: pytest.fail("local sidecars must not use the Hub"),
+    )
 
     cfg = PrismaQuantConfig.from_config({"config_file": "quant_config.json"})
     got = cfg.get_codebooks()
     assert cfg.codebook_file == relative_sidecar
     assert torch.equal(got[_NAME], table)
+    assert cfg._sidecar_source == (str(tmp_path), None)
 
 
-def test_hub_id_resolves_both_external_files(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "resolved_commit,requested_revision,expected_revision",
+    [
+        ("B" * 40, "mutable-release-tag", "b" * 40),
+        (None, "A" * 40, "a" * 40),
+        ("malformed-resolved-commit", "C" * 40, "c" * 40),
+    ],
+)
+def test_hub_id_pins_both_external_files_to_one_model_revision(
+    tmp_path,
+    monkeypatch,
+    resolved_commit,
+    requested_revision,
+    expected_revision,
+):
     config_path = tmp_path / "downloaded-quant-config.json"
     sidecar_path = tmp_path / "downloaded-codebooks.pqcb"
     table = _write_sidecar(sidecar_path)
     config_path.write_text(json.dumps(
         _full_config(codebook_tensor_sha256(table))), encoding="utf-8")
-    _set_model(monkeypatch, "owner/model")
+    model_config = _set_model(
+        monkeypatch,
+        "owner/model",
+        resolved_commit=resolved_commit,
+        revision=requested_revision,
+    )
 
     import huggingface_hub
     calls = []
 
-    def fake_download(*, repo_id, filename):
-        calls.append((repo_id, filename))
+    def fake_download(*, repo_id, filename, revision):
+        calls.append((repo_id, filename, revision))
+        # The selected source must be cached before the first lazy download;
+        # a moving tag/config cannot change the codebook's revision afterward.
+        model_config.hf_config._commit_hash = "moved-after-first-download"
+        model_config.revision = "also-moved-after-first-download"
         return str({
             "quant_config.json": config_path,
             "cb_codebooks.pqcb": sidecar_path,
@@ -162,9 +222,47 @@ def test_hub_id_resolves_both_external_files(tmp_path, monkeypatch):
     cfg = PrismaQuantConfig.from_config({"config_file": "quant_config.json"})
     assert torch.equal(cfg.get_codebooks()[_NAME], table)
     assert calls == [
-        ("owner/model", "quant_config.json"),
-        ("owner/model", "cb_codebooks.pqcb"),
+        ("owner/model", "quant_config.json", expected_revision),
+        ("owner/model", "cb_codebooks.pqcb", expected_revision),
     ]
+
+
+@pytest.mark.parametrize(
+    "resolved_commit,requested_revision",
+    [
+        (None, None),
+        (None, ""),
+        (None, "main"),
+        (None, "release/v1"),
+        (None, "a" * 39),
+        (None, "g" * 40),
+        ("malformed-resolved-commit", "main"),
+        ("f" * 39, "release/v1"),
+    ],
+)
+def test_unpinned_or_mutable_hub_sidecars_fail_before_download(
+    monkeypatch, resolved_commit, requested_revision
+):
+    _set_model(
+        monkeypatch,
+        "owner/unpinned",
+        resolved_commit=resolved_commit,
+        revision=requested_revision,
+    )
+
+    import huggingface_hub
+    calls = []
+    monkeypatch.setattr(
+        huggingface_hub,
+        "hf_hub_download",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    cfg = PrismaQuantConfig.from_config({"config_file": "quant_config.json"})
+    with pytest.raises(
+        RuntimeError, match="has no immutable revision for Gridbook sidecars"
+    ):
+        cfg.get_codebooks()
+    assert calls == []
 
 
 def test_config_without_hash_mapping_remains_loadable(tmp_path, monkeypatch):

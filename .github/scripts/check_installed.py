@@ -37,9 +37,11 @@ ENTRY_POINT_GROUP = "vllm.general_plugins"
 REQUIRED_SOURCES = [
     "csrc/cb_gemv.cu",
     "csrc/cb_fused_gemm.cu",
+    "csrc/cb_fused_fp4_gemm.cu",
     "csrc/cb_persistent_tc.cu",
     "csrc/cutlass_fork/sm120_cb_mma_tma.hpp",
     "csrc/cutlass_fork/sm120_cb_fused_mma.hpp",
+    "csrc/cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
     "csrc/cutlass_fork/sm120_expert_row_broadcast.hpp",
 ]
 

@@ -371,14 +371,33 @@ consistent pair is outside its scope.
 
 ## 5. Configuration vocabulary (`config.json`)
 
-The quantization config is compressed-tensors-**style** but a distinct
-`quant_method` (its scheme vocabulary cannot express codebooks). It is embedded in
-`config.json["quantization_config"]` so vLLM auto-detects it; a producer MAY also
-write a standalone `quant_config.json` mirror.
+The quantization config is compressed-tensors-**style** but uses a distinct
+`quant_method` because compressed-tensors' scheme vocabulary cannot express
+codebooks. A producer **MUST** write the canonical method name `"gridbook"`.
+
+The primary published layout is a pointer stub embedded in
+`config.json["quantization_config"]`, so vLLM can auto-detect Gridbook without
+inlining the full assignment:
 
 ```jsonc
 {
-  "quant_method": "prismaquant",          // REQUIRED, exactly this string (§6)
+  "quant_method": "gridbook",             // REQUIRED for new artifacts
+  "format": "nvfp4_cb",
+  "config_file": "quant_config.json",      // default when omitted
+  "codebook_file": "cb_codebooks.pqcb"     // default when omitted
+}
+```
+
+`config_file` names the sidecar containing the full configuration. The default
+is `quant_config.json`. A consumer **MUST** also accept the compatibility form
+where that full configuration is inlined directly in
+`config.json["quantization_config"]` (identified by the presence of
+`config_groups`). The full configuration, whether referenced or inline, uses
+the following vocabulary:
+
+```jsonc
+{
+  "quant_method": "gridbook",             // canonical producer value (§6)
   "format": "nvfp4_cb",
   "layout_version": 2,                     // top-level; present only for v2 (fp4 two-tier). Absent => v1.
   "config_groups": {
@@ -436,15 +455,16 @@ decode; a consumer **MUST NOT** require them.
 
 ## 6. Runtime registration and dispatch
 
-**Registry key.** The vLLM quantization-method key **MUST** be the exact string
-`"prismaquant"`. This is the value in `config.json["quantization_config"]
-["quant_method"]` for every published artifact, and changing it would break
-already-shipped checkpoints. The string is a stable identifier only; it implies no
-dependency on any particular producing project.
+**Registry keys.** The canonical vLLM quantization-method key is the exact string
+`"gridbook"`. New artifacts **MUST** write this value in
+`config.json["quantization_config"]["quant_method"]`. A conforming runtime
+**MUST** register `"gridbook"` and **MUST** also accept `"prismaquant"` as a
+read-only legacy alias so artifacts exported before the rename continue to load.
+The alias selects the same configuration and dispatch implementation; producers
+**MUST NOT** write it for new artifacts. Neither identifier implies a runtime
+dependency on the producing project.
 
-A conforming runtime registers a quantization config under `"prismaquant"` (in
-vLLM: `register_quantization_config("prismaquant")`, invoked from a
-`vllm.general_plugins` entry point) and dispatches per module prefix:
+A conforming runtime dispatches per module prefix:
 
 - prefix matches a group's `targets` → the CB method (decode per that group's
   `scheme`);
@@ -529,7 +549,8 @@ coordinates; it **MUST** keep the LSB-first superblock packing (§1.1) and the
    safetensors sidecar (§4);
 6. the `config.json` vocabulary and the "absence of `scale_coding` ⇒ v1" /
    "unknown `scale_coding.kind` ⇒ refuse" rules (§5);
-7. the `"prismaquant"` registry key (§6);
+7. the canonical `"gridbook"` registry key and legacy `"prismaquant"` read alias
+   (§6);
 8. INV-1 for any serving implementation (§7).
 
 **Implementation notes (non-normative but load-bearing for servability).** On the

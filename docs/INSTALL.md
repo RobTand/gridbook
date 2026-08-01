@@ -83,7 +83,8 @@ it already fails soft.
 | **H100 `sm_90`** | expected ✅ | expected ✅ | ❌ fails soft → expand path | **INFERRED, UNTESTED.** |
 | **RTX 4090 / L40S `sm_89`** | expected ✅ | expected ✅ | ❌ fails soft → expand path | **INFERRED, UNTESTED.** |
 | **A100 `sm_80`** | expected ✅ for FP4-CB | ❌ FP8-CB requires `sm_89+` | n/a | **FAILS EARLY for FP8-CB.** Gridbook rejects the first FP8-CB target during model construction instead of loading a serve that will fail above 16 tokens. FP4-CB retains its BF16 fallback; untested on this card. |
-| **Older / no `nvcc` / non-NVIDIA** | Triton fallback | Triton fallback | n/a | Correct numerics, prototype speed. Not a serving target. |
+| **Supported NVIDIA GPU, no `nvcc`** | Triton fallback | Triton/stock fallback | n/a | Correct numerics, prototype speed. Not a serving target. |
+| **Non-NVIDIA** | unsupported | unsupported | unsupported | **UNSUPPORTED / UNQUALIFIED.** No ROCm backend or dispatch hook ships in this release. |
 
 Per-artifact caveat: an artifact may contain non-CB groups served by stock
 `compressed-tensors` (the 27B's vision tower is NVFP4 W4A16). Those groups carry

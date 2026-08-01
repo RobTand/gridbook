@@ -153,7 +153,8 @@ arch-specific — this table separates what was **measured** from what is
 | **RTX 5090, `sm_120`** | same | same | same | **USER-REPORTED** working (vLLM 0.25.1, 27B artifact, [issue #1](https://github.com/RobTand/gridbook/issues/1)) after that issue's memory patches. No speed numbers published; the exact `nvcc` arch flag (`sm_120` vs the measured `sm_121`) is untested here. |
 | **H100 `sm_90`, RTX 4090 / L40S `sm_89`** | expected to work — the decode kernel contains no arch guards, no inline PTX and no `-arch` flag | expected to work (needs `sm_89+` fp8 support) | **fails, fail-softs** to the expand path with a warning (the fused kernel is `sm_120`-family only) | **INFERRED, UNTESTED.** Also gated by whatever the artifact's non-CB groups need (e.g. the 27B vision tower's NVFP4). |
 | **A100 `sm_80`** | expected to work | **expected to fail**: the dense FP8-CB prefill calls `cutlass_scaled_mm` on fp8 with no capability guard and no fallback | n/a | **NOT RECOMMENDED.** The declared capability floor is 8.0, but a prompt longer than 16 tokens is expected to error. INFERRED from code; no A100 was tested. |
-| **No `nvcc`, or non-NVIDIA** | Triton fallback | Triton fallback | n/a | **Correct, slow.** Use for numerics verification and CI, not for serving. |
+| **Supported NVIDIA GPU, no `nvcc`** | Triton fallback | Triton/stock fallback | n/a | **Correct, slow.** Use for numerics verification and CI, not for serving. |
+| **Non-NVIDIA** | unsupported | unsupported | unsupported | **UNSUPPORTED / UNQUALIFIED.** The canceled ROCm prototype is not shipped or dispatched. |
 
 Tested software stack (verified in-container, 2026-07-28): vLLM
 `0.23.1rc1.dev764+g54b16d8a9`, torch `2.11.0+cu130`, triton `3.6.0`,

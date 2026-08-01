@@ -5,22 +5,11 @@
 #
 # WHY ONE PROCESS PER FILE
 # ------------------------
-# tests/test_target_namespace_compat.py deliberately injects stub `vllm.*`
-# modules into sys.modules so it can exercise the config resolver without the
-# serving stack.  Those stubs persist for the rest of the session, so a later
-# file's `pytest.importorskip("vllm")` guard *passes* and the test then dies on
-# `import vllm._custom_ops`.  Measured 2026-07-28 in a clean container
-# (python:3.10-slim, installed wheel only, torch 2.13.0+cpu, no GPU / nvcc /
-# vLLM / prismaquant):
-#   pytest test_transient_fp8.py                     -> 1 passed, 7 skipped
-#   pytest test_target_namespace_compat.py test_transient_fp8.py
-#           (one process)                            -> 3 failed, 31 passed,
-#                                                       4 skipped
-# The 3 failures are spurious: ModuleNotFoundError on `vllm._custom_ops` in
-# tests whose importorskip("vllm") guard was satisfied by the stubs.  Per-file
-# isolation removes the coupling without touching the shared test sources.
-# (The durable fix is a conftest that restores sys.modules; that lives in the
-# plugin source tree, not here.)
+# The vLLM-stubbing tests now use tests/conftest.py to snapshot and restore the
+# exact affected import graph; a combined collection/run is order-independent.
+# Keep per-file execution here because this is the installed-wheel release gate:
+# it gives each optional dependency/CUDA probe a clean interpreter and reports
+# the precise distribution test file that failed without sacrificing coverage.
 #
 # WHY NO PYTEST MARKERS
 # ---------------------

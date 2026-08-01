@@ -1,20 +1,17 @@
 """Microbench: CUDA FP8_CB decode-GEMV vs the Triton decode-GEMM on real 27B
 shapes. Run inside the serving container (needs nvcc):
 
-  docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
+  docker run --rm --gpus all -v /home/rob/gridbook:/gridbook \\
     --entrypoint bash vllm-node:latest -c \\
-    'PYTHONPATH=/repo:/repo/plugins/gridbook \\
-     python3 /repo/plugins/gridbook/tests/bench_cuda_gemv.py'
+    'PYTHONPATH=/gridbook python3 /gridbook/tests/bench_cuda_gemv.py'
 
 Reports us/call and effective packed-weight GB/s (the bandwidth-bound target:
 GB10 LPDDR5X ~= 273 GB/s peak, ~230-250 achievable).
 """
-import sys
 import time
 
 import torch
 
-sys.path.insert(0, "/repo/plugins/gridbook")
 from gridbook import codec  # noqa: E402
 from gridbook.cuda_ext import get_ext  # noqa: E402
 from gridbook.kernels import cb_decode_linear  # noqa: E402

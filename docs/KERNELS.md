@@ -73,8 +73,11 @@ buffer, runs a GEMM, and frees the buffer. Memory stays bounded (INV-1). FP8-CB
 expands **directly to FP8** (the codebook values are already on the E4M3 grid)
 and calls the stock native tensor-core GEMM (INV-2). FP4-CB v2 currently expands
 to BF16 and calls cuBLAS; that is a correctness-first fallback which does not yet
-meet INV-2. The native-FP4 decode-in-prologue kernel described below is opt-in
-because it changes the served activation bucket and still needs a quality A/B.
+meet INV-2. The separate native-FP4 decode-in-prologue kernel is opt-in
+because it changes the served activation bucket. Its same-process screen found
+a material distribution change and a dense timing loss, so it failed promotion
+and remains opt-in; see the
+[fused-NVFP4 enablement audit](audits/fused_nvfp4_enablement_2026-07-31.md).
 
 The honest limitation of transient-expand is **memory traffic**: the tile is
 written to HBM and then read back by the GEMM, so prefill moves roughly 2× the
@@ -84,7 +87,7 @@ artifact prefill went 1.62 s → 1.08 s TTFT versus the native baseline's 0.75 s
 residual ~1.44× set by the doubled traffic. Only a kernel that **never
 materializes the tile** closes it fully.
 
-### Fused decode-in-prologue (the 1× fix)
+### FP8-CB fused decode-in-prologue (the 1× fix)
 
 A fused collective mainloop that **decodes CB indices inside the GEMM's
 global→shared prologue** — never writing the expanded tile to HBM — exists and is
@@ -161,7 +164,13 @@ microbatch, so `--max-num-batched-tokens 16384` matters for this path.
 unset policy is the conservative per-expert `loop`. The native-FP4 grouped path
 is enabled with `PRISMAQUANT_CB_FUSED_FP4_MOE=1` (or `128`/`256` to select its
 tile), while an explicit `PRISMAQUANT_CB_PREFILL` remains authoritative and is a
-reliable bisection control. Stock's transient is a bf16 expand rather than
+reliable bisection control. This is deliberately an A/B opt-in: its grouped
+routing and native-MMA arithmetic are qualified, but switching from Gridbook's
+fp32-emulated activation QDQ to native UE4M3 activation factors materially
+changes the served distribution. It must not be promoted on kernel parity or
+raw speed alone; see the
+[fused-NVFP4 enablement audit](audits/fused_nvfp4_enablement_2026-07-31.md).
+Stock's transient is a bf16 expand rather than
 the fp8-direct CUDA one, at 2 B/elt, so its chunk is sized from a **byte budget**
 (`PRISMAQUANT_CB_PREFILL_CHUNK_BYTES`, default 1 GiB) instead of the fp8 lane's
 flat 256: on a 192-expert Hy3-class band that is 1,184 MiB of measured
@@ -171,9 +180,9 @@ drops the `codec.pad_qweight` copy — `type_size = 4k+9` leaves the expanders'
 bytes were never read (bit-identical output, verified with
 `PRISMAQUANT_CB_EXPAND=pad`).
 
-The remaining MoE prefill target is a persistent/grouped decode-in-mainloop
-schedule (the expand is ~35% of MoE layer time at Laguna scale) — see
-[`ROADMAP.md`](../ROADMAP.md).
+The remaining MoE prefill target is an activation-contract-preserving
+persistent/grouped decode-in-mainloop schedule (the expand is ~35% of MoE
+layer time at Laguna scale) — see [`ROADMAP.md`](../ROADMAP.md).
 
 ---
 
@@ -229,11 +238,14 @@ Loading *any* additional CUDA extension into the serving process shifts the
 allocator's addresses, which changes alignment-sensitive kernel dispatch elsewhere
 in the model and perturbs floating-point reduction order. On the 27B artifact this
 produced a **±17%** swing in the confident-KL *evaluation* (both readings still far
-better than the baseline). It is not a bug in the CB kernels — both prefill paths
-are bit-identical offline — but it is the concrete mechanism behind
-cross-session KL drift. When running an A/B, **match extension residency across
-arms** or the comparison is confounded. This matters more for benchmarking than
-serving; it is documented in [`BENCHMARKS.md`](BENCHMARKS.md) too.
+better than the baseline). It was not a bug in the historical FP8-CB operators:
+the expanded and fused prefill arms compared there were bit-identical offline.
+That statement does **not** apply to native-fused FP4, which changes the
+activation-scale contract. The allocator effect is nevertheless the concrete
+mechanism behind cross-session KL drift. When running an A/B, **match extension
+residency across arms** or the comparison is confounded. This matters more for
+benchmarking than serving; it is documented in [`BENCHMARKS.md`](BENCHMARKS.md)
+too.
 
 ## Status summary
 
@@ -244,7 +256,7 @@ serving; it is documented in [`BENCHMARKS.md`](BENCHMARKS.md) too.
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
 | MoE grouped decode GEMV, smem-resident dictionary | **Opt-in** (`PRISMAQUANT_CB_GEMV=v2`), never a default. Wins 1.13–1.58× on k13/k16/k20 in a 16-cell GB10 sweep; loses on k24 at K≥2048 (occupancy wall), where a compiled predicate routes the cell back to the shipped kernel. Reassociation-class output difference vs the default schedule (9/204 synthetic cells, worst `max_rel` 5.88e-03) — **not** bit-exact. Live GB10 validation on Jason Wong's 117B Laguna release dispatched all 94 expert stacks to v2 with no fallback and measured 24.993 vs 23.585 tok/s (+5.97%); long-prefill, concurrency, and soak requests completed without Gridbook errors |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
-| Fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — persistent-N is the answer |
+| FP8-CB fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — persistent-N is the answer |
 | Persistent-N large-M dense prefill | **Built and MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. Quarantined behind `PRISMAQUANT_ENABLE_PTC=1` as a schedule reference; do not enable it. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
-| MoE prefill | **Shipped**: CUDA chunk-expander into vLLM's fused-MoE grouped kernel; fp8-CB default is `auto` (measured per-layer path selection). Laguna-S-2.1 117B: 293 → 1,821 tok/s @8k, 207 → 1,822 @63k. fp4-CB defaults to conservative `loop`; fused-FP4 is explicit opt-in pending served quality, while explicit `stock` uses a byte-budgeted expert chunk (1,184 MiB vs 4,736 MiB measured transient on a 192-expert band) and no pad copy |
+| MoE prefill | **Shipped**: CUDA chunk-expander into vLLM's fused-MoE grouped kernel; fp8-CB default is `auto` (measured per-layer path selection). Laguna-S-2.1 117B: 293 → 1,821 tok/s @8k, 207 → 1,822 @63k. fp4-CB defaults to conservative `loop`; native fused-FP4 remains an explicit A/B opt-in after failing the model-equivalence screen, while explicit `stock` uses a byte-budgeted expert chunk (1,184 MiB vs 4,736 MiB measured transient on a 192-expert band) and no pad copy |
 | Triton fallbacks | **Shipped** for every path (correctness/CI; not INV-2-eligible) |

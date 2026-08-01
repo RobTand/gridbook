@@ -66,6 +66,7 @@ using ClusterShape = Shape<_1, _1, _1>;
 // TileN is pinned at 128 by the blockscaled SF smem atom (Blk_MN = 128);
 // TileK = 128 is half a 256-weight CB superblock (the fork's decode grain).
 using TileShapeFp4 = Shape<_128, _128, _128>;
+using TileShapeFp4M256 = Shape<_256, _128, _128>;
 
 using Sm1xxCfg = cutlass::detail::Sm1xxBlockScaledConfig<16>;
 
@@ -121,6 +122,54 @@ struct AssertSmemFits {
   static constexpr bool value = true;
 };
 
+void check_same_cuda_device(torch::Tensor const& anchor,
+                            torch::Tensor const& tensor,
+                            char const* name) {
+  TORCH_CHECK(tensor.device() == anchor.device(), name,
+              " must be on the same CUDA device as a (", anchor.device(),
+              "), got ", tensor.device());
+}
+
+void check_dense_packed_row_storage(torch::Tensor const& packed,
+                                    int64_t rows,
+                                    int64_t required_row_bytes) {
+  TORCH_CHECK(packed.size(1) >= required_row_bytes,
+              "packed visible row width ", packed.size(1),
+              " is smaller than the required ", required_row_bytes,
+              " bytes; passing a narrow view may not hide bytes read by the "
+              "fused kernel");
+  TORCH_CHECK(packed.stride(0) >= required_row_bytes,
+              "packed row stride ", packed.stride(0),
+              " is smaller than the required ", required_row_bytes,
+              " bytes");
+
+  // A logical shape/stride check alone does not attest a tensor whose backing
+  // storage was externally resized after the view was created.  The fused
+  // producer reads ``required_row_bytes`` from every row starting at
+  // data_ptr()+row*stride(0), so prove that the final read remains inside the
+  // underlying uint8 storage.  Division avoids overflow in (rows-1)*stride.
+  TORCH_CHECK(packed.storage_offset() >= 0,
+              "packed storage offset must be nonnegative");
+  const uint64_t storage_bytes = packed.storage().nbytes();
+  const uint64_t storage_offset =
+      static_cast<uint64_t>(packed.storage_offset());
+  const uint64_t row_bytes = static_cast<uint64_t>(required_row_bytes);
+  const uint64_t row_stride = static_cast<uint64_t>(packed.stride(0));
+  const uint64_t rows_before_last = static_cast<uint64_t>(rows - 1);
+  TORCH_CHECK(storage_offset <= storage_bytes &&
+                  row_bytes <= storage_bytes - storage_offset,
+              "packed backing storage is too small for even the first "
+              "required row");
+  const uint64_t bytes_before_last =
+      storage_bytes - storage_offset - row_bytes;
+  TORCH_CHECK(rows_before_last == 0 ||
+                  row_stride <= bytes_before_last / rows_before_last,
+              "packed backing storage is too small for ", rows,
+              " rows of ", required_row_bytes, " bytes at stride ",
+              packed.stride(0), " from storage offset ",
+              packed.storage_offset());
+}
+
 // Policy rebind: builder-constructed blockscaled collective -> the CB fused
 // fp4 mainloop (Stages pinned to 2, everything else inherited verbatim).
 template <int NewStages, class T>
@@ -161,12 +210,20 @@ torch::Tensor sm120_nvf4_mm_scaled(torch::Tensor a, torch::Tensor sfa,
   const int64_t sfb_need = ((N + 127) / 128) * 128 * (K / 16);
   TORCH_CHECK(sfa.is_cuda() && sfa.numel() == sfa_need && sfa.is_contiguous(),
               "sfa must be the swizzled ue4m3 plane, numel ", sfa_need);
-  TORCH_CHECK(sfb.is_cuda() && sfb.numel() == sfb_need && sfb.is_contiguous(),
+  TORCH_CHECK(sfa.scalar_type() == torch::kUInt8,
+              "sfa must have uint8 storage");
+  TORCH_CHECK(sfb.is_cuda() && sfb.scalar_type() == torch::kUInt8 &&
+              sfb.numel() == sfb_need && sfb.is_contiguous(),
               "sfb must be the swizzled ue4m3 plane, numel ", sfb_need);
   TORCH_CHECK(a_scales.is_cuda() && a_scales.scalar_type() == torch::kFloat32 &&
               a_scales.numel() == M && a_scales.is_contiguous());
   TORCH_CHECK(b_scales.is_cuda() && b_scales.scalar_type() == torch::kFloat32 &&
               b_scales.numel() == N && b_scales.is_contiguous());
+  check_same_cuda_device(a, sfa, "sfa");
+  check_same_cuda_device(a, b, "b");
+  check_same_cuda_device(a, sfb, "sfb");
+  check_same_cuda_device(a, a_scales, "a_scales");
+  check_same_cuda_device(a, b_scales, "b_scales");
 
   const c10::cuda::OptionalCUDAGuard guard(a.device());
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -202,8 +259,14 @@ torch::Tensor sm120_nvf4_mm_scaled(torch::Tensor a, torch::Tensor sfa,
   auto workspace = torch::empty({(int64_t)ws}, a.options().dtype(torch::kUInt8));
   TORCH_CHECK(gemm.can_implement(args) == cutlass::Status::kSuccess,
               "nvf4 ref can_implement failed");
-  TORCH_CHECK(gemm.initialize(args, workspace.data_ptr()) == cutlass::Status::kSuccess);
-  TORCH_CHECK(gemm.run(stream) == cutlass::Status::kSuccess);
+  auto init_status = gemm.initialize(args, workspace.data_ptr(), stream);
+  TORCH_CHECK(init_status == cutlass::Status::kSuccess,
+              "nvf4 ref initialize failed: ",
+              cutlass::cutlassGetStatusString(init_status));
+  auto run_status = gemm.run(stream);
+  TORCH_CHECK(run_status == cutlass::Status::kSuccess,
+              "nvf4 ref launch failed: ",
+              cutlass::cutlassGetStatusString(run_status));
   return d;
 }
 
@@ -214,8 +277,7 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
     torch::Tensor a, torch::Tensor sfa, torch::Tensor packed,
     torch::Tensor lut, torch::Tensor compose, torch::Tensor a_scales,
     torch::Tensor b_scales, int64_t N, int64_t K, int64_t k_bits,
-    int64_t n_sub, int64_t type_size, bool is_v2,
-    c10::optional<torch::Tensor> debug_out = c10::nullopt) {
+    int64_t n_sub, int64_t type_size, bool is_v2) {
   using TileShape = TileShapeFp4;
   using Mainloop = typename SwapToFusedFp4<
       2, typename CfgFp4<TileShape>::BuilderMainloop>::type;
@@ -228,8 +290,10 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
   TORCH_CHECK(a.is_cuda() && a.scalar_type() == torch::kUInt8 && a.dim() == 2 &&
               a.stride(1) == 1 && a.size(1) * 2 == K && a.stride(0) == K / 2,
               "a must be contiguous packed-e2m1 uint8 [M, K/2]");
-  TORCH_CHECK(K % 256 == 0, "K must be a multiple of 256");
-  TORCH_CHECK(N % 8 == 0, "N must be a multiple of 8 (bf16 TMA epilogue "
+  TORCH_CHECK(K > 0 && K % 256 == 0,
+              "K must be a positive multiple of 256");
+  TORCH_CHECK(N > 0 && N % 8 == 0,
+              "N must be a positive multiple of 8 (bf16 TMA epilogue "
               "alignment; every exported CB Linear satisfies this)");
   TORCH_CHECK(k_bits >= 9 && k_bits <= 24, "fp4 rung k_bits out of range");
   TORCH_CHECK(n_sub == 1 || n_sub == 2, "fp4 n_sub must be 1 (signed) or 2");
@@ -238,13 +302,14 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
   const int M = (int)a.size(0);
   const int64_t n_sb = K / 256;
   const int64_t sfa_need = ((M + 127) / 128) * 128 * (K / 16);
-  TORCH_CHECK(sfa.is_cuda() && sfa.numel() == sfa_need && sfa.is_contiguous(),
-              "sfa must be the swizzled ue4m3 plane, numel ", sfa_need);
+  TORCH_CHECK(sfa.is_cuda() && sfa.scalar_type() == torch::kUInt8 &&
+              sfa.numel() == sfa_need && sfa.is_contiguous(),
+              "sfa must be contiguous uint8 swizzled ue4m3 storage, numel ",
+              sfa_need);
   TORCH_CHECK(packed.is_cuda() && packed.scalar_type() == torch::kUInt8 &&
               packed.dim() == 2 && packed.size(0) == N && packed.stride(1) == 1,
               "packed must be uint8 [N, row_bytes(+pad)]");
-  TORCH_CHECK(packed.stride(0) >= n_sb * type_size,
-              "packed row stride too small for K/type_size");
+  check_dense_packed_row_storage(packed, N, n_sb * type_size);
   // No tail-slack requirement: the consumer's gmem gathers stay inside each
   // row's own superblock (aligned-u32 index windows end <= ts-1; the scale
   // plane is read with u8 loads).
@@ -258,15 +323,23 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
               lut.is_contiguous() && lut.numel() == lut_need,
               "value LUT must be uint8[", lut_need, "] for this rung");
   TORCH_CHECK(lut_need <= 16384, "value LUT exceeds the smem carve");
+  TORCH_CHECK(compose.is_cuda() && compose.scalar_type() == torch::kUInt8 &&
+              compose.is_contiguous(),
+              "compose must be contiguous CUDA uint8 storage");
   if (is_v2) {
-    TORCH_CHECK(compose.is_cuda() && compose.scalar_type() == torch::kUInt8 &&
-                compose.is_contiguous() && compose.numel() == 4096,
+    TORCH_CHECK(compose.numel() == 4096,
                 "v2 compose table must be uint8[4096] (256x16 e4m3 bytes)");
   }
   TORCH_CHECK(a_scales.is_cuda() && a_scales.scalar_type() == torch::kFloat32 &&
               a_scales.numel() == M && a_scales.is_contiguous());
   TORCH_CHECK(b_scales.is_cuda() && b_scales.scalar_type() == torch::kFloat32 &&
               b_scales.numel() == N && b_scales.is_contiguous());
+  check_same_cuda_device(a, sfa, "sfa");
+  check_same_cuda_device(a, packed, "packed");
+  check_same_cuda_device(a, lut, "lut");
+  check_same_cuda_device(a, compose, "compose");
+  check_same_cuda_device(a, a_scales, "a_scales");
+  check_same_cuda_device(a, b_scales, "b_scales");
 
   const c10::cuda::OptionalCUDAGuard guard(a.device());
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -288,8 +361,7 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
        lut.data_ptr<uint8_t>(), (int32_t)lut.numel(),
        is_v2 ? compose.data_ptr<uint8_t>() : nullptr,
        (int32_t)k_bits, (int32_t)n_sub, (int32_t)type_size,
-       (int32_t)(is_v2 ? 1 : 0), nullptr, 0,
-       debug_out.has_value() ? debug_out->data_ptr<uint8_t>() : nullptr},
+       (int32_t)(is_v2 ? 1 : 0), nullptr, 0, 0, nullptr},
       {// EVT args: children first, then node op args (empty for multiplies).
        {{b_scales.data_ptr<float>(), 0.0f, Stride<_0, _1, _0>{}},
         {{a_scales.data_ptr<float>(), 0.0f, Stride<_1, _0, _0>{}}, {}, {}},
@@ -302,8 +374,14 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
   auto workspace = torch::empty({(int64_t)ws}, a.options().dtype(torch::kUInt8));
   TORCH_CHECK(gemm.can_implement(args) == cutlass::Status::kSuccess,
               "fused fp4 can_implement failed (K%256? type_size? lut?)");
-  TORCH_CHECK(gemm.initialize(args, workspace.data_ptr()) == cutlass::Status::kSuccess);
-  TORCH_CHECK(gemm.run(stream) == cutlass::Status::kSuccess);
+  auto init_status = gemm.initialize(args, workspace.data_ptr(), stream);
+  TORCH_CHECK(init_status == cutlass::Status::kSuccess,
+              "fused fp4 initialize failed: ",
+              cutlass::cutlassGetStatusString(init_status));
+  auto run_status = gemm.run(stream);
+  TORCH_CHECK(run_status == cutlass::Status::kSuccess,
+              "fused fp4 launch failed: ",
+              cutlass::cutlassGetStatusString(run_status));
   return d;
 }
 
@@ -316,17 +394,15 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
 // per-expert-channel weight scale (SFB carries the whole weight scale), so
 // the epilogue stays the plain ScaledFusion with b_scales = ones.
 // ---------------------------------------------------------------------------
-using TileShapeFp4M256 = Shape<_256, _128, _128>;
-
-template <class TileShape>
-torch::Tensor run_fp4_moe_grouped(torch::Tensor a, torch::Tensor sfa,
-                                  torch::Tensor packed, torch::Tensor lut,
-                                  torch::Tensor compose,
-                                  torch::Tensor a_scales,
-                                  torch::Tensor b_scales,
-                                  torch::Tensor expert_ids, int64_t N,
-                                  int64_t K, int64_t k_bits, int64_t n_sub,
-                                  int64_t type_size, bool is_v2) {
+torch::Tensor run_fp4_moe_grouped_m128(
+    torch::Tensor a, torch::Tensor sfa, torch::Tensor packed,
+    torch::Tensor lut, torch::Tensor compose, torch::Tensor a_scales,
+    torch::Tensor b_scales, torch::Tensor expert_ids, int64_t N, int64_t K,
+    int64_t k_bits, int64_t n_sub, int64_t type_size, bool is_v2) {
+  // Keep this concrete (rather than templating the host runner on TileShape).
+  // nvcc 13 otherwise preserves unsigned C<16u>/C<2u> layout aliases in the
+  // host pass, producing an unregistered device_kernel duplicate.
+  using TileShape = TileShapeFp4;
   using Mainloop = typename SwapToFusedFp4<
       2, typename CfgFp4<TileShape>::BuilderMainloop>::type;
   using Epilogue = typename CfgFp4<TileShape>::Epilogue;
@@ -358,7 +434,8 @@ torch::Tensor run_fp4_moe_grouped(torch::Tensor a, torch::Tensor sfa,
        is_v2 ? compose.data_ptr<uint8_t>() : nullptr,
        (int32_t)k_bits, (int32_t)n_sub, (int32_t)type_size,
        (int32_t)(is_v2 ? 1 : 0),
-       expert_ids.data_ptr<int>(), N * row_bytes, nullptr},
+       expert_ids.data_ptr<int>(), N * row_bytes, (int32_t)packed.size(0),
+       nullptr},
       {{{b_scales.data_ptr<float>(), 0.0f, Stride<_0, _1, _0>{}},
         {{a_scales.data_ptr<float>(), 0.0f, Stride<_1, _0, _0>{}}, {}, {}},
         {}},
@@ -370,8 +447,81 @@ torch::Tensor run_fp4_moe_grouped(torch::Tensor a, torch::Tensor sfa,
   auto workspace = torch::empty({(int64_t)ws}, a.options().dtype(torch::kUInt8));
   TORCH_CHECK(gemm.can_implement(args) == cutlass::Status::kSuccess,
               "fused fp4 moe can_implement failed");
-  TORCH_CHECK(gemm.initialize(args, workspace.data_ptr()) == cutlass::Status::kSuccess);
-  TORCH_CHECK(gemm.run(stream) == cutlass::Status::kSuccess);
+  auto init_status = gemm.initialize(args, workspace.data_ptr(), stream);
+  TORCH_CHECK(init_status == cutlass::Status::kSuccess,
+              "fused fp4 moe initialize failed: ",
+              cutlass::cutlassGetStatusString(init_status),
+              "; CUDA status: ", cudaGetErrorString(cudaPeekAtLastError()));
+  auto run_status = gemm.run(stream);
+  TORCH_CHECK(run_status == cutlass::Status::kSuccess,
+              "fused fp4 moe launch failed: ",
+              cutlass::cutlassGetStatusString(run_status),
+              "; CUDA status: ", cudaGetErrorString(cudaPeekAtLastError()));
+  return d;
+}
+
+torch::Tensor run_fp4_moe_grouped_m256(
+    torch::Tensor a, torch::Tensor sfa, torch::Tensor packed,
+    torch::Tensor lut, torch::Tensor compose, torch::Tensor a_scales,
+    torch::Tensor b_scales, torch::Tensor expert_ids, int64_t N, int64_t K,
+    int64_t k_bits, int64_t n_sub, int64_t type_size, bool is_v2) {
+  // See the M128 runner: the kernel config must remain concrete at this host
+  // call site so nvcc emits and registers the matching TileM=256 host stub.
+  using TileShape = TileShapeFp4M256;
+  using Mainloop = typename SwapToFusedFp4<
+      2, typename CfgFp4<TileShape>::BuilderMainloop>::type;
+  using Epilogue = typename CfgFp4<TileShape>::Epilogue;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>, Mainloop, Epilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  static_assert(AssertSmemFits<GemmKernel>::value);
+
+  const int Mp = (int)a.size(0);
+  const int64_t row_bytes = packed.size(2);
+  const c10::cuda::OptionalCUDAGuard guard(a.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto d = torch::empty({Mp, N}, a.options().dtype(torch::kBFloat16));
+
+  using StrideA = typename GemmKernel::StrideA;
+  using StrideD = typename GemmKernel::StrideD;
+  StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {Mp, (int)K, 1});
+  StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {Mp, (int)N, 1});
+  auto layout_sfa = Sm1xxCfg::tile_atom_to_shape_SFA(
+      cute::make_shape(Mp, (int)N, (int)K, 1));
+
+  typename Gemm::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {Mp, (int)N, (int)K, 1},
+      {reinterpret_cast<const cutlass::float_e2m1_t*>(a.data_ptr()), sa,
+       reinterpret_cast<const ElementSF*>(sfa.data_ptr()), layout_sfa,
+       packed.data_ptr<uint8_t>(), row_bytes,
+       lut.data_ptr<uint8_t>(), (int32_t)lut.numel(),
+       is_v2 ? compose.data_ptr<uint8_t>() : nullptr,
+       (int32_t)k_bits, (int32_t)n_sub, (int32_t)type_size,
+       (int32_t)(is_v2 ? 1 : 0),
+       expert_ids.data_ptr<int>(), N * row_bytes, (int32_t)packed.size(0),
+       nullptr},
+      {{{b_scales.data_ptr<float>(), 0.0f, Stride<_0, _1, _0>{}},
+        {{a_scales.data_ptr<float>(), 0.0f, Stride<_1, _0, _0>{}}, {}, {}},
+        {}},
+       nullptr, typename GemmKernel::StrideC{},
+       reinterpret_cast<ElementD*>(d.data_ptr()), sd}};
+
+  Gemm gemm;
+  size_t ws = Gemm::get_workspace_size(args);
+  auto workspace = torch::empty({(int64_t)ws}, a.options().dtype(torch::kUInt8));
+  TORCH_CHECK(gemm.can_implement(args) == cutlass::Status::kSuccess,
+              "fused fp4 moe can_implement failed");
+  auto init_status = gemm.initialize(args, workspace.data_ptr(), stream);
+  TORCH_CHECK(init_status == cutlass::Status::kSuccess,
+              "fused fp4 moe initialize failed: ",
+              cutlass::cutlassGetStatusString(init_status),
+              "; CUDA status: ", cudaGetErrorString(cudaPeekAtLastError()));
+  auto run_status = gemm.run(stream);
+  TORCH_CHECK(run_status == cutlass::Status::kSuccess,
+              "fused fp4 moe launch failed: ",
+              cutlass::cutlassGetStatusString(run_status),
+              "; CUDA status: ", cudaGetErrorString(cudaPeekAtLastError()));
   return d;
 }
 
@@ -395,10 +545,12 @@ torch::Tensor cb_fused_fp4_moe_grouped(
               tile_m, "); pad each expert's row segment");
   const int64_t n_sb = K / 256;
   const int64_t sfa_need = ((Mp + 127) / 128) * 128 * (K / 16);
-  TORCH_CHECK(sfa.is_cuda() && sfa.numel() == sfa_need && sfa.is_contiguous(),
-              "sfa must be the swizzled ue4m3 plane, numel ", sfa_need);
+  TORCH_CHECK(sfa.is_cuda() && sfa.scalar_type() == torch::kUInt8 &&
+              sfa.numel() == sfa_need && sfa.is_contiguous(),
+              "sfa must be contiguous uint8 swizzled ue4m3 storage, numel ",
+              sfa_need);
   TORCH_CHECK(packed.is_cuda() && packed.scalar_type() == torch::kUInt8 &&
-              packed.dim() == 3 && packed.size(1) == N &&
+              packed.dim() == 3 && packed.size(0) > 0 && packed.size(1) == N &&
               packed.stride(2) == 1 && packed.stride(1) == packed.size(2) &&
               packed.stride(0) == N * packed.size(2),
               "packed must be fully contiguous uint8 [E, N, row_bytes]");
@@ -413,9 +565,12 @@ torch::Tensor cb_fused_fp4_moe_grouped(
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8 &&
               lut.is_contiguous() && lut.numel() == lut_need &&
               lut_need <= 16384, "value LUT must be uint8[", lut_need, "]");
+  TORCH_CHECK(compose.is_cuda() && compose.scalar_type() == torch::kUInt8 &&
+              compose.is_contiguous(),
+              "compose must be contiguous CUDA uint8 storage");
   if (is_v2) {
-    TORCH_CHECK(compose.is_cuda() && compose.scalar_type() == torch::kUInt8 &&
-                compose.is_contiguous() && compose.numel() == 4096);
+    TORCH_CHECK(compose.numel() == 4096,
+                "v2 compose table must be uint8[4096]");
   }
   TORCH_CHECK(a_scales.is_cuda() && a_scales.scalar_type() == torch::kFloat32 &&
               a_scales.numel() == Mp && a_scales.is_contiguous());
@@ -426,12 +581,19 @@ torch::Tensor cb_fused_fp4_moe_grouped(
               expert_ids.is_contiguous() &&
               expert_ids.numel() == Mp / tile_m,
               "expert_ids must be contiguous int32 [Mp/tile_m]");
+  check_same_cuda_device(a, sfa, "sfa");
+  check_same_cuda_device(a, packed, "packed");
+  check_same_cuda_device(a, lut, "lut");
+  check_same_cuda_device(a, compose, "compose");
+  check_same_cuda_device(a, a_scales, "a_scales");
+  check_same_cuda_device(a, b_scales, "b_scales");
+  check_same_cuda_device(a, expert_ids, "expert_ids");
   if (tile_m == 256) {
-    return run_fp4_moe_grouped<TileShapeFp4M256>(
+    return run_fp4_moe_grouped_m256(
         a, sfa, packed, lut, compose, a_scales, b_scales, expert_ids, N, K,
         k_bits, n_sub, type_size, is_v2);
   }
-  return run_fp4_moe_grouped<TileShapeFp4>(
+  return run_fp4_moe_grouped_m128(
       a, sfa, packed, lut, compose, a_scales, b_scales, expert_ids, N, K,
       k_bits, n_sub, type_size, is_v2);
 }
@@ -469,7 +631,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("compose"), py::arg("a_scales"), py::arg("b_scales"),
         py::arg("N"), py::arg("K"), py::arg("k_bits"), py::arg("n_sub"),
         py::arg("type_size"), py::arg("is_v2"),
-        py::arg("debug_out") = py::none(),
         "NVFP4_CB decode-in-prologue fused BLOCK-SCALED GEMM: packed CB rows "
         "+ smem value/compose LUTs decoded straight into the e2m1/SFB smem "
         "operands of the NVF4 MMA; per-token activation scale x per-channel "

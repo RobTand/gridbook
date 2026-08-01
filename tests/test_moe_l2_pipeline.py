@@ -25,10 +25,10 @@ Run scopes:
 * everything else (serving container: vLLM + CUDA + the extension carrying
   ``cb_expand_fp8_into``)::
 
-    docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
+    docker run --rm --gpus all -v /home/rob/gridbook:/gridbook \\
       --entrypoint bash vllm-node-tf5-cu132-lfm:latest -c 'pip install -q pytest; \\
-      PYTHONPATH=/repo:/repo/plugins/gridbook python3 -m pytest \\
-      /repo/plugins/gridbook/tests/test_moe_l2_pipeline.py -v'
+      PYTHONPATH=/gridbook python3 -m pytest \\
+      /gridbook/tests/test_moe_l2_pipeline.py -v'
 """
 import pytest
 import torch

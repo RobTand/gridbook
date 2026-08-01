@@ -80,25 +80,25 @@ publisher on the project. Nothing further to do.
 
 ## 2. Cutting a release
 
-### 2.0 Publish order — the docs describe the *packaged* tree
+### 2.0 Source ownership — release this repository directly
 
-`README.md`, `docs/INSTALL.md`, `docs/TROUBLESHOOTING.md` and `ROADMAP.md` assert
-packaging facts as **true today**: that the CUDA sources ship at
-`gridbook/csrc/`, that a non-editable install resolves them, that the packaged
-version matches the release tag, and that `gridbook[serve]` exists. Those are
-properties of the plugin tree inside PrismaQuant. They become true here **only
-after the sync in §2.1**.
+This repository is the **only** source tree for the Gridbook Python runtime,
+CUDA sources, runtime tests, package metadata, and releases. PrismaQuant owns
+the producer/exporter and validates compatibility against an immutable
+Gridbook commit; it does not contain or synchronize a copy of this package.
 
-Publishing docs ahead of that sync ships a README whose headline install command
-produces exactly the broken install `TROUBLESHOOTING.md` declares fixed. So:
+That boundary is deliberate. A runtime change is reviewed, tested, packaged,
+and tagged here exactly once. Cross-project compatibility is expressed through
+the packaged runtime contract and exact external pins, never by copying files.
 
-> **Sync the code first, or in the same commit. Never docs-first.**
-
-The PrismaQuant sync tool is the authoritative drift check:
+Before release, require a clean checkout and confirm the distribution/layout
+gates from this repository itself:
 
 ```bash
-python3 /path/to/prismaquant/scripts/sync_gridbook.py \
-  --check --dest "$PWD"
+git status --short
+python -m pytest tests/ -q
+python -m build
+python .github/scripts/check_dist.py dist .
 ```
 
 ### 2.1 Bump the version — one place
@@ -107,56 +107,51 @@ The version has a **single source of truth**: `__version__` in
 `gridbook/__init__.py`. `pyproject.toml` declares `dynamic = ["version"]` and
 reads it from there, so there is nothing else to edit.
 
-> Code in this repo (everything except `docs/`, `README.md`, `ROADMAP.md`,
-> `MANIFEST.in`, `.github/`) is mirrored from the plugin directory inside the
-> PrismaQuant tree. Bump `__version__` **there**, re-sync, then commit here.
-
-**Re-syncing from the plugin tree — path-scoped only.** The mirror is a subset,
-not a copy: this repo also holds `.github/`, `docs/`, `README.md`, `ROADMAP.md`,
-`LICENSE`, `MANIFEST.in`, `Dockerfile`, `CITATION.cff`, `CONTRIBUTING.md`, none
-of which exist upstream. A tree-root `rsync --delete` would delete all of them,
-CI included. Sync the mirrored paths and nothing else:
-
-```bash
-PLUGIN=/path/to/prismaquant/plugins/gridbook
-rsync -a --delete --exclude='__pycache__' "$PLUGIN/gridbook/" ./gridbook/
-rsync -a --delete --exclude='__pycache__' "$PLUGIN/tests/"    ./tests/
-cp "$PLUGIN/pyproject.toml" ./pyproject.toml
-```
-
-`--delete` is safe *inside* those three paths and is what removes a kernel file
-that was deleted upstream. If the tree still carries the pre-fix repo-root
-`csrc/`, delete it once with `git rm -r csrc` — `check_dist.py` fails until you
-do.
-
-Version line: `0.0.1` is spent (it was published as a description of a
-superseded Triton prototype and predates the packaging fix). The public line
-starts at **`0.1.0`**.
+Bump it **in this repository**, add the corresponding `CHANGELOG.md` entry, and
+update static release metadata such as `CITATION.cff` in the same PR. A
+PrismaQuant compatibility pin is updated only after this PR merges, using the
+resulting immutable commit.
 
 ### 2.2 Pre-tag gate that CI cannot run
 
 CI has no GPU and no CUDA toolkit, so **it cannot prove the extension compiles**.
 The packaging checks in CI pass happily on a wheel whose source resolution is
 still wrong — only an actual compile from the *installed* package closes that
-loop. Run this by hand before tagging, on a box with `nvcc` (~30 s, compile-only,
-**no `--gpus` needed**):
+loop. Run this by hand before tagging, on a supported Blackwell GPU with `nvcc`.
+The loader queries the concrete device capability and the fused gate executes
+GPU operators, so GPU passthrough is mandatory:
 
 ```bash
 python -m build
-docker run --rm -v "$PWD/dist:/dist" --entrypoint bash <your-vllm-image> -c '
+docker run --rm --gpus all -v "$PWD/dist:/dist" \
+  --entrypoint bash <your-vllm-image> -c '
   pip install --no-deps -q /dist/gridbook-*.whl
   cd /                      # never run this from the repo: it would shadow the install
   TORCH_CUDA_ARCH_LIST=12.1 python -c "
-from gridbook.cuda_ext import get_ext, csrc_dir
+from gridbook.cuda_ext import get_ext, get_fused_fp4_ext, csrc_dir
 print(\"csrc:\", csrc_dir())
 m = get_ext()
 assert m is not None, \"extension failed to build\"
 assert hasattr(m, \"cb_gemv_fp8\"), \"built module is missing cb_gemv_fp8\"
-print(\"ok:\", m)"'
+f = get_fused_fp4_ext()
+assert f is not None, \"fused NVFP4 extension failed to build\"
+for symbol in (\"cb_fused_fp4_prefill_mm_scaled\",
+               \"cb_fused_fp4_moe_grouped\",
+               \"cb_fused_fp4_moe_tile_sizes\"):
+    assert hasattr(f, symbol), f\"built fused module is missing {symbol}\"
+assert list(f.cb_fused_fp4_moe_tile_sizes()) == [128, 256]
+print(\"ok:\", m, f)"'
 ```
 
-If that prints a compiled module, the packaging is genuinely sound. Two ways it
-can fail, and they mean different things:
+The fused extension also requires the GPU operator/SASS suite from an installed
+wheel. Stage `tests/test_fused_fp4_prefill.py` outside the checkout, install the
+matching PrismaQuant producer only as a test fixture, and run it on the release
+GPU image. The release gate is 0 failures, 0 skips, `OMMA.SF.16864` present in
+both fused symbols, and no `QMMA` in either symbol. Both fused runtime flags
+remain default-off unless the served quality gate separately promotes them.
+
+If the compile prints both modules, the packaging is genuinely sound. Two ways
+it can fail, and they mean different things:
 
 - `[prismaquant-cb] ERROR: broken gridbook install — …` → the packaged sources
   are missing. **Do not tag.** This is a packaging defect.

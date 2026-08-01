@@ -15,96 +15,111 @@ import types
 
 import pytest
 
-if "vllm" not in sys.modules:
+torch = pytest.importorskip("torch")
+
+
+def _install_vllm_stubs():
+    """Install the vLLM surface imported by Gridbook's dense CB runtime."""
+    def _mod(name):
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        return module
+
+    _mod("vllm")
+    _mod("vllm.model_executor")
+    _mod("vllm.model_executor.layers")
+    _mod("vllm.model_executor.layers.quantization")
+    linear = _mod("vllm.model_executor.layers.linear")
+
+    class LinearBase:
+        pass
+
+    class UnquantizedLinearMethod:
+        pass
+
+    class LinearMethodBase:
+        pass
+
+    linear.LinearBase = LinearBase
+    linear.UnquantizedLinearMethod = UnquantizedLinearMethod
+    linear.LinearMethodBase = LinearMethodBase
+    linear.register_weight_loader_v2_supported_method = lambda cls: cls
+    parameter = _mod("vllm.model_executor.parameter")
+
+    class _StubParam(torch.nn.Parameter):
+        def __new__(cls, data, **kw):
+            return super().__new__(cls, data, requires_grad=False)
+
+        def __init__(self, data, **kw):
+            pass
+
+    parameter.ModelWeightParameter = _StubParam
+    parameter.ChannelQuantScaleParameter = _StubParam
+    base = _mod("vllm.model_executor.layers.quantization.base_config")
+
+    class QuantizationConfig:
+        def __init__(self):
+            pass
+
+    base.QuantizationConfig = QuantizationConfig
+    base.QuantizeMethodBase = object
+    compressed_utils = _mod(
+        "vllm.model_executor.layers.quantization.compressed_tensors.utils")
+
+    def _stub_should_ignore(layer_name, ignore=(), fused_mapping=None):
+        try:
+            import regex as regex_engine
+        except ImportError:
+            import re as regex_engine
+
+        def _matches(name):
+            return any(
+                regex_engine.match(entry[3:], name) is not None
+                if entry.startswith("re:") else entry == name
+                for entry in ignore)
+
+        fused_mapping = fused_mapping or {}
+        leaf = layer_name.rsplit(".", 1)[-1]
+        if leaf in fused_mapping and layer_name not in ignore:
+            stem = layer_name[:-len(leaf)]
+            verdicts = [_matches(stem + shard) for shard in fused_mapping[leaf]]
+            if len(set(verdicts)) != 1:
+                raise ValueError("Found a different quantization schemes")
+            return verdicts[0]
+        return _matches(layer_name)
+
+    compressed_utils.should_ignore_layer = _stub_should_ignore
+    embedding = _mod("vllm.model_executor.layers.vocab_parallel_embedding")
+    embedding.UnquantizedEmbeddingMethod = type("UEM", (), {})
+    embedding.VocabParallelEmbedding = type("VPE", (), {})
+    fused_moe = _mod("vllm.model_executor.layers.fused_moe")
+    fused_moe.RoutedExperts = type("RoutedExperts", (), {})
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _runtime_modules(isolated_gridbook_runtime_imports):
+    """Import Gridbook against a private real-or-stubbed vLLM graph."""
+    del isolated_gridbook_runtime_imports
     try:
-        import vllm  # noqa: F401
+        from vllm.model_executor.layers.linear import LinearMethodBase  # noqa: F401
+        from vllm.model_executor.layers.quantization.compressed_tensors.utils import (  # noqa: E501,F401
+            should_ignore_layer,
+        )
     except Exception:
-        torch = pytest.importorskip("torch")
+        for name in list(sys.modules):
+            if name == "vllm" or name.startswith("vllm."):
+                sys.modules.pop(name, None)
+        _install_vllm_stubs()
 
-        def _mod(name):
-            m = types.ModuleType(name)
-            sys.modules[name] = m
-            return m
+    from gridbook.config import (
+        PrismaQuantConfig as config_class,
+        _canonical_prefix as canonical_prefix,
+        _canonical_target as canonical_target,
+    )
 
-        _mod("vllm")
-        _mod("vllm.model_executor")
-        _mod("vllm.model_executor.layers")
-        _mod("vllm.model_executor.layers.quantization")
-        lin = _mod("vllm.model_executor.layers.linear")
-
-        class LinearBase:  # minimal stand-ins: only isinstance/base use here
-            pass
-
-        class UnquantizedLinearMethod:
-            pass
-
-        class LinearMethodBase:  # PrismaQuantCBLinearMethod's base
-            pass
-
-        lin.LinearBase = LinearBase
-        lin.UnquantizedLinearMethod = UnquantizedLinearMethod
-        lin.LinearMethodBase = LinearMethodBase
-        lin.register_weight_loader_v2_supported_method = lambda cls: cls
-        par = _mod("vllm.model_executor.parameter")
-
-        class _StubParam(torch.nn.Parameter):
-            def __new__(cls, data, **kw):
-                return super().__new__(cls, data, requires_grad=False)
-
-            def __init__(self, data, **kw):
-                pass
-
-        par.ModelWeightParameter = _StubParam
-        par.ChannelQuantScaleParameter = _StubParam
-        bc = _mod("vllm.model_executor.layers.quantization.base_config")
-
-        class QuantizationConfig:
-            def __init__(self):
-                pass
-
-        bc.QuantizationConfig = QuantizationConfig
-        bc.QuantizeMethodBase = object
-        ctu = _mod(
-            "vllm.model_executor.layers.quantization.compressed_tensors.utils")
-
-        def _stub_should_ignore(layer_name, ignore=(), fused_mapping=None):
-            try:
-                import regex as regex_engine
-            except ImportError:
-                # ``regex`` arrives with a real vLLM installation, but it is
-                # intentionally not a Gridbook dependency.  Keep the CPU-only
-                # test shim usable in the wheel's minimal dependency set.
-                import re as regex_engine
-
-            def _matches(name):
-                return any(
-                    regex_engine.match(entry[3:], name) is not None
-                    if entry.startswith("re:") else entry == name
-                    for entry in ignore)
-
-            fused_mapping = fused_mapping or {}
-            leaf = layer_name.rsplit(".", 1)[-1]
-            if leaf in fused_mapping and layer_name not in ignore:
-                stem = layer_name[:-len(leaf)]
-                verdicts = [_matches(stem + shard)
-                            for shard in fused_mapping[leaf]]
-                if len(set(verdicts)) != 1:
-                    raise ValueError("Found a different quantization schemes")
-                return verdicts[0]
-            return _matches(layer_name)
-
-        ctu.should_ignore_layer = _stub_should_ignore
-        vpe = _mod("vllm.model_executor.layers.vocab_parallel_embedding")
-        vpe.UnquantizedEmbeddingMethod = type("UEM", (), {})
-        vpe.VocabParallelEmbedding = type("VPE", (), {})
-        fm = _mod("vllm.model_executor.layers.fused_moe")
-        fm.RoutedExperts = type("RoutedExperts", (), {})
-
-from gridbook.config import (  # noqa: E402
-    PrismaQuantConfig,
-    _canonical_prefix,
-    _canonical_target,
-)
+    globals()["PrismaQuantConfig"] = config_class
+    globals()["_canonical_prefix"] = canonical_prefix
+    globals()["_canonical_target"] = canonical_target
 
 _SCHEME = {"grid": "fp8", "mode": "product", "k": 44, "n_sub": 4,
            "type_size": 176, "group_size": 0, "vec_dim": 8,

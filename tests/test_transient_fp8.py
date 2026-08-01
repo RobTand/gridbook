@@ -7,20 +7,21 @@ Two parts, split by the ``-k`` selector so each runs where it can:
     ``expand_cb_to_value`` decodes the codebook VALUE for every (n, j). It must
     equal ``nvfp4_cb_reconstruct / weight_scale`` (reconstruct = value * scale),
     and the tile must be exactly on the e4m3 grid (so the fp8 cast is lossless).
-      PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/gridbook \\
+      PYTHONPATH=/home/rob/prismaquant:/home/rob/gridbook \\
         /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python -m pytest \\
-        plugins/gridbook/tests/test_transient_fp8.py -q -k value_expand
+        /home/rob/gridbook/tests/test_transient_fp8.py -q -k value_expand
 
 * Part B -- ``-k gemm`` (serving container, needs vLLM):
     the full transient GEMM (``scaled_fp8_quant`` + ``cutlass_scaled_mm`` over the
     expanded e4m3 tile) matches a fp32 dequant reference; and the per-layer
     transient is bounded + steady across forwards (INV-1).
-      docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
+      docker run --rm --gpus all -v /home/rob/gridbook:/gridbook \\
+        -v /home/rob/prismaquant:/prismaquant \\
         -v /home/rob/dq-runs/nvfp4-cb-phase0/serve:/artifacts \\
         --entrypoint bash vllm-node:latest -c 'pip install -e \\
-        /repo/plugins/gridbook --no-deps -q; \\
-        PYTHONPATH=/repo:/repo/plugins/gridbook python3 -m pytest \\
-        /repo/plugins/gridbook/tests/test_transient_fp8.py -q -k gemm'
+        /gridbook --no-deps -q; \\
+        PYTHONPATH=/prismaquant python3 -m pytest \\
+        /gridbook/tests/test_transient_fp8.py -q -k gemm'
 """
 import json
 import os

@@ -25,10 +25,11 @@ for cudagraph_mode=FULL. These tests pin, in order:
      the replayed output matches the eager result on that new routing.
 
 Run (serving container: vLLM + triton + prismaquant + CUDA):
-    docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
+    docker run --rm --gpus all -v /home/rob/gridbook:/gridbook \\
+      -v /home/rob/prismaquant:/prismaquant \\
       --entrypoint bash vllm-node:latest -c 'pip install -q pytest; \\
-      PYTHONPATH=/repo:/repo/plugins/gridbook python3 -m pytest \\
-      /repo/plugins/gridbook/tests/test_moe_stock_prefill.py -v -s'
+      PYTHONPATH=/gridbook:/prismaquant python3 -m pytest \\
+      /gridbook/tests/test_moe_stock_prefill.py -v -s'
 """
 import types
 

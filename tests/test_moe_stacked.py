@@ -6,9 +6,9 @@ decode (which reuses the dense, separately bit-exact-tested, expand kernels) is
 correct. The vLLM-dependent MoE-method construction/forward test is skip-guarded
 and runs in the container in the post-27B GPU window (resource-discipline hold).
 
-  PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/gridbook \
+  PYTHONPATH=/home/rob/prismaquant:/home/rob/gridbook \
     CUDA_VISIBLE_DEVICES= /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python \
-    -m pytest plugins/gridbook/tests/test_moe_stacked.py -q
+    -m pytest /home/rob/gridbook/tests/test_moe_stacked.py -q
 """
 import os
 

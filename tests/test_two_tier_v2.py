@@ -4,9 +4,9 @@ from the packed 9 bytes (1 E8M0 super + 8 sub nibble bytes) and must match
 `nvfp4_cb_reconstruct` bit-exactly. Venv (triton + prismaquant, no vLLM); the
 dispatch test is vLLM-guarded.
 
-  PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/gridbook \
+  PYTHONPATH=/home/rob/prismaquant:/home/rob/gridbook \
     /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python -m pytest \
-    plugins/gridbook/tests/test_two_tier_v2.py -q
+    /home/rob/gridbook/tests/test_two_tier_v2.py -q
 """
 import pytest
 import torch

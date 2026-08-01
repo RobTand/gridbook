@@ -120,10 +120,10 @@ pushes, pull requests, and manual dispatch): open the PR, or use the
 
 ## Pull requests
 
-- Small and focused beats large and sweeping; this repo is mirrored from an
-  internal monorepo, so a PR is applied on the source side and synced back. Your
-  change may therefore land as a differently-shaped commit — authorship is
-  preserved in the commit message, and the issue/PR is linked.
+- Small and focused beats large and sweeping. This repository is the canonical
+  and only Gridbook runtime tree: changes are reviewed, tested, and released
+  directly from the PR that lands here. Producer repositories validate a
+  packaged compatibility contract; no source mirror or sync step exists.
 - Please describe how you tested it, on what hardware.
 - By contributing you agree your contribution is licensed under Apache-2.0, the
   same license as the project. There is no CLA.
