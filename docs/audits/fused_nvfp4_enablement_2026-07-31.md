@@ -119,7 +119,9 @@ The original installed-wheel fail-closed CUDA module run passed **68/68 tests
 with zero skips, failures, or errors in 127.64 seconds** on GB10, including its
 cold JIT build during collection. At current HEAD, the combined pinned-container
 gate passed **99/99 tests** in 125.12 seconds across fused prefill, static-LSQ,
-rowwise, and activation-reference suites. The installed wheel was
+rowwise, and activation-reference suites. A broader current-source run then
+passed **291 tests** with three capability-based skips and zero failures in
+100.85 seconds, including grouped-MoE and harness coverage. The installed wheel was
 force-installed outside either source checkout for the release gate; its tests
 and producer fixture were separately mounted read-only. Coverage includes:
 
@@ -295,6 +297,8 @@ Evidence SHA-256 values:
 929ba22455ca0d3d81617787437d24258d71785d399a88d7aa125893e947b247  qwen06-k24-static-lsq-v5-s512-chunk256-seed43-n8-screen.json (intermediate screen; preserved)
 114fac9e4a98ad13210b95c134824984c78d9f142aa579cc0415563edc36dd17  qwen06-k24-static-lsq-v5-s512-chunk256-seed43-n32-screen.json
 602411da3d1286187b1e38352ef3d36ba7b2062090380416166595d9c482ac77  lfm25-k16-lsq-moe128-s128-chunk64-n4.json (invalid fallback evidence; preserved)
+2b08c0a41329a169ac2957ca873d0941f447a0b3dc8d1caa1bdd1e362d0e25a0  lfm25-k16-lsq-moe128-s17-chunk33-eligibility.json (current-source fail-closed reason)
+c61c725eeae18fed83f2815bd9c790b48bde138b08a6091c97a45d43794869ff  cuda-fused-nvfp4-v0.4.2.xml (291 pass, 3 capability skips)
 d44cc164e2aa140372428d0fa5cd037d5cfbcd73ac06754d5bed9ec72d7ef3a7  cuda-operator-tests-installed-wheel-v0.4.1.xml (final 68-case release gate)
 c60f6fa59c56660686075f35ae3a66fb428376716af68dd3e91092711ac38bf7  cuda-operator-tests-stagewise-final.log (prior 33-case stagewise run)
 211d1cd7fb5705d172353d8efb6348c02be32142ed9555fdd4c77c343ddb5896  cuda-operator-tests-stagewise-final.xml (prior 33-case stagewise run)
