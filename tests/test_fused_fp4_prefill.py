@@ -104,7 +104,7 @@ def prep_weight(k, N, K, mode, coding, seed):
     w_deq = vals.reshape(N, K).float() * scales.repeat_interleave(16, dim=1)
     return dict(qwp=qwp, lut=lut, compose=compose, ts=ts, n_sub=n_sub,
                 is_v2=is_v2, b_packed=b_packed, sfb_sw=sfb_sw, w_deq=w_deq,
-                cb_flat=cb_flat, k=k, N=N, K=K)
+                cb_flat=cb_flat, scales=scales, k=k, N=N, K=K)
 
 
 def quant_act(x2, gs=None):
@@ -293,6 +293,46 @@ def test_padded_row_stride_view():
     assert torch.equal(y_a.view(torch.uint16), y_b.view(torch.uint16))
 
 
+def test_fused_multilut_distinct_merged_roles_bitexact_vs_stock():
+    """Each 128-row N tile must stage the LUT named by its merged role.
+
+    The second block flips every E2M1 value's sign while retaining the exact
+    packed index and scale planes.  A kernel that accidentally reuses LUT zero
+    for both tiles therefore cannot pass this bitwise stock-NVFP4 oracle.
+    """
+    k, role_n, K, M = 16, 128, 1024, 64
+    wctx = prep_weight(k, N=role_n, K=K, mode="product",
+                       coding=fmt.SCALE_CODING_TWO_TIER, seed=109)
+    packed = torch.cat((wctx["qwp"], wctx["qwp"]), dim=0).contiguous()
+    lut0 = wctx["lut"]
+    # Product LUT entries are u16 nibble quads. XORing bit 3 of every nibble
+    # produces the matching sign-flipped codebook without changing indices.
+    lut1 = torch.bitwise_xor(lut0, torch.tensor(0x88, device=DEV,
+                                                dtype=torch.uint8))
+    luts = torch.cat((lut0, lut1)).contiguous()
+    tile_ids = torch.tensor([0, 1], dtype=torch.int32, device=DEV)
+
+    b_packed = torch.cat((wctx["b_packed"], wctx["b_packed"] ^ 0x88),
+                         dim=0).contiguous()
+    scales = torch.cat((wctx["scales"], wctx["scales"]), dim=0)
+    sfb = codec.swizzle_sf_plane(
+        scales.to(torch.float8_e4m3fn).view(torch.uint8)).contiguous()
+    N = 2 * role_n
+
+    torch.manual_seed(110)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    aq, sfa, _, recip = quant_act(x)
+    a_scales = recip.reshape(1).expand(M).contiguous().float()
+    b_scales = torch.ones(N, dtype=torch.float32, device=DEV)
+    y_ref = ext.sm120_nvf4_mm_scaled(
+        aq, sfa, b_packed, sfb, a_scales, b_scales, N, K)
+    y_fused = ext.cb_fused_fp4_prefill_mm_scaled(
+        aq, sfa, packed, luts, wctx["compose"], a_scales, b_scales,
+        N, K, k, wctx["n_sub"], wctx["ts"], True, tile_ids)
+    assert torch.equal(y_fused.view(torch.uint16), y_ref.view(torch.uint16))
+    assert not torch.equal(y_fused[:, :role_n], y_fused[:, role_n:])
+
+
 def test_fused_vs_triton_bucket_delta_documented():
     """The fused path's native-NVFP4 activation bucket vs the Triton decode
     path's fp32-group-scale bucket: a real, bounded numerics difference (NOT
@@ -385,6 +425,18 @@ def test_bindings_reject_invalid_tensor_contracts():
     with pytest.raises(RuntimeError, match="compose must be contiguous CUDA"):
         ext.cb_fused_fp4_prefill_mm_scaled(
             *dense_args[:4], dense_args[4].cpu(), *dense_args[5:])
+    multi_lut = torch.cat((wctx["lut"], wctx["lut"])).contiguous()
+    with pytest.raises(RuntimeError, match="multiple value LUT blocks require"):
+        ext.cb_fused_fp4_prefill_mm_scaled(
+            *dense_args[:3], multi_lut, *dense_args[4:])
+    with pytest.raises(RuntimeError, match="lut_tile_ids must be contiguous"):
+        ext.cb_fused_fp4_prefill_mm_scaled(
+            *dense_args[:3], multi_lut, *dense_args[4:],
+            torch.zeros(1, dtype=torch.int32))
+    with pytest.raises(RuntimeError, match="lut_tile_ids must be contiguous"):
+        ext.cb_fused_fp4_prefill_mm_scaled(
+            *dense_args[:3], multi_lut, *dense_args[4:],
+            torch.zeros(2, dtype=torch.int32, device=DEV))
     short_visible_row = wctx["qwp"].narrow(1, 0, row_bytes - 1)
     with pytest.raises(RuntimeError, match="packed visible row width"):
         ext.cb_fused_fp4_prefill_mm_scaled(
@@ -404,11 +456,12 @@ def test_bindings_reject_invalid_tensor_contracts():
         ext.cb_fused_fp4_prefill_mm_scaled(
             *dense_args[:2], storage_short_view, *dense_args[3:])
     # The old optional debug pointer had no capacity/device check and allowed a
-    # short tensor to be overwritten by the fixed-size smem dump. It is not a
-    # production argument anymore.
+    # short tensor to be overwritten by the fixed-size smem dump. The new final
+    # argument is the checked LUT tile map; a further tensor is still refused.
     with pytest.raises(TypeError):
         ext.cb_fused_fp4_prefill_mm_scaled(
-            *dense_args, torch.zeros(1, dtype=torch.uint8, device=DEV))
+            *dense_args, torch.zeros(1, dtype=torch.int32, device=DEV),
+            torch.zeros(1, dtype=torch.uint8, device=DEV))
 
     E, tile_m = 2, 128
     stack = torch.empty(E, N, row_bytes, dtype=torch.uint8, device=DEV)

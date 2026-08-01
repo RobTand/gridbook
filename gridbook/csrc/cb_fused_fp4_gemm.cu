@@ -35,6 +35,10 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <climits>
+#include <optional>
+
+#include <pybind11/stl.h>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
@@ -277,7 +281,8 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
     torch::Tensor a, torch::Tensor sfa, torch::Tensor packed,
     torch::Tensor lut, torch::Tensor compose, torch::Tensor a_scales,
     torch::Tensor b_scales, int64_t N, int64_t K, int64_t k_bits,
-    int64_t n_sub, int64_t type_size, bool is_v2) {
+    int64_t n_sub, int64_t type_size, bool is_v2,
+    std::optional<torch::Tensor> lut_tile_ids) {
   using TileShape = TileShapeFp4;
   using Mainloop = typename SwapToFusedFp4<
       2, typename CfgFp4<TileShape>::BuilderMainloop>::type;
@@ -320,9 +325,32 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
       ? ((1LL << w0) + (1LL << (k_bits / 2))) * 2
       : (1LL << (k_bits - 8)) * 4;
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8 &&
-              lut.is_contiguous() && lut.numel() == lut_need,
-              "value LUT must be uint8[", lut_need, "] for this rung");
+              lut.is_contiguous() && lut.numel() >= lut_need &&
+              lut.numel() % lut_need == 0,
+              "value LUT must contain one or more contiguous uint8[", lut_need,
+              "] blocks for this rung");
   TORCH_CHECK(lut_need <= 16384, "value LUT exceeds the smem carve");
+  TORCH_CHECK(lut.numel() / lut_need <= INT32_MAX,
+              "too many concatenated value LUT blocks");
+  const int32_t num_lut_blocks = static_cast<int32_t>(lut.numel() / lut_need);
+  const int64_t num_lut_tiles_64 = (N + 127) / 128;
+  TORCH_CHECK(num_lut_tiles_64 <= INT32_MAX, "too many dense N tiles");
+  int32_t const* lut_tile_ids_ptr = nullptr;
+  int32_t num_lut_tiles = 0;
+  if (lut_tile_ids.has_value()) {
+    torch::Tensor const& ids = *lut_tile_ids;
+    TORCH_CHECK(ids.defined() && ids.is_cuda() &&
+                ids.scalar_type() == torch::kInt32 && ids.is_contiguous() &&
+                ids.numel() == num_lut_tiles_64,
+                "lut_tile_ids must be contiguous CUDA int32[ceil(N/128)] (",
+                num_lut_tiles_64, " entries)");
+    check_same_cuda_device(a, ids, "lut_tile_ids");
+    lut_tile_ids_ptr = ids.data_ptr<int32_t>();
+    num_lut_tiles = static_cast<int32_t>(num_lut_tiles_64);
+  } else {
+    TORCH_CHECK(num_lut_blocks == 1,
+                "multiple value LUT blocks require lut_tile_ids");
+  }
   TORCH_CHECK(compose.is_cuda() && compose.scalar_type() == torch::kUInt8 &&
               compose.is_contiguous(),
               "compose must be contiguous CUDA uint8 storage");
@@ -358,7 +386,8 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
       {reinterpret_cast<const cutlass::float_e2m1_t*>(a.data_ptr()), sa,
        reinterpret_cast<const ElementSF*>(sfa.data_ptr()), layout_sfa,
        packed.data_ptr<uint8_t>(), packed.stride(0),
-       lut.data_ptr<uint8_t>(), (int32_t)lut.numel(),
+       lut.data_ptr<uint8_t>(), (int32_t)lut_need,
+       lut_tile_ids_ptr, num_lut_blocks, num_lut_tiles,
        is_v2 ? compose.data_ptr<uint8_t>() : nullptr,
        (int32_t)k_bits, (int32_t)n_sub, (int32_t)type_size,
        (int32_t)(is_v2 ? 1 : 0), nullptr, 0, 0, nullptr},
@@ -431,6 +460,7 @@ torch::Tensor run_fp4_moe_grouped_m128(
        reinterpret_cast<const ElementSF*>(sfa.data_ptr()), layout_sfa,
        packed.data_ptr<uint8_t>(), row_bytes,
        lut.data_ptr<uint8_t>(), (int32_t)lut.numel(),
+       nullptr, 1, 0,
        is_v2 ? compose.data_ptr<uint8_t>() : nullptr,
        (int32_t)k_bits, (int32_t)n_sub, (int32_t)type_size,
        (int32_t)(is_v2 ? 1 : 0),
@@ -496,6 +526,7 @@ torch::Tensor run_fp4_moe_grouped_m256(
        reinterpret_cast<const ElementSF*>(sfa.data_ptr()), layout_sfa,
        packed.data_ptr<uint8_t>(), row_bytes,
        lut.data_ptr<uint8_t>(), (int32_t)lut.numel(),
+       nullptr, 1, 0,
        is_v2 ? compose.data_ptr<uint8_t>() : nullptr,
        (int32_t)k_bits, (int32_t)n_sub, (int32_t)type_size,
        (int32_t)(is_v2 ? 1 : 0),
@@ -631,6 +662,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("compose"), py::arg("a_scales"), py::arg("b_scales"),
         py::arg("N"), py::arg("K"), py::arg("k_bits"), py::arg("n_sub"),
         py::arg("type_size"), py::arg("is_v2"),
+        py::arg("lut_tile_ids") = py::none(),
         "NVFP4_CB decode-in-prologue fused BLOCK-SCALED GEMM: packed CB rows "
         "+ smem value/compose LUTs decoded straight into the e2m1/SFB smem "
         "operands of the NVF4 MMA; per-token activation scale x per-channel "

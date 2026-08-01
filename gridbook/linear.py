@@ -88,6 +88,13 @@ def _fp4_fused_mode() -> str:
 # amortizes x across the row tile.
 CUDA_GEMV_M_MAX = int(os.environ.get("PRISMAQUANT_CB_CUDA_M_MAX", "8"))
 
+# The dense native-NVFP4 collective owns one 128-row N tile per CTA.  A fused
+# projection may therefore use more than one interned codebook block as long as
+# every tile resolves to exactly one block.  Keep this in lockstep with
+# ``TileShapeFp4`` in csrc/cb_fused_fp4_gemm.cu; the extension independently
+# validates the resulting tile map at its public boundary.
+FP4_FUSED_TILE_N = 128
+
 # NOTE on a rejected variant (2026-07-18): N-chunking the transient expand +
 # GEMM with side-stream overlap measured 0.46x (small-N GEMMs lose more than
 # the overlap hides) AND is not bit-exact — cutlass_scaled_mm picks different
@@ -256,6 +263,9 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # tensor values) is deliberate: differently named codebooks remain
         # distinct even when their current contents happen to match.
         block_offsets: dict[tuple[str, ...], int] = {}
+        block_ids: dict[tuple[str, ...], int] = {}
+        block_ranges: list[tuple[int, int]] = []
+        role_block_ids: list[tuple[int, int]] = []
         cb_cumoffset = 0
         for i, sp in enumerate(shard_prefixes):
             ref = self.quant_config.target_scheme[sp]["codebook_ref"]
@@ -265,6 +275,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 flat = codec.build_flat_codebook(
                     subs, self.prefix, "fp4" if self.is_fp4 else "fp8")
                 block_offsets[names] = cb_cumoffset
+                block_ids[names] = len(blocks)
+                block_ranges.append((cb_cumoffset, flat.numel()))
                 blocks.append(flat)
                 cb_cumoffset += flat.numel()
             w = shard_widths[i]
@@ -273,6 +285,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # which remains correct when blocks differ in size.
             row_offsets.append(torch.full((w,), block_offsets[names],
                                           dtype=torch.int32, device=dev))
+            role_block_ids.append((w, block_ids[names]))
         cb_flat = torch.cat(blocks).contiguous()
         cb_row_offset = torch.cat(row_offsets).contiguous()
 
@@ -284,6 +297,31 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             "every output row (kernels index it by row).")
         layer._cb_flat = cb_flat
         layer._cb_row_offset = cb_row_offset
+        # The native-FP4 decode-in-prologue kernel stages one value LUT per
+        # 128-row N tile.  Preserve the interned block ranges so it can build
+        # one packed LUT per unique reference (rather than re-materializing the
+        # role copies), and derive a tiny tile->block identity tensor without a
+        # CUDA->host synchronization.  A role boundary is harmless when both
+        # sides share the same interned block; a boundary between DIFFERENT
+        # blocks must land on a tile edge.  Otherwise fail closed to the exact
+        # shipping path instead of decoding any row through the wrong LUT.
+        layer._cb_fp4_lut_ranges = tuple(block_ranges)
+        if self.is_fp4:
+            row_block_ids: list[int] = []
+            for width, block_id in role_block_ids:
+                row_block_ids.extend([block_id] * width)
+            tile_ids = []
+            tile_safe = len(row_block_ids) == rows
+            for start in range(0, rows, FP4_FUSED_TILE_N):
+                tile = row_block_ids[start:start + FP4_FUSED_TILE_N]
+                if not tile or any(block_id != tile[0] for block_id in tile):
+                    tile_safe = False
+                    break
+                tile_ids.append(tile[0])
+            layer._cb_fp4_fused_lut_ok = tile_safe
+            layer._cb_fp4_lut_tile_ids = (
+                torch.tensor(tile_ids, dtype=torch.int32, device=dev)
+                if tile_safe else None)
         # The fp8 mid-M fused kernel has no row-offset input: every row uses
         # LUT base zero.  Derive and cache its safety fact without a CUDA->host
         # sync.  One interned block means every role necessarily points at the
@@ -434,10 +472,32 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             ok = (codec.fp4_value_lut_nbytes(self.k, self.n_sub)
                   <= codec.FP4_FUSED_LUT_MAX_BYTES)
         if ok:
-            # Single uniform codebook block (the kernel has no per-row LUT
-            # offset — same constraint as the fp8 fused entries).
-            ro = layer._cb_row_offset
-            ok = bool((ro.max() == ro.min()).item()) and int(ro[0]) == 0
+            # Every 128-row N tile must resolve to one interned codebook block.
+            # Production layers cache this from shard metadata at load time.
+            # The tensor fallback keeps manually constructed test layers safe;
+            # it is evaluated once and cached, just like the old uniform-LUT
+            # check, and therefore cannot add a sync to steady-state serving.
+            ok = getattr(layer, "_cb_fp4_fused_lut_ok", None)
+            if ok is None:
+                ro = layer._cb_row_offset
+                ok = (ro.numel() == layer._cb_N and ro.numel() > 0)
+                tile_bases = []
+                if ok:
+                    for start in range(0, layer._cb_N, FP4_FUSED_TILE_N):
+                        tile = ro[start:start + FP4_FUSED_TILE_N]
+                        base = int(tile[0])
+                        if not bool((tile == base).all().item()):
+                            ok = False
+                            break
+                        tile_bases.append(base)
+                if ok:
+                    unique_bases = list(dict.fromkeys(tile_bases))
+                    base_to_id = {base: i for i, base in enumerate(unique_bases)}
+                    layer._cb_fp4_lut_tile_ids = torch.tensor(
+                        [base_to_id[base] for base in tile_bases],
+                        dtype=torch.int32, device=ro.device)
+                layer._cb_fp4_fused_lut_ok = bool(ok)
+            ok = bool(ok)
         if ok:
             try:
                 import vllm._custom_ops as vops
@@ -461,10 +521,25 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         from .cuda_ext import get_fused_fp4_ext
         fext = get_fused_fp4_ext()
         lut = getattr(layer, "_cb_fp4_lut", None)
+        ranges = getattr(layer, "_cb_fp4_lut_ranges", None)
+        if not ranges:
+            # Defensive compatibility for manually constructed single-LUT
+            # layers. Production loaders always provide exact ranges.
+            ranges = ((0, layer._cb_flat.numel()),)
         if lut is None:
             dev = layer._cb_flat.device
-            lut = codec.build_fp4_value_lut(
-                layer._cb_flat, self.k, self.n_sub).to(dev)
+            lut_bytes = codec.fp4_value_lut_nbytes(self.k, self.n_sub)
+            lut_blocks = []
+            for offset, length in ranges:
+                block = layer._cb_flat.narrow(0, offset, length)
+                block_lut = codec.build_fp4_value_lut(
+                    block, self.k, self.n_sub).to(dev)
+                if block_lut.numel() != lut_bytes:
+                    raise RuntimeError(
+                        f"{self.prefix}: FP4 fused LUT block has "
+                        f"{block_lut.numel()} bytes, expected {lut_bytes}")
+                lut_blocks.append(block_lut)
+            lut = torch.cat(lut_blocks).contiguous()
             layer._cb_fp4_lut = lut
             layer._cb_fp4_compose_u8 = (
                 codec.build_compose_u8(self._sub_table).to(dev) if self.is_v2
@@ -475,11 +550,16 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         gs = ((448.0 * 6.0) / amax.clamp_min(1e-12)).to(torch.float32)
         aq, sfa = vops.scaled_fp4_quant(x2, gs)
         a_scales = (1.0 / gs).reshape(1).expand(M).contiguous()
+        # Preserve the original single-LUT launch contract (and its overlap of
+        # LUT staging with the first A/SFA TMA). Only a genuinely multi-block
+        # projection needs the per-N-tile indirection.
+        lut_tile_ids = (layer._cb_fp4_lut_tile_ids
+                        if len(ranges) > 1 else None)
         y = fext.cb_fused_fp4_prefill_mm_scaled(
             aq, sfa.view(torch.uint8).reshape(-1), layer._cb_qw_padded,
             layer._cb_fp4_lut, layer._cb_fp4_compose_u8, a_scales,
             layer._cb_fp4_ones, N, K, self.k, self.n_sub, self.type_size,
-            self.is_v2)
+            self.is_v2, lut_tile_ids)
         return y.reshape(*x.shape[:-1], N)
 
     def apply(self, layer, x, bias=None):

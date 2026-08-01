@@ -199,6 +199,10 @@ struct CollectiveMma<
   // bytes STRAIGHT FROM GMEM during decode (L1/L2-hot; the decode-GEMV
   // pattern). All gmem windows stay inside the row's own superblock (u8
   // loads for the scale plane), so NO tail slack is required of the buffer.
+  // The final u32 carries the dense projection's N-tile -> interned LUT-block
+  // identity.  It is published under the same mbarrier as the packed pointer
+  // and row base, so consumers cannot stage a LUT for the wrong projection
+  // role. MoE/single-LUT calls publish identity zero.
   static constexpr int CbStageDescBytes = 16;
 
   // Fixed smem LUT carve (R6): value LUT sized for the LARGEST fp4 rung
@@ -280,6 +284,9 @@ struct CollectiveMma<
                                           // quads (tbl0 then tbl1); signed ->
                                           // u32 nibble octets (magnitudes)
     int32_t lut_bytes{0};                 // <= CbLutMaxBytes
+    int32_t const* ptr_lut_tile_ids{nullptr}; // dense: [ceil(N/TileN)]
+    int32_t num_lut_blocks{1};            // concatenated fixed-size LUT blocks
+    int32_t num_lut_tiles{0};             // bounds ptr_lut_tile_ids before read
     uint8_t const* ptr_compose{nullptr};  // v2: (256*16) e4m3 bytes; else null
     int32_t k_bits{0};
     int32_t n_sub{2};                     // 2 = product, 1 = signed
@@ -321,6 +328,9 @@ struct CollectiveMma<
     uint8_t const* ptr_lut;
     uint8_t const* ptr_compose;
     int32_t lut_bytes;
+    int32_t const* ptr_lut_tile_ids;
+    int32_t num_lut_blocks;
+    int32_t num_lut_tiles;
     int32_t k_bits;
     int32_t n_sub;
     int32_t type_size;
@@ -357,6 +367,7 @@ struct CollectiveMma<
       tma_load_a, tma_load_sfa, args.layout_SFA,
       args.ptr_packed, args.packed_row_bytes,
       args.ptr_lut, args.ptr_compose, args.lut_bytes,
+      args.ptr_lut_tile_ids, args.num_lut_blocks, args.num_lut_tiles,
       args.k_bits, args.n_sub, args.type_size, args.is_v2,
       static_cast<int32_t>(N), args.ptr_expert_ids,
       args.packed_expert_stride, args.num_experts, args.ptr_debug,
@@ -378,6 +389,9 @@ struct CollectiveMma<
     implementable = implementable && (args.type_size == 4 * args.k_bits + (args.is_v2 ? 9 : 16));
     implementable = implementable && (args.packed_row_bytes >= (K / 256) * args.type_size);
     implementable = implementable && (args.lut_bytes > 0) && (args.lut_bytes <= CbLutMaxBytes);
+    implementable = implementable && (args.num_lut_blocks > 0);
+    implementable = implementable &&
+        (args.ptr_lut_tile_ids == nullptr || args.num_lut_tiles == ceil_div(N, TileN));
     implementable = implementable && (!args.is_v2 || args.ptr_compose != nullptr);
     return implementable;
   }
@@ -541,6 +555,21 @@ struct CollectiveMma<
     // to 0; their outputs are discarded by the caller) + the CTA's first
     // output row. The consumers gather packed bytes from gmem directly.
     const int n_base = int(n_coord) * TileN;
+    int lut_block_id = 0;
+    if (params.ptr_lut_tile_ids != nullptr) {
+      const int tile = int(n_coord);
+      // Keep this fail-closed on device: copying min/max to the host would add
+      // a synchronization to every dense launch and break graph capture.  A
+      // corrupt/mutated map must trap before it can become an out-of-bounds
+      // model-codebook read.
+      if (tile < 0 || tile >= params.num_lut_tiles) {
+        asm volatile("trap;");
+      }
+      lut_block_id = __ldg(params.ptr_lut_tile_ids + tile);
+      if (lut_block_id < 0 || lut_block_id >= params.num_lut_blocks) {
+        asm volatile("trap;");
+      }
+    }
     const uint8_t* __restrict__ gp = params.ptr_packed;
     if (params.ptr_expert_ids != nullptr) {
       int eid = __ldg(params.ptr_expert_ids + int(m_coord));
@@ -571,6 +600,7 @@ struct CollectiveMma<
         *reinterpret_cast<uint64_t*>(slot) =
             reinterpret_cast<uint64_t>(gp);
         *reinterpret_cast<int32_t*>(slot + 8) = n_base;
+        *reinterpret_cast<int32_t*>(slot + 12) = lut_block_id;
       }
       __syncwarp();
 
@@ -599,10 +629,13 @@ struct CollectiveMma<
 
   // --- once-per-CTA LUT staging (R6) --------------------------------------
   CUTLASS_DEVICE void
-  load_lut(TensorStorage& shared_tensors, Params const& params, int thread_idx) const {
+  load_lut(TensorStorage& shared_tensors, Params const& params, int thread_idx,
+           int lut_block_id) const {
     {
       uint32_t* dst = reinterpret_cast<uint32_t*>(shared_tensors.smem_lut.data());
-      const uint32_t* src = reinterpret_cast<const uint32_t*>(params.ptr_lut);
+      const uint8_t* selected = params.ptr_lut +
+          int64_t(lut_block_id) * params.lut_bytes;
+      const uint32_t* src = reinterpret_cast<const uint32_t*>(selected);
       const int nwords = (params.lut_bytes + 3) >> 2;
       for (int w = thread_idx; w < nwords; w += ThreadCount) {
         dst[w] = __ldg(src + w);
@@ -838,11 +871,13 @@ struct CollectiveMma<
                  accum);
     };
 
-    // Once-per-CTA codebook staging (same race-freedom argument as the fp8
-    // fork: only the MMA warpgroups touch these regions, they enter mma() in
-    // lockstep, and the NamedBarrier below orders staging before every read).
-    if (!lut_resident_) {
-      load_lut(shared_tensors, params, thread_idx);
+    // Preserve the original overlap for single-LUT and grouped-MoE calls: their
+    // identity is statically zero, so LUT staging can run while the first A/SFA
+    // TMA transaction is in flight. A multi-LUT dense CTA waits for its first
+    // stage descriptor, which publishes the checked N-tile identity under that
+    // same pipeline barrier.
+    if (!lut_resident_ && params.ptr_lut_tile_ids == nullptr) {
+      load_lut(shared_tensors, params, thread_idx, 0);
       cutlass::arch::NamedBarrier::sync(
           thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
       lut_resident_ = true;
@@ -850,6 +885,15 @@ struct CollectiveMma<
 
     int t_abs = 0;
     pipeline.consumer_wait(smem_pipe_read);
+    if (!lut_resident_) {
+      const uint8_t* slot = shared_tensors.smem_BP.data()
+          + read_stage * CbStageDescBytes;
+      const int lut_block_id = *reinterpret_cast<const int32_t*>(slot + 12);
+      load_lut(shared_tensors, params, thread_idx, lut_block_id);
+      cutlass::arch::NamedBarrier::sync(
+          thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+      lut_resident_ = true;
+    }
     decode_stage(shared_tensors, sB_base, sB_nosw, sB_sw, sfb_layout, params,
                  read_stage, t_abs >> 1, t_abs & 1, thread_idx);
     cutlass::arch::NamedBarrier::sync(

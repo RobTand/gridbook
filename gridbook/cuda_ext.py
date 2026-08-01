@@ -509,7 +509,7 @@ _FUSED_FP4_BUILD_INPUTS = (
     "cb_fused_fp4_gemm.cu",
     "cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
 )
-_FUSED_FP4_ABI_SCHEMA = 1
+_FUSED_FP4_ABI_SCHEMA = 2
 
 
 # Both families are guarded independently at their call sites

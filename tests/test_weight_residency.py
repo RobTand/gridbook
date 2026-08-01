@@ -615,3 +615,170 @@ def test_fused_lut_guard_rejects_incompatible_fp8_layout(attr, value):
     method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
     setattr(method, attr, value)
     assert method._fused_fp8_lut_ok(layer) is False
+
+
+# ---------------------------------------------------------------------------
+# 4. native-FP4 fused roles: one unambiguous LUT identity per 128-row N tile
+# ---------------------------------------------------------------------------
+
+_FP4_K = 16
+_FP4_TYPE_SIZE = 4 * _FP4_K + 9
+_FP4_SCHEME = {
+    "grid": "fp4", "mode": "product", "k": _FP4_K, "n_sub": 2,
+    "type_size": _FP4_TYPE_SIZE, "group_size": 16, "vec_dim": 8,
+    "codebook_group": "attn", "codebook_source": "learned",
+    "scale_coding": {"kind": "two_tier"},
+}
+_FP4_REF_A = ("cb.fp4.a0", "cb.fp4.a1")
+_FP4_REF_B = ("cb.fp4.b0", "cb.fp4.b1")
+_FP4_BLOCK_VALUES = 2 * (2 ** (_FP4_K // 2)) * 4
+
+
+def _fp4_fused_loaded_layer(role_refs, widths):
+    target_scheme = {
+        role: {**_FP4_SCHEME, "codebook_ref": list(ref)}
+        for role, ref in zip(_FUSED_ROLES, role_refs)
+    }
+    codebooks = {}
+    for ref in role_refs:
+        # Differently named blocks deliberately decode to different E2M1 values
+        # so the dispatch test below can prove both physical LUTs were built.
+        value = 0.0 if ref == _FP4_REF_A else 1.0
+        for name in ref:
+            codebooks[name] = torch.full(
+                (2 ** (_FP4_K // 2), 4), value, dtype=torch.bfloat16)
+
+    class _FusedFp4Config:
+        def __init__(self):
+            self.target_scheme = target_scheme
+
+        @staticmethod
+        def shard_target_keys(prefix, *, unfused_fallback=False):
+            assert prefix == _FUSED_PREFIX and unfused_fallback
+            return list(_FUSED_ROLES)
+
+        @staticmethod
+        def get_codebooks():
+            return codebooks
+
+    method = PrismaQuantCBLinearMethod(
+        _FusedFp4Config(),
+        {**_FP4_SCHEME, "codebook_ref": list(role_refs[0])},
+        _FUSED_PREFIX,
+    )
+    layer = _Layer()
+    rows = sum(widths)
+    row_bytes = (_K // codec.SUPERBLOCK) * _FP4_TYPE_SIZE
+    layer.cb_qweight = torch.nn.Parameter(
+        torch.randint(0, 256, (rows, row_bytes), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    layer.logical_widths = list(widths)
+    layer._cb_input_size = _K
+    method.process_weights_after_loading(layer)
+    return method, layer
+
+
+def test_distinct_fp4_refs_emit_tile_identity_map_without_role_lut_copies():
+    method, layer = _fp4_fused_loaded_layer(
+        (_FP4_REF_A, _FP4_REF_B, _FP4_REF_A), (128, 256, 128))
+    assert method.is_fp4
+    assert layer._cb_fp4_fused_lut_ok is True
+    assert layer._cb_fp4_lut_ranges == (
+        (0, _FP4_BLOCK_VALUES),
+        (_FP4_BLOCK_VALUES, _FP4_BLOCK_VALUES),
+    )
+    assert torch.equal(
+        layer._cb_fp4_lut_tile_ids,
+        torch.tensor([0, 1, 1, 0], dtype=torch.int32),
+    )
+    assert layer._cb_flat.numel() == 2 * _FP4_BLOCK_VALUES
+
+
+def test_fp4_tile_map_fails_closed_when_distinct_role_boundary_is_unaligned(
+        monkeypatch):
+    method, layer = _fp4_fused_loaded_layer(
+        (_FP4_REF_A, _FP4_REF_B, _FP4_REF_A), (64, 128, 64))
+    assert layer._cb_fp4_fused_lut_ok is False
+    assert layer._cb_fp4_lut_tile_ids is None
+
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = object()
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    from gridbook import cuda_ext
+    monkeypatch.setattr(
+        cuda_ext, "get_fused_fp4_ext",
+        lambda: pytest.fail("ambiguous tile map queried fused extension"))
+    assert method._fused_fp4_ok(layer, _K) is False
+
+
+def test_fp4_multilut_dispatch_builds_unique_blocks_and_passes_tile_ids(
+        monkeypatch):
+    method, layer = _fp4_fused_loaded_layer(
+        (_FP4_REF_A, _FP4_REF_B, _FP4_REF_A), (128, 256, 128))
+    M, N, K = 32, layer._cb_N, layer._cb_K
+    vops = types.ModuleType("vllm._custom_ops")
+
+    def _quant(x, _global_scale):
+        return (torch.zeros(x.shape[0], x.shape[1] // 2, dtype=torch.uint8),
+                torch.zeros(1, dtype=torch.uint8))
+
+    vops.scaled_fp4_quant = _quant
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    calls = []
+
+    class _FusedExt:
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(
+                aq, sfa, packed, lut, compose, a_scales, b_scales,
+                n, k, k_bits, n_sub, type_size, is_v2, lut_tile_ids):
+            calls.append((lut.clone(), lut_tile_ids.clone(), n, k, k_bits,
+                          n_sub, type_size, is_v2))
+            return torch.full((aq.shape[0], n), 13.0, dtype=torch.bfloat16)
+
+    from gridbook import cuda_ext
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: _FusedExt())
+    out = method._try_fused_fp4(
+        layer, torch.ones(M, K, dtype=torch.bfloat16), N, K, M)
+    assert torch.equal(out, torch.full_like(out, 13.0))
+    assert len(calls) == 1
+    lut, tile_ids, *_ = calls[0]
+    block_bytes = codec.fp4_value_lut_nbytes(_FP4_K, 2)
+    assert lut.numel() == 2 * block_bytes
+    assert not torch.equal(lut[:block_bytes], lut[block_bytes:])
+    assert torch.equal(tile_ids, torch.tensor([0, 1, 1, 0], dtype=torch.int32))
+
+
+def test_fp4_single_lut_dispatch_keeps_offset_free_binding(monkeypatch):
+    method, layer = _fp4_fused_loaded_layer(
+        (_FP4_REF_A, _FP4_REF_A, _FP4_REF_A), (128, 128, 128))
+    M, N, K = 32, layer._cb_N, layer._cb_K
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = lambda x, _scale: (
+        torch.zeros(x.shape[0], x.shape[1] // 2, dtype=torch.uint8),
+        torch.zeros(1, dtype=torch.uint8),
+    )
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    tile_maps = []
+
+    class _FusedExt:
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(*args):
+            tile_maps.append(args[-1])
+            return torch.zeros(M, N, dtype=torch.bfloat16)
+
+    from gridbook import cuda_ext
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: _FusedExt())
+    x = torch.ones(M, K, dtype=torch.bfloat16)
+    assert method._try_fused_fp4(layer, x, N, K, M) is not None
+    # Exercise the cached-LUT call as well: ``ranges`` must remain available and
+    # the optional map must stay absent so the kernel preserves TMA/LUT overlap.
+    assert method._try_fused_fp4(layer, x, N, K, M) is not None
+    assert tile_maps == [None, None]
+    assert layer._cb_fp4_lut.numel() == codec.fp4_value_lut_nbytes(_FP4_K, 2)
