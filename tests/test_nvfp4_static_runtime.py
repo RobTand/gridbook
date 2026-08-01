@@ -1,13 +1,15 @@
 """CPU integration gates for config, dense load, and fused eligibility."""
 from __future__ import annotations
 
+import json
+import struct
 import sys
 import types
 
 import pytest
 
 torch = pytest.importorskip("torch")
-safetensors_torch = pytest.importorskip("safetensors.torch")
+pytest.importorskip("safetensors")
 
 from gridbook.nvfp4_activation_contract import (
     CONTRACT_KEY,
@@ -135,15 +137,34 @@ def _config(scales, *, scheme=None, targets=None, contract=True):
 
 
 def _resolved(tmp_path, scales, *, cfg=None):
-    tensors = {
-        f"{name}.{TENSOR_SUFFIX}": torch.tensor([value], dtype=torch.float32)
-        for name, value in scales.items()
-    }
-    safetensors_torch.save_file(tensors, tmp_path / "model.safetensors")
+    _write_f32_scalars(
+        tmp_path / "model.safetensors",
+        {f"{name}.{TENSOR_SUFFIX}": value for name, value in scales.items()},
+    )
     config = PrismaQuantConfig.from_config(cfg or _config(scales))
     config._sidecar_source = (str(tmp_path), None)
     config._ensure_resolved()
     return config
+
+
+def _write_f32_scalars(path, values):
+    """Write a minimal safetensors fixture without NumPy or writer APIs."""
+    header = {}
+    payload = []
+    offset = 0
+    for name, value in sorted(values.items()):
+        data = struct.pack("<f", float(value))
+        header[name] = {
+            "dtype": "F32",
+            "shape": [1],
+            "data_offsets": [offset, offset + len(data)],
+        }
+        payload.append(data)
+        offset += len(data)
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    padding = (-len(encoded)) % 8
+    encoded += b" " * padding
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(payload))
 
 
 def test_config_attests_complete_physical_payload(tmp_path):
@@ -188,9 +209,7 @@ def test_config_rejects_digest_mismatch_and_missing_scalar(tmp_path):
 
     missing_dir = tmp_path / "missing"
     missing_dir.mkdir()
-    safetensors_torch.save_file(
-        {"unrelated": torch.ones(1)}, missing_dir / "model.safetensors"
-    )
+    _write_f32_scalars(missing_dir / "model.safetensors", {"unrelated": 1.0})
     config = PrismaQuantConfig.from_config(cfg)
     config._sidecar_source = (str(missing_dir), None)
     with pytest.raises(ValueError, match="target_count"):
