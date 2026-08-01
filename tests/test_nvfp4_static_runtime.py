@@ -285,7 +285,7 @@ def test_static_scale_makes_native_quantization_chunk_invariant(monkeypatch):
     method.type_size = 73
     method.is_v2 = True
     method._sub_table = [1.0] * 16
-    method._fused_fp4_ok = lambda layer, K: True
+    method._fused_fp4_ok = lambda layer, K, *, rowwise=False: not rowwise
     layer = types.SimpleNamespace(
         _cb_fp4_input_global_scale=torch.tensor([3.0]),
         _cb_fp4_lut=torch.ones(1),
@@ -321,3 +321,77 @@ def test_static_scale_makes_native_quantization_chunk_invariant(monkeypatch):
     assert torch.equal(calls[0][0][0] * calls[0][1],
                        calls[1][0][0] * calls[1][1])
     assert calls[0][1].item() == calls[1][1].item() == 3.0
+
+
+def test_dense_rowwise_quantizer_outputs_feed_the_existing_fused_gemm(
+    monkeypatch,
+):
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    method.is_v2 = True
+    method._sub_table = [1.0] * 16
+    method._fused_fp4_ok = (
+        lambda layer, K, *, rowwise=False: rowwise
+    )
+    layer = types.SimpleNamespace(
+        _cb_fp4_lut=torch.ones(1),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(8),
+        _cb_qw_padded=torch.ones(8, 73, dtype=torch.uint8),
+    )
+    quant_calls = []
+    gemm_calls = []
+
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = lambda *_args: pytest.fail(
+        "rowwise mode must not enter the static vLLM quantizer"
+    )
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    from gridbook import cuda_ext
+
+    class Ext:
+        @staticmethod
+        def cb_nvfp4_quantize_rows(x, multiplier):
+            # A deterministic row-local stand-in lets this CPU test prove that
+            # no batch reduction is added around the extension call.
+            packed = x[:, :128].to(torch.float32).round().to(torch.uint8)
+            sfa = x[:, :16].to(torch.float32).round().to(torch.uint8)
+            scales = x.float().abs().amax(dim=1) / (multiplier * 6.0)
+            quant_calls.append((packed.clone(), sfa.clone(), scales.clone(),
+                                multiplier))
+            return packed, sfa, scales
+
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(
+            aq, sfa, packed_weight, lut, compose, a_scales, b_scales,
+            n, k, k_bits, n_sub, type_size, is_v2, lut_tile_ids,
+        ):
+            gemm_calls.append((aq.clone(), sfa.clone(), a_scales.clone(),
+                               packed_weight, lut_tile_ids))
+            return torch.zeros(aq.shape[0], n, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: Ext())
+    target = torch.arange(256, dtype=torch.bfloat16).reshape(1, 256)
+    peers = torch.full((2, 256), 1.0e4, dtype=torch.bfloat16)
+    one = method._try_fused_fp4(
+        layer, target, 8, 256, 1, rowwise=True
+    )
+    batch = method._try_fused_fp4(
+        layer, torch.cat((target, peers)), 8, 256, 3, rowwise=True
+    )
+
+    assert one.shape == (1, 8)
+    assert batch.shape == (3, 8)
+    assert [call[3] for call in quant_calls] == [448.0, 448.0]
+    assert torch.equal(quant_calls[0][0][0], quant_calls[1][0][0])
+    assert torch.equal(quant_calls[0][1][0], quant_calls[1][1][0])
+    assert torch.equal(quant_calls[0][2][0], quant_calls[1][2][0])
+    # Packed data, flattened SFA, and the returned residual scales flow
+    # directly into the sole existing GEMM implementation.
+    assert torch.equal(gemm_calls[0][0], quant_calls[0][0])
+    assert torch.equal(gemm_calls[0][1], quant_calls[0][1].reshape(-1))
+    assert torch.equal(gemm_calls[0][2], quant_calls[0][2])

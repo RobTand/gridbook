@@ -11,7 +11,10 @@ identical in both arms.
 The two arms intentionally do not have the same activation contract:
 
 * baseline: Gridbook's fp32-emulated group-scale activation QDQ;
-* fused: native NVFP4 per-tensor global scale + UE4M3 group factors.
+* fused static modes: native NVFP4 attested per-tensor global scale + UE4M3
+  group factors;
+* fused rowwise modes: native NVFP4 independent runtime scale per row + UE4M3
+  group factors.
 
 Consequently the useful quality outputs are target-token NLL/PPL and paired
 top-K coarse KL, not tensor equality.  Optional one-token request wall timing
@@ -82,6 +85,7 @@ FUSED_ENV = "PRISMAQUANT_CB_FUSED_FP4"
 FUSED_MOE_ENV = "PRISMAQUANT_CB_FUSED_FP4_MOE"
 PREFILL_ENV = "PRISMAQUANT_CB_PREFILL"
 VLLM_MP_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
+DENSE_FUSED_MODES = ("1", "midm", "rowwise", "rowwise_midm")
 _TEACHER_QUALITY_PROMOTION_GATES = (
     "max_teacher_fused_mean_kl",
     "max_teacher_fused_kl_regression",
@@ -167,8 +171,10 @@ def activate_arm(
 
     if arm not in ARMS:
         raise ValueError(f"unknown arm {arm!r}; expected one of {ARMS}")
-    if fused_mode not in ("1", "midm"):
-        raise ValueError("fused_mode must be '1' or 'midm'")
+    if fused_mode not in DENSE_FUSED_MODES:
+        raise ValueError(
+            "fused_mode must be one of: " + ", ".join(DENSE_FUSED_MODES)
+        )
     selected = fused_mode if arm == "fused" else ""
     environ[FUSED_ENV] = selected
     mode_cache.clear()
@@ -716,8 +722,8 @@ class DenseDispatchProbe:
             record["apply_shapes"][shape] += 1
             if m > self.prefill_threshold:
                 record["fp4_prefill_calls"] += 1
-                mode_allows = self.fused_mode == "1" or (
-                    self.fused_mode == "midm" and m <= 128
+                mode_allows = self.fused_mode in ("1", "rowwise") or (
+                    self.fused_mode in ("midm", "rowwise_midm") and m <= 128
                 )
                 if record["arm"] == "fused" and bias is None and mode_allows:
                     record["candidate_gate_opportunities"] += 1
@@ -760,10 +766,15 @@ class DenseDispatchProbe:
             probe._on_apply(method, layer, x, bias)
             return original_apply(method, layer, x, bias)
 
-        def wrapped_try(method, layer, x, n, k, m):
+        def wrapped_try(method, layer, x, n, k, m, *, rowwise=False):
             shape = probe._on_try_start(method, layer, n, k, m)
             try:
-                output = original_try(method, layer, x, n, k, m)
+                if rowwise:
+                    output = original_try(
+                        method, layer, x, n, k, m, rowwise=True
+                    )
+                else:
+                    output = original_try(method, layer, x, n, k, m)
             except Exception:
                 probe._on_try_finish(method, shape, None, error=True)
                 raise
@@ -829,7 +840,8 @@ class MoEDispatchProbe:
         original_loop = self._original_loop
 
         def wrapped_fused(
-            method, layer, x, topk_weights, topk_ids, act, *, tile_m=128
+            method, layer, x, topk_weights, topk_ids, act, *, tile_m=128,
+            rowwise=False,
         ):
             record = probe._record()
             record["pids"].add(os.getpid())
@@ -841,14 +853,11 @@ class MoEDispatchProbe:
                 record["probe_errors"] += 1
             prefix = str(getattr(method, "prefix", "<unknown>"))
             try:
+                kwargs = {"tile_m": tile_m}
+                if rowwise:
+                    kwargs["rowwise"] = True
                 output = original_fused(
-                    method,
-                    layer,
-                    x,
-                    topk_weights,
-                    topk_ids,
-                    act,
-                    tile_m=tile_m,
+                    method, layer, x, topk_weights, topk_ids, act, **kwargs
                 )
             except Exception:
                 record["fused_errors"] += 1
@@ -2628,8 +2637,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--mode", choices=("dense", "moe128", "moe256"), default="dense"
     )
     parser.add_argument(
-        "--fused-mode", choices=("1", "midm"), default="1",
-        help="dense-only dispatch range; MoE modes select their TileM by --mode",
+        "--fused-mode", choices=DENSE_FUSED_MODES, default="1",
+        help=(
+            "dense activation family/range; MoE modes select their TileM "
+            "by --mode"
+        ),
     )
     parser.add_argument("--warmup-pairs", type=_positive_int, default=1)
     parser.add_argument("--timing-repeats", type=_nonnegative_int, default=0)

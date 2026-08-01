@@ -128,6 +128,14 @@ _PREFILL_MODES = frozenset({
 })
 _PREFILL_MODE_STATE: list[str | None] = []
 _FUSED_FP4_MOE_STATE: list[str] = []
+_FUSED_FP4_MOE_STATIC_MODES = frozenset(("1", "128", "256"))
+_FUSED_FP4_MOE_ROWWISE_MODES = frozenset(
+    ("rowwise", "rowwise128", "rowwise256")
+)
+_FUSED_FP4_MOE_MODES = (
+    _FUSED_FP4_MOE_STATIC_MODES | _FUSED_FP4_MOE_ROWWISE_MODES
+)
+_FUSED_FP4_MOE_ALLOWED_MODES = frozenset(("",)) | _FUSED_FP4_MOE_MODES
 
 
 def _requested_prefill_mode() -> str | None:
@@ -157,10 +165,11 @@ def _requested_fused_fp4_moe_mode() -> str:
     supported way to compare the paths.
     """
     current = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "").strip()
-    if current not in ("", "1", "128", "256"):
+    if current not in _FUSED_FP4_MOE_ALLOWED_MODES:
         raise ValueError(
             "invalid PRISMAQUANT_CB_FUSED_FP4_MOE="
-            f"{current!r}; expected '', '1', '128', or '256'"
+            f"{current!r}; expected '', '1', '128', '256', 'rowwise', "
+            "'rowwise128', or 'rowwise256'"
         )
     if not _FUSED_FP4_MOE_STATE:
         _FUSED_FP4_MOE_STATE.append(current)
@@ -602,11 +611,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # fp4-MMA fused MoE prefill. One tile-indexed grouped
         # block-scaled launch per projection stage (OMMA.SF.16864, k=64),
         # the fp8 grouped_fused_v2 mechanism with the packed-CB decode in the
-        # producer/prologue. Values: "1"/"128" tile_m=128, "256" tile_m=256.
-        # NOTE the activation bucket changes on this path (native NVFP4 quant,
-        # not codec.fp4_group16_act_qdq). An explicit PRISMAQUANT_CB_PREFILL
-        # is authoritative and bypasses this opt-in attempt, so stock/loop
-        # remain real bisection controls rather than being silently preempted.
+        # producer/prologue. Static values: "1"/"128" tile_m=128 and "256"
+        # tile_m=256. Runtime per-row values: "rowwise"/"rowwise128" and
+        # "rowwise256". Static modes require the artifact's fully attested,
+        # stage-specific activation scalars; only explicit rowwise modes may
+        # fuse a legacy artifact. An explicit PRISMAQUANT_CB_PREFILL remains
+        # authoritative and bypasses this opt-in attempt, so stock/loop remain
+        # real bisection controls rather than being silently preempted.
         # Explicit opt-in until a served quality gate and routing-shape ladder
         # pass. Tile 128 is 5.2-5.6x faster than the per-expert loop on the
         # measured shapes, but its padding cost has a sharp token-count cliff.
@@ -615,10 +626,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         requested_mode = _requested_prefill_mode()
         if requested_mode is None and self.is_fp4 and num_tokens > 16:
             gf4 = _requested_fused_fp4_moe_mode()
-            if gf4 in ("1", "128", "256"):
+            if gf4 in _FUSED_FP4_MOE_MODES:
                 out = self._apply_prefill_grouped_fused_fp4(
                     layer, x, topk_weights, topk_ids, act,
-                    tile_m=256 if gf4 == "256" else 128)
+                    tile_m=256 if gf4 in ("256", "rowwise256") else 128,
+                    rowwise=gf4 in _FUSED_FP4_MOE_ROWWISE_MODES)
                 if out is not None:
                     return out
 
@@ -661,19 +673,23 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         raise AssertionError(f"unhandled validated CB prefill mode: {mode}")
 
     # -- prefill: fp4 grouped FUSED (block-scaled decode-in-prologue) --------
-    def _gf4_ok(self, layer) -> bool:
+    def _gf4_ok(self, layer, *, rowwise: bool = False) -> bool:
         """Eligibility for the fp4 grouped fused prefill (cached per layer).
         Mirrors cb_fused_fp4_moe_grouped's TORCH_CHECKs so a miss is a silent
-        fall-through to the shipping fp4 modes, never a crash."""
-        ok = getattr(layer, "_cb_gf4_ok", None)
+        fall-through to the shipping fp4 modes, never a crash. Static and
+        rowwise activation symbol families are isolated from each other."""
+        cache_attr = ("_cb_gf4_rowwise_ok" if rowwise
+                      else "_cb_gf4_static_ok")
+        ok = getattr(layer, cache_attr, None)
         if ok is not None:
             return ok
         ok = (self.is_fp4 and self.is_v2
-              and getattr(self, "has_static_fp4_activation", False)
-              and getattr(layer, "_cb_fp4_input_global_scale_w13", None)
-              is not None
-              and getattr(layer, "_cb_fp4_input_global_scale_w2", None)
-              is not None
+              and (rowwise or (
+                  getattr(self, "has_static_fp4_activation", False)
+                  and getattr(layer, "_cb_fp4_input_global_scale_w13", None)
+                  is not None
+                  and getattr(layer, "_cb_fp4_input_global_scale_w2", None)
+                  is not None))
               and 12 <= self.k <= 24
               and self.n_sub in (1, 2)
               and self.type_size == 4 * self.k + 9
@@ -682,7 +698,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if ok:
             ok = (codec.fp4_value_lut_nbytes(self.k, self.n_sub)
                   <= codec.FP4_FUSED_LUT_MAX_BYTES)
-        if ok:
+        if ok and not rowwise:
             try:
                 import vllm._custom_ops as vops
                 ok = hasattr(vops, "scaled_fp4_quant")
@@ -691,15 +707,27 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if ok:
             from .cuda_ext import get_fused_fp4_ext
             fext = get_fused_fp4_ext()
-            ok = fext is not None and hasattr(fext, "cb_fused_fp4_moe_grouped")
-        layer._cb_gf4_ok = bool(ok)
-        return layer._cb_gf4_ok
+            ok = (fext is not None
+                  and hasattr(fext, "cb_fused_fp4_moe_grouped")
+                  and (not rowwise
+                       or hasattr(fext, "cb_nvfp4_quantize_rows")))
+        setattr(layer, cache_attr, bool(ok))
+        return bool(ok)
 
-    def _fp4_quant(self, layer, x2: torch.Tensor, which: str):
+    def _fp4_quant(self, layer, x2: torch.Tensor, which: str, *,
+                   rowwise: bool = False, fext=None):
         """Native NVFP4 activation quant (packed e2m1 + swizzled ue4m3 SFA +
-        the per-row fp32 residual for the EVT). The producer-calibrated static
-        global scale is stage-specific and batch-invariant, so quant-after-
-        gather == gather-after-quant per row and chunking cannot change it."""
+        the per-row fp32 residual for the EVT). Static mode uses the producer-
+        calibrated, stage-specific scalar. Rowwise mode derives each scalar
+        independently at runtime and consumes no artifact metadata."""
+        if rowwise:
+            if fext is None:
+                from .cuda_ext import get_fused_fp4_ext
+                fext = get_fused_fp4_ext()
+            return fext.cb_nvfp4_quantize_rows(
+                x2.contiguous(), codec.FP8_ELEMENT_MAX
+            )
+
         import vllm._custom_ops as vops
         gs = getattr(layer, f"_cb_fp4_input_global_scale_{which}")
         aq, sf = vops.scaled_fp4_quant(x2, gs)
@@ -709,7 +737,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         return aq, sf.view(torch.uint8).reshape(-1), recip
 
     def _apply_prefill_grouped_fused_fp4(self, layer, x, topk_weights,
-                                         topk_ids, act, *, tile_m=128):
+                                         topk_ids, act, *, tile_m=128,
+                                         rowwise: bool = False):
         """fp4 counterpart of ``_apply_prefill_grouped_fused_v2``: identical
         padded routing / gather / throwaway-row combine; the projection GEMMs
         are ONE ``cb_fused_fp4_moe_grouped`` each (native NVF4 block-scaled
@@ -718,7 +747,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         (the swizzled SFA plane is row-block-interleaved and cannot be
         gathered), which is bit-equivalent per row at a fixed global scale.
         Returns None on any constraint miss."""
-        if not self._gf4_ok(layer):
+        if not self._gf4_ok(layer, rowwise=rowwise):
+            return None
+        if rowwise and x.dtype not in (torch.bfloat16, torch.float16):
             return None
         from .cuda_ext import get_fused_fp4_ext
         fext = get_fused_fp4_ext()
@@ -773,7 +804,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         Mp = a_pad.shape[0]
 
         # stage 1: gate_up = a_pad @ W13[expert_of_tile]^T
-        aq1, sfa1, recip1 = self._fp4_quant(layer, a_pad, "w13")
+        aq1, sfa1, recip1 = self._fp4_quant(
+            layer, a_pad, "w13", rowwise=rowwise, fext=fext
+        )
         del a_pad
         gate_up = fext.cb_fused_fp4_moe_grouped(
             aq1, sfa1, w13, lut, compose,
@@ -785,7 +818,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         del gate_up
 
         # stage 2: y = act @ W2[expert_of_tile]^T — SAME expert_ids.
-        aq2, sfa2, recip2 = self._fp4_quant(layer, a, "w2")
+        aq2, sfa2, recip2 = self._fp4_quant(
+            layer, a, "w2", rowwise=rowwise, fext=fext
+        )
         del a
         y = fext.cb_fused_fp4_moe_grouped(
             aq2, sfa2, w2, lut, compose,

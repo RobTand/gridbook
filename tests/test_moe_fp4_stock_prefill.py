@@ -152,9 +152,10 @@ def _dispatch_mode(moe, monkeypatch, m, fused_fp4="fused_fp4"):
     monkeypatch.setattr(
         cls, "_apply_prefill_grouped_fused_v2",
         lambda self, *a, **kw: "grouped_fused", raising=True)
+    fused_impl = (fused_fp4 if callable(fused_fp4)
+                  else lambda self, *a, **kw: fused_fp4)
     monkeypatch.setattr(
-        cls, "_apply_prefill_grouped_fused_fp4",
-        lambda self, *a, **kw: fused_fp4, raising=True)
+        cls, "_apply_prefill_grouped_fused_fp4", fused_impl, raising=True)
     monkeypatch.setattr(cls, "_cuda_moe_ok", lambda self, layer: False)
     lay = _layer()
     lay._cb_layer_id = None
@@ -172,11 +173,32 @@ def test_unset_fp4_uses_conservative_loop(moe, monkeypatch):
     assert _dispatch_mode(moe, monkeypatch, _fp4(moe)) == "loop"
 
 
-@pytest.mark.parametrize("value", ["1", "128", "256"])
+@pytest.mark.parametrize(
+    "value",
+    ["1", "128", "256", "rowwise", "rowwise128", "rowwise256"],
+)
 def test_fp4_fused_prefill_is_explicitly_opted_in(moe, monkeypatch, value):
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", value)
     assert _dispatch_mode(moe, monkeypatch, _fp4(moe)) == "fused_fp4"
+
+
+@pytest.mark.parametrize(
+    "value,tile_m",
+    [("rowwise", 128), ("rowwise128", 128), ("rowwise256", 256)],
+)
+def test_moe_rowwise_selectors_plumb_activation_family_and_tile(
+    moe, monkeypatch, value, tile_m
+):
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", value)
+
+    def selected(self, *args, **kwargs):
+        return kwargs["rowwise"], kwargs["tile_m"]
+
+    assert _dispatch_mode(
+        moe, monkeypatch, _fp4(moe), fused_fp4=selected
+    ) == (True, tile_m)
 
 
 def test_opted_in_fp4_fused_miss_falls_back_to_loop(moe, monkeypatch):
@@ -186,7 +208,7 @@ def test_opted_in_fp4_fused_miss_falls_back_to_loop(moe, monkeypatch):
         moe, monkeypatch, _fp4(moe), fused_fp4=None) == "loop"
 
 
-@pytest.mark.parametrize("value", ["yes", "MIDM", "129"])
+@pytest.mark.parametrize("value", ["yes", "MIDM", "129", "rowwise_128"])
 def test_fp4_fused_prefill_rejects_unknown_modes(moe, monkeypatch, value):
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", value)
@@ -229,10 +251,45 @@ def test_moe_fused_fp4_selector_enforces_lut_smem_limit(
     assert method._gf4_ok(layer) is expected
 
 
-def test_legacy_moe_artifact_is_fused_ineligible(moe):
+def test_legacy_moe_artifact_fuses_only_in_explicit_rowwise_family(
+    moe, monkeypatch
+):
     method = _fp4(moe)
     method.has_static_fp4_activation = False
-    assert method._gf4_ok(_layer(E=4, hidden=512, inter=256)) is False
+    layer = _layer(E=4, hidden=512, inter=256)
+    del layer._cb_fp4_input_global_scale_w13
+    del layer._cb_fp4_input_global_scale_w2
+    from gridbook import cuda_ext
+
+    class FusedExt:
+        cb_fused_fp4_moe_grouped = object()
+        cb_nvfp4_quantize_rows = object()
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: FusedExt())
+    assert method._gf4_ok(layer) is False
+    assert method._gf4_ok(layer, rowwise=True) is True
+
+
+def test_moe_rowwise_eligibility_requires_matching_symbol_family(
+    moe, monkeypatch
+):
+    method = _fp4(moe)
+    layer = _layer(E=4, hidden=512, inter=256)
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = object()
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    from gridbook import cuda_ext
+
+    class StaticOnlyExt:
+        cb_fused_fp4_moe_grouped = object()
+
+    monkeypatch.setattr(
+        cuda_ext, "get_fused_fp4_ext", lambda: StaticOnlyExt()
+    )
+    assert method._gf4_ok(layer) is True
+    assert method._gf4_ok(layer, rowwise=True) is False
 
 
 def test_moe_native_quant_uses_distinct_static_stage_scales(
@@ -259,6 +316,50 @@ def test_moe_native_quant_uses_distinct_static_stage_scales(
     assert observed == [2.5, 1.25]
     assert torch.equal(reciprocal1, torch.full((3,), 0.4))
     assert torch.equal(reciprocal2, torch.full((3,), 0.8))
+
+
+def test_moe_rowwise_quant_uses_returned_per_row_operands(moe, monkeypatch):
+    method = _fp4(moe)
+    method.has_static_fp4_activation = False
+    layer = types.SimpleNamespace()
+    calls = []
+
+    class Ext:
+        @staticmethod
+        def cb_nvfp4_quantize_rows(x, multiplier):
+            packed = x[:, :128].to(torch.float32).round().to(torch.uint8)
+            sfa = x[:, :16].to(torch.float32).round().to(torch.uint8)
+            scales = x.float().abs().amax(dim=1) / (multiplier * 6.0)
+            calls.append((packed.clone(), sfa.clone(), scales.clone(),
+                          multiplier))
+            return packed, sfa, scales
+
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = lambda *_args: pytest.fail(
+        "rowwise MoE quantization must not read static stage scalars"
+    )
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+
+    target = torch.arange(256, dtype=torch.bfloat16).reshape(1, 256)
+    one = method._fp4_quant(
+        layer, target, "w13", rowwise=True, fext=Ext()
+    )
+    batch = method._fp4_quant(
+        layer,
+        torch.cat((target, torch.full_like(target, 1.0e4))),
+        "w2",
+        rowwise=True,
+        fext=Ext(),
+    )
+    assert [call[3] for call in calls] == [448.0, 448.0]
+    assert torch.equal(one[0], calls[0][0])
+    assert torch.equal(one[1], calls[0][1])
+    assert torch.equal(one[2], calls[0][2])
+    assert torch.equal(one[0][0], batch[0][0])
+    assert torch.equal(one[1][0], batch[1][0])
+    assert torch.equal(one[2][0], batch[2][0])
 
 
 def test_moe_create_and_per_layer_loader_own_static_scalars(moe):

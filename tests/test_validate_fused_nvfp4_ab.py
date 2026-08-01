@@ -68,6 +68,11 @@ def test_activate_arm_mutates_env_and_clears_cached_mode():
     ) == "midm"
     assert environ[ab.FUSED_ENV] == "midm"
     assert cache == []
+    assert ab.activate_arm(
+        "fused", fused_mode="rowwise", environ=environ, mode_cache=cache
+    ) == "rowwise"
+    assert environ[ab.FUSED_ENV] == "rowwise"
+    assert cache == []
     with pytest.raises(ValueError, match="unknown arm"):
         ab.activate_arm("other", fused_mode="1", environ=environ, mode_cache=cache)
 
@@ -926,6 +931,48 @@ def test_dispatch_probe_records_success_fallback_and_pid_without_torch():
         probe.restore()
 
 
+def test_dense_dispatch_probe_forwards_rowwise_family_without_losing_telemetry():
+    observed = []
+
+    class Layer:
+        _cb_N = 512
+        _cb_K = 256
+
+    class X:
+        def numel(self):
+            return 64 * 256
+
+    class Method:
+        is_fp4 = True
+        prefix = "model.layers.0.mlp.down_proj"
+
+        def _try_fused_fp4(self, layer, x, n, k, m, *, rowwise=False):
+            del layer, x, n, k, m
+            observed.append(rowwise)
+            return object()
+
+        def _apply_inline(self, layer, x, bias=None):
+            del bias
+            return self._try_fused_fp4(
+                layer, x, layer._cb_N, layer._cb_K,
+                x.numel() // layer._cb_K, rowwise=True,
+            )
+
+    probe = ab.DenseDispatchProbe(
+        Method, prefill_threshold=16, fused_mode="rowwise"
+    )
+    probe.install()
+    try:
+        with probe.measurement("fused", "rowwise") as record:
+            assert Method()._apply_inline(Layer(), X()) is not None
+        assert observed == [True]
+        assert record["candidate_gate_opportunities"] == 1
+        assert record["fused_attempts"] == 1
+        assert record["fused_successes"] == 1
+    finally:
+        probe.restore()
+
+
 def test_moe_probe_proves_loop_and_grouped_fused_routes_without_torch():
     class X:
         shape = (128, 1024)
@@ -970,6 +1017,51 @@ def test_moe_probe_proves_loop_and_grouped_fused_routes_without_torch():
         assert list(fused["success_shapes"]) == [
             "T128:E256:H1024:I512:topk8:tile256"
         ]
+    finally:
+        probe.restore()
+
+
+def test_moe_dispatch_probe_forwards_rowwise_family_without_losing_telemetry():
+    observed = []
+
+    class X:
+        shape = (128, 1024)
+
+    class TopK:
+        shape = (128, 8)
+
+    class Layer:
+        _cb_E = 256
+        _cb_hidden = 1024
+        _cb_inter = 512
+
+    class Method:
+        prefix = "model.layers.0.mlp.experts"
+
+        def _apply_prefill_grouped_fused_fp4(
+            self, layer, x, topk_weights, topk_ids, act, *, tile_m=128,
+            rowwise=False,
+        ):
+            del layer, x, topk_weights, topk_ids, act
+            observed.append((rowwise, tile_m))
+            return object()
+
+        def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
+            del layer, x, topk_weights, topk_ids, act
+            return object()
+
+    method = Method()
+    probe = ab.MoEDispatchProbe(Method)
+    probe.install()
+    try:
+        with probe.measurement("fused", "rowwise") as record:
+            assert method._apply_prefill_grouped_fused_fp4(
+                Layer(), X(), None, TopK(), None,
+                tile_m=256, rowwise=True,
+            )
+        assert observed == [(True, 256)]
+        assert record["fused_attempts"] == 1
+        assert record["fused_successes"] == 1
     finally:
         probe.restore()
 

@@ -180,7 +180,9 @@ def test_dense_fp4_fused_prefill_is_opt_in(monkeypatch):
     assert cb_linear._fp4_fused_mode() == ""
 
 
-@pytest.mark.parametrize("value", ["1", "midm"])
+@pytest.mark.parametrize(
+    "value", ["1", "midm", "rowwise", "rowwise_midm"]
+)
 def test_dense_fp4_fused_prefill_explicit_modes(monkeypatch, value):
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
     assert cb_linear._fp4_fused_mode() == value
@@ -199,6 +201,28 @@ def test_dense_fp4_fused_prefill_cannot_change_mid_process(monkeypatch):
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", "midm")
     with pytest.raises(RuntimeError, match="changed after Gridbook dispatch"):
         cb_linear._fp4_fused_mode()
+
+
+@pytest.mark.parametrize("value", ["rowwise", "rowwise_midm"])
+def test_dense_rowwise_modes_reach_only_the_rowwise_activation_family(
+    monkeypatch, value
+):
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4", value)
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.is_fp4 = True
+    observed = []
+
+    def attempt(layer, x, n, k, m, *, rowwise=False):
+        observed.append(rowwise)
+        return torch.zeros(m, n, dtype=x.dtype)
+
+    method._try_fused_fp4 = attempt
+    layer = types.SimpleNamespace(_cb_N=8, _cb_K=256)
+    out = method._apply_inline(
+        layer, torch.zeros(32, 256, dtype=torch.bfloat16)
+    )
+    assert out.shape == (32, 8)
+    assert observed == [True]
 
 
 @pytest.mark.parametrize(
@@ -241,6 +265,68 @@ def test_dense_fused_fp4_selector_enforces_lut_smem_limit(
 
     monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: FusedExt())
     assert method._fused_fp4_ok(layer, 256) is expected
+
+
+def test_dense_static_and_rowwise_eligibility_are_isolated(monkeypatch):
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.is_fp4 = True
+    method.is_v2 = True
+    method.has_static_fp4_activation = False
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    layer = types.SimpleNamespace(
+        _cb_N=8,
+        _cb_row_offset=torch.zeros(8, dtype=torch.int32),
+    )
+
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = object()
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    from gridbook import cuda_ext
+
+    class FusedExt:
+        cb_fused_fp4_prefill_mm_scaled = object()
+        cb_nvfp4_quantize_rows = object()
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: FusedExt())
+    # A legacy artifact is rejected by the unchanged static family even when
+    # every kernel symbol exists, but the explicit rowwise family may run.
+    assert method._fused_fp4_ok(layer, 256) is False
+    assert method._fused_fp4_ok(layer, 256, rowwise=True) is True
+
+
+def test_dense_rowwise_eligibility_requires_quantizer_and_gemm(monkeypatch):
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.is_fp4 = True
+    method.is_v2 = True
+    method.has_static_fp4_activation = True
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    layer = types.SimpleNamespace(
+        _cb_N=8,
+        _cb_row_offset=torch.zeros(8, dtype=torch.int32),
+        _cb_fp4_input_global_scale=torch.tensor(2.0),
+    )
+
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = object()
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    from gridbook import cuda_ext
+
+    class StaticOnlyExt:
+        cb_fused_fp4_prefill_mm_scaled = object()
+
+    monkeypatch.setattr(
+        cuda_ext, "get_fused_fp4_ext", lambda: StaticOnlyExt()
+    )
+    assert method._fused_fp4_ok(layer, 256) is True
+    assert method._fused_fp4_ok(layer, 256, rowwise=True) is False
 
 
 @pytest.fixture(autouse=True)

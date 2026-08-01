@@ -53,11 +53,18 @@ from .nvfp4_activation_contract import (
 PREFILL_M_THRESHOLD = int(os.environ.get("PRISMAQUANT_PREFILL_M_THRESHOLD", "16"))
 
 # fp4-MMA fused prefill gate (OPT-IN, default OFF): "" = off (the shipping
-# fp4 dispatch is byte-identical), "1" = fused block-scaled prefill for all
-# M > PREFILL_M_THRESHOLD, "midm" = only 16 < M <= 128 (the fp8 kernel's
-# measured niche). Promotion to a default requires a served A/B per
-# docs/lanes/nvfp4-cb/STANDARDS.md — the activation bucket changes.
+# fp4 dispatch is byte-identical); "1"/"midm" use the artifact's attested
+# static activation scalar; "rowwise"/"rowwise_midm" derive an independent
+# native-NVFP4 scalar for every runtime row and therefore require no serialized
+# activation metadata. The ``*_midm`` modes cover only 16 < M <= 128. Every
+# mode remains an explicit experiment until its served quality/performance gate
+# passes; old artifacts can enter the fused path only through a rowwise mode.
 _FP4_FUSED_MODE: list = []
+
+_FP4_FUSED_STATIC_MODES = frozenset(("1", "midm"))
+_FP4_FUSED_ROWWISE_MODES = frozenset(("rowwise", "rowwise_midm"))
+_FP4_FUSED_MODES = _FP4_FUSED_STATIC_MODES | _FP4_FUSED_ROWWISE_MODES
+_FP4_FUSED_ALLOWED_MODES = frozenset(("",)) | _FP4_FUSED_MODES
 
 
 def _fp4_fused_mode() -> str:
@@ -72,10 +79,11 @@ def _fp4_fused_mode() -> str:
     # teacher/task/served-SLO evidence remains incomplete. See
     # docs/audits/fused_nvfp4_enablement_2026-07-31.md.
     current = os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "").strip()
-    if current not in ("", "1", "midm"):
+    if current not in _FP4_FUSED_ALLOWED_MODES:
         raise ValueError(
             "invalid PRISMAQUANT_CB_FUSED_FP4="
-            f"{current!r}; expected '', '1', or 'midm'"
+            f"{current!r}; expected '', '1', 'midm', 'rowwise', or "
+            "'rowwise_midm'"
         )
     if not _FP4_FUSED_MODE:
         _FP4_FUSED_MODE.append(current)
@@ -504,16 +512,21 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 and bool(ok))
 
     # -- fp4-MMA fused prefill (opt-in; see the dispatch site below) ---------
-    def _fused_fp4_ok(self, layer, K: int) -> bool:
+    def _fused_fp4_ok(self, layer, K: int, *, rowwise: bool = False) -> bool:
         """Eligibility for the fused fp4 block-scaled prefill (cached per
         layer). Mirrors the kernel's TORCH_CHECKs so a miss is a silent
-        fall-through, never a crash."""
-        ok = getattr(layer, "_cb_fp4_fused_ok", None)
+        fall-through, never a crash. Static and rowwise activation families
+        are cached separately so probing one can never authorize the other."""
+        cache_attr = ("_cb_fp4_fused_rowwise_ok" if rowwise
+                      else "_cb_fp4_fused_static_ok")
+        ok = getattr(layer, cache_attr, None)
         if ok is not None:
             return ok
         ok = (self.is_fp4
-              and getattr(self, "has_static_fp4_activation", False)
-              and getattr(layer, "_cb_fp4_input_global_scale", None) is not None
+              and (rowwise or (
+                  getattr(self, "has_static_fp4_activation", False)
+                  and getattr(layer, "_cb_fp4_input_global_scale", None)
+                  is not None))
               and 12 <= self.k <= 24
               and self.n_sub in (1, 2)
               and K % 256 == 0
@@ -549,7 +562,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                         dtype=torch.int32, device=ro.device)
                 layer._cb_fp4_fused_lut_ok = bool(ok)
             ok = bool(ok)
-        if ok:
+        if ok and not rowwise:
             try:
                 import vllm._custom_ops as vops
                 ok = hasattr(vops, "scaled_fp4_quant")
@@ -559,16 +572,18 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             from .cuda_ext import get_fused_fp4_ext
             fext = get_fused_fp4_ext()
             ok = (fext is not None
-                  and hasattr(fext, "cb_fused_fp4_prefill_mm_scaled"))
-        layer._cb_fp4_fused_ok = ok
-        return ok
+                  and hasattr(fext, "cb_fused_fp4_prefill_mm_scaled")
+                  and (not rowwise
+                       or hasattr(fext, "cb_nvfp4_quantize_rows")))
+        setattr(layer, cache_attr, bool(ok))
+        return bool(ok)
 
-    def _try_fused_fp4(self, layer, x, N: int, K: int, M: int):
+    def _try_fused_fp4(self, layer, x, N: int, K: int, M: int, *,
+                       rowwise: bool = False):
         """One fused NVF4 block-scaled GEMM over this layer's packed rows, or
         None if ineligible (the caller then runs the shipping path)."""
-        if not self._fused_fp4_ok(layer, K):
+        if not self._fused_fp4_ok(layer, K, rowwise=rowwise):
             return None
-        import vllm._custom_ops as vops
         from .cuda_ext import get_fused_fp4_ext
         fext = get_fused_fp4_ext()
         lut = getattr(layer, "_cb_fp4_lut", None)
@@ -600,11 +615,22 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 else torch.zeros(1, dtype=torch.uint8, device=dev))
             layer._cb_fp4_ones = torch.ones(N, dtype=torch.float32, device=dev)
         x2 = x.reshape(-1, K)
-        gs = layer._cb_fp4_input_global_scale
-        aq, sfa = vops.scaled_fp4_quant(x2, gs)
-        a_scales = _nvfp4_reciprocal_vector(
-            layer, which="dense", scale=gs, rows=M
-        )
+        if rowwise:
+            if x2.dtype not in (torch.bfloat16, torch.float16):
+                return None
+            # Full UE4M3 range per row. The extension returns the exact three
+            # operands consumed by the existing fused GEMM; no weight decoder,
+            # GEMM, or artifact representation is duplicated for this mode.
+            aq, sfa, a_scales = fext.cb_nvfp4_quantize_rows(
+                x2.contiguous(), codec.FP8_ELEMENT_MAX
+            )
+        else:
+            import vllm._custom_ops as vops
+            gs = layer._cb_fp4_input_global_scale
+            aq, sfa = vops.scaled_fp4_quant(x2, gs)
+            a_scales = _nvfp4_reciprocal_vector(
+                layer, which="dense", scale=gs, rows=M
+            )
         # Preserve the original single-LUT launch contract (and its overlap of
         # LUT staging with the first A/SFA TMA). Only a genuinely multi-block
         # projection needs the per-N-tile indirection.
@@ -644,13 +670,18 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # paths' fp32-group-scale QDQ — the hardware SF operand is ue4m3, an
         # fp32 group scale is unrepresentable. The current promotion A/B is red;
         # the audit's reconsideration gates require stronger served quality and
-        # workload evidence. That is why this remains opt-in. "1" = all prefill
-        # M; "midm" = only the fp8
-        # kernel's proven 16<M<=128 niche.
-        if (self.is_fp4 and bias is None and M > PREFILL_M_THRESHOLD
-                and _fp4_fused_mode() in ("1", "midm")
-                and not (_fp4_fused_mode() == "midm" and M > 128)):
-            y = self._try_fused_fp4(layer, x, N, K, M)
+        # workload evidence. That is why this remains opt-in. Static modes use
+        # only producer-attested scalars; rowwise modes derive batch-invariant
+        # runtime scalars and are the sole fused option for legacy artifacts.
+        fused_mode = (_fp4_fused_mode()
+                      if self.is_fp4 and bias is None
+                      and M > PREFILL_M_THRESHOLD else "")
+        if (fused_mode in _FP4_FUSED_MODES
+                and not (fused_mode.endswith("midm") and M > 128)):
+            y = self._try_fused_fp4(
+                layer, x, N, K, M,
+                rowwise=fused_mode in _FP4_FUSED_ROWWISE_MODES,
+            )
             if y is not None:
                 return y
 
