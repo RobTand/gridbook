@@ -13,7 +13,7 @@ falls back to a correct-but-slow Triton path.
 # Single source of truth for package and release metadata. This file is synced
 # from PrismaQuant's development tree into the standalone Gridbook release repo;
 # release tags are cut only from the latter and must match this value exactly.
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 
 def register() -> None:
