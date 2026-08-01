@@ -262,6 +262,24 @@ def test_activate_execution_arm_keeps_moe_prefill_unset():
         moe_mode_cache=moe_cache,
     ) == "256"
     assert environ[ab.FUSED_MOE_ENV] == "256"
+    assert ab.activate_execution_arm(
+        "fused",
+        execution_mode="moe128",
+        dense_fused_mode="static_lsq",
+        environ=environ,
+        dense_mode_cache=dense_cache,
+        moe_mode_cache=moe_cache,
+    ) == "static_lsq128"
+    assert environ[ab.FUSED_MOE_ENV] == "static_lsq128"
+    assert ab.activate_execution_arm(
+        "fused",
+        execution_mode="moe256",
+        dense_fused_mode="static_lsq_midm",
+        environ=environ,
+        dense_mode_cache=dense_cache,
+        moe_mode_cache=moe_cache,
+    ) == "static_lsq256"
+    assert environ[ab.FUSED_MOE_ENV] == "static_lsq256"
     environ[ab.PREFILL_ENV] = "loop"
     with pytest.raises(RuntimeError, match="must remain unset"):
         ab.activate_execution_arm(
@@ -362,7 +380,7 @@ assert moe._FUSED_FP4_MOE_STATE == ["256"]
 with ab.scoped_execution_arm(
     "fused",
     execution_mode="moe128",
-    dense_fused_mode="1",
+    dense_fused_mode="static_lsq",
     environ=os.environ,
     dense_mode_cache=linear._FP4_FUSED_MODE,
     moe_mode_cache=moe._FUSED_FP4_MOE_STATE,
@@ -370,7 +388,7 @@ with ab.scoped_execution_arm(
     moe_selector=moe._requested_fused_fp4_moe_mode,
 ):
     assert linear._fp4_fused_mode() == ""
-    assert moe._requested_fused_fp4_moe_mode() == "128"
+    assert moe._requested_fused_fp4_moe_mode() == "static_lsq128"
 
 # Outside the explicit harness scope, the real production selectors still
 # reject a changed execution contract in this same process.
@@ -1335,6 +1353,51 @@ def test_moe_dispatch_probe_forwards_rowwise_family_without_losing_telemetry():
                 tile_m=256, rowwise=True,
             )
         assert observed == [(True, 256)]
+        assert record["fused_attempts"] == 1
+        assert record["fused_successes"] == 1
+    finally:
+        probe.restore()
+
+
+def test_moe_dispatch_probe_forwards_static_lsq_without_losing_telemetry():
+    observed = []
+
+    class X:
+        shape = (128, 1024)
+
+    class TopK:
+        shape = (128, 8)
+
+    class Layer:
+        _cb_E = 256
+        _cb_hidden = 1024
+        _cb_inter = 512
+
+    class Method:
+        prefix = "model.layers.0.mlp.experts"
+
+        def _apply_prefill_grouped_fused_fp4(
+            self, layer, x, topk_weights, topk_ids, act, *, tile_m=128,
+            rowwise=False, static_lsq=False,
+        ):
+            del layer, x, topk_weights, topk_ids, act
+            observed.append((rowwise, static_lsq, tile_m))
+            return object()
+
+        def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
+            del layer, x, topk_weights, topk_ids, act
+            return object()
+
+    method = Method()
+    probe = ab.MoEDispatchProbe(Method)
+    probe.install()
+    try:
+        with probe.measurement("fused", "static_lsq") as record:
+            assert method._apply_prefill_grouped_fused_fp4(
+                Layer(), X(), None, TopK(), None,
+                tile_m=256, static_lsq=True,
+            )
+        assert observed == [(False, True, 256)]
         assert record["fused_attempts"] == 1
         assert record["fused_successes"] == 1
     finally:

@@ -237,12 +237,24 @@ def activate_execution_arm(
         )
     if arm not in ARMS:
         raise ValueError(f"unknown arm {arm!r}; expected one of {ARMS}")
+    if dense_fused_mode not in DENSE_FUSED_MODES:
+        raise ValueError(
+            "dense_fused_mode must be one of: "
+            + ", ".join(DENSE_FUSED_MODES)
+        )
     if PREFILL_ENV in environ:
         raise RuntimeError(
             f"{PREFILL_ENV} must remain unset for the grouped-MoE A/B"
         )
     environ[FUSED_ENV] = ""
-    selected = execution_mode.removeprefix("moe") if arm == "fused" else ""
+    tile_m = execution_mode.removeprefix("moe")
+    if dense_fused_mode.startswith("static_lsq"):
+        candidate_mode = f"static_lsq{tile_m}"
+    elif dense_fused_mode.startswith("rowwise"):
+        candidate_mode = f"rowwise{tile_m}"
+    else:
+        candidate_mode = tile_m
+    selected = candidate_mode if arm == "fused" else ""
     environ[FUSED_MOE_ENV] = selected
     dense_mode_cache.clear()
     moe_mode_cache.clear()
@@ -920,7 +932,7 @@ class MoEDispatchProbe:
 
         def wrapped_fused(
             method, layer, x, topk_weights, topk_ids, act, *, tile_m=128,
-            rowwise=False,
+            rowwise=False, static_lsq=False,
         ):
             record = probe._record()
             record["pids"].add(os.getpid())
@@ -935,6 +947,8 @@ class MoEDispatchProbe:
                 kwargs = {"tile_m": tile_m}
                 if rowwise:
                     kwargs["rowwise"] = True
+                if static_lsq:
+                    kwargs["static_lsq"] = True
                 output = original_fused(
                     method, layer, x, topk_weights, topk_ids, act, **kwargs
                 )

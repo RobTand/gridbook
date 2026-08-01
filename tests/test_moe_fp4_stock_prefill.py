@@ -175,7 +175,11 @@ def test_unset_fp4_uses_conservative_loop(moe, monkeypatch):
 
 @pytest.mark.parametrize(
     "value",
-    ["1", "128", "256", "rowwise", "rowwise128", "rowwise256"],
+    [
+        "1", "128", "256",
+        "static_lsq", "static_lsq128", "static_lsq256",
+        "rowwise", "rowwise128", "rowwise256",
+    ],
 )
 def test_fp4_fused_prefill_is_explicitly_opted_in(moe, monkeypatch, value):
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
@@ -201,6 +205,28 @@ def test_moe_rowwise_selectors_plumb_activation_family_and_tile(
     ) == (True, tile_m)
 
 
+@pytest.mark.parametrize(
+    "value,tile_m",
+    [
+        ("static_lsq", 128),
+        ("static_lsq128", 128),
+        ("static_lsq256", 256),
+    ],
+)
+def test_moe_static_lsq_selectors_reuse_grouped_path_and_select_tile(
+    moe, monkeypatch, value, tile_m
+):
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", value)
+
+    def selected(self, *args, **kwargs):
+        return kwargs["rowwise"], kwargs["static_lsq"], kwargs["tile_m"]
+
+    assert _dispatch_mode(
+        moe, monkeypatch, _fp4(moe), fused_fp4=selected
+    ) == (False, True, tile_m)
+
+
 def test_opted_in_fp4_fused_miss_falls_back_to_loop(moe, monkeypatch):
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", "1")
@@ -208,7 +234,9 @@ def test_opted_in_fp4_fused_miss_falls_back_to_loop(moe, monkeypatch):
         moe, monkeypatch, _fp4(moe), fused_fp4=None) == "loop"
 
 
-@pytest.mark.parametrize("value", ["yes", "MIDM", "129", "rowwise_128"])
+@pytest.mark.parametrize(
+    "value", ["yes", "MIDM", "129", "rowwise_128", "static_lsq_128"]
+)
 def test_fp4_fused_prefill_rejects_unknown_modes(moe, monkeypatch, value):
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", value)
@@ -268,6 +296,7 @@ def test_legacy_moe_artifact_fuses_only_in_explicit_rowwise_family(
     monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: FusedExt())
     assert method._gf4_ok(layer) is False
     assert method._gf4_ok(layer, rowwise=True) is True
+    assert method._gf4_ok(layer, static_lsq=True) is False
 
 
 def test_moe_rowwise_eligibility_requires_matching_symbol_family(
@@ -290,6 +319,47 @@ def test_moe_rowwise_eligibility_requires_matching_symbol_family(
     )
     assert method._gf4_ok(layer) is True
     assert method._gf4_ok(layer, rowwise=True) is False
+    assert method._gf4_ok(layer, static_lsq=True) is False
+
+
+def test_moe_static_lsq_eligibility_requires_attested_host_scales_and_symbol(
+    moe, monkeypatch
+):
+    method = _fp4(moe)
+    layer = _layer(E=4, hidden=512, inter=256)
+    layer._cb_fp4_input_global_scale_w13_f32 = 2.5
+    layer._cb_fp4_input_global_scale_w2_f32 = 1.25
+    from gridbook import cuda_ext
+
+    class LsqExt:
+        cb_fused_fp4_moe_grouped = object()
+        cb_nvfp4_quantize_static_lsq = object()
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: LsqExt())
+    assert method._gf4_ok(layer, static_lsq=True) is True
+    assert method._gf4_ok(layer, rowwise=True, static_lsq=True) is False
+
+    unstamped = _layer(E=4, hidden=512, inter=256)
+    assert method._gf4_ok(unstamped, static_lsq=True) is False
+
+    legacy = _fp4(moe)
+    legacy.has_static_fp4_activation = False
+    legacy_layer = _layer(E=4, hidden=512, inter=256)
+    legacy_layer._cb_fp4_input_global_scale_w13_f32 = 2.5
+    legacy_layer._cb_fp4_input_global_scale_w2_f32 = 1.25
+    assert legacy._gf4_ok(legacy_layer, static_lsq=True) is False
+
+    no_lsq_symbol = _layer(E=4, hidden=512, inter=256)
+    no_lsq_symbol._cb_fp4_input_global_scale_w13_f32 = 2.5
+    no_lsq_symbol._cb_fp4_input_global_scale_w2_f32 = 1.25
+
+    class GroupedOnlyExt:
+        cb_fused_fp4_moe_grouped = object()
+
+    monkeypatch.setattr(
+        cuda_ext, "get_fused_fp4_ext", lambda: GroupedOnlyExt()
+    )
+    assert method._gf4_ok(no_lsq_symbol, static_lsq=True) is False
 
 
 def test_moe_native_quant_uses_distinct_static_stage_scales(
@@ -365,6 +435,92 @@ def test_moe_rowwise_quant_uses_returned_per_row_operands(moe, monkeypatch):
     assert torch.equal(one[0][0], batch[0][0])
     assert torch.equal(one[1][0], batch[1][0])
     assert torch.equal(one[2][0], batch[2][0])
+
+
+def test_moe_static_lsq_quant_reuses_shared_quantizer_with_stage_host_scales(
+    moe, monkeypatch
+):
+    method = _fp4(moe)
+    layer = types.SimpleNamespace(
+        _cb_fp4_input_global_scale_w13_f32=2.5,
+        _cb_fp4_input_global_scale_w2_f32=1.25,
+    )
+    calls = []
+
+    class Ext:
+        @staticmethod
+        def cb_nvfp4_quantize_static_lsq(x, scale):
+            calls.append((x, scale))
+            return (x, torch.zeros(1, dtype=torch.uint8),
+                    torch.full((x.shape[0],), scale, dtype=torch.float32))
+
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = lambda *_args: pytest.fail(
+        "static-LSQ MoE must reuse the shared LSQ quantizer"
+    )
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+
+    rows = torch.arange(512, dtype=torch.bfloat16).reshape(2, 256)
+    w13 = method._fp4_quant(
+        layer, rows, "w13", static_lsq=True, fext=Ext()
+    )
+    w2 = method._fp4_quant(
+        layer, torch.flip(rows, dims=(1,)).contiguous(), "w2",
+        static_lsq=True, fext=Ext(),
+    )
+    assert [scale for _x, scale in calls] == [2.5, 1.25]
+    assert calls[0][0].is_contiguous() and calls[1][0].is_contiguous()
+    assert torch.equal(w13[2], torch.full((2,), 2.5))
+    assert torch.equal(w2[2], torch.full((2,), 1.25))
+
+
+def test_moe_post_load_caches_attested_static_lsq_stage_scales(
+    moe, monkeypatch
+):
+    method = _fp4(moe)
+    method.scheme["codebook_ref"] = "cb"
+
+    class QuantConfig:
+        @staticmethod
+        def get_codebooks():
+            return {"cb": torch.zeros(1)}
+
+        @staticmethod
+        def moe_activation_stage_targets(prefix):
+            assert prefix == "test"
+            return {"w13": ["gate_up"], "w2": ["down"]}
+
+        @staticmethod
+        def activation_scales_for_targets(targets):
+            return [2.5 if targets == ["gate_up"] else 1.25]
+
+    method.quant_config = QuantConfig()
+    layer = _layer(E=1, hidden=256, inter=256)
+    layer.w13_input_global_scale = torch.nn.Parameter(torch.tensor([2.5]))
+    layer.w2_input_global_scale = torch.nn.Parameter(torch.tensor([1.25]))
+    layer.w13_cb_qweight = torch.empty(1, 512, 73, dtype=torch.uint8)
+    layer.w2_cb_qweight = torch.empty(1, 256, 73, dtype=torch.uint8)
+
+    monkeypatch.setattr(moe, "assert_cb_experts_filled", lambda *_args: None)
+    monkeypatch.setattr(
+        moe.codec, "build_flat_codebook", lambda *_args: torch.zeros(1)
+    )
+    monkeypatch.setattr(
+        moe.codec, "build_compose_table", lambda *_args: torch.zeros(1)
+    )
+    monkeypatch.setattr(
+        moe, "cb_gemv_choice", lambda *_args: (False, "cpu test")
+    )
+    from gridbook import ops
+    monkeypatch.setattr(ops, "register_cb_layer", lambda *_args: 7)
+
+    method.process_weights_after_loading(layer)
+    assert layer._cb_fp4_input_global_scale_w13.item() == 2.5
+    assert layer._cb_fp4_input_global_scale_w2.item() == 1.25
+    assert layer._cb_fp4_input_global_scale_w13_f32 == 2.5
+    assert layer._cb_fp4_input_global_scale_w2_f32 == 1.25
 
 
 def test_moe_create_and_per_layer_loader_own_static_scalars(moe):
