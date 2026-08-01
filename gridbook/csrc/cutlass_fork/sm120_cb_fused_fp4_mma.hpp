@@ -758,28 +758,43 @@ struct CollectiveMma<
     // byte (already e4m3, positive by construction).
     uint8_t* sfb_smem = reinterpret_cast<uint8_t*>(shared_tensors.smem_SFB.begin());
     const uint8_t* comp = shared_tensors.smem_compose.data();
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < SfPerThread; ++i) {
-      // Four rows per warp, with eight adjacent group-scale lanes per row.
-      // Besides coalescing the odd-stride row accesses, this lets the cache
-      // merge the eight repeated exponent-byte reads of a v2 row.
+    if (params.is_v2) {
+      // Two lanes own one row and each lane composes four adjacent scales.
+      // The old one-lane-per-scale mapping redundantly issued eight exponent
+      // and eight code-byte loads for a row.  This mapping issues two
+      // exponent and four code-byte loads while retaining all 256 decoder
+      // threads and the exact same compose-table/store contract.
       const int warp = thread_idx >> 5;
       const int lane = thread_idx & 31;
-      const int r = (i * 8 + warp) * 4 + (lane >> 3);
-      const int g = lane & 7;                        // 0..7 in this K-tile
-      const int gs = half * 8 + g;                   // group in superblock
+      const int r = warp * 16 + (lane >> 1);
+      const int g0 = (lane & 1) * 4;                 // 0 or 4 in K-tile
+      const int gs0 = half * 8 + g0;                 // group in superblock
       int n_glob = n_base + r;
       n_glob = n_glob < N_rows ? n_glob : (N_rows - 1);
       const uint8_t* srow = gp + int64_t(n_glob) * row_stride + sb_off + 4 * kb;
-      uint8_t sf;
-      if (params.is_v2) {
-        const int e = __ldg(srow);
-        const int c = (__ldg(srow + 1 + (gs >> 1)) >> ((gs & 1) * 4)) & 0xF;
-        sf = comp[e * 16 + c];
-      } else {
-        sf = __ldg(srow + gs);
+      const int e = __ldg(srow);
+      const int codes01 = __ldg(srow + 1 + (gs0 >> 1));
+      const int codes23 = __ldg(srow + 2 + (gs0 >> 1));
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < 4; ++j) {
+        const int packed_codes = j < 2 ? codes01 : codes23;
+        const int c = (packed_codes >> ((j & 1) * 4)) & 0xF;
+        const uint8_t sf = comp[e * 16 + c];
+        sfb_smem[sfb_layout(make_coord(r, (g0 + j) * 16))] = sf;
       }
-      sfb_smem[sfb_layout(make_coord(r, g * 16))] = sf;
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < SfPerThread; ++i) {
+        const int warp = thread_idx >> 5;
+        const int lane = thread_idx & 31;
+        const int r = (i * 8 + warp) * 4 + (lane >> 3);
+        const int g = lane & 7;                      // 0..7 in this K-tile
+        const int gs = half * 8 + g;                 // group in superblock
+        int n_glob = n_base + r;
+        n_glob = n_glob < N_rows ? n_glob : (N_rows - 1);
+        const uint8_t* srow = gp + int64_t(n_glob) * row_stride + sb_off + 4 * kb;
+        sfb_smem[sfb_layout(make_coord(r, g * 16))] = __ldg(srow + gs);
+      }
     }
   }
 
