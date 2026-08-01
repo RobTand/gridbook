@@ -656,6 +656,19 @@ _COUNT_FIELDS = (
     "probe_errors",
 )
 
+_COUNTER_MAP_FIELDS = (
+    "apply_shapes",
+    "success_shapes",
+    "fallback_shapes",
+    "loop_shapes",
+    "success_prefixes",
+    "fallback_prefixes",
+    "loop_prefixes",
+    "success_tile_m",
+    "success_tile_m_shapes",
+    "success_tile_m_contracts",
+)
+
 
 def _empty_dispatch_record(label: str, arm: str | None) -> dict[str, Any]:
     return {
@@ -663,13 +676,7 @@ def _empty_dispatch_record(label: str, arm: str | None) -> dict[str, Any]:
         "arm": arm,
         **{field: 0 for field in _COUNT_FIELDS},
         "pids": set(),
-        "apply_shapes": Counter(),
-        "success_shapes": Counter(),
-        "fallback_shapes": Counter(),
-        "loop_shapes": Counter(),
-        "success_prefixes": Counter(),
-        "fallback_prefixes": Counter(),
-        "loop_prefixes": Counter(),
+        **{field: Counter() for field in _COUNTER_MAP_FIELDS},
     }
 
 
@@ -679,13 +686,10 @@ def _json_dispatch_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "arm": record["arm"],
         **{field: int(record[field]) for field in _COUNT_FIELDS},
         "pids": sorted(int(pid) for pid in record["pids"]),
-        "apply_shapes": dict(sorted(record["apply_shapes"].items())),
-        "success_shapes": dict(sorted(record["success_shapes"].items())),
-        "fallback_shapes": dict(sorted(record["fallback_shapes"].items())),
-        "loop_shapes": dict(sorted(record["loop_shapes"].items())),
-        "success_prefixes": dict(sorted(record["success_prefixes"].items())),
-        "fallback_prefixes": dict(sorted(record["fallback_prefixes"].items())),
-        "loop_prefixes": dict(sorted(record["loop_prefixes"].items())),
+        **{
+            field: dict(sorted(record[field].items()))
+            for field in _COUNTER_MAP_FIELDS
+        },
     }
 
 
@@ -695,15 +699,7 @@ def aggregate_dispatch(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         for field in _COUNT_FIELDS:
             merged[field] += int(record[field])
         merged["pids"].update(record["pids"])
-        for field in (
-            "apply_shapes",
-            "success_shapes",
-            "fallback_shapes",
-            "loop_shapes",
-            "success_prefixes",
-            "fallback_prefixes",
-            "loop_prefixes",
-        ):
+        for field in _COUNTER_MAP_FIELDS:
             merged[field].update(record[field])
     result = _json_dispatch_record(merged)
     result.pop("label")
@@ -713,6 +709,38 @@ def aggregate_dispatch(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         result["fused_successes"] / attempts if attempts else None
     )
     return result
+
+
+def dense_tile_route_integrity_gate(
+    fused_dispatch: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Require one concrete, legal dense tile route per fused success."""
+
+    successes = int(fused_dispatch["fused_successes"])
+    tile_counts = dict(fused_dispatch["success_tile_m"])
+    shape_counts = dict(fused_dispatch["success_tile_m_shapes"])
+    contract_counts = dict(fused_dispatch["success_tile_m_contracts"])
+    routed = sum(int(count) for count in tile_counts.values())
+    shape_routed = sum(int(count) for count in shape_counts.values())
+    contract_routed = sum(int(count) for count in contract_counts.values())
+    legal_tiles = set(tile_counts).issubset({"128", "256"})
+    return {
+        "observed_successes": successes,
+        "observed_routes": routed,
+        "observed_shape_routes": shape_routed,
+        "observed_contract_routes": contract_routed,
+        "tile_m_counts": tile_counts,
+        "shape_tile_m_counts": shape_counts,
+        "tile_m_contract_counts": contract_counts,
+        "legal_tile_values": legal_tiles,
+        "pass": (
+            successes > 0
+            and routed == successes
+            and shape_routed == successes
+            and contract_routed == successes
+            and legal_tiles
+        ),
+    }
 
 
 class DenseDispatchProbe:
@@ -765,7 +793,8 @@ class DenseDispatchProbe:
         return f"M{int(m)}:N{int(n)}:K{int(k)}"
 
     def _on_try_finish(
-        self, method: Any, shape: str, output: Any, *, error: bool = False
+        self, method: Any, layer: Any, shape: str, output: Any, *,
+        error: bool = False,
     ) -> None:
         record = self._record()
         prefix = str(getattr(method, "prefix", "<unknown>"))
@@ -779,6 +808,21 @@ class DenseDispatchProbe:
             record["fused_successes"] += 1
             record["success_shapes"][shape] += 1
             record["success_prefixes"][prefix] += 1
+            try:
+                tile_m = int(layer._cb_fp4_fused_tile_m)
+                candidate_ctas = int(
+                    layer._cb_fp4_fused_tile_candidate_ctas
+                )
+                sm_count = int(layer._cb_fp4_fused_sm_count)
+            except (AttributeError, TypeError, ValueError):
+                return
+            record["success_tile_m"][str(tile_m)] += 1
+            record["success_tile_m_shapes"][
+                f"{shape}:tile{tile_m}"
+            ] += 1
+            record["success_tile_m_contracts"][
+                f"tile{tile_m}:ctas{candidate_ctas}:sm{sm_count}"
+            ] += 1
 
     def install(self) -> None:
         if self._original_apply is not None:
@@ -809,9 +853,11 @@ class DenseDispatchProbe:
                 else:
                     output = original_try(method, layer, x, n, k, m)
             except Exception:
-                probe._on_try_finish(method, shape, None, error=True)
+                probe._on_try_finish(
+                    method, layer, shape, None, error=True
+                )
                 raise
-            probe._on_try_finish(method, shape, output)
+            probe._on_try_finish(method, layer, shape, output)
             return output
 
         self.method_class._apply_inline = wrapped_apply
@@ -2284,6 +2330,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 and success_fraction >= args.min_fused_success_fraction
             ),
         }
+        core_gates["candidate_dense_tile_route_attested"] = (
+            dense_tile_route_integrity_gate(fused_dispatch)
+        )
         if args.require_zero_fallbacks:
             core_gates["candidate_zero_fallbacks"] = {
                 "observed_fallbacks": fused_dispatch["fused_fallbacks"],

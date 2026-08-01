@@ -1090,7 +1090,10 @@ def test_dispatch_probe_records_success_fallback_and_pid_without_torch():
         prefix = "model.layers.0.mlp.down_proj"
 
         def _try_fused_fp4(self, layer, x, n, k, m):
-            del layer, x, n, k, m
+            del x, n, k
+            layer._cb_fp4_fused_tile_m = 128
+            layer._cb_fp4_fused_tile_candidate_ctas = m
+            layer._cb_fp4_fused_sm_count = 48
             return object()
 
         def _apply_inline(self, layer, x, bias=None):
@@ -1124,8 +1127,39 @@ def test_dispatch_probe_records_success_fallback_and_pid_without_torch():
         assert merged["fused_fallbacks"] == 1
         assert merged["fused_success_fraction"] == pytest.approx(0.5)
         assert len(merged["pids"]) == 1
+        assert merged["success_tile_m"] == {"128": 1}
+        assert merged["success_tile_m_shapes"] == {
+            "M64:N512:K256:tile128": 1
+        }
+        assert merged["success_tile_m_contracts"] == {
+            "tile128:ctas64:sm48": 1
+        }
+        route_gate = ab.dense_tile_route_integrity_gate(merged)
+        assert route_gate["pass"] is True
+        assert route_gate["observed_routes"] == 1
     finally:
         probe.restore()
+
+
+def test_dense_tile_route_integrity_gate_fails_closed():
+    dispatch = ab.aggregate_dispatch((
+        ab._empty_dispatch_record("missing", "fused"),
+    ))
+    dispatch["fused_successes"] = 1
+    missing = ab.dense_tile_route_integrity_gate(dispatch)
+    assert missing["pass"] is False
+    assert missing["observed_routes"] == 0
+
+    dispatch["success_tile_m"] = {"192": 1}
+    dispatch["success_tile_m_shapes"] = {
+        "M256:N512:K256:tile192": 1
+    }
+    dispatch["success_tile_m_contracts"] = {
+        "tile192:ctas4:sm48": 1
+    }
+    invalid = ab.dense_tile_route_integrity_gate(dispatch)
+    assert invalid["pass"] is False
+    assert invalid["legal_tile_values"] is False
 
 
 def test_dense_dispatch_probe_forwards_rowwise_family_without_losing_telemetry():
