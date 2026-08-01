@@ -363,7 +363,7 @@ print(f"[gridbook] prewarmed grouped-BF16 quality extension in "
 # falls back to the transient-expand path by design.
 if "12.0" in arch or "12.1" in arch:
     t = time.time()
-    if cuda_ext.get_fused_ext() is None:
+    if load_for_build(cuda_ext.get_fused_ext) is None:
         print("[gridbook] NOTE: mid-M fused prefill extension did not prewarm; "
               "mid-M prefill will use the transient-expand path (a supported "
               "fallback, not an error).")

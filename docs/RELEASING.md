@@ -127,7 +127,7 @@ docker run --rm --gpus all -v "$PWD/dist:/dist" \
   --entrypoint bash <your-vllm-image> -c '
   pip install --no-deps -q /dist/gridbook-*.whl
   cd /                      # never run this from the repo: it would shadow the install
-  TORCH_CUDA_ARCH_LIST=12.1 python -c "
+  TORCH_CUDA_ARCH_LIST=12.1a python -c "
 from gridbook.cuda_ext import (
     csrc_dir, get_bf16_grouped_ext, get_ext, get_ext_v2,
     get_fused_ext, get_fused_fp4_ext,
@@ -179,6 +179,12 @@ the release GPU image. The release gate is 0 failures, 0 skips,
 `OMMA.SF.16864` present in both fused symbols, and no `QMMA` in either symbol.
 Both fused runtime flags remain default-off unless the served quality gate
 separately promotes them.
+
+The SASS assertion needs matching `cuobjdump` and `nvdisasm` executables. CUDA's
+split-toolkit images may contain only `cuda-cuobjdump`; install the matching
+`cuda-nvdisasm-<major>-<minor>` package or mount that toolkit's `nvdisasm` into
+the validation container. A missing or older disassembler is a failed release
+environment, not a skipped kernel gate.
 
 If the command prints all five extension modules and passes the native-op
 attestation, the installed wheel's native serving floor is genuinely sound.

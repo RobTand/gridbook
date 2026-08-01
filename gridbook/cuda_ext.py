@@ -858,8 +858,10 @@ _FUSED_SYMBOLS = ("cb_fused_prefill_mm_scaled",)
 def get_fused_ext():
     """The CUTLASS decode-in-prologue prefill extension (cb_fused_gemm.cu),
     or None. Separate module from the GEMV ext: it needs the CUTLASS headers
-    (taken from the vLLM install's bundled copy) and a longer JIT build.
-    Fail-soft like get_ext — serving falls back to the transient-expand path."""
+    (taken from the vLLM install's bundled copy), a longer JIT build, and the
+    architecture-accelerated ``sm_120a``/``sm_121a`` target required by its
+    conditional tensor-core instructions. Fail-soft like get_ext — serving
+    falls back to the exact native expansion path."""
     if _fused_tried:
         return _fused
     with _fused_lock:
@@ -872,9 +874,14 @@ def _load_fused_ext_locked():
     """Build and publish fused FP8 with ``_fused_lock`` held."""
     global _fused, _fused_tried
     try:
-        import torch  # noqa: F401
+        import torch
         from torch.utils.cpp_extension import load
 
+        cc = torch.cuda.get_device_capability()
+        if cc not in ((12, 0), (12, 1)):
+            raise RuntimeError(
+                "fused FP8-CB prefill requires compute capability 12.0 or "
+                f"12.1, got {cc[0]}.{cc[1]}")
         cut_inc = _find_cutlass_include()
         cut_root = os.path.dirname(cut_inc)
         src_dir = _require_csrc("cb_fused_gemm.cu")
@@ -882,13 +889,18 @@ def _load_fused_ext_locked():
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
         build_dir = os.path.join(build_dir, "fused")
         os.makedirs(build_dir, exist_ok=True)
+        arch = f"compute_{cc[0]}{cc[1]}a"
+        code = f"sm_{cc[0]}{cc[1]}a"
         mod = load(name="pq_cb_fused",
                    sources=[os.path.join(src_dir, "cb_fused_gemm.cu")],
                    extra_include_paths=[cut_inc,
                                         os.path.join(cut_root, "tools", "util",
                                                      "include"),
                                         src_dir],
-                   extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+                   extra_cuda_cflags=[
+                       "-O3", "--expt-relaxed-constexpr",
+                       f"-gencode=arch={arch},code={code}",
+                   ],
                    build_directory=build_dir, verbose=False)
         _fused = _require_symbols(mod, _FUSED_SYMBOLS,
                                   build_dir=build_dir,

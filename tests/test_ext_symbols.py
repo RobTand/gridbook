@@ -82,6 +82,14 @@ def _prepare_fp4_loader(monkeypatch, tmp_path):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 1))
 
 
+def _prepare_fused_loader(monkeypatch, tmp_path):
+    import torch
+
+    cutlass = _prepare_cutlass(monkeypatch, tmp_path)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 1))
+    return cutlass
+
+
 @pytest.mark.parametrize(
     "loader_name,value_name,tried_name,lock_name,symbols,prepare",
     [
@@ -107,7 +115,7 @@ def test_cold_load_is_published_once_to_concurrent_callers(
     if prepare == "fp4":
         _prepare_fp4_loader(monkeypatch, tmp_path)
     elif prepare == "fused":
-        _prepare_cutlass(monkeypatch, tmp_path)
+        _prepare_fused_loader(monkeypatch, tmp_path)
 
     declared = getattr(cuda_ext, symbols)
     if symbols == "_FUSED_FP4_SYMBOL_FAMILIES":
@@ -632,17 +640,19 @@ def test_fused_fp4_reports_build_exception(monkeypatch, capsys, tmp_path):
 
 def test_fused_fp8_accepts_dense_only_module(monkeypatch, tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
-    _prepare_cutlass(monkeypatch, tmp_path)
+    _prepare_fused_loader(monkeypatch, tmp_path)
     dense = _stub("fused", cuda_ext._FUSED_SYMBOLS)
     calls = _patch_load(monkeypatch, dense)
     assert cuda_ext.get_fused_ext() is dense
     assert calls[0][1]["build_directory"] == str(tmp_path / "fused")
+    assert "-gencode=arch=compute_121a,code=sm_121a" in \
+        calls[0][1]["extra_cuda_cflags"]
 
 
 def test_fused_fp8_refuses_grouped_without_dense_prerequisite(
         monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
-    _prepare_cutlass(monkeypatch, tmp_path)
+    _prepare_fused_loader(monkeypatch, tmp_path)
     grouped = _stub(
         "fused", ("cb_fused_moe_grouped", "cb_fused_moe_tile_m"))
     _patch_load(monkeypatch, grouped)
@@ -654,12 +664,26 @@ def test_fused_fp8_refuses_grouped_without_dense_prerequisite(
 
 def test_fused_fp8_reports_build_exception(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
-    _prepare_cutlass(monkeypatch, tmp_path)
+    _prepare_fused_loader(monkeypatch, tmp_path)
     _patch_load(monkeypatch, error=RuntimeError("CUTLASS failed"))
     assert cuda_ext.get_fused_ext() is None
     error = capsys.readouterr().err
     assert "fused prefill extension unavailable" in error
     assert "CUTLASS failed" in error
+
+
+def test_fused_fp8_rejects_non_blackwell_target(
+        monkeypatch, capsys, tmp_path):
+    import torch
+
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _prepare_cutlass(monkeypatch, tmp_path)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+    calls = _patch_load(monkeypatch, _stub("fused", cuda_ext._FUSED_SYMBOLS))
+    assert cuda_ext.get_fused_ext() is None
+    assert calls == []
+    error = capsys.readouterr().err
+    assert "requires compute capability 12.0 or 12.1, got 9.0" in error
 
 
 def test_no_fake_extension_modules_leak_into_sys_modules():

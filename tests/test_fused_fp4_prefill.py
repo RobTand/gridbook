@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -705,6 +706,9 @@ def test_moe_grouped_invalid_expert_id_traps_fail_closed(bad_eid):
     )
     env = os.environ.copy()
     env["CUDA_LAUNCH_BLOCKING"] = "1"
+    test_dir = str(Path(__file__).resolve().parent)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (test_dir, env.get("PYTHONPATH", "")) if part)
     proc = subprocess.run(
         [sys.executable, "-c", child_code], capture_output=True, text=True,
         env=env, timeout=180)
@@ -983,11 +987,9 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
     Equality is bitwise BF16, so no routing, padding, stage-2 expert identity or
     combine drift can hide behind a numerical tolerance.
     """
-    from gridbook.moe import (
-        MoEActivation,
-        PrismaQuantCBMoEMethod,
-        apply_moe_activation,
-    )
+    from gridbook.moe import PrismaQuantCBMoEMethod
+    from gridbook.native_cutlass import native_moe_activation
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
     monkeypatch.setenv("PRISMAQUANT_CB_GROUPED_TRIM", "1")
     k, n_sub, E, hidden, inter = 16, 2, 5, 256, 256
@@ -1045,7 +1047,10 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
         w13_cb_qweight=w13,
         w2_cb_qweight=w2,
     )
-    act = MoEActivation.from_str("silu")
+    try:
+        act = MoEActivation.from_str("silu")
+    except Exception:  # noqa: BLE001 - enum spelling differs across vLLM
+        act = MoEActivation.SILU
     cases = ("empty", "hotspot", "nonmonotonic", "balanced")
 
     for tile_m in (128, 256):
@@ -1081,7 +1086,7 @@ def test_real_moe_grouped_full_routing_bitexact_vs_per_expert_dense_native(
                     k, n_sub, type_size, gs1)
                 intermediate = torch.empty(
                     (x_pad.shape[0], inter), dtype=gate_up.dtype, device=DEV)
-                apply_moe_activation(act, intermediate, gate_up)
+                native_moe_activation(act, intermediate, gate_up)
 
                 gs2 = stage2_scale
                 dense = _dense_native_role_reference(

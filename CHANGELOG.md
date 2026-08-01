@@ -32,6 +32,10 @@
 - Bind FP8 activation quantization and scaled matrix multiplication directly to
   vLLM's registered native CUDA operators after ABI/shape attestation. Gridbook
   no longer calls the fallback-capable `vllm._custom_ops` convenience wrappers.
+- Compile the optional fused FP8-CB CUTLASS extension for the concrete
+  `sm_120a`/`sm_121a` target derived from the serving GPU. A generic `sm_120`
+  or `sm_121` build can load but device-assert on its first architecture-
+  conditional tensor-core instruction, so it is no longer accepted.
 - Alias HunYuan-V3 shared-CB projections, including their MTP-nested forms, to
   native CB Linears. If a CB tensor instead resolves to a plain BF16 parameter,
   model load now fails rather than decoding the weight into an upstream Linear.
