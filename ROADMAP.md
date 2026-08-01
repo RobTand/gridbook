@@ -75,9 +75,9 @@ resident weight copy, decoder, or matmul merely to create another route.
 #### P0 — decide fused NVFP4 safely
 
 - [ ] **K0.1 — Align the producer and consumer releases.** In PrismaQuant, bump
-  the immutable Gridbook runtime pin from 0.4.1 (`59cebf9`) to 0.4.2
-  (`1634210`), rerun cross-repository contract/provenance CI, and publish the
-  resulting patch release. Do not copy the Gridbook runtime back into the
+  the immutable Gridbook runtime pin from 0.4.1 (`59cebf9`) to the final
+  Gridbook 0.5.0 release commit, rerun cross-repository contract/provenance CI,
+  and publish PrismaQuant 0.5.2. Do not copy the Gridbook runtime back into the
   producer.
 - [ ] **K0.2 — Produce a valid routed-MoE validation artifact.** Re-export a
   manageable representative model with producer-attested, stage-specific
