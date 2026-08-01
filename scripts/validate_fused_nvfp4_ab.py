@@ -58,6 +58,7 @@ import contextlib
 import datetime as dt
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import math
 import os
@@ -75,6 +76,23 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
+
+
+_COMMON_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "gridbook"
+    / "_fused_nvfp4_validation.py"
+)
+_COMMON_SPEC = importlib.util.spec_from_file_location(
+    "_gridbook_fused_nvfp4_validation_common", _COMMON_PATH
+)
+if _COMMON_SPEC is None or _COMMON_SPEC.loader is None:
+    raise RuntimeError(f"could not load validation common module from {_COMMON_PATH}")
+validation_common = sys.modules.get(_COMMON_SPEC.name)
+if validation_common is None:
+    validation_common = importlib.util.module_from_spec(_COMMON_SPEC)
+    sys.modules[_COMMON_SPEC.name] = validation_common
+    _COMMON_SPEC.loader.exec_module(validation_common)
 
 
 SCHEMA = "gridbook.fused-nvfp4-ab.v5"
@@ -1410,6 +1428,12 @@ def _runtime_provenance(
     harness = {
         "path": str(harness_path),
         **_required_file_record(harness_path),
+        "shared_helpers": {
+            "fused_nvfp4_validation": {
+                "path": str(_COMMON_PATH),
+                **_required_file_record(_COMMON_PATH),
+            }
+        },
     }
     gridbook_version = getattr(gridbook, "__version__", None)
     if not isinstance(gridbook_version, str) or not gridbook_version:
@@ -1982,164 +2006,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         os.environ.pop(PREFILL_ENV, None)
 
     started = time.monotonic()
-
-    import torch
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("fused NVFP4 validation requires a CUDA GPU")
-
-    import gridbook
-
-    # Explicit registration makes a source-tree invocation independent of
-    # entry-point discovery. register() is idempotent if vLLM also discovers it.
-    gridbook.register()
-    from gridbook import cb_fill_guard, config as gridbook_config
-    from gridbook import cuda_ext, linear, moe, moe_toplevel_loader
-
-    extension_started = time.monotonic()
-    fused_extension = cuda_ext.get_fused_fp4_ext()
-    extension_load_s = time.monotonic() - extension_started
-    if fused_extension is None:
-        raise RuntimeError("fused FP4 extension did not build/load; refusing a fallback A/B")
-    required_symbol = (
-        "cb_fused_fp4_prefill_mm_scaled"
-        if args.mode == "dense"
-        else "cb_fused_fp4_moe_grouped"
+    bootstrap = validation_common.prepare_validation(
+        args,
+        harness_path=Path(__file__),
+        helpers=sys.modules[__name__],
+        extension_none_message=(
+            "fused FP4 extension did not build/load; refusing a fallback A/B"
+        ),
     )
-    if not hasattr(fused_extension, required_symbol):
-        raise RuntimeError(
-            f"fused FP4 extension lacks required {args.mode} symbol "
-            f"{required_symbol!r}"
-        )
-
-    import vllm
-    from transformers import AutoConfig, AutoTokenizer
-    from vllm import LLM, SamplingParams
-
-    runtime = _runtime_provenance(
-        torch,
-        vllm,
-        gridbook,
-        gridbook_config,
-        linear,
-        moe,
-        moe_toplevel_loader,
-        cb_fill_guard,
-        cuda_ext,
-        Path(__file__),
-    )
-    extension_path_raw = getattr(fused_extension, "__file__", None)
-    if extension_path_raw is None:
-        raise RuntimeError("loaded fused FP4 extension has no filesystem __file__")
-    extension_path = Path(extension_path_raw).resolve()
-    extension_file = _required_file_record(extension_path)
-    extension = {
-        "preloaded_before_model": True,
-        "load_seconds": extension_load_s,
-        "module": getattr(fused_extension, "__name__", None),
-        "path": str(extension_path),
-        "bytes": extension_file["bytes"],
-        "sha256": extension_file["sha256"],
-        "required_symbol": required_symbol,
-        "required_symbol_present": True,
-    }
-
-    candidate_path = Path(args.model).expanduser()
-    candidate_config = AutoConfig.from_pretrained(
-        args.model,
-        trust_remote_code=args.trust_remote_code,
-        revision=args.revision,
-        local_files_only=not args.allow_downloads,
-    )
-    candidate_vocab_size = int(getattr(candidate_config, "vocab_size", 0))
-    if candidate_vocab_size <= 0:
-        raise RuntimeError(
-            f"candidate config has invalid vocab_size={candidate_vocab_size}"
-        )
-    if candidate_path.is_dir():
-        candidate_artifact_provenance = _local_model_provenance(
-            candidate_path, role="candidate"
-        )
-        candidate_load_revision = args.revision
-    else:
-        candidate_artifact_provenance = _hub_model_provenance(
-            candidate_config,
-            role="candidate",
-            model_id=args.model,
-            requested_revision=args.revision,
-        )
-        candidate_load_revision = candidate_artifact_provenance[
-            "resolved_commit_hash"
-        ]
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model,
-        trust_remote_code=args.trust_remote_code,
-        revision=candidate_load_revision,
-        local_files_only=not args.allow_downloads,
-        # Transformers detects the legacy Mistral/Tekken pre-tokenizer regex
-        # used by Laguna and otherwise warns that it can split some inputs
-        # incorrectly.  The option is harmless for tokenizers that do not
-        # need the compatibility repair and makes the sampled corpus contract
-        # explicit and reproducible.
-        fix_mistral_regex=True,
-    )
-
-    teacher_config = None
-    teacher_identity = None
-    teacher_artifact_provenance = None
-    teacher_load_revision = args.teacher_revision
-    if args.teacher_model is not None:
-        teacher_preflight_started = time.monotonic()
-        teacher_config = AutoConfig.from_pretrained(
-            args.teacher_model,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.teacher_revision,
-            local_files_only=not args.allow_downloads,
-        )
-        config_identity = _assert_config_identity(
-            candidate_config, teacher_config
-        )
-        teacher_path = Path(args.teacher_model).expanduser()
-        if teacher_path.is_dir():
-            teacher_artifact_provenance = _local_model_provenance(
-                teacher_path, role="teacher"
-            )
-        else:
-            teacher_artifact_provenance = _hub_model_provenance(
-                teacher_config,
-                role="teacher",
-                model_id=args.teacher_model,
-                requested_revision=args.teacher_revision,
-            )
-            teacher_load_revision = teacher_artifact_provenance[
-                "resolved_commit_hash"
-            ]
-        teacher_tokenizer = AutoTokenizer.from_pretrained(
-            args.teacher_model,
-            trust_remote_code=args.trust_remote_code,
-            revision=teacher_load_revision,
-            local_files_only=not args.allow_downloads,
-            fix_mistral_regex=True,
-        )
-        tokenizer_identity = _assert_tokenizer_identity(
-            tokenizer, teacher_tokenizer
-        )
-        tokenizer_files = _assert_local_tokenizer_files_match(
-            Path(args.model).expanduser(), Path(args.teacher_model).expanduser()
-        )
-        teacher_identity = {
-            "config": config_identity,
-            "tokenizer": tokenizer_identity,
-            "local_tokenizer_files": tokenizer_files,
-            "preflight_seconds": time.monotonic() - teacher_preflight_started,
-        }
-        del teacher_tokenizer
-    prompts, dataset = _load_wikitext_windows(args, tokenizer)
-
-    quality_kl_mode = (
-        KL_FULL_VOCAB if args.teacher_full_vocab_kl else KL_COARSE_TOPK
-    )
-    quality_logprobs = -1 if args.teacher_full_vocab_kl else args.top_k
+    torch = bootstrap.torch
+    linear = bootstrap.linear
+    moe = bootstrap.moe
+    runtime = bootstrap.runtime
+    extension = bootstrap.extension
+    candidate_vocab_size = bootstrap.candidate_vocab_size
+    candidate_artifact_provenance = bootstrap.candidate_artifact_provenance
+    prompts = bootstrap.prompts
+    dataset = bootstrap.dataset
+    quality_kl_mode = bootstrap.quality_kl_mode
 
     probe = (
         DenseDispatchProbe(
@@ -2151,45 +2035,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         else MoEDispatchProbe(moe.PrismaQuantCBMoEMethod)
     )
     probe.install()
-    load_started = time.monotonic()
-    llm_kwargs: dict[str, Any] = {
-        "model": args.model,
-        "trust_remote_code": args.trust_remote_code,
-        "revision": candidate_load_revision,
-        "dtype": args.dtype,
-        "tensor_parallel_size": 1,
-        "gpu_memory_utilization": args.gpu_memory_utilization,
-        "max_model_len": args.seqlen + 16,
-        "max_num_seqs": 1,
-        "max_logprobs": quality_logprobs,
-        "enforce_eager": True,
-        "disable_log_stats": True,
-        "enable_prefix_caching": False,
-        "enable_chunked_prefill": bool(args.enable_chunked_prefill),
-        "seed": args.seed,
-    }
-    if args.quantization:
-        llm_kwargs["quantization"] = args.quantization
-    if args.max_num_batched_tokens is not None:
-        llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
-    try:
-        llm = LLM(**llm_kwargs)
-    except Exception:
-        probe.restore()
-        raise
-    model_load_s = time.monotonic() - load_started
-
-    quality_sampling = SamplingParams(
-        max_tokens=1,
-        temperature=0.0,
-        prompt_logprobs=quality_logprobs,
-        detokenize=False,
+    engine = validation_common.load_candidate_engine(
+        bootstrap, args, probe=probe
     )
-    timing_sampling = SamplingParams(
-        max_tokens=1,
-        temperature=0.0,
-        detokenize=False,
-    )
+    llm = engine.llm
+    quality_sampling = engine.quality_sampling
+    timing_sampling = engine.timing_sampling
+    model_load_s = engine.model_load_seconds
 
     dispatch_records: list[dict[str, Any]] = []
     warmup_records: list[dict[str, Any]] = []
@@ -2218,56 +2070,54 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 record["wall_ms"] = elapsed_ms
                 warmup_records.append(record)
+                del _result
 
-        for prompt_index, prompt_ids in enumerate(prompts):
-            scores: dict[str, PromptScore] = {}
-            walls: dict[str, float] = {}
-            order = paired_arm_order(prompt_index)
-            for arm in order:
-                output, elapsed_ms, record = _run_generate(
-                    llm=llm,
-                    sampling=quality_sampling,
-                    prompt_ids=prompt_ids,
-                    arm=arm,
-                    label=f"quality:{prompt_index}:{arm}",
-                    execution_mode=args.mode,
-                    dense_fused_mode=args.fused_mode,
-                    linear=linear,
-                    moe=moe,
-                    probe=probe,
-                    synchronize=synchronize,
-                )
-                scores[arm] = score_prompt_output(
-                    output,
-                    prompt_ids,
-                    args.top_k,
-                    full_vocab=args.teacher_full_vocab_kl,
-                    expected_vocab_size=(
-                        candidate_vocab_size
-                        if args.teacher_full_vocab_kl
-                        else None
-                    ),
-                )
-                walls[arm] = elapsed_ms
-                record["wall_ms"] = elapsed_ms
-                dispatch_records.append(record)
-            quality_pairs.append({
-                "prompt_index": prompt_index,
-                "pair_order": list(order),
-                "scores": scores,
-                "wall_ms": walls,
-            })
-
-        for repeat in range(args.timing_repeats):
+        # Exact-vocabulary quality materializes very large host objects. Run
+        # timing first so deferred GC/lazy host work cannot land on one arm.
+        for phase in validation_common.measurement_phase_order(
+            args.timing_repeats
+        ):
+            if phase == "timing":
+                validation_common.quiesce_before_timing(torch)
+                for repeat in range(args.timing_repeats):
+                    for prompt_index, prompt_ids in enumerate(prompts):
+                        order = paired_arm_order(
+                            repeat * len(prompts) + prompt_index
+                        )
+                        for arm in order:
+                            _output, elapsed_ms, record = _run_generate(
+                                llm=llm,
+                                sampling=timing_sampling,
+                                prompt_ids=prompt_ids,
+                                arm=arm,
+                                label=(
+                                    f"timing:{repeat}:{prompt_index}:{arm}"
+                                ),
+                                execution_mode=args.mode,
+                                dense_fused_mode=args.fused_mode,
+                                linear=linear,
+                                moe=moe,
+                                probe=probe,
+                                synchronize=synchronize,
+                            )
+                            timing_samples[arm].append(elapsed_ms)
+                            record["wall_ms"] = elapsed_ms
+                            dispatch_records.append(record)
+                            del _output
+                continue
+            if phase != "quality":
+                raise RuntimeError(f"unknown measurement phase {phase!r}")
             for prompt_index, prompt_ids in enumerate(prompts):
-                order = paired_arm_order(repeat * len(prompts) + prompt_index)
+                scores: dict[str, PromptScore] = {}
+                walls: dict[str, float] = {}
+                order = paired_arm_order(prompt_index)
                 for arm in order:
-                    _output, elapsed_ms, record = _run_generate(
+                    output, elapsed_ms, record = _run_generate(
                         llm=llm,
-                        sampling=timing_sampling,
+                        sampling=quality_sampling,
                         prompt_ids=prompt_ids,
                         arm=arm,
-                        label=f"timing:{repeat}:{prompt_index}:{arm}",
+                        label=f"quality:{prompt_index}:{arm}",
                         execution_mode=args.mode,
                         dense_fused_mode=args.fused_mode,
                         linear=linear,
@@ -2275,78 +2125,43 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         probe=probe,
                         synchronize=synchronize,
                     )
-                    timing_samples[arm].append(elapsed_ms)
+                    scores[arm] = score_prompt_output(
+                        output,
+                        prompt_ids,
+                        args.top_k,
+                        full_vocab=args.teacher_full_vocab_kl,
+                        expected_vocab_size=(
+                            candidate_vocab_size
+                            if args.teacher_full_vocab_kl
+                            else None
+                        ),
+                    )
+                    walls[arm] = elapsed_ms
                     record["wall_ms"] = elapsed_ms
                     dispatch_records.append(record)
+                    del output
+                quality_pairs.append({
+                    "prompt_index": prompt_index,
+                    "pair_order": list(order),
+                    "scores": scores,
+                    "wall_ms": walls,
+                })
     finally:
         probe.restore()
 
     quality = _quality_summary(quality_pairs, kl_mode=quality_kl_mode)
-    teacher_quality = None
-    teacher_record = None
-    if args.teacher_model is not None:
-        from transformers import AutoModelForCausalLM
-
-        if teacher_config is None or teacher_identity is None:
-            raise RuntimeError("teacher identity preflight did not complete")
-        teacher_started = time.monotonic()
-        teacher_dtype = getattr(torch, args.teacher_dtype, None)
-        if teacher_dtype is None:
-            raise RuntimeError(
-                f"unsupported teacher torch dtype {args.teacher_dtype!r}"
-            )
-        teacher = AutoModelForCausalLM.from_pretrained(
-            args.teacher_model,
-            config=teacher_config,
-            revision=teacher_load_revision,
-            trust_remote_code=args.trust_remote_code,
-            local_files_only=not args.allow_downloads,
-            dtype=teacher_dtype,
-        ).eval().to(torch.device("cuda"))
-        dtype_attestation = _attest_teacher_model(teacher, torch)
-        architectures = list(getattr(teacher.config, "architectures", None) or [])
-        if architectures and type(teacher).__name__ not in architectures:
-            raise RuntimeError(
-                f"loaded teacher class {type(teacher).__name__!r} is not the "
-                f"attested config architecture {architectures}"
-            )
-        vocab_size = int(getattr(teacher.config, "vocab_size", 0))
-        if vocab_size != candidate_vocab_size:
-            raise RuntimeError(
-                f"teacher vocab_size={vocab_size} differs from candidate "
-                f"vocab_size={candidate_vocab_size}"
-            )
-        max_prompt_token = max(max(prompt) for prompt in prompts)
-        if vocab_size <= max_prompt_token:
-            raise RuntimeError(
-                f"teacher vocab_size={vocab_size} cannot score token "
-                f"id {max_prompt_token} from the candidate tokenizer"
-            )
-        teacher_scores = [
-            score_teacher_prompt(
-                teacher,
-                prompt,
-                args.top_k,
-                torch,
-                full_vocab=args.teacher_full_vocab_kl,
-                expected_vocab_size=candidate_vocab_size,
-            )
-            for prompt in prompts
-        ]
-        arm_scores = {
-            arm: [pair["scores"][arm] for pair in quality_pairs]
-            for arm in ARMS
-        }
-        teacher_quality = {
-            arm: _pairwise_score_summary(
-                teacher_scores,
-                arm_scores[arm],
-                reference_name="teacher",
-                candidate_name=arm,
-                kl_mode=quality_kl_mode,
-            )
-            for arm in ARMS
-        }
+    arm_scores = {
+        arm: [pair["scores"][arm] for pair in quality_pairs]
+        for arm in ARMS
+    }
+    teacher_quality, teacher_record = validation_common.score_teacher(
+        bootstrap,
+        args,
+        arm_scores=arm_scores,
+        arms=ARMS,
+        helpers=sys.modules[__name__],
+    )
+    if teacher_quality is not None:
         teacher_baseline_kl = teacher_quality["baseline"][
             "kl_reference_to_candidate"
         ]["mean"]
@@ -2359,43 +2174,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "kl_mode": quality_kl_mode,
         }
-        teacher_record = {
-            "model": args.teacher_model,
-            "model_resolved": (
-                str(Path(args.teacher_model).expanduser().resolve())
-                if Path(args.teacher_model).expanduser().is_dir()
-                else None
-            ),
-            "revision": args.teacher_revision,
-            "resolved_load_revision": (
-                teacher_load_revision if not teacher_path.is_dir() else None
-            ),
-            "load_and_score_seconds": time.monotonic() - teacher_started,
-            "requested_dtype": args.teacher_dtype,
-            "actual_dtype_attestation": dtype_attestation,
-            "vocab_size": vocab_size,
-            "model_class": (
-                f"{type(teacher).__module__}.{type(teacher).__qualname__}"
-            ),
-            "transformers_version": importlib.metadata.version("transformers"),
-            "identity": teacher_identity,
-            "artifact_provenance": teacher_artifact_provenance,
-            "comparison_contract": {
-                "reference_backend": "Transformers",
-                "candidate_backend": "vLLM",
-                "cross_runtime": True,
-                "target_nll": "exact full-vocabulary normalization",
-                "kl_mode": quality_kl_mode,
-                "kl_convention": _kl_convention(quality_kl_mode),
-            },
-            "role": (
-                "unquantized BF16-parameter Transformers reference; "
-                "non-parameter buffers are dtype-attested separately; never "
-                "used for timing"
-            ),
-        }
-        del teacher, teacher_scores
-        torch.cuda.empty_cache()
     baseline_records = [r for r in dispatch_records if r["arm"] == "baseline"]
     fused_records = [r for r in dispatch_records if r["arm"] == "fused"]
     baseline_dispatch = aggregate_dispatch(baseline_records)
@@ -2507,51 +2285,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "fused": "native NVFP4 global FP32 scale + per-group UE4M3 factors",
             "same_contract": False,
         },
-        "settings": {
-            "model": args.model,
-            "model_resolved": (
-                str(candidate_path.resolve()) if candidate_path.is_dir() else None
-            ),
-            "revision": args.revision,
-            "resolved_load_revision": (
-                candidate_load_revision if not candidate_path.is_dir() else None
-            ),
-            "teacher_model": args.teacher_model,
-            "teacher_revision": args.teacher_revision,
-            "teacher_dtype": args.teacher_dtype,
-            "teacher_full_vocab_kl": bool(args.teacher_full_vocab_kl),
-            "trust_remote_code": bool(args.trust_remote_code),
-            "downloads_allowed": bool(args.allow_downloads),
-            "quantization": args.quantization,
-            "dtype": args.dtype,
-            "mode": args.mode,
-            "fused_mode": args.fused_mode,
-            "moe_fused_tile_m": (
-                int(args.mode.removeprefix("moe"))
-                if args.mode != "dense" else None
-            ),
-            "prefill_env_inherited_then_removed": (
-                inherited_prefill if args.mode != "dense" else None
-            ),
-            "prefill_env_during_measurement": os.environ.get(PREFILL_ENV),
-            "prefill_m_threshold": linear.PREFILL_M_THRESHOLD,
-            "tensor_parallel_size": 1,
-            "enforce_eager": True,
-            "v1_multiprocessing": False,
-            "prefix_caching": False,
-            "chunked_prefill": bool(args.enable_chunked_prefill),
-            "gpu_memory_utilization": args.gpu_memory_utilization,
-            "max_num_batched_tokens": args.max_num_batched_tokens,
-            "top_k": args.top_k,
-            "quality_prompt_logprobs_request": quality_logprobs,
-            "quality_kl_mode": quality_kl_mode,
-            "candidate_vocab_size": candidate_vocab_size,
-            "warmup_pairs": args.warmup_pairs,
-            "timing_repeats": args.timing_repeats,
-            "measurement_only": bool(getattr(args, "measurement_only", False)),
-            "min_fused_success_fraction": args.min_fused_success_fraction,
-            "seed": args.seed,
-        },
+        "settings": validation_common.shared_report_settings(
+            bootstrap,
+            args,
+            arm_settings={
+                "fused_mode": args.fused_mode,
+                "moe_fused_tile_m": (
+                    int(args.mode.removeprefix("moe"))
+                    if args.mode != "dense"
+                    else None
+                ),
+            },
+            inherited_prefill=inherited_prefill,
+            prefill_threshold=linear.PREFILL_M_THRESHOLD,
+            measurement_settings={
+                "warmup_pairs": args.warmup_pairs,
+                "timing_repeats": args.timing_repeats,
+                "measurement_only": bool(
+                    getattr(args, "measurement_only", False)
+                ),
+                "min_fused_success_fraction": (
+                    args.min_fused_success_fraction
+                ),
+            },
+        ),
         "runtime": runtime,
         "extension": extension,
         "candidate_artifact_provenance": candidate_artifact_provenance,
@@ -2579,62 +2336,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True)
-    parser.add_argument(
-        "--teacher-model",
-        help=(
-            "optional local path or revision-pinned Hub ID for an unquantized "
-            "BF16 Transformers teacher"
-        ),
-    )
-    parser.add_argument(
-        "--teacher-revision",
-        help="required explicit revision for a non-local --teacher-model",
-    )
-    parser.add_argument(
-        "--teacher-dtype",
-        choices=("bfloat16",),
-        default="bfloat16",
-        help="teacher parameter dtype; fixed to BF16 and attested after loading",
-    )
-    parser.add_argument(
-        "--teacher-full-vocab-kl",
-        action="store_true",
-        help=(
-            "opt into exact full-vocabulary KL by requesting every vLLM "
-            "prompt logprob and enforcing exact vocabulary cardinality; this "
-            "is memory-heavy for 128k-vocabulary models"
-        ),
-    )
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--dataset-cache-dir", default="/hfcache/datasets")
-    parser.add_argument(
-        "--wikitext-text",
-        type=Path,
-        help="cached WikiText-2 raw split; avoids a `datasets` dependency",
-    )
-    parser.add_argument("--dataset-split", default="test")
-    parser.add_argument("--allow-downloads", action="store_true")
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="explicitly allow model/tokenizer repository Python code",
-    )
-    parser.add_argument(
-        "--revision",
-        help="required explicit revision for a non-local --model",
-    )
-    parser.add_argument("--n-samples", type=_positive_int, default=4)
-    parser.add_argument("--seqlen", type=_positive_int, default=128)
-    parser.add_argument("--window-seed", type=int, default=42)
-    parser.add_argument("--top-k", type=_positive_int, default=1024)
-    parser.add_argument("--dtype", default="bfloat16")
-    parser.add_argument("--quantization")
-    parser.add_argument("--gpu-memory-utilization", type=_unit_interval, default=0.80)
-    parser.add_argument("--max-num-batched-tokens", type=_positive_int)
-    parser.add_argument("--enable-chunked-prefill", action="store_true")
-    parser.add_argument(
-        "--mode", choices=("dense", "moe128", "moe256"), default="dense"
+    validation_common.add_shared_cli_arguments(
+        parser, helpers=sys.modules[__name__], n_samples_default=4
     )
     parser.add_argument(
         "--fused-mode", choices=DENSE_FUSED_MODES, default="1",
@@ -2644,15 +2347,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--warmup-pairs", type=_positive_int, default=1)
-    parser.add_argument("--timing-repeats", type=_nonnegative_int, default=0)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--measurement-only",
-        action="store_true",
-        help=(
-            "explicitly collect evidence without promotion thresholds; the "
-            "report status is measurement_only and configured_gates_pass is null"
-        ),
+    validation_common.add_shared_measurement_cli_arguments(
+        parser, helpers=sys.modules[__name__]
     )
     parser.add_argument(
         "--require-zero-fallbacks",
@@ -2692,29 +2388,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--min-timing-speedup", type=_nonnegative_float)
     args = parser.parse_args(argv)
-    if args.seqlen <= 16:
-        parser.error("--seqlen must exceed the fused prefill threshold (16)")
-    if args.min_timing_speedup is not None and args.timing_repeats == 0:
-        parser.error("--min-timing-speedup requires --timing-repeats > 0")
-    candidate_is_local = Path(args.model).expanduser().is_dir()
-    if not candidate_is_local and not args.revision:
-        parser.error("a non-local --model requires an explicit --revision")
-    teacher_is_local = bool(
-        args.teacher_model
-        and Path(args.teacher_model).expanduser().is_dir()
-    )
-    if args.teacher_model and not teacher_is_local and not args.teacher_revision:
-        parser.error(
-            "a non-local --teacher-model requires an explicit --teacher-revision"
-        )
-    if args.teacher_full_vocab_kl and not args.teacher_model:
-        parser.error("--teacher-full-vocab-kl requires --teacher-model")
     teacher_gates = (
         args.max_teacher_fused_mean_kl,
         args.max_teacher_fused_kl_regression,
     )
-    if any(limit is not None for limit in teacher_gates) and not args.teacher_model:
-        parser.error("teacher-relative gates require --teacher-model")
+    validation_common.validate_shared_cli_args(
+        parser, args, teacher_gate_values=teacher_gates
+    )
     has_thresholds = any(limit is not None for limit in _configured_limit_values(args))
     if not has_thresholds and not args.measurement_only:
         parser.error(

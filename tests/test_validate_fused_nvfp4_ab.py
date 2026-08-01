@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import inspect
 import json
 import math
 import os
@@ -39,10 +41,116 @@ ab = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = ab
 SPEC.loader.exec_module(ab)
 
+V5_HELP_SHA256 = "34c0e1bde4a7a543c400248fc46ac9bfd8f535baacb8cbbeb7534ad0e6140628"
+
 
 class _Logprob:
     def __init__(self, value):
         self.logprob = value
+
+
+def test_v5_schema_and_cli_help_are_compatibility_locked():
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        check=True,
+        capture_output=True,
+    )
+    assert ab.SCHEMA == "gridbook.fused-nvfp4-ab.v5"
+    assert ab.ARMS == ("baseline", "fused")
+    assert ab.DENSE_FUSED_MODES == ("1", "midm", "rowwise", "rowwise_midm")
+    assert hashlib.sha256(completed.stdout).hexdigest() == V5_HELP_SHA256
+
+
+def test_timing_phase_is_executed_before_allocation_heavy_quality():
+    common = ab.validation_common
+    assert common.measurement_phase_order(0) == ("quality",)
+    assert common.measurement_phase_order(1) == ("timing", "quality")
+    assert common.measurement_phase_order(7) == ("timing", "quality")
+    with pytest.raises(ValueError, match="nonnegative"):
+        common.measurement_phase_order(-1)
+    # Both entry points consume this single ordering contract; the v6 test
+    # separately locks its runner to the same helper.
+    assert "validation_common.measurement_phase_order" in inspect.getsource(ab.run)
+
+
+def test_timing_quiescence_collects_host_garbage_before_cuda_sync(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        ab.validation_common.gc,
+        "collect",
+        lambda: events.append("gc") or 17,
+    )
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(synchronize=lambda: events.append("cuda_sync"))
+    )
+    assert ab.validation_common.quiesce_before_timing(torch) == 17
+    assert events == ["gc", "cuda_sync"]
+
+
+def test_shared_engine_bootstrap_preserves_v5_llm_and_sampling_contract():
+    calls = []
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            calls.append(("llm", kwargs))
+
+    class FakeSampling:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            calls.append(("sampling", kwargs))
+
+    bootstrap = SimpleNamespace(
+        candidate_load_revision="resolved-commit",
+        quality_logprobs=1024,
+        llm_class=FakeLLM,
+        sampling_params_class=FakeSampling,
+    )
+    args = SimpleNamespace(
+        model="candidate",
+        trust_remote_code=False,
+        dtype="bfloat16",
+        gpu_memory_utilization=0.8,
+        seqlen=128,
+        enable_chunked_prefill=False,
+        seed=7,
+        quantization="gridbook",
+        max_num_batched_tokens=256,
+    )
+    probe = SimpleNamespace(restore=lambda: calls.append(("restore", {})))
+    engine = ab.validation_common.load_candidate_engine(
+        bootstrap, args, probe=probe
+    )
+    llm_kwargs = calls[0][1]
+    assert llm_kwargs == {
+        "model": "candidate",
+        "trust_remote_code": False,
+        "revision": "resolved-commit",
+        "dtype": "bfloat16",
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.8,
+        "max_model_len": 144,
+        "max_num_seqs": 1,
+        "max_logprobs": 1024,
+        "enforce_eager": True,
+        "disable_log_stats": True,
+        "enable_prefix_caching": False,
+        "enable_chunked_prefill": False,
+        "seed": 7,
+        "quantization": "gridbook",
+        "max_num_batched_tokens": 256,
+    }
+    assert engine.quality_sampling.kwargs == {
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "prompt_logprobs": 1024,
+        "detokenize": False,
+    }
+    assert engine.timing_sampling.kwargs == {
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "detokenize": False,
+    }
+    assert all(name != "restore" for name, _payload in calls)
 
 
 def test_pair_order_is_prompt_paired_and_counterbalanced():
@@ -298,6 +406,43 @@ def test_teacher_pairwise_summary_identifies_better_candidate():
     assert exact["kl_reference_to_candidate"]["mean"] == pytest.approx(0.0)
     assert changed["mean_nll_delta_candidate_minus_reference"] > 0.0
     assert changed["kl_reference_to_candidate"]["mean"] > 0.0
+
+
+def test_v5_quality_and_timing_report_shape_remains_compatible():
+    row = ab.TopKRow((1, 2), (math.log(0.6), math.log(0.3)))
+    score = ab.PromptScore((math.log(0.6),), (row,))
+    quality = ab._quality_summary([{
+        "prompt_index": 0,
+        "pair_order": ["baseline", "fused"],
+        "scores": {"baseline": score, "fused": score},
+        "wall_ms": {"baseline": 2.0, "fused": 1.0},
+    }])
+    assert tuple(quality) == (
+        "arms",
+        "delta",
+        "per_prompt",
+        "kl_mode",
+        "kl_convention",
+    )
+    assert tuple(quality["arms"]) == ("baseline", "fused")
+    assert set(quality["delta"]) == {
+        "mean_nll_fused_minus_baseline",
+        "ppl_fused_over_baseline",
+        "ppl_relative_regression",
+        "target_logprob_abs_delta",
+        "kl_baseline_to_fused",
+        "kl_fused_to_baseline",
+        "kl_baseline_to_fused_confident_positions",
+    }
+    timing = ab._timing_summary({"baseline": [2.0], "fused": [1.0]})
+    assert tuple(timing) == (
+        "metric",
+        "scope",
+        "is_streaming_ttft",
+        "arms",
+        "baseline_over_fused_speedup",
+    )
+    assert timing["baseline_over_fused_speedup"] == pytest.approx(2.0)
 
 
 def test_score_prompt_output_scores_targets_and_drops_position_zero():
@@ -734,6 +879,9 @@ def test_runtime_provenance_hashes_the_actual_imported_package(tmp_path, monkeyp
         )
         assert record["source_sha256"][relative] == ab._sha256(package / relative)
     assert record["harness"]["sha256"] == ab._sha256(harness)
+    shared = record["harness"]["shared_helpers"]["fused_nvfp4_validation"]
+    assert shared["path"] == str(ab._COMMON_PATH)
+    assert shared["sha256"] == ab._sha256(ab._COMMON_PATH)
 
     (package / "moe_toplevel_loader.py").unlink()
     with pytest.raises(RuntimeError, match="moe_toplevel_loader.*unreadable"):

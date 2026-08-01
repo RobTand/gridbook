@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import math
 import os
 import subprocess
@@ -41,6 +42,17 @@ def test_v6_import_preserves_v5_schema_and_arms():
     assert three.v5.SCHEMA == "gridbook.fused-nvfp4-ab.v5"
     assert three.v5.ARMS == ("baseline", "fused")
     assert three.ARMS == ("baseline", "static", "rowwise")
+
+
+def test_v6_runner_uses_shared_timing_before_quality_contract():
+    assert three.validation_common is three.v5.validation_common
+    assert three.validation_common.measurement_phase_order(2) == (
+        "timing",
+        "quality",
+    )
+    assert "validation_common.measurement_phase_order" in inspect.getsource(
+        three.run
+    )
 
 
 def test_all_six_permutations_are_counterbalanced():
