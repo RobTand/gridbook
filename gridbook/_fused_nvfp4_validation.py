@@ -76,6 +76,7 @@ class CandidateEngine:
     quality_sampling: Any
     timing_sampling: Any
     model_load_seconds: float
+    chunked_prefill_contract: dict[str, Any] | None
 
 
 def prepare_validation(
@@ -286,6 +287,7 @@ def load_candidate_engine(
     args: Any,
     *,
     probe: Any,
+    attest_chunked_prefill: bool = False,
 ) -> CandidateEngine:
     """Construct exactly one candidate engine while its dispatch probe is live."""
 
@@ -303,9 +305,13 @@ def load_candidate_engine(
         "enforce_eager": True,
         "disable_log_stats": True,
         "enable_prefix_caching": False,
-        "enable_chunked_prefill": bool(args.enable_chunked_prefill),
         "seed": args.seed,
     }
+    chunked_prefill_request = args.enable_chunked_prefill
+    if chunked_prefill_request is not None:
+        llm_kwargs["enable_chunked_prefill"] = bool(
+            chunked_prefill_request
+        )
     if args.quantization:
         llm_kwargs["quantization"] = args.quantization
     if args.max_num_batched_tokens is not None:
@@ -327,12 +333,104 @@ def load_candidate_engine(
         temperature=0.0,
         detokenize=False,
     )
+    try:
+        chunked_prefill_contract = (
+            attest_chunked_prefill_contract(llm, chunked_prefill_request)
+            if attest_chunked_prefill
+            else None
+        )
+    except Exception:
+        probe.restore()
+        raise
     return CandidateEngine(
         llm=llm,
         quality_sampling=quality_sampling,
         timing_sampling=timing_sampling,
         model_load_seconds=model_load_s,
+        chunked_prefill_contract=chunked_prefill_contract,
     )
+
+
+def attest_chunked_prefill_contract(
+    llm: Any, requested: bool | None
+) -> dict[str, Any]:
+    """Read vLLM's resolved scheduler/model contract without log scraping."""
+
+    if requested is not None and not isinstance(requested, bool):
+        raise RuntimeError(
+            "chunked prefill request must be auto/True/False, got "
+            f"{requested!r}"
+        )
+    engine = getattr(llm, "llm_engine", None)
+    vllm_config = getattr(engine, "vllm_config", None)
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    resolved = getattr(scheduler_config, "enable_chunked_prefill", None)
+    official_default = getattr(
+        model_config, "is_chunked_prefill_supported", None
+    )
+    runner_type = getattr(model_config, "runner_type", None)
+    if not isinstance(resolved, bool):
+        raise RuntimeError(
+            "vLLM scheduler config did not expose boolean "
+            "enable_chunked_prefill"
+        )
+    if not isinstance(official_default, bool):
+        raise RuntimeError(
+            "vLLM model config did not expose boolean "
+            "is_chunked_prefill_supported"
+        )
+    if not isinstance(runner_type, str) or not runner_type:
+        raise RuntimeError("vLLM model config did not expose runner_type")
+
+    explicit = requested is not None
+    requested_matches_resolved = (
+        None if requested is None else requested == resolved
+    )
+    conflicts_with_official_contract = bool(
+        explicit and requested != official_default
+    )
+    would_trigger_vllm_warning = bool(
+        explicit
+        and (
+            (
+                runner_type == "generate"
+                and requested is False
+                and official_default is True
+            )
+            or (
+                runner_type == "pooling"
+                and requested is True
+                and official_default is False
+            )
+        )
+    )
+    promotion_compatible = bool(
+        not conflicts_with_official_contract
+        and requested_matches_resolved is not False
+    )
+    return {
+        "requested": (
+            "auto" if requested is None
+            else "enable" if requested
+            else "disable"
+        ),
+        "engine_kwarg_omitted": requested is None,
+        "resolved_enabled": resolved,
+        "model_official_default_enabled": official_default,
+        "model_runner_type": runner_type,
+        "requested_matches_resolved": requested_matches_resolved,
+        "explicit_override_conflicts_with_official_contract": (
+            conflicts_with_official_contract
+        ),
+        "would_trigger_vllm_warning": would_trigger_vllm_warning,
+        "promotion_compatible": promotion_compatible,
+        "attestation_source": (
+            "LLM.llm_engine.vllm_config.{scheduler_config."
+            "enable_chunked_prefill,model_config."
+            "is_chunked_prefill_supported,model_config.runner_type}"
+        ),
+    }
 
 
 def score_teacher(
@@ -514,6 +612,7 @@ def add_shared_cli_arguments(
     *,
     helpers: Any,
     n_samples_default: int,
+    chunked_prefill_tristate: bool = False,
 ) -> None:
     """Add byte-for-byte-compatible common v5/v6 CLI arguments."""
 
@@ -578,7 +677,28 @@ def add_shared_cli_arguments(
     parser.add_argument(
         "--max-num-batched-tokens", type=helpers._positive_int
     )
-    parser.add_argument("--enable-chunked-prefill", action="store_true")
+    if chunked_prefill_tristate:
+        chunked = parser.add_mutually_exclusive_group()
+        chunked.add_argument(
+            "--enable-chunked-prefill",
+            dest="enable_chunked_prefill",
+            action="store_const",
+            const=True,
+            default=None,
+            help="explicitly require chunked prefill",
+        )
+        chunked.add_argument(
+            "--disable-chunked-prefill",
+            dest="enable_chunked_prefill",
+            action="store_const",
+            const=False,
+            help=(
+                "explicitly disable chunked prefill; promotion fails if this "
+                "conflicts with the model's official vLLM contract"
+            ),
+        )
+    else:
+        parser.add_argument("--enable-chunked-prefill", action="store_true")
     parser.add_argument(
         "--mode", choices=("dense", "moe128", "moe256"), default="dense"
     )

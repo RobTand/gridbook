@@ -418,6 +418,7 @@ def core_integrity_gates(
     selector_attestations: Sequence[Mapping[str, Any]],
     permutation_attestations: Mapping[str, Mapping[str, Any]],
     expected_measurements: int,
+    chunked_prefill_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
     observed_pids = sorted({
         pid for arm in ARMS for pid in dispatch[arm]["pids"]
@@ -435,6 +436,12 @@ def core_integrity_gates(
         "baseline_probe_no_errors": {
             "observed_errors": dispatch["baseline"]["probe_errors"],
             "pass": dispatch["baseline"]["probe_errors"] == 0,
+        },
+        "chunked_prefill_execution_contract": {
+            **dict(chunked_prefill_contract),
+            "pass": (
+                chunked_prefill_contract.get("promotion_compatible") is True
+            ),
         },
         "selector_cache_attestation": {
             "expected_measurements": expected_measurements,
@@ -649,8 +656,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     probe.install()
     engine = validation_common.load_candidate_engine(
-        bootstrap, args, probe=probe
+        bootstrap, args, probe=probe, attest_chunked_prefill=True
     )
+    chunked_prefill_contract = engine.chunked_prefill_contract
+    if chunked_prefill_contract is None:
+        raise RuntimeError("chunked-prefill contract attestation did not run")
     llm = engine.llm
     quality_sampling = engine.quality_sampling
     timing_sampling = engine.timing_sampling
@@ -838,6 +848,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         selector_attestations=selector_attestations,
         permutation_attestations=permutation_attestations,
         expected_measurements=expected_measurements,
+        chunked_prefill_contract=chunked_prefill_contract,
     )
     kl_limitation = (
         "Exact full-vocabulary KL was requested and cardinality-attested."
@@ -882,6 +893,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             inherited_prefill=inherited_prefill,
             prefill_threshold=linear.PREFILL_M_THRESHOLD,
             measurement_settings={
+                "chunked_prefill": chunked_prefill_contract[
+                    "resolved_enabled"
+                ],
+                "chunked_prefill_contract": chunked_prefill_contract,
                 "warmup_cycles": args.warmup_cycles,
                 "timing_repeats": args.timing_repeats,
             },
@@ -928,7 +943,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     validation_common.add_shared_cli_arguments(
-        parser, helpers=v5, n_samples_default=6
+        parser,
+        helpers=v5,
+        n_samples_default=6,
+        chunked_prefill_tristate=True,
     )
     parser.add_argument(
         "--dense-range",
