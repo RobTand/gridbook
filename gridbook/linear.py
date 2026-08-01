@@ -61,12 +61,23 @@ def _fp4_fused_mode() -> str:
     # ue4m3 scale factors — measured ~7.5e-2 relative against Triton. The fused
     # kernel is bit-exact against the stock NVF4 collective, so this is
     # arguably the *more* faithful rendering of what NVFP4 hardware serving
-    # does; but it is a change in served numerics that has NOT been validated
-    # on the serving metric (no KL/PPL A/B). See
-    # docs/KERNELS.md ("Fused decode-in-prologue").
+    # does; but it is a change in served numerics. The same-process A/B failed
+    # the equivalence and dense-timing promotion screens, while representative
+    # teacher/task/served-SLO evidence remains incomplete. See
+    # docs/audits/fused_nvfp4_enablement_2026-07-31.md.
+    current = os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "").strip()
+    if current not in ("", "1", "midm"):
+        raise ValueError(
+            "invalid PRISMAQUANT_CB_FUSED_FP4="
+            f"{current!r}; expected '', '1', or 'midm'"
+        )
     if not _FP4_FUSED_MODE:
-        _FP4_FUSED_MODE.append(
-            os.environ.get("PRISMAQUANT_CB_FUSED_FP4", "").strip())
+        _FP4_FUSED_MODE.append(current)
+    elif current != _FP4_FUSED_MODE[0]:
+        raise RuntimeError(
+            "PRISMAQUANT_CB_FUSED_FP4 changed after Gridbook dispatch was "
+            "fixed; restart the process instead of mixing activation contracts"
+        )
     return _FP4_FUSED_MODE[0]
 
 
@@ -76,28 +87,6 @@ def _fp4_fused_mode() -> str:
 # 2.7x at M=4, 1.2x at M=8, and LOSES (0.66x) at M=16 where Triton's tl.dot
 # amortizes x across the row tile.
 CUDA_GEMV_M_MAX = int(os.environ.get("PRISMAQUANT_CB_CUDA_M_MAX", "8"))
-
-# ROCm/HIP kernels (gridbook/csrc_hip). Imported only when torch is a ROCm
-# build, so a CUDA install neither imports nor builds anything HIP; `_HIP` stays
-# None and `_apply_inline` keeps its previous behaviour exactly.
-#
-# RELEASE HOLD, and why this file is still synced verbatim. The HIP lane is
-# held out of the public gridbook project until it has a serving metric
-# (scripts/sync_gridbook.py HELD_PATHS: csrc_hip/, hip_ext.py, linear_hip.py),
-# so in the RELEASE tree `linear_hip` does not exist and this import raises
-# ImportError -> the except arm below sets `_HIP = None` -> the dispatch is
-# byte-identical to the pre-ROCm one. That degradation is what lets the hold be
-# on PATHS only. Holding these lines too would fork linear.py -- the package's
-# most-edited file, the dispatch core -- between the two trees, and the drift
-# gate would then have to carry a *content* exception it cannot check the way
-# it checks a path exception. Path hold: policy. Content fork: band-aid.
-try:                                                # pragma: no cover - env
-    if getattr(torch.version, "hip", None):
-        from . import linear_hip as _HIP
-    else:
-        _HIP = None
-except Exception:                                   # pragma: no cover - env
-    _HIP = None
 
 # NOTE on a rejected variant (2026-07-18): N-chunking the transient expand +
 # GEMM with side-stream overlap measured 0.46x (small-N GEMMs lose more than
@@ -187,14 +176,18 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         import glob
         import json
         import struct
-        from vllm.config import get_current_vllm_config
-        model_dir = get_current_vllm_config().model_config.model
+        model_dir, revision = qc._get_sidecar_source()
         if not os.path.isdir(model_dir):
             # Hub repo id: vLLM already downloaded the weights; reuse its
-            # snapshot dir instead of a raw path join (serve-by-id fix).
+            # exact revision's snapshot dir instead of a raw path join.  The
+            # shared config source also pins quant_config.json and the codebook
+            # to this same immutable commit.
             from huggingface_hub import snapshot_download
-            model_dir = snapshot_download(model_dir,
-                                          allow_patterns=["*.safetensors"])
+            model_dir = snapshot_download(
+                model_dir,
+                revision=revision,
+                allow_patterns=["*.safetensors"],
+            )
         files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
         cache = {}
         for st in files:
@@ -437,9 +430,9 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
               and K % 256 == 0
               and layer._cb_N % 8 == 0
               and self.type_size == 4 * self.k + (9 if self.is_v2 else 16))
-        if ok and self.n_sub == 2:
-            w0 = self.k - self.k // 2
-            ok = ((1 << w0) + (1 << (self.k // 2))) * 2 <= 16384
+        if ok:
+            ok = (codec.fp4_value_lut_nbytes(self.k, self.n_sub)
+                  <= codec.FP4_FUSED_LUT_MAX_BYTES)
         if ok:
             # Single uniform codebook block (the kernel has no per-row LUT
             # offset — same constraint as the fp8 fused entries).
@@ -504,17 +497,6 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         return self._apply_inline(layer, x, bias)
 
     def _apply_inline(self, layer, x, bias=None):
-        # ROCm/HIP: one guarded delegation, additive by construction. `_HIP` is
-        # None on a CUDA box (and whenever the HIP extension does not build), so
-        # the path below is byte-identical to what it was before ROCm support
-        # existed. See linear_hip.maybe_apply — it returns None for every rung
-        # or shape the HIP kernels do not cover, and the CUDA/Triton dispatch
-        # then runs unchanged.
-        if _HIP is not None:
-            _hip_out = _HIP.maybe_apply(self, layer, x, bias)
-            if _hip_out is not None:
-                return _hip_out
-
         N, K = layer._cb_N, layer._cb_K
         M = x.reshape(-1, K).shape[0]
 
@@ -525,9 +507,10 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # CHANGES on this path: native NVFP4 quantization (per-tensor fp32
         # global x per-group-16 ue4m3 SF) instead of the Triton/transient
         # paths' fp32-group-scale QDQ — the hardware SF operand is ue4m3, an
-        # fp32 group scale is unrepresentable. Promotion therefore requires a
-        # served KL A/B (docs/KERNELS.md), which is
-        # why this lands opt-in. "1" = all prefill M; "midm" = only the fp8
+        # fp32 group scale is unrepresentable. The current promotion A/B is red;
+        # the audit's reconsideration gates require stronger served quality and
+        # workload evidence. That is why this remains opt-in. "1" = all prefill
+        # M; "midm" = only the fp8
         # kernel's proven 16<M<=128 niche.
         if (self.is_fp4 and bias is None and M > PREFILL_M_THRESHOLD
                 and _fp4_fused_mode() in ("1", "midm")

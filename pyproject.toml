@@ -85,4 +85,10 @@ include = ["gridbook*"]
 # package) precisely so this glob can reach them; package-data also lands in
 # the sdist automatically. Do not move csrc back to the repo root.
 [tool.setuptools.package-data]
-gridbook = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/cutlass_fork/*.hpp"]
+gridbook = [
+    "runtime_contract.json",
+    "csrc/*.cu",
+    "csrc/*.cuh",
+    "csrc/*.h",
+    "csrc/cutlass_fork/*.hpp",
+]

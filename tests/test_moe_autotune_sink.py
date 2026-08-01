@@ -153,15 +153,14 @@ def test_lambda_term_is_still_unimplemented():
     carries a time field, and this pins that so 'persist the timings' is not
     mistaken for 'the allocator now optimizes latency'.
 
-    Monorepo-only: the allocator is not part of the released gridbook package,
-    and this file is synced verbatim into the standalone release repo
-    (prismaquant scripts/sync_gridbook.py), where the import cannot resolve.
-    importorskip, not a bare import, so that run reports "cannot check" rather
-    than a red suite."""
+    Cross-project optional check: the allocator is not part of Gridbook. When
+    PrismaQuant is installed alongside Gridbook this pins the boundary; in a
+    standalone Gridbook test run, importorskip reports "cannot check" rather
+    than a false pass."""
     Candidate = pytest.importorskip(
         "prismaquant.allocator_solver",
-        reason="allocator lives in the prismaquant monorepo, not in the "
-               "released gridbook package").Candidate
+        reason="allocator lives in the separate PrismaQuant producer project, "
+               "not in the released Gridbook package").Candidate
 
     fields = set(getattr(Candidate, "__dataclass_fields__", {}))
     assert not (fields & {"latency_ms", "time_cost", "lambda_time", "ms"})

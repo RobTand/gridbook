@@ -27,21 +27,20 @@ Checks
 3. No drift: every ``.cu``/``.cuh``/``.hpp`` that exists under
    ``<repo>/gridbook/csrc`` in the checkout is present in both artifacts.  This
    catches a new kernel file that nobody added to the package-data globs.
-4. No stray top-level ``csrc/`` **in the checkout**.  The public tree is an
-   rsync of the in-tree plugin; a path-scoped rsync that copies ``gridbook/``
-   into a tree that still holds the pre-fix repo-root ``csrc/`` leaves two
-   copies of every kernel, and the root one then rots silently.  This has to be
+4. No stray top-level ``csrc/`` **in the checkout**.  A tree that holds the
+   pre-fix repo-root ``csrc/`` as well as ``gridbook/csrc`` has two copies of
+   every kernel, and the root one then rots silently.  This has to be
    checked against the checkout, not the artifacts: MANIFEST.in never grafts a
    root ``csrc/``, so setuptools packages neither -- an artifact-only scan
    passes vacuously and proves nothing.  (The artifact scan is kept as well, as
    a cheap guard against a future MANIFEST.in rule that *does* graft it, but it
-   is check 4b, not the check that catches the rsync.)
+   is check 4b, not the check that catches a duplicate checkout source tree.)
 5. Core distribution metadata is present (fatal: Name/Version/Requires-Python).
    Cosmetic-but-recommended metadata (Author-email, Project-URL, Classifier,
    Summary) is reported as a warning, not a failure -- missing PyPI polish is
    not a reason to block a merge.
 6. The wheel is *publishable*, not just installable: the long description is
-   the public README (not the in-tree plugin's internal dev README), it carries
+   the canonical public README, it carries
    none of the retired prototype/INV-2 framing, and a declared
    ``License-Expression`` is backed by an actual license file.  ``twine check``
    passes on a wheel that fails all three -- it checks that the metadata
@@ -51,6 +50,7 @@ from __future__ import annotations
 
 import email
 import pathlib
+import re
 import sys
 import tarfile
 import zipfile
@@ -62,8 +62,11 @@ PKG = "gridbook"
 #   cb_gemv_v2.cu       -> cuda_ext.get_ext_v2()         (smem-resident-dict
 #                                                         decode GEMV, opt-in)
 #   cb_fused_gemm.cu    -> cuda_ext.get_fused_ext()      (fused prefill)
+#   cb_fused_fp4_gemm.cu -> cuda_ext.get_fused_fp4_ext() (fused NVFP4 prefill)
 #   cb_persistent_tc.cu -> cuda_ext.get_persistent_ext() (opt-in, still shipped)
 # cb_fused_gemm.cu #includes the three cutlass_fork headers listed below.
+# cb_fused_fp4_gemm.cu #includes sm120_cb_fused_fp4_mma.hpp; both are also
+# JIT-identity inputs and therefore belong on this non-vacuous floor.
 # An opt-in kernel still belongs on this floor: check 3 (drift) would also
 # notice it missing, but only while the file exists in the checkout the CI job
 # happens to be run against. This list is the literal floor that cannot be
@@ -73,9 +76,11 @@ REQUIRED = [
     f"{PKG}/csrc/cb_gemv.cu",
     f"{PKG}/csrc/cb_gemv_v2.cu",
     f"{PKG}/csrc/cb_fused_gemm.cu",
+    f"{PKG}/csrc/cb_fused_fp4_gemm.cu",
     f"{PKG}/csrc/cb_persistent_tc.cu",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_mma_tma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_fused_mma.hpp",
+    f"{PKG}/csrc/cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_expert_row_broadcast.hpp",
 ]
 
@@ -172,12 +177,8 @@ def check_checkout_layout(root: pathlib.Path) -> None:
         ok(f"checkout: {stale} exists but holds no native sources")
         return
     err(f"checkout: stale repo-root csrc/ holds {len(files)} native source(s) "
-        f"(e.g. {files[0].relative_to(root)}). The canonical location is "
-        f"{PKG}/csrc/. Remove the root copy: `git rm -r csrc`. Do NOT fix this "
-        f"with a tree-root `rsync --delete` from the in-tree plugin -- that "
-        f"deletes every public-only file (.github/, docs/, LICENSE, README, "
-        f"MANIFEST.in, ...). Sync path-scoped instead: "
-        f"`rsync -a --delete <plugin>/gridbook/ ./gridbook/`.")
+        f"(e.g. {files[0].relative_to(root)}). The canonical and only runtime "
+        f"location is {PKG}/csrc/. Remove the root copy: `git rm -r csrc`.")
 
 
 def check_publishable(wheel: pathlib.Path) -> None:
@@ -186,13 +187,10 @@ def check_publishable(wheel: pathlib.Path) -> None:
     Two defects got as far as a staged, ``twine check``-clean artifact and were
     caught only by a human reading the METADATA by hand:
 
-    * **The long description was the wrong README.** A build run from the
-      in-tree plugin (``prismaquant/plugins/gridbook``) picks up that tree's
-      short internal dev README, so the PyPI landing page rendered as
-      "# vllm-prismaquant ... prototype (i) ... INV-2 (WAIVED)" -- the retired
-      framing, permanently, on the project's front door. Releases must be built
-      from the public repo, whose README.md is the public one. This check is
-      how that rule is enforced rather than remembered.
+    * **The long description was the wrong README.** Releases must be built
+      from this canonical repository, whose README is the public one. This
+      check enforces that the built metadata contains that document rather
+      than an unrelated or stale checkout's README.
     * **No license file.** ``License-Expression: Apache-2.0`` is only a
       *declaration*; the Apache-2.0 text itself is carried by the
       ``license-files`` mechanism, and a tree without a LICENSE at the root
@@ -215,9 +213,8 @@ def check_publishable(wheel: pathlib.Path) -> None:
             "the build)")
     elif first.strip() != f"# {PKG}":
         err(f"wheel long description does not start with '# {PKG}' (got "
-            f"{first.strip()!r}). This is the signature of a build run from "
-            f"the in-tree plugin, whose README.md is the internal dev one. "
-            f"Build releases from the public repo.")
+            f"{first.strip()!r}). Build releases only from the canonical "
+            f"Gridbook repository.")
     else:
         ok(f"long description is the public README (starts '# {PKG}')")
 
@@ -242,6 +239,37 @@ def check_publishable(wheel: pathlib.Path) -> None:
     elif licenses:
         ok(f"license text shipped: {licenses} "
            f"(License-File: {md.get_all('License-File')})")
+
+
+def check_release_metadata(root: pathlib.Path, version: str) -> None:
+    """Static citation/changelog identity must match the built distribution."""
+    citation = root / "CITATION.cff"
+    changelog = root / "CHANGELOG.md"
+    if not citation.is_file():
+        err("checkout has no CITATION.cff")
+    else:
+        match = re.search(
+            r'^version:\s*["\']([^"\']+)["\']\s*$',
+            citation.read_text(encoding="utf-8"),
+            flags=re.MULTILINE,
+        )
+        if match is None:
+            err("CITATION.cff has no parseable version field")
+        elif match.group(1) != version:
+            err(f"CITATION.cff version {match.group(1)!r} != built version "
+                f"{version!r}")
+        else:
+            ok(f"CITATION.cff version matches built version {version}")
+    if not changelog.is_file():
+        err("checkout has no CHANGELOG.md")
+    elif not re.search(
+        rf"^## {re.escape(version)}(?:\s|$)",
+        changelog.read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    ):
+        err(f"CHANGELOG.md has no release heading for {version}")
+    else:
+        ok(f"CHANGELOG.md has release heading for {version}")
 
 
 def main() -> int:
@@ -286,6 +314,8 @@ def main() -> int:
     if not _errors:
         ok(f"metadata: {md.get('Name')} {md.get('Version')} "
            f"(requires-python {md.get('Requires-Python')})")
+    if md.get("Version"):
+        check_release_metadata(root, md["Version"])
     # Recommended, not load-bearing -- warn only.
     for field in ("Summary", "Author-email", "Project-URL", "Classifier"):
         if not md.get_all(field):

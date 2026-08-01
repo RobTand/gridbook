@@ -1,7 +1,7 @@
 """Serve-time proof that every registered CB expert stack was actually FILLED.
 
-The per-arch top-level loader install (``plugin.py``) is opt-in per vLLM module
-path. Its failure mode when a line is missing is not a crash but **coherent
+The per-arch top-level loader install is driven by the packaged runtime contract
+one vLLM module path at a time. Its failure mode when a path is missing is not a crash but **coherent
 garbage generation**: the arch's own ``load_weights`` never matches our stacked
 ``…experts.<proj>.cb_qweight`` tensors, the registered ``w13/w2_cb_qweight``
 buffers keep their ``torch.empty`` contents, and the FusedMoE happily serves
@@ -17,7 +17,8 @@ every load path:
   * BOTH fill paths mark it ``True`` — the instance-level hook in ``moe.py`` and
     ``moe_toplevel_loader.load_weights`` at its ``loaded.add`` site;
   * ``assert_cb_experts_filled`` raises otherwise, naming the model class and the
-    vLLM module path that has to be added to ``plugin._CB_TOPLEVEL_MODULE_PATHS``.
+    vLLM module path that has to be added to
+    ``runtime_contract.json``'s ``top_level_loader_modules``.
 
 Zero extra memory, arch-independent, fires once per layer, and there is no env
 bypass by design. Scoped to the params the local rank actually registered (an
@@ -124,7 +125,8 @@ def assert_cb_experts_filled(layer, prefix: str) -> None:
         f"  gridbook top-level CB loaders installed on: {_installed_paths_hint()}\n"
         f"If the model class's vLLM module path is not in that list, this arch "
         f"maps MoE experts at the TOP LEVEL and needs its module path added to "
-        f"_CB_TOPLEVEL_MODULE_PATHS in gridbook/plugin.py. If it IS in the list, "
+        f"producer_profiles.top_level_loader_modules in "
+        f"gridbook/runtime_contract.json. If it IS in the list, "
         f"the wrap installed but matched no stacked "
         f"'…experts.<proj>.cb_qweight' tensor — check the checkpoint's expert "
         f"tensor names against moe_toplevel_loader.resolve_cb_expert_param."

@@ -3,10 +3,9 @@ compressed-tensors groups (no "scheme" key) are delegated to a real
 CompressedTensorsConfig (serving-kernel.md §2). vLLM-only, so skip-guarded —
 run in the vllm-node container:
 
-  docker run --rm --gpus all -v /home/rob/prismaquant:/repo --entrypoint bash \
-    vllm-node:latest -c 'pip install -e /repo/plugins/gridbook --no-deps -q; \
-    PYTHONPATH=/repo/plugins/gridbook python3 -m pytest \
-    /repo/plugins/gridbook/tests/test_delegation.py -q'
+  docker run --rm --gpus all -v /home/rob/gridbook:/gridbook --entrypoint bash \
+    vllm-node:latest -c 'pip install -e /gridbook --no-deps -q; \
+    cd /; python3 -m pytest /gridbook/tests/test_delegation.py -q'
 """
 import pytest
 

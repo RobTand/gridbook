@@ -1,7 +1,8 @@
 """``PrismaQuantConfig`` — the vLLM quantization config for the NVFP4-CB /
 FP8-CB out-of-tree lane (docs/lanes/nvfp4-cb/serving-kernel.md §2, LAYOUT.md §4).
 
-vLLM auto-detects us from ``quant_method == "prismaquant"``. The exporter writes
+vLLM auto-detects the canonical ``quant_method == "gridbook"`` and accepts the
+legacy ``"prismaquant"`` alias declared by the packaged runtime contract. The exporter writes
 ``config.json['quantization_config']`` as a *pointer* (``config_file`` ->
 ``quant_config.json`` + ``codebook_file`` -> ``cb_codebooks.pqcb``); the full
 ``config_groups`` / ``ignore`` live in ``quant_config.json``. We resolve that
@@ -32,12 +33,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
+from .runtime_contract import load_runtime_contract
 try:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
 except Exception:  # pragma: no cover - older vLLM
     RoutedExperts = None
 
 _MOE_LEAVES = ("gate_up_proj", "down_proj", "gate_proj", "up_proj")
+_RUNTIME_CONTRACT = load_runtime_contract()
+_QUANT_METHOD_CANONICAL = _RUNTIME_CONTRACT["quant_method"]["canonical"]
+_QUANT_METHOD_ACCEPTED = frozenset(
+    _RUNTIME_CONTRACT["quant_method"]["accepted"]
+)
 
 # vLLM fuses these siblings into one module; packed_modules_mapping is populated
 # by dispatch time, but we keep the standard mapping as a fallback.
@@ -124,7 +131,50 @@ def _canonical_target(name: str) -> str:
     return _canonical_prefix(name)
 
 
-def _resolve_model_file(model_dir: str, fname: str) -> str:
+def _sidecar_revision(model_config: Any, model_dir: str) -> str | None:
+    """Return one immutable revision for every sidecar of a Hub model.
+
+    ``hf_config._commit_hash`` is the revision Transformers actually resolved
+    while vLLM prepared the model, so it is authoritative over a requested
+    tag or branch in ``model_config.revision``.  If Transformers did not expose
+    it, only a full 40-hex commit in ``model_config.revision`` is an immutable
+    fallback.  Local directories need no Hub revision and retain their ordinary
+    path-join behavior.
+    """
+
+    if os.path.isdir(model_dir):
+        return None
+
+    def immutable_commit(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if (
+            len(value) == 40
+            and all(char in "0123456789abcdefABCDEF" for char in value)
+        ):
+            return value.lower()
+        return None
+
+    hf_config = getattr(model_config, "hf_config", None)
+    resolved_commit = getattr(hf_config, "_commit_hash", None)
+    immutable_resolved_commit = immutable_commit(resolved_commit)
+    if immutable_resolved_commit is not None:
+        return immutable_resolved_commit
+    requested_revision = getattr(model_config, "revision", None)
+    immutable_requested_revision = immutable_commit(requested_revision)
+    if immutable_requested_revision is not None:
+        return immutable_requested_revision
+    raise RuntimeError(
+        f"Hub model {model_dir!r} has no immutable revision for Gridbook "
+        "sidecars; neither vLLM model_config.hf_config._commit_hash nor "
+        "model_config.revision is a full 40-hex commit SHA"
+    )
+
+
+def _resolve_model_file(
+    model_dir: str, fname: str, *, revision: str | None = None
+) -> str:
     """Local path for a sidecar file next to the model. When the model was
     given as a Hub repo id (``vllm serve rdtand/...``) rather than a local
     directory, fetch the sidecar from the Hub — vLLM's own loader handles the
@@ -133,8 +183,15 @@ def _resolve_model_file(model_dir: str, fname: str) -> str:
     until 2026-07-22."""
     if os.path.isdir(model_dir):
         return os.path.join(model_dir, fname)
+    if not isinstance(revision, str) or not revision.strip():
+        raise RuntimeError(
+            f"refusing to fetch Gridbook sidecar {fname!r} for unpinned Hub "
+            f"model {model_dir!r}"
+        )
     from huggingface_hub import hf_hub_download
-    return hf_hub_download(repo_id=model_dir, filename=fname)
+    return hf_hub_download(
+        repo_id=model_dir, filename=fname, revision=revision.strip()
+    )
 
 
 class PrismaQuantConfig(QuantizationConfig):
@@ -155,6 +212,32 @@ class PrismaQuantConfig(QuantizationConfig):
         self.ct_config = None                        # stock CompressedTensorsConfig
         self._codebooks: dict[str, torch.Tensor] | None = None
         self._tp_world_size: int | None = None
+        # Cached as one pair so pointer quant_config.json and its declared
+        # codebook can never be fetched from different revisions if a mutable
+        # requested tag moves between the two lazy reads.
+        self._sidecar_source: tuple[str, str | None] | None = None
+
+    def _get_sidecar_source(self) -> tuple[str, str | None]:
+        if self._sidecar_source is None:
+            from vllm.config import get_current_vllm_config
+
+            model_config = get_current_vllm_config().model_config
+            try:
+                model_dir = os.fspath(model_config.model)
+            except TypeError as exc:
+                raise RuntimeError(
+                    "vLLM model_config.model is not a filesystem path or Hub ID"
+                ) from exc
+            if not isinstance(model_dir, str) or not model_dir:
+                raise RuntimeError(
+                    "vLLM model_config.model is not a nonempty string path or "
+                    "Hub ID"
+                )
+            self._sidecar_source = (
+                model_dir,
+                _sidecar_revision(model_config, model_dir),
+            )
+        return self._sidecar_source
 
     def _require_supported_tensor_parallel(self) -> None:
         if self._tp_world_size == 1:
@@ -198,9 +281,9 @@ class PrismaQuantConfig(QuantizationConfig):
         cfg = self._raw_config
         if "config_groups" not in cfg:
             cfg_file = cfg.get("config_file", "quant_config.json")
-            from vllm.config import get_current_vllm_config
-            model_dir = get_current_vllm_config().model_config.model
-            with open(_resolve_model_file(model_dir, cfg_file)) as fh:
+            model_dir, revision = self._get_sidecar_source()
+            with open(_resolve_model_file(
+                    model_dir, cfg_file, revision=revision)) as fh:
                 cfg = json.load(fh)
             self.codebook_file = cfg.get("codebook_file", self.codebook_file)
         # Normalise stored namespaces ONCE, here, so all downstream resolution
@@ -277,7 +360,7 @@ class PrismaQuantConfig(QuantizationConfig):
 
     @classmethod
     def get_name(cls):
-        return "gridbook"
+        return _QUANT_METHOD_CANONICAL
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
         # Shipping CUDA decode and grouped-MoE bindings require BF16 inputs.
@@ -302,18 +385,16 @@ class PrismaQuantConfig(QuantizationConfig):
     def override_quantization_method(cls, hf_quant_cfg, user_quant, **kwargs):
         # "gridbook" is the registry key going forward; "prismaquant" is the
         # legacy key older local artifacts carry — both dispatch here.
-        if user_quant in ("gridbook", "prismaquant"):
-            return "gridbook"
+        if user_quant in _QUANT_METHOD_ACCEPTED:
+            return _QUANT_METHOD_CANONICAL
         if hf_quant_cfg is not None and \
-                hf_quant_cfg.get("quant_method") in ("gridbook", "prismaquant"):
-            return "gridbook"
+                hf_quant_cfg.get("quant_method") in _QUANT_METHOD_ACCEPTED:
+            return _QUANT_METHOD_CANONICAL
         return None
 
     # -- codebook sidecar (loaded once, shared across all layers) ------------
     def get_codebooks(self) -> dict[str, torch.Tensor]:
         if self._codebooks is None:
-            from vllm.config import get_current_vllm_config
-
             from .cb_digest import load_codebooks
 
             # Resolve the full quant config before opening the sidecar: the
@@ -334,11 +415,12 @@ class PrismaQuantConfig(QuantizationConfig):
                     "declared; omit the field for a legacy artifact")
             else:
                 expected_sha256 = provenance.get("codebook_sha256")
-            model_dir = get_current_vllm_config().model_config.model
+            model_dir, revision = self._get_sidecar_source()
             # This is the single choke point used by linear.py, moe.py, and
             # moe_toplevel_loader.py, and it is memoized after verification.
             self._codebooks = load_codebooks(
-                _resolve_model_file(model_dir, self.codebook_file),
+                _resolve_model_file(
+                    model_dir, self.codebook_file, revision=revision),
                 expected_sha256=expected_sha256)
         return self._codebooks
 

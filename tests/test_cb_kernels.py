@@ -2,9 +2,9 @@
 tensors (docs/lanes/nvfp4-cb/serving-kernel.md prototype (i)).
 
 Run:
-  PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/gridbook \
+  PYTHONPATH=/home/rob/prismaquant:/home/rob/gridbook \
     /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python -m pytest \
-    plugins/gridbook/tests/test_cb_kernels.py -v
+    /home/rob/gridbook/tests/test_cb_kernels.py -v
 
 Two checks per artifact/Linear:
   * exact-match unpack — the kernel's byte-window codeword extraction is
@@ -18,7 +18,7 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-# `prismaquant` is the monorepo that develops this package; it does not exist
+# `prismaquant` is the producer and an optional test fixture; it does not exist
 # in the released `gridbook` distribution. A bare import here breaks COLLECTION
 # of the whole suite outside the monorepo (not just this module), so gate it the
 # same way the plugin import below is gated: report "cannot check" via a skip
@@ -31,9 +31,9 @@ _bit_split = _pq_fmts._bit_split
 nvfp4_cb_reconstruct = _pq_fmts.nvfp4_cb_reconstruct
 nvfp4_cb_unpack = _pq_fmts.nvfp4_cb_unpack
 
-# The plugin package sits outside the repo's PYTHONPATH and needs triton (and,
-# transitively for the full plugin, vLLM) — present in the serving container,
-# not necessarily in the build venv. Skip cleanly instead of breaking
+# Gridbook needs triton (and, transitively for full registration, vLLM), which
+# is present in the serving container but not necessarily in the build venv.
+# Skip cleanly instead of breaking
 # collection of the main suite.
 codec = pytest.importorskip(
     "gridbook.codec",

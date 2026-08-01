@@ -2,7 +2,7 @@
 
 The regression this pins is the #1 CB-lane support trap: an MoE arch whose vLLM
 loader maps experts at the TOP LEVEL, with no entry in
-``plugin._CB_TOPLEVEL_MODULE_PATHS``. Nothing crashes — the stacked CB expert
+``runtime_contract.json``'s top-level loader modules. Nothing crashes — the stacked CB expert
 params keep their ``torch.empty`` contents and the FusedMoE serves uninitialised
 memory (commit ``9a79963``: Laguna, 93% of params). The guard turns that into a
 hard failure at ``process_weights_after_loading``.
@@ -14,9 +14,9 @@ Two arms, same synthetic top-level model class:
 torch-only (no vLLM): both ``cb_fill_guard`` and ``moe_toplevel_loader`` import
 nothing from vLLM, so this runs in any venv with torch.
 
-  PYTHONPATH=/home/rob/prismaquant/plugins/gridbook CUDA_VISIBLE_DEVICES= \\
+  PYTHONPATH=/home/rob/gridbook CUDA_VISIBLE_DEVICES= \\
     /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python \\
-    -m pytest plugins/gridbook/tests/test_cb_fill_guard.py -q
+    -m pytest /home/rob/gridbook/tests/test_cb_fill_guard.py -q
 """
 import pytest
 import torch
@@ -121,13 +121,13 @@ def test_unwired_arch_raises_naming_the_module_path():
     msg = str(exc.value)
     assert "w13_cb_qweight" in msg and "w2_cb_qweight" in msg
     assert m.experts.prefix in msg
-    # the message must point at the registry line to add
-    assert "_CB_TOPLEVEL_MODULE_PATHS" in msg
-    assert "gridbook/plugin.py" in msg
+    # the message must point at the sole registry to change
+    assert "top_level_loader_modules" in msg
+    assert "gridbook/runtime_contract.json" in msg
 
 
 def test_wired_arch_passes_and_records_the_module_path():
-    """Loader installed (what plugin.py's module-path tuple does): fills, passes."""
+    """Loader installed (what the runtime-contract registry does): fills, passes."""
     cls = _make_model_cls()
     install_toplevel_cb_expert_loader(cls)
     assert cls.__module__ in installed_module_paths()
@@ -192,14 +192,15 @@ def test_scoped_to_params_the_local_rank_registered():
 
 
 def test_registry_is_data_not_a_try_except_chain():
-    """R10 (i): the per-arch opt-in is a module-path tuple.
+    """R10 (i): the per-arch opt-in comes from the packaged contract.
 
     Read with ``ast`` rather than imported — ``gridbook.plugin`` needs vLLM,
-    which this venv does not have, and the point of the check is the literal.
+    which this venv does not have. The plugin must consume, not repeat, paths.
     """
     import ast
     import importlib.util
     import pathlib
+    from gridbook.runtime_contract import load_runtime_contract
 
     # Resolve through the PACKAGE, not a repo-relative sibling path: the
     # release pipeline's "verify installed wheel" job runs this suite against
@@ -210,14 +211,20 @@ def test_registry_is_data_not_a_try_except_chain():
     if spec is None or not spec.origin:            # pragma: no cover - env
         pytest.skip("gridbook.plugin source not locatable")
     src = pathlib.Path(spec.origin)
-    tree = ast.parse(src.read_text())
-    paths = None
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.AnnAssign)
-                and getattr(node.target, "id", "") == "_CB_TOPLEVEL_MODULE_PATHS"):
-            paths = ast.literal_eval(node.value)
-    assert isinstance(paths, tuple) and all(isinstance(p, str) for p in paths)
-    for arch in ("hy_v3", "hy_v3_mtp", "laguna", "qwen3_5", "qwen3_5_mtp"):
+    source = src.read_text()
+    tree = ast.parse(source)
+    paths = load_runtime_contract()[
+        "producer_profiles"]["top_level_loader_modules"]
+    assert "load_runtime_contract" in source
+    assert "vllm.model_executor.models." not in source
+    for arch in (
+        "hy_v3",
+        "hy_v3_mtp",
+        "laguna",
+        "qwen3_5",
+        "qwen3_5_mtp",
+        "lfm2_moe",
+    ):
         assert f"vllm.model_executor.models.{arch}" in paths, arch
     # no arch-specific class imports left in the install path
     imported = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}

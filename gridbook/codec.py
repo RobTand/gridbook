@@ -248,6 +248,27 @@ def pack_e2m1_codes(codes: torch.Tensor) -> torch.Tensor:
     return (lo | (hi << 4)).to(torch.uint8)
 
 
+FP4_FUSED_LUT_MAX_BYTES = 16 * 1024
+
+
+def fp4_value_lut_nbytes(k_bits: int, n_sub: int) -> int:
+    """Exact byte size of the fused FP4 value LUT for one rung.
+
+    Keep the eligibility arithmetic in one Python owner so dense and MoE
+    dispatch cannot disagree about the 16-KiB shared-memory carve.  The CUDA
+    binding independently rechecks the result at its public boundary.
+    """
+    if k_bits < 8:
+        raise ValueError("fp4 value LUT: k_bits must be at least 8")
+    if n_sub == 2:
+        w0 = k_bits - k_bits // 2
+        w1 = k_bits // 2
+        return ((1 << w0) + (1 << w1)) * 2
+    if n_sub == 1:
+        return (1 << (k_bits - 8)) * 4
+    raise ValueError(f"fp4 value LUT: unsupported n_sub={n_sub}")
+
+
 def build_fp4_value_lut(cb_flat: torch.Tensor, k_bits: int,
                         n_sub: int) -> torch.Tensor:
     """The fused kernel's smem value LUT, as a flat uint8 tensor.

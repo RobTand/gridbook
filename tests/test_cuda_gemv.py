@@ -4,11 +4,11 @@ Triton decode-GEMM it replaces and the fp64 reconstruct reference.
 Needs nvcc (JIT build) — runs in the serving container, skips in the build
 venv:
 
-  docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
+  docker run --rm --gpus all -v /home/rob/gridbook:/gridbook \\
     -v /home/rob/dq-runs/nvfp4-cb-phase0/serve:/artifacts \\
     --entrypoint bash vllm-node:latest -c \\
-    'PYTHONPATH=/repo:/repo/plugins/gridbook python3 -m pytest \\
-     /repo/plugins/gridbook/tests/test_cuda_gemv.py -v'
+    'PYTHONPATH=/gridbook python3 -m pytest \\
+     /gridbook/tests/test_cuda_gemv.py -v'
 
 The KL-preservation contract: identical weight rounding (bf16(val*scale)),
 bit-exact activation QDQ, fp32 accumulation — only summation order may differ

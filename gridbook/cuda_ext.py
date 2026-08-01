@@ -29,8 +29,14 @@ bit-for-bit.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import shlex
+import shutil
+import subprocess
 import sys
+import sysconfig
 import threading
 
 _ext = None
@@ -102,6 +108,60 @@ def _require_csrc(*names: str) -> str:
             f"toolchain — reinstall gridbook (`pip install --force-reinstall "
             f"gridbook`) or install from a checkout.")
     return d
+
+
+def _sha256_file(path: str) -> str:
+    """Return the content identity of one JIT build input."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _compiler_identity(command: str | None) -> dict[str, object]:
+    """Best-effort identity for a compiler command, without using a shell.
+
+    Compiler discovery must never become a new reason for a fail-soft JIT to
+    fail.  An absent or unqueryable executable is therefore represented in the
+    identity instead of raising.  ``shlex`` supports safe ``CXX=ccache g++``
+    style commands while ``shell=False`` prevents command substitution.
+    """
+    if not command:
+        return {"argv": [], "path": None, "version": None}
+    try:
+        argv = shlex.split(os.fspath(command))
+    except ValueError as exc:
+        return {"argv": [os.fspath(command)], "path": None,
+                "version": f"{type(exc).__name__}: {exc}"}
+    if not argv:
+        return {"argv": [], "path": None, "version": None}
+    resolved = shutil.which(argv[0])
+    if resolved is None and os.path.isfile(argv[0]):
+        resolved = os.path.abspath(argv[0])
+    if resolved is None:
+        return {"argv": argv, "path": None, "version": "not found"}
+    probe = [resolved, *argv[1:], "--version"]
+    try:
+        result = subprocess.run(
+            probe, check=False, capture_output=True, text=True, timeout=10)
+        output = (result.stdout or result.stderr).strip()
+        version = f"exit={result.returncode}: {output}"
+    except (OSError, subprocess.SubprocessError) as exc:
+        version = f"{type(exc).__name__}: {exc}"
+    return {"argv": argv, "path": os.path.realpath(resolved),
+            "version": version}
+
+
+def _optional_runtime_value(owner, name: str):
+    """Read or call an optional runtime ABI field, returning ``None``."""
+    value = getattr(owner, name, None)
+    if value is None:
+        return None
+    try:
+        return value() if callable(value) else value
+    except Exception:  # noqa: BLE001 — optional telemetry cannot break a JIT
+        return None
 
 
 def _cache_diagnostics(build_dir: str) -> str:
@@ -441,6 +501,17 @@ _fused_fp4_tried = False
 _fused_fp4_lock = threading.Lock()
 
 
+# These two packaged files define the Gridbook-owned fused FP4 implementation.
+# Both are explicit build inputs: torch's extension versioner hashes the source
+# passed to ``load`` but does not make an included header part of its stable
+# module name or caller-selected build-directory identity.
+_FUSED_FP4_BUILD_INPUTS = (
+    "cb_fused_fp4_gemm.cu",
+    "cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
+)
+_FUSED_FP4_ABI_SCHEMA = 1
+
+
 # Both families are guarded independently at their call sites
 # (linear._try_fused_fp4 and moe._gf4_ok). A binary containing either family
 # remains useful and must not be rejected merely because the other was built
@@ -449,6 +520,119 @@ _FUSED_FP4_SYMBOL_FAMILIES = (
     ("dense prefill", ("cb_fused_fp4_prefill_mm_scaled",)),
     ("grouped MoE prefill", ("cb_fused_fp4_moe_grouped",)),
 )
+
+
+def _fused_fp4_build_identity(torch, cpp_extension, *, src_dir: str,
+                              cutlass_include: str,
+                              util_include: str,
+                              capability: tuple[int, int]):
+    """Return ``(digest, payload)`` for every practical binary ABI input.
+
+    The digest keys both the build directory and extension module name.  That
+    keeps persistent caches from reusing an FP4 binary across changes to the
+    included Gridbook header, target architecture, Python/Torch ABI, CUDA
+    toolkit, or host compiler.  A small set of external CUTLASS sentinels is
+    also hashed; Ninja's generated dependency file remains authoritative for
+    the complete external include graph inside a keyed directory.
+    """
+    c_ext = getattr(torch, "_C", None)
+    cuda_home = getattr(cpp_extension, "CUDA_HOME", None)
+    nvcc = os.environ.get("CUDACXX")
+    if not nvcc and cuda_home:
+        nvcc = os.path.join(os.fspath(cuda_home), "bin", "nvcc")
+    if not nvcc:
+        nvcc = "nvcc"
+
+    cxx = os.environ.get("CXX")
+    if not cxx:
+        cxx = _optional_runtime_value(cpp_extension, "get_cxx_compiler")
+
+    packaged_inputs = {
+        name: _sha256_file(os.path.join(src_dir, name))
+        for name in _FUSED_FP4_BUILD_INPUTS
+    }
+    cutlass_inputs = {}
+    for label, path in (
+        ("cutlass/cutlass.h",
+         os.path.join(cutlass_include, "cutlass", "cutlass.h")),
+        ("cutlass/version.h",
+         os.path.join(cutlass_include, "cutlass", "version.h")),
+        ("cutlass/util/packed_stride.hpp",
+         os.path.join(util_include, "cutlass", "util",
+                      "packed_stride.hpp")),
+    ):
+        cutlass_inputs[label] = (
+            _sha256_file(path) if os.path.isfile(path) else None)
+
+    major, minor = capability
+    payload = {
+        "schema": _FUSED_FP4_ABI_SCHEMA,
+        "bindings": [
+            [label, list(names)]
+            for label, names in _FUSED_FP4_SYMBOL_FAMILIES
+        ],
+        "inputs": packaged_inputs,
+        "cutlass_inputs": cutlass_inputs,
+        "target": {
+            "capability": [major, minor],
+            "compute": f"compute_{major}{minor}a",
+            "code": f"sm_{major}{minor}a",
+        },
+        "python": {
+            "cache_tag": getattr(sys.implementation, "cache_tag", None),
+            "soabi": sysconfig.get_config_var("SOABI"),
+        },
+        "torch": {
+            "version": str(getattr(torch, "__version__", "unknown")),
+            "cuda": (None if getattr(getattr(torch, "version", None),
+                                     "cuda", None) is None else
+                     str(torch.version.cuda)),
+            "cxx11_abi": _optional_runtime_value(
+                torch, "compiled_with_cxx11_abi"),
+            "glibcxx_cxx11_abi": _optional_runtime_value(
+                c_ext, "_GLIBCXX_USE_CXX11_ABI"),
+            "pybind11_compiler": _optional_runtime_value(
+                c_ext, "_PYBIND11_COMPILER_TYPE"),
+            "pybind11_stdlib": _optional_runtime_value(
+                c_ext, "_PYBIND11_STDLIB"),
+            "pybind11_build_abi": _optional_runtime_value(
+                c_ext, "_PYBIND11_BUILD_ABI"),
+        },
+        "cuda": {
+            "compiled_version": _optional_runtime_value(
+                c_ext, "_cuda_getCompiledVersion"),
+            "runtime_version": _optional_runtime_value(
+                c_ext, "_cuda_getRuntimeVersion"),
+            "driver_version": _optional_runtime_value(
+                c_ext, "_cuda_getDriverVersion"),
+            "nvcc": _compiler_identity(nvcc),
+        },
+        "host_compiler": _compiler_identity(
+            None if cxx is None else os.fspath(cxx)),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), payload
+
+
+def _require_fused_fp4_identity(mod, *, expected_name: str, identity: str,
+                                build_dir: str, source: str):
+    """Validate the identity-bearing ``PyInit_*`` module ABI.
+
+    ``TORCH_EXTENSION_NAME`` makes the requested name part of the compiled
+    module's exported initializer.  Requiring that same name after import is a
+    practical ABI attestation without maintaining a second C++ version
+    literal.  The full digest is then exposed for release/runtime telemetry.
+    """
+    actual = getattr(mod, "__name__", None)
+    if actual != expected_name:
+        raise StaleExtensionError(_mismatch_message(
+            mod, build_dir=build_dir, source=source,
+            requirement=(f"JIT ABI identity mismatch: expected module "
+                         f"{expected_name!r}, loaded {actual!r}")))
+    mod.__gridbook_jit_identity__ = identity
+    mod.__gridbook_jit_abi_schema__ = _FUSED_FP4_ABI_SCHEMA
+    return mod
 
 
 def get_fused_fp4_ext():
@@ -469,12 +653,41 @@ def get_fused_fp4_ext():
         return _load_fused_fp4_ext_locked()
 
 
+def preload_fused_extensions(*, strict: bool = False) -> dict[str, bool]:
+    """Attempt both independent fused JIT modules for residency-matched A/Bs.
+
+    Each loader is fail-soft in normal operation, but keep the attempts
+    independent even if a monkeypatch, import failure, or future strict mode
+    raises.  Loading only the FP8 module does not residency-match an NVFP4
+    baseline with its fused candidate.  The returned status lets validation
+    code prove residency; ``strict=True`` raises only after both attempts.
+    """
+    status: dict[str, bool] = {}
+    errors: dict[str, Exception] = {}
+    for family, load_ext in (
+        ("fp8", get_fused_ext),
+        ("fp4", get_fused_fp4_ext),
+    ):
+        try:
+            status[family] = load_ext() is not None
+        except Exception as exc:  # noqa: BLE001 — report after both attempts
+            status[family] = False
+            errors[family] = exc
+    if strict and not all(status.values()):
+        detail = ", ".join(
+            f"{family}={errors.get(family, 'unavailable')}"
+            for family, loaded in status.items() if not loaded
+        )
+        raise RuntimeError(f"fused extension preload failed: {detail}")
+    return status
+
+
 def _load_fused_fp4_ext_locked():
     """Build and publish fused FP4 with ``_fused_fp4_lock`` held."""
     global _fused_fp4, _fused_fp4_tried
     try:
         import torch
-        from torch.utils.cpp_extension import load
+        from torch.utils import cpp_extension
 
         cut_inc = os.environ.get("PRISMAQUANT_CUTLASS_INCLUDE")
         if not cut_inc:
@@ -486,24 +699,32 @@ def _load_fused_fp4_ext_locked():
                                 "include")
         if os.path.isdir(util_inc):
             incs.append(util_inc)
-        src_dir = _require_csrc("cb_fused_fp4_gemm.cu")
-        build_dir = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
-            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
-        build_dir = os.path.join(build_dir, "fused_fp4")
-        os.makedirs(build_dir, exist_ok=True)
+        src_dir = _require_csrc(*_FUSED_FP4_BUILD_INPUTS)
         cc = torch.cuda.get_device_capability()
+        identity, _identity_payload = _fused_fp4_build_identity(
+            torch, cpp_extension, src_dir=src_dir,
+            cutlass_include=cut_inc, util_include=util_inc,
+            capability=cc)
+        module_name = f"pq_cb_fused_fp4_{identity}"
+        build_root = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
+        build_dir = os.path.join(build_root, "fused_fp4", identity)
+        os.makedirs(build_dir, exist_ok=True)
         arch = f"compute_{cc[0]}{cc[1]}a"
         code = f"sm_{cc[0]}{cc[1]}a"
-        mod = load(
-            name="pq_cb_fused_fp4",
+        mod = cpp_extension.load(
+            name=module_name,
             sources=[os.path.join(src_dir, "cb_fused_fp4_gemm.cu")],
             extra_include_paths=incs + [src_dir],
             extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr",
                                f"-gencode=arch={arch},code={code}"],
             build_directory=build_dir, verbose=False)
-        _fused_fp4 = _require_any_symbol_family(
+        mod = _require_any_symbol_family(
             mod, _FUSED_FP4_SYMBOL_FAMILIES, build_dir=build_dir,
             source="cb_fused_fp4_gemm.cu")
+        _fused_fp4 = _require_fused_fp4_identity(
+            mod, expected_name=module_name, identity=identity,
+            build_dir=build_dir, source="cb_fused_fp4_gemm.cu")
     except StaleExtensionError as exc:
         print(f"[prismaquant-cb] ERROR: incompatible fused fp4 prefill "
               f"extension — {exc} fp4 prefill stays on the Triton/transient "

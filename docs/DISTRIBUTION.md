@@ -1,9 +1,12 @@
 # Distribution — decision record and one-time action checklist
 
-**Status:** decision brief, written 2026-07-28 and corrected the same day after an
-adversarial verification pass (**§7** lists what changed and why). Nothing in this
-document has been executed. Every outward-facing action below is deliberately left
-for a human.
+**Status:** historical decision record, written 2026-07-28. The original
+two-tree synchronization design was retired on 2026-07-31: this repository is
+now the sole owner of Gridbook runtime code, CUDA sources, tests, packaging,
+and releases. PrismaQuant consumes a pinned external Gridbook contract and no
+longer vendors the package. [`RELEASING.md`](RELEASING.md) is authoritative for
+current release steps; two-tree passages below are retained only to explain
+the failure mode that motivated single ownership.
 
 **Scope.** `gridbook` is technically finished enough to be used by strangers and
 is not being used by strangers. This document records *why* each distribution
@@ -23,20 +26,13 @@ is written as `unverified` rather than filled in.
 
 ### Two facts about this document itself — read before trusting a checkbox
 
-**1. `gridbook` has two trees, and a claim about "the tree" is meaningless
-unless it names one.**
+**1. `github.com/RobTand/gridbook` is the only Gridbook source tree.**
 
-| | Tree | Role |
-|---|---|---|
-| **(A)** | `prismaquant/plugins/gridbook` (private monorepo) | source of truth for shared code + `pyproject.toml`; edits land here first |
-| **(B)** | this repo — `github.com/RobTand/gridbook` | rsync of (A) **plus** public-only files (`README.md`, `LICENSE`, `ROADMAP.md`, `docs/`, `.github/`, `Dockerfile`, `MANIFEST.in`); **release artifacts are built from here** |
-
-Every state claim below is written as *"landed in (A)"* or *"green in (B)"*,
-never as "done". The distinction is not pedantic: on 2026-07-28 an earlier
-revision of this document said the packaging fix was done, which was true of (A)
-and false of (B) — and a `python -m build` in (B) at that moment produced a
-`0.0.1` wheel containing **zero** CUDA sources. §3.0 is the gate that exists
-because of that.
+The former PrismaQuant mirror created precisely the ambiguity this document
+warned about: one tree could contain a packaging fix while the other produced
+a source-less wheel. The fix is ownership, not a more elaborate sync. Runtime
+changes now land here; producer integration installs an immutable commit and
+validates the packaged runtime contract.
 
 **2. Citations here quote strings, not line numbers.** Both trees change several
 times an hour while this workstream is in flight; a first draft of this document
@@ -577,26 +573,21 @@ tree release artifacts are built from** (`MANIFEST.in`: *"Release artifacts are
 built from THIS tree (the public repo)"*). A box ticked on the strength of tree
 (A) is not ticked. §3.0 exists to make that impossible to forget.
 
-### 3.0 Tree-sync gate — **run this first, every time, before any build**
+### 3.0 Canonical-tree gate — **run this first, every time, before any build**
 
-Shared code and `pyproject.toml` are authored in tree (A) and reach tree (B) only
-by rsync. There is therefore a window — sometimes hours, sometimes minutes — in
-which (B) is a strictly older program than (A). Building a release in that window
-is how a spent version number and a source-less wheel both become permanent at
-once. This gate is the *only* protection against it that runs before the tag.
+Build only from a clean checkout of this repository. There is no upstream
+runtime mirror to compare or synchronize. The package tree, tests, metadata,
+and release workflow reviewed in the PR are exactly the tree being released.
 
-- [ ] **The rsync from (A) to (B) has happened since the last change to (A).**
-      From (B):
+- [ ] **The checkout is clean and on the reviewed release commit.**
 
       ```bash
-      diff -rq --exclude=__pycache__ --exclude='*.egg-info' \
-        /home/rob/prismaquant/plugins/gridbook/gridbook ./gridbook
-      diff -q /home/rob/prismaquant/plugins/gridbook/pyproject.toml ./pyproject.toml
+      test -z "$(git status --porcelain)"
+      git log -1 --show-signature --oneline
       ```
 
-      Both must be silent. (`README.md`, `tests/` and every public-only file may
-      legitimately differ — those are not rsynced. Only `gridbook/` and
-      `pyproject.toml` are shared source.)
+      PrismaQuant updates its immutable compatibility pin only after this
+      commit merges; that downstream pin is not an input to this build.
 - [ ] **The packaging invariant holds in (B), checked in (B).** Check the
       *behaviour*, not the source text — a `grep` for `os.pardir` matches the
       docstring that warns against reintroducing it, which makes it useless as a
@@ -750,21 +741,11 @@ else silently changes what is being gated.
       `docs/BENCHMARKS.md` (e.g. 27B: ~10.3 tok/s). A silent Triton fallback is
       the exact failure this gate exists to catch, and it is invisible without a
       speed check.
-- [ ] Confirm on the wheel-installed path that the artifact's registry key
-      resolves. Note the live discrepancy: `plugin.py` registers `"gridbook"`
-      first and `"prismaquant"` second (marked *legacy*), all three shipped
-      artifacts carry `"quant_method": "gridbook"`, while `docs/SPEC.md` still
-      says the key MUST be `"prismaquant"`. **The spec must be corrected to match
-      the code before the spec is promoted anywhere.**
-      *Correction to an earlier revision of this document, which asserted that
-      `ROADMAP.md` calls the `"prismaquant"` key "permanent". It does not —
-      `grep -i permanent ROADMAP.md` returns nothing (rc=1), and the word appears
-      only in `docs/SPEC.md`, about the `scale_coding`-absence→v1 backward-compat
-      anchor, not the registry key. `ROADMAP.md` in fact already agrees with this
-      box: "**Both are now wrong in the shipped world** … The spec needs to be
-      corrected to describe what ships — an implementation written from the current
-      text cannot load a published artifact." SPEC.md is the only document that
-      needs changing.*
+- [ ] Confirm on the wheel-installed path that both artifact registry keys
+      resolve to the same implementation: canonical `"gridbook"` and the
+      read-only legacy alias `"prismaquant"`. Published artifacts use the
+      canonical key and the pointer-sidecar layout. `docs/SPEC.md` now describes
+      that shipped contract, including the fully inlined compatibility form.
 
 ### 3.5 Docs accuracy — no upload with a false README
 
@@ -965,13 +946,11 @@ install command.
 costs a PR and returns approximately nothing. `pprp/Awesome-LLM-Quantization` has
 436 stars but is a *papers* list, not a tools list.
 
-**7. Do not promote `docs/SPEC.md` as implementable until §3.4 lands.** The spec
-is the artifact an independent implementer is asked to trust, and today a faithful
-implementation of §6 registers `"prismaquant"` and fails to load **100%** of
-published artifacts (all three carry `"quant_method": "gridbook"`). §5's
-description of where the config lives is also inverted relative to the shipped
-layout. Promoting the spec before fixing it converts a documentation bug into a
-credibility one.
+**7. The `docs/SPEC.md` registry/config-layout blocker is closed.** Sections 5
+and 6 now specify the shipped pointer-sidecar layout, canonical `"gridbook"`
+producer key, legacy `"prismaquant"` read alias, and accepted fully inlined
+compatibility form. The remaining §3.4 wheel-installed serve smoke is an
+implementation/release gate, not a specification contradiction.
 
 **8. Do not claim `vllm-gridbook` "just in case".** §0.1. Two names is two
 release lines and a permanent explanation.

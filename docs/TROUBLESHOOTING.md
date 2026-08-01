@@ -449,14 +449,14 @@ incoherent (not merely low-quality).
 **Most likely cause on a Mixture-of-Experts model**: the architecture's expert
 weights were never routed through the codebook loader. Some MoE architectures
 load experts at the top-level model rather than through vLLM's per-layer fused
-MoE loader; those need an explicit per-architecture registration in the plugin
-(`gridbook/plugin.py`). Registered today: HunYuan-V3 (and its MTP drafter),
-Laguna, and Qwen3.5-MoE (and its MTP). An unregistered architecture fails
-*silently* into wrong weights rather than raising.
+MoE loader; those need an explicit module entry in the packaged
+`gridbook/runtime_contract.json`. That file is the sole authoritative list;
+the plugin derives its loader registry from it. An unregistered architecture
+is rejected by the post-load fill guard before it can serve wrong weights.
 
 **What to do** — open an issue naming the model architecture class (the
-`architectures` field in the model's `config.json`). Adding one is a guarded
-one-liner.
+`architectures` field in the model's `config.json`). Adding one is a contract
+change with a loader/fill regression test.
 
 Other checks: confirm you are not mixing a checkpoint with a plugin version that
 predates its architecture support, and confirm the artifact is complete (see

@@ -18,15 +18,16 @@ must match the loop within the suite's tolerance class:
 Two run scopes:
 
 * ``-k qdq_once`` (build venv, NO vLLM, CPU ok): the per-row QDQ property.
-    PYTHONPATH=/home/rob/prismaquant:/home/rob/prismaquant/plugins/gridbook \\
+    PYTHONPATH=/home/rob/prismaquant:/home/rob/gridbook \\
       /home/rob/dq-runs/venvs/prismaquant-cu130/bin/python -m pytest \\
-      plugins/gridbook/tests/test_moe_batched_prefill.py -q -k qdq_once
+      /home/rob/gridbook/tests/test_moe_batched_prefill.py -q -k qdq_once
 
 * everything else (serving container: vLLM + triton + prismaquant + CUDA):
-    docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
+    docker run --rm --gpus all -v /home/rob/gridbook:/gridbook \\
+      -v /home/rob/prismaquant:/prismaquant \\
       --entrypoint bash vllm-node-tf5-cu132-lfm:latest -c 'pip install -q pytest; \\
-      PYTHONPATH=/repo:/repo/plugins/gridbook python3 -m pytest \\
-      /repo/plugins/gridbook/tests/test_moe_batched_prefill.py -v'
+      PYTHONPATH=/gridbook:/prismaquant python3 -m pytest \\
+      /gridbook/tests/test_moe_batched_prefill.py -v'
 """
 import types
 

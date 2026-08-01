@@ -32,10 +32,11 @@ Run scopes:
   at every TileM (``gridbook.moe_routing`` is torch-only for exactly this
   reason), and the auto-selection policy.
 * everything else (serving container: vLLM + CUDA + the fused extension):
-    docker run --rm --gpus all -v /home/rob/prismaquant:/repo \\
+    docker run --rm --gpus all -v /home/rob/gridbook:/gridbook \\
+      -v /home/rob/prismaquant:/prismaquant \\
       --entrypoint bash vllm-node-tf5-cu132-lfm:latest -c 'pip install -q pytest; \\
-      PYTHONPATH=/repo:/repo/plugins/gridbook python3 -m pytest \\
-      /repo/plugins/gridbook/tests/test_moe_grouped_fused.py -v'
+      PYTHONPATH=/gridbook:/prismaquant python3 -m pytest \\
+      /gridbook/tests/test_moe_grouped_fused.py -v'
 """
 import pytest
 import torch

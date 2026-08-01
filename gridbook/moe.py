@@ -122,6 +122,7 @@ _PREFILL_MODES = frozenset({
     "stock",
 })
 _PREFILL_MODE_STATE: list[str | None] = []
+_FUSED_FP4_MOE_STATE: list[str] = []
 
 
 def _requested_prefill_mode() -> str | None:
@@ -141,6 +142,29 @@ def _requested_prefill_mode() -> str | None:
             "restart the process instead of mixing prefill contracts"
         )
     return _PREFILL_MODE_STATE[0]
+
+
+def _requested_fused_fp4_moe_mode() -> str:
+    """Validated, process-stable fused-FP4 MoE opt-in selector.
+
+    A typo must not turn an intended enablement A/B into an unlabelled baseline
+    run, and changing the activation contract between forwards is never a
+    supported way to compare the paths.
+    """
+    current = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "").strip()
+    if current not in ("", "1", "128", "256"):
+        raise ValueError(
+            "invalid PRISMAQUANT_CB_FUSED_FP4_MOE="
+            f"{current!r}; expected '', '1', '128', or '256'"
+        )
+    if not _FUSED_FP4_MOE_STATE:
+        _FUSED_FP4_MOE_STATE.append(current)
+    elif current != _FUSED_FP4_MOE_STATE[0]:
+        raise RuntimeError(
+            "PRISMAQUANT_CB_FUSED_FP4_MOE changed after Gridbook dispatch was "
+            "fixed; restart the process instead of mixing activation contracts"
+        )
+    return _FUSED_FP4_MOE_STATE[0]
 
 
 def _grouped_mm_available() -> bool:
@@ -534,11 +558,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # Explicit opt-in until a served quality gate and routing-shape ladder
         # pass. Tile 128 is 5.2-5.6x faster than the per-expert loop on the
         # measured shapes, but its padding cost has a sharp token-count cliff.
-        # The same unvalidated-on-serving-metric caveat as the dense gate in
-        # linear.py applies.
+        # The same failed-promotion-screen and incomplete served-evidence caveat
+        # as the dense gate in linear.py applies.
         requested_mode = _requested_prefill_mode()
         if requested_mode is None and self.is_fp4 and num_tokens > 16:
-            gf4 = os.environ.get("PRISMAQUANT_CB_FUSED_FP4_MOE", "").strip()
+            gf4 = _requested_fused_fp4_moe_mode()
             if gf4 in ("1", "128", "256"):
                 out = self._apply_prefill_grouped_fused_fp4(
                     layer, x, topk_weights, topk_ids, act,
@@ -598,9 +622,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
               and self.type_size == 4 * self.k + 9
               and layer._cb_hidden % codec.SUPERBLOCK == 0
               and layer._cb_inter % codec.SUPERBLOCK == 0)
-        if ok and self.n_sub == 2:
-            w0 = self.k - self.k // 2
-            ok = ((1 << w0) + (1 << (self.k // 2))) * 2 <= 16384
+        if ok:
+            ok = (codec.fp4_value_lut_nbytes(self.k, self.n_sub)
+                  <= codec.FP4_FUSED_LUT_MAX_BYTES)
         if ok:
             try:
                 import vllm._custom_ops as vops

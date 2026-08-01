@@ -8,8 +8,10 @@ for the format itself see [`SPEC.md`](SPEC.md).
 The **served path is the CUDA kernel set** (`gridbook/csrc/cb_gemv.cu`, JIT-built
 via `cuda_ext.get_ext()`, plus the CUTLASS fused prefill extension). The
 **Triton** path (`kernels.py`) was the original correctness-first reference and
-remains the bit-exact fallback when `nvcc` is unavailable — correct everywhere,
-but several times slower and not a serving target.
+remains the bit-exact fallback when `nvcc` is unavailable — correct on
+supported NVIDIA execution contracts, but several times slower and not a
+serving target. Non-NVIDIA hardware is unsupported and unqualified; no ROCm
+backend or dispatch hook ships in this release.
 
 ## Invariants
 
@@ -27,6 +29,16 @@ but several times slower and not a serving target.
   fallback rather than a performance one.
 
 ## Scope
+
+The producer/runtime boundary is machine-readable at
+`gridbook/runtime_contract.json` and loadable without torch or vLLM through
+`gridbook.runtime_contract.load_runtime_contract()`. It declares accepted
+quantization names, serialized packing/type-size rules, supported CB rung
+families, and producer-profile loader coverage. The plugin derives its own
+registration aliases and top-level loader-module list from this file rather
+than repeating them in Python. PrismaQuant pins an immutable Gridbook
+commit and validates against this packaged contract; it does not vendor a
+second runtime tree or maintain a parallel loader table.
 
 - **Product** mode, ANY integer k: even splits (NVFP4_CB_K16 → (8,8);
   FP8_CB_K44 → (11,11,11,11)) and ceil-first uneven splits per SPEC §1
@@ -161,8 +173,8 @@ tooling and model cards — see the README's naming section.)
 | `PRISMAQUANT_CB_DECODE` | `cuda` | `triton` forces the Triton decode path (much slower; bisection only). |
 | `PRISMAQUANT_CB_GEMV` | `inherited` | Which grouped fp4-CB decode GEMV serves a layer: `inherited` \| `auto` \| `v2`. Unset/`inherited` reproduces the shipped dispatch and never attempts the experimental JIT build. Explicit `auto` or `v2` may use `cb_gemv_v2.cu` only on native Blackwell cc 12.0/12.1 devices with the required opt-in shared memory and where the compiled occupancy predicate says it wins; this PR's execution battery covers cc 12.1. FP8-only serves never build it. **Not** bit-exact against `inherited` (reassociation class). An unknown spelling raises; changing it mid-process raises. |
 | `PRISMAQUANT_CB_PREFILL` | `auto` (fp8-CB) / `loop` (fp4-CB) | MoE prefill path: `auto` \| `stock` \| `grouped_fused` \| `grouped_fused_r1` \| `loop` \| `batched` \| `l2_pipeline`. `batched`, `grouped_fused_r1`, and `l2_pipeline` are diagnostic/A-B modes; `l2_pipeline` wedged live serving three times. For fp4-CB, unset selects conservative `loop`; any explicit mode also bypasses the separate fused-FP4 opt-in attempt. Unknown spellings fail, and changing the value mid-process requires a restart. |
-| `PRISMAQUANT_CB_FUSED_FP4` | off | Dense fp4-CB native-FP4 prefill opt-in: `1` for every prefill shape or `midm` for 16 < M <= 128. Changes the activation-scale bucket (fp32 emulation to native ue4m3), so it remains off pending served KL/PPL. |
-| `PRISMAQUANT_CB_FUSED_FP4_MOE` | off | Grouped-MoE fp4-CB native-FP4 prefill opt-in: `1`/`128` selects TileM 128; `256` selects TileM 256. An ineligible attempt fails closed to `loop`. It has the same activation-contract and served-quality gate as the dense path. |
+| `PRISMAQUANT_CB_FUSED_FP4` | off | Dense fp4-CB native-FP4 prefill opt-in: `1` for every prefill shape or `midm` for 16 < M <= 128. It changes the activation-scale bucket (fp32 emulation to native UE4M3), and the enablement screen found a material distribution shift while the dense path was slower. Unknown spellings and mid-process changes fail; restart between A/B arms. Keep it off; see the [dated audit](audits/fused_nvfp4_enablement_2026-07-31.md). |
+| `PRISMAQUANT_CB_FUSED_FP4_MOE` | off | Grouped-MoE fp4-CB native-FP4 prefill opt-in: `1`/`128` selects TileM 128; `256` selects TileM 256. An ineligible attempt fails closed to `loop`; unknown spellings and mid-process changes fail. The grouped arithmetic is qualified on the pinned GB10 test matrix, but the same activation-contract change failed the model-equivalence screen; keep it off pending the gates in the [dated audit](audits/fused_nvfp4_enablement_2026-07-31.md). |
 | `PRISMAQUANT_CB_FUSED_MIDM` | `1` | `0` skips the CUTLASS mid-M fused prefill kernel — including its JIT build, which is worth doing on non-`sm_120` GPUs where the build is doomed anyway. |
 | `PRISMAQUANT_PREFILL_M_THRESHOLD` | `16` | Token count above which a dense Linear takes the prefill path instead of the decode GEMV. |
 | `PRISMAQUANT_CB_CUDA_M_MAX` | `8` | Within the decode regime, the largest M handled by the CUDA GEMV before the Triton decode-GEMM takes over (measured crossover on GB10). |
@@ -171,7 +183,7 @@ tooling and model cards — see the README's naming section.)
 | `PRISMAQUANT_CB_EXPAND` | CUDA (fp8-CB) / raw view (fp4-CB) | `triton` restores the previous padded Triton expander on the fp8-CB branch; `pad` restores the padded copy on the fp4-CB branch. Both are bisection escapes — the default and the padded call produce bit-identical weights. |
 | `PRISMAQUANT_DEBUG_PREFIXES` | off | `1` prints, per Linear, whether it resolved to a CB scheme or fell through — the first tool to reach for when memory use is higher than expected (silent BF16 fallback). |
 | `PRISMAQUANT_CB_PREFILL_TIMING` | off | `1` emits per-stage prefill timers. |
-| `PRISMAQUANT_PRELOAD_FUSED` | off | `1` force-builds the fused extension at registration so both arms of a served A/B carry identical extension residency (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |
+| `PRISMAQUANT_PRELOAD_FUSED` | off | `1` independently attempts to build/preload both fused extensions (FP8-CB and NVFP4-CB) at registration so both arms of a served A/B can carry identical extension residency. Normal registration remains fail-soft; a validation harness must separately attest its required module (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |
 | `PRISMAQUANT_ENABLE_PTC` | off | Builds the quarantined persistent-N kernel. **Do not set this** — measured negative and under a stability quarantine. |
 
 ### The rest of them

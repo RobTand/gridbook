@@ -6,8 +6,8 @@ within fp8-MMA reassociation tolerance, and the DECODED resident tile is
 bit-exact by construction (same decode as cb_expand_fp8 — cross-checked
 here via the expander).
 
-Run (GPU): PYTHONPATH=. pytest plugins/gridbook/tests/test_persistent_tc.py -v
-Bench:     python plugins/gridbook/tests/test_persistent_tc.py bench
+Run (GPU): PYTHONPATH=. pytest tests/test_persistent_tc.py -v
+Bench:     python tests/test_persistent_tc.py bench
 """
 import sys
 

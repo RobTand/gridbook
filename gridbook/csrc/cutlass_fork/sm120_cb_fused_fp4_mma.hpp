@@ -291,6 +291,7 @@ struct CollectiveMma<
     // indirection lives ENTIRELY in the producer staging. nullptr => dense.
     int const* ptr_expert_ids{nullptr};
     int64_t packed_expert_stride{0};      // = N * row_bytes for stacked packs
+    int32_t num_experts{0};               // bounds ptr_expert_ids before gather
     // DEBUG ONLY (tests): when non-null, the CTA at (m=0, n=0) dumps its
     // first-K-tile decoded smem_B bytes, smem_SFB bytes, staged packed rows
     // and the smem LUT here after the first decode barrier. Never set in
@@ -327,6 +328,7 @@ struct CollectiveMma<
     int32_t N_rows;
     int const* ptr_expert_ids;
     int64_t packed_expert_stride;
+    int32_t num_experts;
     uint8_t* ptr_debug;
     uint32_t tma_transaction_bytes = TmaTransactionBytes;
     uint32_t tma_transaction_bytes_mk = TmaTransactionBytesMK;
@@ -357,7 +359,7 @@ struct CollectiveMma<
       args.ptr_lut, args.ptr_compose, args.lut_bytes,
       args.k_bits, args.n_sub, args.type_size, args.is_v2,
       static_cast<int32_t>(N), args.ptr_expert_ids,
-      args.packed_expert_stride, args.ptr_debug,
+      args.packed_expert_stride, args.num_experts, args.ptr_debug,
       TmaTransactionBytes, TmaTransactionBytesMK, TmaTransactionBytesNK
     };
   }
@@ -542,6 +544,15 @@ struct CollectiveMma<
     const uint8_t* __restrict__ gp = params.ptr_packed;
     if (params.ptr_expert_ids != nullptr) {
       int eid = __ldg(params.ptr_expert_ids + int(m_coord));
+      // -1 is the routing pad sentinel and deliberately maps to expert zero;
+      // its output row is discarded by the caller.  Every other ID must name
+      // a resident expert. Keep this check on device: a host min/max would add
+      // a synchronization to every grouped launch and break graph capture.
+      // `trap` is fail-closed and, unlike an unchecked stride, cannot turn a
+      // corrupt routing tensor into an out-of-bounds model-weight read.
+      if (eid < -1 || eid >= params.num_experts) {
+        asm volatile("trap;");
+      }
       gp += int64_t(eid < 0 ? 0 : eid) * params.packed_expert_stride;
     }
 

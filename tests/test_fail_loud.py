@@ -22,10 +22,9 @@ Instances are built with ``__new__`` and explicit attributes, the same
 init-bypass the other MoE test files use (``test_moe_stock_prefill._build``,
 ``test_moe_stacked``): nothing here exercises ``__init__``.
 
-Run: ``python -m pytest tests/test_fail_loud.py -q``. Like
-tests/test_target_namespace_compat.py this file injects stub ``vllm.*`` modules
-into ``sys.modules`` when vLLM is absent, so it must get its OWN pytest process
--- which is what .github/scripts/run_cpu_tests.sh already does for every file.
+Run: ``python -m pytest tests/test_fail_loud.py -q``. When vLLM is absent the
+module-scoped runtime fixture installs private stubs and restores the exact
+prior import graph afterward, so this file is safe in a combined pytest run.
 """
 import sys
 import types
@@ -34,39 +33,50 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-# vLLM symbols gridbook.moe imports at module scope. Stubbed only when vLLM is
-# genuinely absent, exactly as tests/test_target_namespace_compat.py does it.
-if "vllm" not in sys.modules:
+def _install_vllm_stubs():
+    """Install the vLLM surface imported by Gridbook's MoE runtime."""
+    def _mod(name):
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        parent, _, leaf = name.rpartition(".")
+        if parent:
+            setattr(sys.modules[parent], leaf, module)
+        return module
+
+    _mod("vllm")
+    _mod("vllm.model_executor")
+    model_utils = _mod("vllm.model_executor.utils")
+    model_utils.set_weight_attrs = lambda p, attrs: None
+    _mod("vllm.model_executor.layers")
+    fused_moe = _mod("vllm.model_executor.layers.fused_moe")
+    fused_moe.RoutedExperts = type("RoutedExperts", (), {})
+    config = _mod("vllm.model_executor.layers.fused_moe.config")
+    config.FusedMoEConfig = type("FusedMoEConfig", (), {})
+    config.FusedMoEQuantConfig = type("FusedMoEQuantConfig", (), {})
+    base = _mod("vllm.model_executor.layers.fused_moe.fused_moe_method_base")
+    base.FusedMoEMethodBase = type("FusedMoEMethodBase", (), {})
+    activation = _mod("vllm.model_executor.layers.fused_moe.activation")
+    activation.MoEActivation = type("MoEActivation", (), {})
+    activation.apply_moe_activation = lambda *a, **kw: None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _runtime_modules(isolated_gridbook_runtime_imports):
+    """Import Gridbook against a private real-or-stubbed vLLM graph."""
+    del isolated_gridbook_runtime_imports
     try:
-        import vllm  # noqa: F401
+        from vllm.model_executor.layers.fused_moe.config import (  # noqa: F401
+            FusedMoEConfig,
+        )
     except Exception:
-        def _mod(name):
-            m = types.ModuleType(name)
-            sys.modules[name] = m
-            parent, _, leaf = name.rpartition(".")
-            if parent:
-                setattr(sys.modules[parent], leaf, m)
-            return m
+        for name in list(sys.modules):
+            if name == "vllm" or name.startswith("vllm."):
+                sys.modules.pop(name, None)
+        _install_vllm_stubs()
 
-        _mod("vllm")
-        _mod("vllm.model_executor")
-        me_utils = _mod("vllm.model_executor.utils")
-        me_utils.set_weight_attrs = lambda p, attrs: None
-        _mod("vllm.model_executor.layers")
-        fm = _mod("vllm.model_executor.layers.fused_moe")
-        fm.RoutedExperts = type("RoutedExperts", (), {})
-        fmc = _mod("vllm.model_executor.layers.fused_moe.config")
-        fmc.FusedMoEConfig = type("FusedMoEConfig", (), {})
-        fmc.FusedMoEQuantConfig = type("FusedMoEQuantConfig", (), {})
-        fmb = _mod("vllm.model_executor.layers.fused_moe.fused_moe_method_base")
-        fmb.FusedMoEMethodBase = type("FusedMoEMethodBase", (), {})
-        fma = _mod("vllm.model_executor.layers.fused_moe.activation")
-        fma.MoEActivation = type("MoEActivation", (), {})
-        fma.apply_moe_activation = lambda *a, **kw: None
-
-codec = pytest.importorskip("gridbook.codec")
-moe = pytest.importorskip("gridbook.moe")
-cuda_ext = pytest.importorskip("gridbook.cuda_ext")
+    globals()["codec"] = pytest.importorskip("gridbook.codec")
+    globals()["moe"] = pytest.importorskip("gridbook.moe")
+    globals()["cuda_ext"] = pytest.importorskip("gridbook.cuda_ext")
 
 K, N_SUB = 44, 4                       # the shipped fp8-CB rung
 TYPE_SIZE = 4 * K                      # fp8-CB superblock byte width

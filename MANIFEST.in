@@ -1,6 +1,6 @@
 # Sdist contents beyond the package itself. Release artifacts are built from
-# THIS tree (the public repo), so the sdist gets the full public README, the
-# docs/ set and the roadmap; the in-tree plugin has none of those.
+# THIS canonical tree, so the sdist gets the full public README, docs, and
+# roadmap alongside the runtime package.
 #
 # The runtime CUDA sources need no rule here: they live inside the package
 # (gridbook/csrc) and are declared as [tool.setuptools.package-data] in
@@ -12,6 +12,8 @@
 include ROADMAP.md
 graft docs
 recursive-include tests *.py
+include scripts/prepare_lfm_fused_validation.py
+include scripts/validate_fused_nvfp4_ab.py
 
 # ...but `graft docs` is indiscriminate, and two things under docs/ are internal
 # working material, not documentation for someone who ran `pip install gridbook`.

@@ -91,8 +91,10 @@ def moe(request):
 @pytest.fixture(autouse=True)
 def _reset_prefill_mode_state(moe):
     moe._PREFILL_MODE_STATE.clear()
+    moe._FUSED_FP4_MOE_STATE.clear()
     yield
     moe._PREFILL_MODE_STATE.clear()
+    moe._FUSED_FP4_MOE_STATE.clear()
 
 
 def _method(moe, *, grid, k, n_sub, type_size, is_v2=True):
@@ -179,6 +181,49 @@ def test_opted_in_fp4_fused_miss_falls_back_to_loop(moe, monkeypatch):
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", "1")
     assert _dispatch_mode(
         moe, monkeypatch, _fp4(moe), fused_fp4=None) == "loop"
+
+
+@pytest.mark.parametrize("value", ["yes", "MIDM", "129"])
+def test_fp4_fused_prefill_rejects_unknown_modes(moe, monkeypatch, value):
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", value)
+    with pytest.raises(ValueError, match="invalid PRISMAQUANT_CB_FUSED_FP4_MOE"):
+        _dispatch_mode(moe, monkeypatch, _fp4(moe))
+
+
+def test_fp4_fused_prefill_cannot_change_mid_process(moe, monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL", raising=False)
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", "128")
+    assert _dispatch_mode(moe, monkeypatch, _fp4(moe)) == "fused_fp4"
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", "256")
+    with pytest.raises(RuntimeError, match="changed after Gridbook dispatch"):
+        _dispatch_mode(moe, monkeypatch, _fp4(moe))
+
+
+@pytest.mark.parametrize(
+    "k,n_sub,expected",
+    [(24, 2, True), (20, 1, True), (21, 1, False)],
+    ids=["product-k24-16k", "signed-s20-16k", "signed-s21-over-16k"],
+)
+def test_moe_fused_fp4_selector_enforces_lut_smem_limit(
+    moe, monkeypatch, k, n_sub, expected
+):
+    """Drive the real MoE eligibility selector at the 16-KiB LUT edge."""
+
+    method = _fp4(moe, k=k, n_sub=n_sub)
+    layer = _layer(E=4, hidden=512, inter=256)
+    vops = types.ModuleType("vllm._custom_ops")
+    vops.scaled_fp4_quant = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", vops)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", vops,
+                        raising=False)
+    from gridbook import cuda_ext
+
+    class FusedExt:
+        cb_fused_fp4_moe_grouped = object()
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: FusedExt())
+    assert method._gf4_ok(layer) is expected
 
 
 def test_default_prefill_mode_fp8_is_still_auto(moe, monkeypatch):

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.1 — 2026-08-01
+
+- Keep dense and grouped-MoE fused native-NVFP4 prefill default-off after a
+  teacher-backed LFM2.5 stop gate rejected promotion (mean full-vocabulary KL
+  0.2472, PPL +5.65%, and teacher-to-candidate KL +0.1311 over the conservative
+  path). The native activation bucket, not the decoded weight arithmetic, is
+  the dominant change.
+- Harden the opt-in fused CUDA implementation: validate device, dtype,
+  contiguity, shape, storage, codebook, scale, and expert-ID contracts; launch
+  on the active stream; trap invalid routed experts; and fix the concrete
+  TileM128/TileM256 grouped runners for current CUDA toolchains.
+- Add operator-level coverage for SASS instruction selection, every
+  fused-eligible FP4 rung under both layouts, oversized-rung rejection, ragged
+  shapes, non-default streams, CUDA graphs, malformed
+  inputs, routing, real MoE stage shapes, and stagewise numerical attribution.
+  The final CUDA gate passed 68/68 with no skips.
+- Add immutable same-revision Hub loading for configuration, checkpoint
+  headers, and codebook sidecars; preload both fused extensions independently;
+  and wire the LFM top-level expert loader.
+- Add fail-closed preparation and same-session teacher A/B tooling for fused
+  enablement, with full-vocabulary metrics, exact artifact/runtime provenance,
+  and explicit quality thresholds before a report can be promotion-complete.
+- Make this repository the sole owner of Gridbook runtime code, CUDA sources,
+  tests, packaging, and releases. Producer repositories consume a packaged
+  runtime contract at an immutable commit; no Gridbook source tree is mirrored.
+- Remove the unreachable, unvalidated ROCm delegation hook and its permanently
+  skipped parity test. AMD support can return as a normal Gridbook feature once
+  it has hardware access and served qualification.
+
+[Full diff](https://github.com/RobTand/gridbook/compare/v0.4.0...v0.4.1)
+
 ## 0.4.0 — 2026-07-31
 
 - Keep dense and grouped-MoE fused native-FP4 prefill behind explicit opt-in

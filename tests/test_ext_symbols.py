@@ -57,6 +57,10 @@ def _patch_load(monkeypatch, result=None, *, error=None):
         calls.append((args, kwargs))
         if error is not None:
             raise error
+        if result is not None and "name" in kwargs:
+            # torch's real loader imports the module under the requested
+            # TORCH_EXTENSION_NAME. Preserve that ABI behavior in the stub.
+            result.__name__ = kwargs["name"]
         return result
 
     monkeypatch.setattr(cpp_extension, "load", fake_load)
@@ -143,6 +147,7 @@ def test_cold_load_is_published_once_to_concurrent_callers(
         started.set()
         if not release.wait(timeout=10):
             raise TimeoutError("test did not release the cold JIT")
+        good.__name__ = kwargs["name"]
         return good
 
     monkeypatch.setattr(cpp_extension, "load", blocking_load)
@@ -499,9 +504,122 @@ def test_fused_fp4_accepts_each_useful_partial_module(
     calls = _patch_load(monkeypatch, good)
     assert cuda_ext.get_fused_fp4_ext() is good
     kwargs = calls[0][1]
-    assert kwargs["build_directory"] == str(tmp_path / "fused_fp4")
+    assert re.fullmatch(r"pq_cb_fused_fp4_[0-9a-f]{64}", kwargs["name"])
+    identity = kwargs["name"].removeprefix("pq_cb_fused_fp4_")
+    assert kwargs["build_directory"] == str(
+        tmp_path / "fused_fp4" / identity)
+    assert good.__gridbook_jit_identity__ == identity
+    assert good.__gridbook_jit_abi_schema__ == \
+        cuda_ext._FUSED_FP4_ABI_SCHEMA
     assert "-gencode=arch=compute_121a,code=sm_121a" in \
         kwargs["extra_cuda_cflags"]
+
+
+def _identity_fixture(tmp_path):
+    src = tmp_path / "csrc"
+    header = src / "cutlass_fork" / "sm120_cb_fused_fp4_mma.hpp"
+    header.parent.mkdir(parents=True)
+    (src / "cb_fused_fp4_gemm.cu").write_text("source-v1")
+    header.write_text("header-v1")
+
+    cutlass = tmp_path / "cutlass" / "include"
+    (cutlass / "cutlass").mkdir(parents=True)
+    (cutlass / "cutlass" / "cutlass.h").write_text("cutlass-v1")
+    (cutlass / "cutlass" / "version.h").write_text("version-v1")
+    util = tmp_path / "cutlass" / "tools" / "util" / "include"
+    packed = util / "cutlass" / "util" / "packed_stride.hpp"
+    packed.parent.mkdir(parents=True)
+    packed.write_text("packed-v1")
+    return src, header, cutlass, util
+
+
+def _fake_torch_identity():
+    c_api = types.SimpleNamespace(
+        _GLIBCXX_USE_CXX11_ABI=True,
+        _PYBIND11_COMPILER_TYPE="gcc",
+        _PYBIND11_STDLIB="libstdcpp",
+        _PYBIND11_BUILD_ABI="cxxabi1011",
+        _cuda_getCompiledVersion=lambda: 12080,
+        _cuda_getRuntimeVersion=lambda: 12080,
+        _cuda_getDriverVersion=lambda: 12090,
+    )
+    return types.SimpleNamespace(
+        __version__="2.9.0+cu128",
+        version=types.SimpleNamespace(cuda="12.8"),
+        compiled_with_cxx11_abi=lambda: True,
+        _C=c_api,
+    )
+
+
+def test_fused_fp4_identity_covers_sources_arch_and_toolchain(
+        monkeypatch, tmp_path):
+    src, header, cutlass, util = _identity_fixture(tmp_path)
+    fake_torch = _fake_torch_identity()
+    fake_cpp = types.SimpleNamespace(
+        CUDA_HOME="/toolkit", get_cxx_compiler=lambda: "c++")
+    compiler_revision = {"value": "v1"}
+    monkeypatch.setattr(
+        cuda_ext, "_compiler_identity",
+        lambda command: {"command": command,
+                         "revision": compiler_revision["value"]})
+
+    def identity(capability=(12, 1)):
+        return cuda_ext._fused_fp4_build_identity(
+            fake_torch, fake_cpp, src_dir=str(src),
+            cutlass_include=str(cutlass), util_include=str(util),
+            capability=capability)
+
+    initial, payload = identity()
+    assert payload["target"]["code"] == "sm_121a"
+    assert payload["torch"]["version"] == "2.9.0+cu128"
+    assert payload["torch"]["cuda"] == "12.8"
+    assert payload["torch"]["glibcxx_cxx11_abi"] is True
+    assert payload["cuda"]["runtime_version"] == 12080
+    assert payload["cuda"]["nvcc"]["command"] == "/toolkit/bin/nvcc"
+    assert payload["host_compiler"]["command"] == "c++"
+
+    (src / "cb_fused_fp4_gemm.cu").write_text("source-v2")
+    source_changed, _ = identity()
+    assert source_changed != initial
+    (src / "cb_fused_fp4_gemm.cu").write_text("source-v1")
+    header.write_text("header-v2")
+    header_changed, _ = identity()
+    assert header_changed != initial
+    header.write_text("header-v1")
+    arch_changed, _ = identity((12, 0))
+    assert arch_changed != initial
+
+    fake_torch.__version__ = "2.10.0+cu128"
+    torch_changed, _ = identity()
+    assert torch_changed != initial
+    fake_torch.__version__ = "2.9.0+cu128"
+    fake_torch._C._GLIBCXX_USE_CXX11_ABI = False
+    abi_changed, _ = identity()
+    assert abi_changed != initial
+    fake_torch._C._GLIBCXX_USE_CXX11_ABI = True
+    fake_torch.version.cuda = "13.0"
+    cuda_changed, _ = identity()
+    assert cuda_changed != initial
+    fake_torch.version.cuda = "12.8"
+    compiler_revision["value"] = "v2"
+    compiler_changed, _ = identity()
+    assert compiler_changed != initial
+
+
+def test_fused_fp4_rejects_wrong_identity_module(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _prepare_fp4_loader(monkeypatch, tmp_path)
+    wrong = _stub("pq_cb_fused_fp4_wrong",
+                  ("cb_fused_fp4_prefill_mm_scaled",))
+    pytest.importorskip("torch")
+    cpp_extension = pytest.importorskip("torch.utils.cpp_extension")
+    monkeypatch.setattr(cpp_extension, "load", lambda *args, **kwargs: wrong)
+
+    assert cuda_ext.get_fused_fp4_ext() is None
+    error = capsys.readouterr().err
+    assert "JIT ABI identity mismatch" in error
+    assert "pq_cb_fused_fp4_wrong" in error
 
 
 def test_fused_fp4_refuses_module_with_only_optional_symbols(
