@@ -12,6 +12,7 @@ from gridbook.nvfp4_activation_contract import (
     FULL_E4M3_POLICY,
     GROUP_SIZE,
     LEGACY_POLICY,
+    MSE_GRID_POLICY,
     TENSOR_SUFFIX,
     VALUE_DTYPE,
     parse_contract,
@@ -144,3 +145,14 @@ def test_policy_is_digest_bound():
     scales = {"a": 1.0}
     assert target_values_sha256(scales, policy=LEGACY_POLICY) != \
         target_values_sha256(scales, policy=FULL_E4M3_POLICY)
+    assert target_values_sha256(scales, policy=MSE_GRID_POLICY) not in {
+        target_values_sha256(scales, policy=LEGACY_POLICY),
+        target_values_sha256(scales, policy=FULL_E4M3_POLICY),
+    }
+
+
+def test_mse_grid_is_valid_v1_static_policy():
+    record = _record({"a": 1.25}, policy=MSE_GRID_POLICY)
+    parsed = parse_contract({"execution_contracts": {CONTRACT_KEY: record}})
+    assert parsed["input_global_scale_policy"] == MSE_GRID_POLICY
+    assert validate_payload(parsed, {"a": torch.tensor([1.25])}) == {"a": 1.25}

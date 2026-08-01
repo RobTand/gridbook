@@ -28,7 +28,12 @@ LEGACY_POLICY = "legacy_6_over_calibration_amax.v1"
 FULL_E4M3_POLICY = (
     "full_e4m3_range_448x6_over_calibration_amax.v1"
 )
-SUPPORTED_POLICIES = frozenset((LEGACY_POLICY, FULL_E4M3_POLICY))
+MSE_GRID_POLICY = "mse_grid_calibrated.v1"
+SUPPORTED_POLICIES = frozenset((
+    LEGACY_POLICY,
+    FULL_E4M3_POLICY,
+    MSE_GRID_POLICY,
+))
 
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -262,6 +267,7 @@ __all__ = [
     "FULL_E4M3_POLICY",
     "GROUP_SIZE",
     "LEGACY_POLICY",
+    "MSE_GRID_POLICY",
     "SUPPORTED_POLICIES",
     "TENSOR_SUFFIX",
     "VALUE_DTYPE",
