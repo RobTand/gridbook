@@ -152,7 +152,8 @@
       "laguna",
       "qwen3",
       "qwen3_5",
-      "qwen3_5_dense"
+      "qwen3_5_dense",
+      "deepseek_v4"
     ],
     "top_level_loader_modules": [
       "vllm.model_executor.models.hy_v3",
@@ -160,7 +161,13 @@
       "vllm.model_executor.models.laguna",
       "vllm.model_executor.models.qwen3_5",
       "vllm.model_executor.models.qwen3_5_mtp",
-      "vllm.model_executor.models.lfm2_moe"
+      "vllm.model_executor.models.lfm2_moe",
+      "vllm.models.deepseek_v4.nvidia.model",
+      "vllm.models.deepseek_v4.nvidia.mtp",
+      "vllm.models.deepseek_v4.nvidia.dspark",
+      "vllm.models.deepseek_v4.amd.model",
+      "vllm.models.deepseek_v4.amd.mtp",
+      "vllm.models.deepseek_v4.amd.dspark"
     ]
   }
 }

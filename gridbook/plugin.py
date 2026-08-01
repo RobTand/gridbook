@@ -33,7 +33,13 @@ from .runtime_contract import load_runtime_contract
 
 
 _TOPLEVEL_CLASS_SUFFIXES = ("ForCausalLM", "ForCausalLMBase",
-                            "ForConditionalGeneration", "MTP")
+                            "ForConditionalGeneration", "MTP",
+                            # DeepSeek-V4 names its DSpark drafter class
+                            # ``DeepSeekV4DSpark`` -- it matches none of the
+                            # suffixes above, so without this the drafter
+                            # loads UNWRAPPED and its CB expert tensors are
+                            # handed to the arch's own loader.
+                            "DSpark")
 
 
 def _install_on_module_classes(module_path: str) -> None:
