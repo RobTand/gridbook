@@ -16,6 +16,20 @@ plumbed. Inlined configs (``config_groups`` already present) are also accepted.
 compressed-tensors vocabulary -> a real ``CompressedTensorsConfig`` we construct
 and delegate to (``CompressedTensorsW4A4Nvfp4`` for NVFP4 groups, the fp8 scheme
 for FP8_DYNAMIC). ``ignore`` -> ``UnquantizedLinearMethod``.
+
+**Block-FP8 delegation (gap G3).** A DSv4-CB artifact's CB export only
+touches the routed-expert tensors its codebooks cover; attention/dense
+Linears are left in the checkpoint's OWN native FP8 block-quant format,
+which is neither a CT group nor an ``ignore`` entry — it is declared by
+four sibling keys living directly on ``quantization_config``
+(``weight_block_size``, ``activation_scheme``, ``fmt``, ``scale_fmt`` — see
+``_build_fp8_config``). vLLM's DeepSeek V4 loader renames every non-expert
+checkpoint ``.scale`` -> ``.weight_scale_inv`` unconditionally before
+looking the param up by name, so those Linears need a REAL
+``Fp8LinearMethod`` (the same one ``quant_method=deepseek_v4_fp8`` would
+have built) or the load KeyErrors on the first attention tensor. Built
+only when ``weight_block_size`` is present, so HY3/Laguna (no such keys)
+never construct it and stay on today's unquantized-passthrough behaviour.
 """
 from __future__ import annotations
 
@@ -210,6 +224,7 @@ class PrismaQuantConfig(QuantizationConfig):
         self.target_scheme: dict[str, dict] = {}    # CB module -> scheme dict
         self._cb_targets: set[str] = set()
         self.ct_config = None                        # stock CompressedTensorsConfig
+        self.fp8_config = None                       # stock vLLM Fp8Config (block-quant)
         self._codebooks: dict[str, torch.Tensor] | None = None
         self._tp_world_size: int | None = None
         # Cached as one pair so pointer quant_config.json and its declared
@@ -309,6 +324,13 @@ class PrismaQuantConfig(QuantizationConfig):
         self._alias_collapsed_shared_prefixes()
         self.ct_config = (self._build_ct_config(stock_groups)
                           if stock_groups else None)
+        # Gap G3: build the block-FP8 arm ONLY when the source config
+        # actually carries the marker key (see _build_fp8_config) — HY3/
+        # Laguna artifacts never do, so this stays None and inert for them,
+        # exactly mirroring the ct_config gate immediately above.
+        self.fp8_config = (self._build_fp8_config()
+                           if "weight_block_size" in self._full_config
+                           else None)
         self._resolved = True
 
     def _alias_collapsed_shared_prefixes(self) -> None:
@@ -353,10 +375,48 @@ class PrismaQuantConfig(QuantizationConfig):
             ct_dict["format"] = "mixed-precision"
         return CompressedTensorsConfig.from_config(ct_dict)
 
+    def _build_fp8_config(self):
+        """A real vLLM block-FP8 config over the non-CB, non-ignored Linears
+        (gap G3). DSv4-CB leaves attention/dense weights in the checkpoint's
+        own native FP8 block-quant format — plain ``<name>.weight`` +
+        ``<name>.scale``, e4m3, UE8M0-packed scales — because the CB export
+        only ever touches the routed-expert tensors its codebooks cover.
+        Those four facts are exactly the four sibling keys the encoder
+        mirrors from the source checkpoint onto ``quantization_config``
+        (``weight_block_size``, ``activation_scheme``, ``fmt``,
+        ``scale_fmt``) whenever the source had them — so their presence IS
+        the "is this artifact block-FP8 outside its CB groups?" signal;
+        absence (HY3/Laguna) must build nothing (enforced by the caller,
+        _ensure_resolved).
+
+        We build ``DeepseekV4FP8Config`` — the exact class the native
+        ``quant_method=deepseek_v4_fp8`` path constructs
+        (vllm/models/deepseek_v4/quant_config.py) — rather than the plain
+        ``Fp8Config`` it subclasses. Its ``get_quant_method`` is identical
+        to the base class for every ``LinearBase`` we hand it (its override
+        only special-cases ``FusedMoE``, which we never pass here — CB
+        already owns every expert prefix on this artifact); the reason it
+        has to be THIS subclass is ``is_scale_e8m0``, which resolves off
+        the live ``hf_config.expert_dtype`` ("fp4" for DSv4-Flash) and
+        makes ``Fp8LinearMethod.create_weights`` register
+        ``weight_scale_inv`` as native ``float8_e8m0fnu`` — bit-for-bit
+        what ``scale_fmt: "ue8m0"`` declares on disk. The plain base config
+        has no such property (``getattr(..., False)`` default) and would
+        silently upcast every scale to float32 instead.
+        """
+        from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
+        return DeepseekV4FP8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme=self._full_config["activation_scheme"],
+            ignored_layers=list(self.ignore) + sorted(self._cb_targets),
+            weight_block_size=self._full_config["weight_block_size"],
+        )
+
     def __repr__(self) -> str:
         return (f"PrismaQuantConfig(resolved={self._resolved}, "
                 f"cb_targets={len(self.target_scheme)}, "
-                f"stock_ct={'yes' if self.ct_config is not None else 'no'})")
+                f"stock_ct={'yes' if self.ct_config is not None else 'no'}, "
+                f"stock_fp8={'yes' if self.fp8_config is not None else 'no'})")
 
     @classmethod
     def get_name(cls):
@@ -514,6 +574,9 @@ class PrismaQuantConfig(QuantizationConfig):
         if self.ct_config is not None:
             self.ct_config.packed_modules_mapping = getattr(
                 self, "packed_modules_mapping", {}) or {}
+        if self.fp8_config is not None:
+            self.fp8_config.packed_modules_mapping = getattr(
+                self, "packed_modules_mapping", {}) or {}
 
         if isinstance(layer, LinearBase):
             # 1) CB target (has a "scheme") — ours (precise, fused-aware; ahead
@@ -534,6 +597,18 @@ class PrismaQuantConfig(QuantizationConfig):
             #    (canonical prefix — CT targets are serving-namespace names).
             if self.ct_config is not None:
                 return self.ct_config.get_quant_method(
+                    layer, _canonical_prefix(prefix))
+            # 4) block-FP8 delegation (gap G3). A DSv4-CB artifact's
+            #    attention/dense Linears are plain checkpoint FP8
+            #    block-quant tensors — no CT group, no CB scheme — because
+            #    the export only ever touches the routed-expert tensors its
+            #    codebooks cover. See _build_fp8_config for why a method
+            #    MUST be returned here rather than falling through to
+            #    UnquantizedLinearMethod: vLLM's DeepSeek V4 loader renames
+            #    every non-expert checkpoint ``.scale`` -> ``.weight_scale_
+            #    inv`` unconditionally and then looks the param up by name.
+            if self.fp8_config is not None:
+                return self.fp8_config.get_quant_method(
                     layer, _canonical_prefix(prefix))
             return UnquantizedLinearMethod()
 
@@ -622,3 +697,5 @@ class PrismaQuantConfig(QuantizationConfig):
             hf_to_vllm_mapper.apply_list(sorted(self._cb_targets)))
         if self.ct_config is not None:
             self.ct_config.apply_vllm_mapper(hf_to_vllm_mapper)
+        if self.fp8_config is not None:
+            self.fp8_config.apply_vllm_mapper(hf_to_vllm_mapper)
