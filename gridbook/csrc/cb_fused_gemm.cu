@@ -15,11 +15,12 @@
 //   * fused at M<=128 (ONE M-tile -> no redundancy): WINS — 1.04x / 1.26x /
 //     1.45x vs serial at M=32/64/128. This is the fused kernel's honest
 //     serving niche today: the mid-M band (17..128) between the decode GEMV
-//     and the transient path. Serving dispatch not yet wired (default path
-//     unchanged); see tests/test_fused_prefill.py for the bit-exact gates.
-//   * The large-M endgame requires a weight-stationary/persistent-N
-//     schedule (decode each B tile ONCE, loop M inside the CTA) — a
-//     kernel-layer restructure, not a collective fork.
+//     and the transient path. Serving dispatch is on by default with an
+//     explicit opt-out; see tests/test_fused_prefill.py for the bit-exact gates.
+//   * Large-M needs a weight-stationary/no-HBM-materialization design that
+//     amortizes each B decode across M. The first dense persistent-N build
+//     measured negative (2-5.7x slower than transient at 27B shapes), so any
+//     replacement starts from a fresh roofline rather than this collective.
 //
 // Entry points:
 //  - sm120_fp8_mm_fork:  128x128x128 passthrough through the UNCHANGED forked

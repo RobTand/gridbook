@@ -867,7 +867,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # Mid-M fused decode-in-prologue (task 7's measured WIN niche): at
         # M in (16, 128] ONE M-tile covers the batch, so decoding B inside
         # the CUTLASS prologue has no redundancy and beats expand+GEMM by
-        # 1.04-1.45x (M=32/64/128, GB10). OPT-IN (PRISMAQUANT_CB_FUSED_MIDM=1).
+        # 1.04-1.45x (M=32/64/128, GB10). DEFAULT; set
+        # PRISMAQUANT_CB_FUSED_MIDM=0 to opt out.
         # Numerics: the _scaled entry applies BOTH the per-token activation
         # scale and the per-channel weight scale inside its fp32 EVT epilogue
         # and rounds once to bf16 — the same rounding ORDER as

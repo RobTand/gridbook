@@ -1,9 +1,12 @@
 /***************************************************************************************************
  * PrismaQuant FP8_CB PERSISTENT-N fused mainloop for sm120 (GB10) — §4b DRAFT.
  *
- * STATUS: design-complete draft, NOT yet compiled (authored 2026-07-23 during
- * the driver-mismatch GPU outage; iterate in the next GPU window). Derived
- * from sm120_cb_fused_mma.hpp (the mid-M decode-in-prologue collective).
+ * STATUS: ARCHIVED SCHEDULE REFERENCE. The later dense persistent-N build was
+ * parity-green but measured 2--5.7x slower than transient expand + GEMM at 27B
+ * shapes and is quarantined behind PRISMAQUANT_ENABLE_PTC=1. This header is not
+ * an active implementation plan; the distinct grouped-MoE schedule is tracked
+ * in ROADMAP.md. Derived from sm120_cb_fused_mma.hpp (the mid-M
+ * decode-in-prologue collective).
  *
  * The schedule (docs/lanes/nvfp4-cb/persistent-n-prefill.md §4/§7):
  *   - Grid = one CTA per (N-tile stream); CTA c owns N-tiles {c, c+G, ...}
