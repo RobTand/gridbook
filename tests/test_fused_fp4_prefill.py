@@ -28,7 +28,9 @@ Contracts pinned:
     the audit's full reconsideration gates.
   * grouped (MoE) == per-expert dense BIT-IDENTICAL at tile_m 128 and 256.
   * vLLM's scaled_fp4_quant swizzled-SF layout == the codec reference the
-    kernels' SFA TMA descriptor assumes (guards the serving dispatch).
+    kernels' SFA TMA descriptor assumes for a representative random sample
+    (guards serving dispatch, not arbitrary packed-byte equivalence). Exact
+    midpoint/underflow operator oracles live in test_nvfp4_act_quant_ref.py.
 """
 import os
 import re
@@ -971,7 +973,9 @@ def test_stagewise_activation_accumulation_decomposition(
 
 
 # ---------------------------------------------------------------------------
-# serving-dispatch guard: vLLM's fp4 quant swizzle == the codec reference
+# Representative serving-dispatch guard: vLLM's fp4 quant swizzle == the
+# codec reference. This is not an exhaustive numerical oracle: vLLM uses
+# hardware approximate reciprocals for arbitrary nonzero scale factors.
 # ---------------------------------------------------------------------------
 def test_vllm_scaled_fp4_quant_layout_matches_codec():
     vops = pytest.importorskip("vllm._custom_ops")
