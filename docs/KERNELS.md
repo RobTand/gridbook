@@ -128,7 +128,10 @@ passing `+0.2635%` PPL point estimate whose prompt-cluster interval still crosse
 the limit. Raw operator speed has not reached native-microkernel parity, while
 offline one-token wall time is not streaming TTFT or p95 served-SLO evidence.
 Keep the dense flag off by default until broader exact/model/task validation;
-`static_lsq` is not yet wired or quality-qualified for grouped MoE.
+grouped MoE can reuse the same `static_lsq` quantizer and grouped GEMM, but it
+is not quality-qualified. The available partial-LFM artifact predates the
+serialized activation contract, so its LSQ attempt correctly fails closed
+before kernel dispatch rather than inventing runtime scales.
 
 ### FP8-CB fused decode-in-prologue (the 1× fix)
 
@@ -300,7 +303,7 @@ too.
 | MoE grouped decode GEMV, smem-resident dictionary | **Opt-in** (`PRISMAQUANT_CB_GEMV=v2`), never a default. Wins 1.13–1.58× on k13/k16/k20 in a 16-cell GB10 sweep; loses on k24 at K≥2048 (occupancy wall), where a compiled predicate routes the cell back to the shipped kernel. Reassociation-class output difference vs the default schedule (9/204 synthetic cells, worst `max_rel` 5.88e-03) — **not** bit-exact. Live GB10 validation on Jason Wong's 117B Laguna release dispatched all 94 expert stacks to v2 with no fallback and measured 24.993 vs 23.585 tok/s (+5.97%); long-prefill, concurrency, and soak requests completed without Gridbook errors |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
 | FP8-CB fused decode-in-prologue prefill | **Bit-exact, wins M∈(16,128], loses large M** — persistent-N is the answer |
-| NVFP4-CB fused native-FP4 prefill (dense) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, p95 served, and MoE gates remain open |
+| NVFP4-CB fused native-FP4 prefill (dense) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, and p95 served gates remain open |
 | Persistent-N large-M dense prefill | **Built and MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. Quarantined behind `PRISMAQUANT_ENABLE_PTC=1` as a schedule reference; do not enable it. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
-| MoE prefill | **Shipped**: CUDA chunk-expander into vLLM's fused-MoE grouped kernel; fp8-CB default is `auto` (measured per-layer path selection). Laguna-S-2.1 117B: 293 → 1,821 tok/s @8k, 207 → 1,822 @63k. fp4-CB defaults to conservative `loop`; native fused-FP4 remains an explicit A/B opt-in, and dense `static_lsq` supplies no MoE qualification. Explicit `stock` uses a byte-budgeted expert chunk (1,184 MiB vs 4,736 MiB measured transient on a 192-expert band) and no pad copy |
+| MoE prefill | **Shipped**: CUDA chunk-expander into vLLM's fused-MoE grouped kernel; fp8-CB default is `auto` (measured per-layer path selection). Laguna-S-2.1 117B: 293 → 1,821 tok/s @8k, 207 → 1,822 @63k. fp4-CB defaults to conservative `loop`; native fused-FP4 and its shared `static_lsq` policy remain explicit A/B opt-ins without MoE quality qualification. Explicit `stock` uses a byte-budgeted expert chunk (1,184 MiB vs 4,736 MiB measured transient on a 192-expert band) and no pad copy |
 | Triton fallbacks | **Shipped** for every path (correctness/CI; not INV-2-eligible) |

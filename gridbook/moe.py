@@ -694,8 +694,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
     def _gf4_ok(self, layer, *, rowwise: bool = False,
                 static_lsq: bool = False) -> bool:
         """Eligibility for the fp4 grouped fused prefill (cached per layer).
-        Mirrors cb_fused_fp4_moe_grouped's TORCH_CHECKs so a miss is a silent
-        fall-through to the shipping fp4 modes, never a crash. Static,
+        Mirrors cb_fused_fp4_moe_grouped's TORCH_CHECKs so a miss is a safe
+        fall-through to the shipping fp4 modes with a cached diagnostic. Static,
         static-LSQ, and rowwise activation symbol families are isolated from
         each other."""
         if rowwise and static_lsq:
@@ -705,23 +705,37 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             "_cb_gf4_static_lsq_ok" if static_lsq else
             "_cb_gf4_static_ok"
         )
+        reason_attr = f"{cache_attr}_reason"
         ok = getattr(layer, cache_attr, None)
         if ok is not None:
             return ok
-        ok = (self.is_fp4 and self.is_v2
-              and (rowwise or (
-                  getattr(self, "has_static_fp4_activation", False)
-                  and getattr(layer, "_cb_fp4_input_global_scale_w13", None)
-                  is not None
-                  and getattr(layer, "_cb_fp4_input_global_scale_w2", None)
-                  is not None))
-              and 12 <= self.k <= 24
-              and self.n_sub in (1, 2)
-              and self.type_size == 4 * self.k + 9
-              and layer._cb_hidden % codec.SUPERBLOCK == 0
-              and layer._cb_inter % codec.SUPERBLOCK == 0)
-        if ok and static_lsq:
-            ok = all(
+        reason = None
+        if not self.is_fp4:
+            reason = "format is not FP4-CB"
+        elif not self.is_v2:
+            reason = "format is not two-tier layout v2"
+        elif not rowwise and not getattr(
+            self, "has_static_fp4_activation", False
+        ):
+            reason = "artifact has no attested static activation contract"
+        elif not rowwise and any(
+            getattr(layer, f"_cb_fp4_input_global_scale_{which}", None)
+            is None
+            for which in ("w13", "w2")
+        ):
+            reason = "artifact has no loaded stage activation scales"
+        elif not 12 <= self.k <= 24:
+            reason = f"k={self.k} is outside the fused range [12, 24]"
+        elif self.n_sub not in (1, 2):
+            reason = f"n_sub={self.n_sub} is not 1 or 2"
+        elif self.type_size != 4 * self.k + 9:
+            reason = "serialized row type_size is not FP4-CB layout v2"
+        elif layer._cb_hidden % codec.SUPERBLOCK != 0:
+            reason = "hidden size is not superblock aligned"
+        elif layer._cb_inter % codec.SUPERBLOCK != 0:
+            reason = "intermediate size is not superblock aligned"
+        if reason is None and static_lsq:
+            have_host_scales = all(
                 getattr(
                     layer,
                     f"_cb_fp4_input_global_scale_{which}_f32",
@@ -729,25 +743,45 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 ) is not None
                 for which in ("w13", "w2")
             )
-        if ok:
-            ok = (codec.fp4_value_lut_nbytes(self.k, self.n_sub)
-                  <= codec.FP4_FUSED_LUT_MAX_BYTES)
-        if ok and not rowwise and not static_lsq:
+            if not have_host_scales:
+                reason = "attested stage scales have no cached host values"
+        if (reason is None
+                and codec.fp4_value_lut_nbytes(self.k, self.n_sub)
+                > codec.FP4_FUSED_LUT_MAX_BYTES):
+            reason = "decoded codebook exceeds the fused LUT capacity"
+        if reason is None and not rowwise and not static_lsq:
             try:
                 import vllm._custom_ops as vops
-                ok = hasattr(vops, "scaled_fp4_quant")
+                have_quantizer = hasattr(vops, "scaled_fp4_quant")
             except Exception:  # noqa: BLE001
-                ok = False
-        if ok:
+                have_quantizer = False
+            if not have_quantizer:
+                reason = "vLLM scaled_fp4_quant is unavailable"
+        if reason is None:
             from .cuda_ext import get_fused_fp4_ext
             fext = get_fused_fp4_ext()
-            ok = (fext is not None
-                  and hasattr(fext, "cb_fused_fp4_moe_grouped")
-                  and (not rowwise
-                       or hasattr(fext, "cb_nvfp4_quantize_rows"))
-                  and (not static_lsq or hasattr(
-                      fext, "cb_nvfp4_quantize_static_lsq")))
+            if fext is None:
+                reason = "fused FP4 extension is unavailable"
+            elif not hasattr(fext, "cb_fused_fp4_moe_grouped"):
+                reason = "grouped fused FP4 symbol is unavailable"
+            elif rowwise and not hasattr(fext, "cb_nvfp4_quantize_rows"):
+                reason = "rowwise native FP4 quantizer is unavailable"
+            elif static_lsq and not hasattr(
+                fext, "cb_nvfp4_quantize_static_lsq"
+            ):
+                reason = "static-LSQ native FP4 quantizer is unavailable"
+        ok = reason is None
         setattr(layer, cache_attr, bool(ok))
+        setattr(layer, reason_attr, reason)
+        if not ok:
+            family = "rowwise" if rowwise else (
+                "static_lsq" if static_lsq else "static"
+            )
+            print(
+                f"[prismaquant-cb] fused_fp4_moe {self.prefix} "
+                f"mode={family} -> fallback ({reason})",
+                flush=True,
+            )
         return bool(ok)
 
     def _fp4_quant(self, layer, x2: torch.Tensor, which: str, *,

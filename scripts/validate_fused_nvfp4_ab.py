@@ -672,6 +672,7 @@ _COUNTER_MAP_FIELDS = (
     "apply_shapes",
     "success_shapes",
     "fallback_shapes",
+    "fallback_reasons",
     "loop_shapes",
     "success_prefixes",
     "fallback_prefixes",
@@ -959,6 +960,15 @@ class MoEDispatchProbe:
                 record["fused_fallbacks"] += 1
                 record["fallback_shapes"][shape] += 1
                 record["fallback_prefixes"][prefix] += 1
+                reason_attr = (
+                    "_cb_gf4_static_lsq_ok_reason" if static_lsq else
+                    "_cb_gf4_rowwise_ok_reason" if rowwise else
+                    "_cb_gf4_static_ok_reason"
+                )
+                reason = getattr(layer, reason_attr, None)
+                record["fallback_reasons"][str(
+                    reason or "post-eligibility constraint"
+                )] += 1
             else:
                 record["fused_successes"] += 1
                 record["success_shapes"][shape] += 1

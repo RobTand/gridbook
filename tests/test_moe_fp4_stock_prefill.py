@@ -348,6 +348,9 @@ def test_moe_static_lsq_eligibility_requires_attested_host_scales_and_symbol(
     legacy_layer._cb_fp4_input_global_scale_w13_f32 = 2.5
     legacy_layer._cb_fp4_input_global_scale_w2_f32 = 1.25
     assert legacy._gf4_ok(legacy_layer, static_lsq=True) is False
+    assert legacy_layer._cb_gf4_static_lsq_ok_reason == (
+        "artifact has no attested static activation contract"
+    )
 
     no_lsq_symbol = _layer(E=4, hidden=512, inter=256)
     no_lsq_symbol._cb_fp4_input_global_scale_w13_f32 = 2.5

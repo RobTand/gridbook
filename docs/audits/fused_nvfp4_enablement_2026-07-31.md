@@ -96,6 +96,16 @@ An earlier dense 8 × 512 BF16-teacher screen was mixed rather than evidence of 
 
 The LFM smoke closes the earlier missing teacher-backed integration loop without overstating its sample. The corrected partial artifact and the unquantized BF16 teacher have matching config/tokenizer identity; the teacher has only BF16 parameters and no quantization config; prompt-logprob coverage is exact over all 128,000 output IDs. Chunked prefill was enabled because that is LFM's supported vLLM contract. The original fixed-residual fused path moved the distribution by orders of magnitude more than the `1e-4` equivalence limit and worsened both target PPL and teacher KL. That remains stop-gate evidence for that activation policy; the later dense `static_lsq` result does not retroactively qualify it or supply the missing MoE `static_lsq` validation.
 
+The MoE serving selector now reuses that same `static_lsq` quantizer for both
+stages and feeds its output to the unchanged grouped kernel. A current-source
+4×128, chunk-64 attempt on the corrected partial LFM artifact was intentionally
+rejected as invalid evidence: all 128 candidate attempts failed closed to the
+loop. The artifact predates the attested activation contract and contains zero
+serialized `input_global_scale` tensors, so Gridbook had no lawful fixed `G`
+for either stage. Its identical outputs and `0.9995x` timing are fallback
+telemetry, not LSQ quality/performance evidence. A producer re-export with
+stage-specific serialized scales is required before the MoE A/B can run.
+
 The manually forced grouped TileM256 path is operator-qualified but not
 model-qualified. Its only grouped-model screen used the artifact's legacy
 tokenizer-regex behavior, one prompt, and one timing repeat. Dense automatic
@@ -189,6 +199,11 @@ The review fixed these concrete defects and test gaps:
 17. Extended dense dispatch telemetry to attest TileM, shape, candidate CTA
     count, and cached SM count on every fused success, and made the A/B harness
     require exactly one legal route record per success.
+18. Reused the same fixed-`G` LSQ quantizer in grouped MoE for explicit
+    TileM128/256 selectors. Both stages call the unchanged grouped GEMM and
+    packed weights. Eligibility now caches and reports the exact fail-closed
+    reason, and the A/B report aggregates those reasons rather than making a
+    zero-difference fallback look like validation.
 
 The first partial LFM artifact failed before any kernel ran because untouched BF16 expert banks had been rewritten into an aggregate representation its vLLM loader could not consume. That failure exposed the Gridbook loader gap fixed here and a producer-side partial-export defect fixed in PrismaQuant PR #40. A corrected 14,537,263,589-byte artifact then passed exact recursive inventory and codebook verification: four selected layers produced eight packed U8 CB tensors replacing exactly 384 selected per-expert tensors, while all 1,918 common untouched tensors retained their dtype and shape. vLLM loaded and executed that artifact in the LFM row above. The original failed artifact remains an integration regression, not model evidence.
 
@@ -279,6 +294,7 @@ Evidence SHA-256 values:
 25bb5c80759958b3e3d17cfdace93ba0c1ff529a23e1a48afa8411957bcf4330  qwen06-k24-static-lsq-v5-s512-chunk256-seed43-exact.json
 929ba22455ca0d3d81617787437d24258d71785d399a88d7aa125893e947b247  qwen06-k24-static-lsq-v5-s512-chunk256-seed43-n8-screen.json (intermediate screen; preserved)
 114fac9e4a98ad13210b95c134824984c78d9f142aa579cc0415563edc36dd17  qwen06-k24-static-lsq-v5-s512-chunk256-seed43-n32-screen.json
+602411da3d1286187b1e38352ef3d36ba7b2062090380416166595d9c482ac77  lfm25-k16-lsq-moe128-s128-chunk64-n4.json (invalid fallback evidence; preserved)
 d44cc164e2aa140372428d0fa5cd037d5cfbcd73ac06754d5bed9ec72d7ef3a7  cuda-operator-tests-installed-wheel-v0.4.1.xml (final 68-case release gate)
 c60f6fa59c56660686075f35ae3a66fb428376716af68dd3e91092711ac38bf7  cuda-operator-tests-stagewise-final.log (prior 33-case stagewise run)
 211d1cd7fb5705d172353d8efb6348c02be32142ed9555fdd4c77c343ddb5896  cuda-operator-tests-stagewise-final.xml (prior 33-case stagewise run)

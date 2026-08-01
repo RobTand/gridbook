@@ -1404,6 +1404,53 @@ def test_moe_dispatch_probe_forwards_static_lsq_without_losing_telemetry():
         probe.restore()
 
 
+def test_moe_dispatch_probe_records_fail_closed_reason():
+    class X:
+        shape = (64, 1024)
+
+    class TopK:
+        shape = (64, 4)
+
+    class Layer:
+        _cb_E = 32
+        _cb_hidden = 1024
+        _cb_inter = 512
+        _cb_gf4_static_lsq_ok_reason = (
+            "artifact has no attested static activation contract"
+        )
+
+    class Method:
+        prefix = "model.layers.0.mlp.experts"
+
+        def _apply_prefill_grouped_fused_fp4(
+            self, layer, x, topk_weights, topk_ids, act, *, tile_m=128,
+            rowwise=False, static_lsq=False,
+        ):
+            del layer, x, topk_weights, topk_ids, act, tile_m, rowwise
+            assert static_lsq is True
+            return None
+
+        def _apply_prefill_loop(self, layer, x, topk_weights, topk_ids, act):
+            del layer, x, topk_weights, topk_ids, act
+            return object()
+
+    method = Method()
+    probe = ab.MoEDispatchProbe(Method)
+    probe.install()
+    try:
+        with probe.measurement("fused", "static_lsq") as record:
+            assert method._apply_prefill_grouped_fused_fp4(
+                Layer(), X(), None, TopK(), None,
+                tile_m=128, static_lsq=True,
+            ) is None
+        assert record["fused_fallbacks"] == 1
+        assert record["fallback_reasons"] == {
+            "artifact has no attested static activation contract": 1
+        }
+    finally:
+        probe.restore()
+
+
 def test_teacher_kl_absolute_and_fused_regression_gates_can_fail_status():
     args = SimpleNamespace(
         max_mean_kl=None,
