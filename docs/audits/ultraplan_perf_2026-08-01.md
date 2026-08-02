@@ -1,7 +1,9 @@
 # Ultraplan: performance gaps, redundancies, and the FP8-CB ↔ NVFP4-CB convergence plan
 
 Date: 2026-08-01. Audited at commit `593f524` ("Merge native CUDA/CUTLASS-only
-Gridbook 0.5.0 release"). Static analysis of the full tree (Python dispatch,
+Gridbook 0.5.0 release"); §6 additionally audits the producer,
+[prismaquant](https://github.com/RobTand/prismaquant), at `dca6f80` (0.5.2).
+Static analysis of the full tree (Python dispatch,
 `csrc/`, `cutlass_fork/`, build system, docs, tests); no GPU was available to
 this audit, so every number quoted below is a *previously published* measurement
 with its source cited, and every proposal states the evidence gate it must pass.
@@ -18,6 +20,10 @@ Goals, as set for this audit:
    and CUTLASS GEMMs.
 4. Run **native CUTLASS kernels on `sm_120`/`sm_121`**. Other NVIDIA hardware is
    a secondary concern.
+5. Establish how the producer decides **NVFP4 vs FP8-CB allocation at similar
+   bit rate** — noting the competition runs everywhere up to **4.5 bpw**, since
+   that is vanilla NVFP4's effective rate, not just at the CB ladder boundary
+   (§6).
 
 ---
 
@@ -338,7 +344,107 @@ actionability:
 
 ---
 
-## 6. Explicit non-goals of this plan
+## 6. Producer-side allocation: NVFP4 vs FP8-CB at matched bytes (prismaquant)
+
+Audited in the producer at `dca6f80`. The framing matters: this is **not** a
+ladder-boundary question. Vanilla NVFP4 is **4.5 bpw effective** (E2M1 + one
+UE4M3 scale per 16-block), so it is the standing alternative for *every* unit
+at or below 4.5 bpw — `FP8_CB_K28`–`K36` (3.508–4.508) compete with it
+per-layer at near-matched bytes (`NVFP4` = 4.500 sits between `FP8_CB_K35` =
+4.383 and `K36` = 4.508), and below that the solver can fund a vanilla-NVFP4
+promotion on one layer with cheaper CB rungs elsewhere. Gridbook ROADMAP D0.3
+names exactly this pair of experiments.
+
+### How the decision is made today (from the code, not the docs)
+
+- **A pure quality-under-bytes optimizer.** `solve_allocation`
+  (`allocator_solver.py:439`) is a multi-choice knapsack: minimize total
+  predicted Δloss subject to a whole-artifact bpp/byte constraint (byte-budget
+  mode at `allocator.py:3458`: min Δloss, ties → larger footprint), with an
+  outer exact-payload loop because the DP's additive bytes model excludes the
+  shared codebook sidecar. It is **global** — cross-layer byte-neutral trades
+  are already expressible; each rung wins a unit iff its Δloss-per-extra-bin
+  beats every other unit's claim on the same bins. **No latency or serving
+  term exists anywhere in the objective or constraints.**
+- **One flat candidate list, no family mechanics.** NVFP4_CB rungs, FP8_CB
+  rungs, and vanilla NVFP4/FP8 are ordinary entries priced in the same
+  ½·Fisher·MSE nats; exact ties resolve to the *cheaper* rung via menu order.
+  Per-format calibrated-gain multipliers exist but production passes none
+  (α = 1.0 everywhere).
+- **Under shipped two-tier v2 coding the two CB ladders do not overlap.**
+  NVFP4_CB tops out at K24 = 3.281 bpw; FP8_CB starts at K28 = 3.508 — a
+  0.226 bpw hole (the K24 = K28-rate coincidence holds only under v1 coding).
+  So within-CB "matched bpp" competition is nearly moot; the live contests are
+  CB-vs-vanilla-NVFP4 at ≤ 4.5 bpw and global byte-neutral trades.
+- **Menus are per-model script config, and outcomes are partly menu artifacts.**
+  `FORMATS` env in the driver scripts: the 27B production run offered only
+  four FP8-CB rungs (+ NVFP4/FP8/BF16); the 295B joint regen offered the full
+  34-rung ladder + natives and assigned **36 dense/shared Linears to vanilla
+  FP8 and zero to vanilla NVFP4 — "offered and never chosen."** Two caveats
+  make that zero weaker than it looks: vanilla NVFP4 is **denied outright on
+  packed MoE experts** (no stock-CT packed-expert emit path in the container),
+  so the expert mass was never a fair contest; and the producer's own
+  `format-speed-policy.md` flags the outcome as accuracy-only — *"zero
+  selected NVFP4 units are circular evidence"* for speed.
+
+### Three cost-model asymmetries that currently distort the call
+
+1. **W4A4 vs W8A8 activation cost is priced only on the measured `output_mse`
+   branch** of the cost precedence. Packed experts
+   (`PRISMAQUANT_EXPERT_COST_SAMPLE=16` in every production script) and
+   ladder-interpolated rungs (`CB_LADDER_INTERP=1`, ditto) fall to
+   **weight-only Fisher pricing**, where the activation-contract difference is
+   structurally invisible — NVFP4-CB gets credit for its cheaper index stream
+   with none of its A-side cost, on most rows of a production run.
+2. **Per-family fitted ladders, never cross-calibrated.** `_cb_ladder_split`
+   fits NVFP4_CB_K and FP8_CB_K as separate curves (own anchors, holdout,
+   law); anchors are activation-aware while interpolated rungs are
+   weight-only, and the DP compares the mixed estimators as if identical.
+3. **The producer models exactly one gridbook kernel gate** (`K % 256` for CB).
+   It knows nothing of the `N % 8` (FP4) / `N % 16` (FP8) load gates,
+   `n_sub`, the fused mid-M rung set, or LUT residency — it can legally assign
+   a rung whose fast serving lane does not exist. (The 27B ladder pricing five
+   unbacked fused-mid-M rungs, gridbook K1.2, is the same defect seen from the
+   other end.)
+
+### Plan — P5, producer-side (runs parallel to P1–P4; artifacts are where
+allocation decisions become permanent)
+
+- **P5a — make the quality axis fair first.** Extend activation-aware pricing
+  (measured `output_mse`, or a per-family activation penalty calibrated once
+  per model from a measured sample) to packed experts and interpolated rungs,
+  and add a cross-family calibration check on the anchors. Gate: per-family
+  predicted-vs-measured Δloss residuals on held-out layers must sit in
+  family-symmetric bands before any cross-family verdict is published.
+- **P5b — encode gridbook's real eligibility in the serving profile.**
+  `out_features_multiple_of: 8` (FP4-CB) / `16` (FP8-CB), and the concrete
+  fused-lane route (backed rung set, activation contract, fallback) as
+  candidate metadata — the producer-side mirror of K1.2, so neither repo can
+  price an unbacked lane.
+- **P5c — implement the constrained Pareto solver the producer's
+  `format-speed-policy.md` already specifies and defers** ("not yet
+  implemented"): hard p95 TTFT / p95 ITL / p05 TPS / memory constraints as a
+  second axis in `solve_allocation`, explicitly **no** λ-blended
+  quality+latency objective (NATIVE-PARITY forbids it). Feed it the measured
+  per-format × M-regime dispatch table from §2: until P1/P2 land, choosing
+  FP8-CB over vanilla NVFP4 at ~4.5 bpw buys quality at a measured **1.44×
+  dense-prefill cost**, and the allocator should see that trade rather than
+  discover it at the release gate. The dormant precedent is in-repo:
+  `mtp_rung_selection.py` already selects the MTP drafter rung
+  throughput-optimally from served measurements.
+- **P5d — run the D0.3 exact-rate experiments with the fixed pricing.**
+  (i) `FP8_CB_K36` vs vanilla NVFP4 at matched exact whole-artifact bytes on
+  dense units; (ii) below 4.5 bpw, byte-neutral sweeps where NVFP4 promotions
+  are funded by lower CB rungs. Unlock packed experts for the contest via
+  gridbook D0.2 (fail-closed packed-expert native delegation — which is also
+  Triton-elimination item §5.3) so the 295B-class expert mass stops being
+  decided by an emit-path gap.
+
+The NATIVE-PARITY rule binds all of P5: kernel and per-layer timings propose;
+only the served protocol promotes, and the performance denominator is the
+fastest *globally feasible* assignment.
+
+## 7. Explicit non-goals of this plan
 
 - No revival of any measured-negative schedule without new profiling (§1 list).
 - No second encoder, no TP > 1, no vLLM core patches (ROADMAP non-goals).
@@ -349,7 +455,7 @@ actionability:
 - No relabeling: offline wall-clock and microbenchmarks in P1–P3 propose;
   only the NATIVE-PARITY served protocol promotes.
 
-## 7. Sequenced summary
+## 8. Sequenced summary
 
 | Phase | Items | Served-path effect | Numerics risk |
 |---|---|---|---|
@@ -358,9 +464,14 @@ actionability:
 | P2 | a: dense FP4 fused mid-M CB→BF16; b: K1.1 grouped decode-in-mainloop; K1.3 dense roofline | removes FP4 mid-M hole; attacks the ~35% MoE expand tax and (evidence-gated) the dense 1.44× | reduction order only |
 | P3 | K0.2 → K0.5 → K0.4 → K0.6 fused native-NVFP4 chain | true W4A4 rate where the gate passes | full quality-gate chain |
 | P4 | 27B graph streaming gate, v2 GEMV sm_120 qualification, K1.2 rungs, preload completeness | ~20% decode latency candidate; +6% Laguna decode; 27B ladder gets its fused mid-M lane | qualification runs |
+| P5 | producer: activation-fair pricing, eligibility metadata, constrained Pareto solver, D0.3 exact-rate runs | future artifacts allocate NVFP4-vs-FP8-CB on true quality *and* served latency across the whole ≤ 4.5 bpw regime | producer-side; measured-fit gated |
 
 The FP8-CB ↔ NVFP4-CB gap closes from both ends: P1+P2 make the
 *contract-preserving* NVFP4 path structurally identical to FP8-CB's (native
 Blackwell collective, decode in the mainloop, no transient tile), and P3 gives
 NVFP4 the *native-rate* lane FP8 already effectively has — but only through the
-gates that keep the quality claim honest.
+gates that keep the quality claim honest. P5 then makes the *allocation*
+between them honest too: once the producer prices the activation contract on
+every row, knows which serving lanes are actually backed, and carries served
+latency as a hard constraint, "NVFP4 vs FP8-CB at matched bytes" stops being
+circular evidence and becomes a measured decision.
