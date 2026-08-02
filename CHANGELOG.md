@@ -2,6 +2,90 @@
 
 ## Unreleased
 
+- **K1.2 — the FP8-CB fused mid-M rung surface, and why it is already
+  complete.** The lane instantiated `k ∈ {28,32,36,40,44,48}` while production
+  permits every integer K28–K48, which read like five missing instantiations on
+  the published 27B artifact's 8-rung K36–K47 ladder. It is not: the compiled
+  set is exactly what a **format + TMA law** admits. `type_size = 4k` is the
+  packed-B TMA box's contiguous extent and must be a 16-byte multiple
+  (`k % 4 == 0`); and the fused mainloop decodes with a *single* width
+  `CbSubW = k/4`, while the format splits `k` over `n_sub = 4` **raggedly**
+  (`csrc/cb_gemv.cu` `SubSplit`), so at k37 the true widths are `(10,9,9,9)` and
+  a uniform decode would be *wrong*, not merely unaligned. ROADMAP K1.2's second
+  arm is therefore the live one, and is implemented: the compiled set is
+  queryable (`cb_fused_kbits()`), `linear.py` and `moe.py` stop carrying
+  duplicate literal ladders and gate on the derived law
+  (`codec.FP8_FUSED_KBITS`) before confirming against the module, every switch
+  and report in the kernel is generated from one rung list, the rung check and
+  `moe_tile_supported` became laws (the smem predicate is a closed form
+  `static_assert`ed cell-by-cell against the probe's twelve measured numbers),
+  and an off-law rung is refused with a message naming the law and the routes
+  that *do* serve it. Per-rung bit-exact gates are now parametrized from the
+  module's own reported surface rather than a hand-written four-of-six list.
+  The published smem table was **regenerated** — it quoted the pre-R6 base and
+  was stale by up to 16,384 B. No kernel instantiation changed; the cold-cache
+  JIT build moves 71.4 s -> 76.0/75.7 s (GB10 container, 20 instantiations),
+  i.e. +4.6 s of compile-time *evaluation* — the law predicates and the
+  twelve-cell `static_assert` table pinning the smem closed form to the probe —
+  not of code generation.
+- **K0.4 — graph-safe grouped TileM selector and full dispatch telemetry.**
+  `moe_routing.cb_grouped_tile_m` replaces a choice that was worse than manual:
+  the FP8 grouped path resolved `tile_m=None` to the kernel's compiled default,
+  so serving could never reach TileM=256 at all, and the FP4 path read its tile
+  off the *suffix* of an activation-policy env string. The selector is
+  CUDA-graph-safe **by construction** — every input is a host-known integer
+  (`topk_ids.shape`, layer constants, the build's own compiled tile list, the
+  cached non-synchronizing SM count), so there is no device read to sync on,
+  which matters because `tile_m` fixes both the kernel symbol and every routing
+  tensor's shape. The rule is `ρ = P/E > 512` plus the dense selector's
+  `ceil(2·SM/3)` occupancy floor, derived from the exact
+  `pad₂₅₆ − pad₁₂₈` padding lemma and a decode:MMA ratio that is `1:t`
+  independent of N and K (so both projection stages give one condition); the
+  threshold is calibrated by inverting the dense TileM A/B and remains proposal
+  data for the grouped lanes. Telemetry now emits K0.4's full list — requested
+  activation policy, actual kernel symbol, TileM, problem shape, activation
+  contract, fallback state and the **exact** fallback reason — for dense *and*
+  MoE calls, extending the 0.4.2 dense mechanism (plain scalars on the layer,
+  tensor-free, sync-free, last-write-wins) rather than adding a parallel one,
+  with two-phase writes and selector provenance so a tile choice is auditable
+  offline. The FP8 grouped gate recorded a bare bool before this; it now names
+  the failing clause. Both tiles are gated **bit-identical** pre-combine in
+  stable-argsorted pair order — the selector is a pure performance choice.
+- **Fixed a CUDA-graph capture defect in the padded grouped routing.**
+  `cb_grouped_pad_routing` documented "NO HOST READS" while calling
+  `torch.bincount`, which sizes its CUDA output from `.max().item()` and
+  therefore host-syncs — the exact trap the persistent-B lane hit and gated with
+  a negative control. Every padded grouped lane was uncapturable as a result.
+  Counts now come from the `scatter_add_` form that lane already proved
+  (identical integers, static shape, pure device work).
+- **Fixed a packaging bug that broke JIT builds from an installed wheel.**
+  `csrc/*.hpp` was matched by no `package-data` glob (`csrc/*.h` does not match
+  `.hpp`, and `csrc/cutlass_fork/*.hpp` is a different directory), so
+  `cb_grouped_common.hpp` shipped in **neither** the wheel nor the sdist. It is
+  a declared build input of all four fused/grouped loaders, so an installed
+  wheel could not build any of them (`_require_csrc` raises
+  `IncompleteInstallError`). Added the glob and reconciled all three mirrors of
+  the runtime-required floor (`check_dist.py`, `check_installed.py`,
+  `test_release_metadata.py`), which had also fallen a wave behind on the
+  fp4v2, persistent-B and shared-header sources.
+- **`PRISMAQUANT_PRELOAD_FUSED=1` now warms every native extension family**
+  (decode GEMV, GEMV-v2, grouped BF16, both fused FP8/NVFP4 modules, fused
+  FP4-v2, persistent-B MoE) instead of only the two fused ones, so a
+  residency-matched A/B cannot be confounded by a module one arm never loaded
+  — the audit's §3 P4 "preload must be a full warm-up" item, and the practical
+  half of the documented ±17% measurement-arithmetic caveat. Each family is
+  attempted independently and fail-soft; strict mode still reports every failure
+  after every attempt. `preload_fused_extensions` remains as a delegating alias
+  because it is the published name.
+- The sm12x grouped-BF16 lane's in-mainloop A-row gather and swizzle-group
+  expert packing are now **wired through `moe.py`**, not just available: stage
+  one of the routed bridge takes the gather entry point (its `[Mp, K]` padded
+  activation copy no longer exists — `dest` *is* the row-source vector), and
+  `_padded_route` applies `pack_expert_blocks` using the per-expert block counts
+  from the block-offset host read already taken, gated on `chunk >= E` because
+  narrower expert chunks index blocks by expert-major contiguity. Stage two
+  stays in padded mode by construction: its input is the padded intermediate.
+
 - Close the sm12x grouped-BF16 lane's ragged-padding tax with two
   construction changes to the SAME compiled collective (schedule, tile,
   stages and smem untouched; audit §3 P1 follow-through):

@@ -166,6 +166,75 @@ Two performance fixes are also shared by every dense activation policy:
   already-qualified concrete GEMM runners. Selected raw cells gained
   22.57–50.32%; narrow cells where TileM256 lost 19.81–21.69% remain on 128.
 
+### Grouped (MoE) TileM selection (K0.4)
+
+The routed grouped lanes now select TileM the same way, from
+`moe_routing.cb_grouped_tile_m`. Before this the FP8 grouped path resolved
+`tile_m=None` to the kernel's compiled default — so serving never reached
+TileM=256 no matter what the shared-memory table admitted — and the FP4 path
+read its tile off the *suffix* of an activation-policy env string
+(`static_lsq256`), putting a performance knob on a numerics selector.
+
+**Rule.** With `P = tokens × top_k` routed pairs over `E` experts and
+`ρ = P/E`, TileM=256 is selected only when `ρ > 512` **and** the grid lower
+bound `ceil(P/256) × ceil(min(2·inter, hidden)/TileN)` reaches the same
+`ceil(2·SM_count/3)` occupancy floor the dense selector uses. TileN is 64 for
+the FP8 grouped tile and 128 for the FP4 one. A build that did not compile 256
+for this rung, a failed SM probe, or the zero-margin `(256, k32)` cell all
+select 128.
+
+**Why ρ.** A CTA decodes `TileN×K` weights once and then issues `t·TileN·K`
+MACs, so `T(t) ∝ B(t)·(d + t·m)` over `B(t) = Σ_e ceil(c_e/t)` M-tiles. The
+decode:MMA ratio is `1:t` independent of `N` and `K`, so **both projection
+stages give the same condition** even though their shapes differ. The exact
+padding lemma — `pad₂₅₆(c) − pad₁₂₈(c) = 128` iff `c mod 256 ∈ [1,128]`, else
+0 — turns that into `ρ > 128·(1 + 256/x)` for `x = d/m`, and inverting the
+dense TileM A/B above (22.57–50.32% at fixed occupancy ⇒ `2(x+128)/(x+256) ∈
+[1.226, 1.503]`) bounds `x ∈ [75, 259]`, i.e. a threshold in `[254, 565]`. The
+shipped 512 is the pessimistic end and is **proposal data for the grouped lanes
+until a routed sweep pins it**; the mainloop is warp-specialized, so under
+perfect decode/MMA overlap the crossover moves and the additive model is the
+less conservative of the two in exactly the band `x` lands in.
+
+**Graph safety.** The selector reads *only* host-known integers —
+`topk_ids.shape`, layer constants, the extension's own compiled tile list, and
+the cached (non-synchronizing) SM count. It never touches the routed histogram,
+which is device data. That is not a convenience: `tile_m` fixes both the kernel
+symbol (`run_moe_grouped<TM,KB>` is a distinct `__global__` per TileM) and every
+routing tensor's shape (`cap_blocks = P//tile_m + E`), so it must be decidable
+at graph-record time. A histogram-reading selector would also have to run
+strictly *upstream* of `cb_grouped_pad_routing` (which takes `tile_m` as an
+input and produces the trim read as an output), making its read a new, earlier
+sync rather than one foldable into the existing one. The price is that a
+histogram-free rule must hold for every histogram consistent with `(P, E)`, so
+it widens later than an oracle would; both thresholds are above ordinary
+chunked-prefill batch sizes.
+
+Related fix: `cb_grouped_pad_routing` documented "NO HOST READS" while calling
+`torch.bincount`, which sizes its CUDA output from `.max().item()` and
+therefore host-syncs — the same trap the persistent-B lane hit. Every padded
+grouped lane was uncapturable as a result. The counts now come from the
+`scatter_add_` form that lane already proved (identical integers, static shape).
+
+Both tiles compute the same values; the suite gates that by **equality**
+pre-combine in stable-argsorted pair order, not by tolerance.
+
+### Dispatch telemetry (K0.4)
+
+Every fused call — dense and routed — records its latest route on the layer as
+plain Python scalars via `nvfp4_activation_contract.emit_route`: requested
+activation `policy`, the `symbol` actually invoked, `tile_m`, problem `shape`,
+the activation `contract` that ran, fallback `state`
+(`served`/`fallback`/`error`), the exact `reason`, and selector provenance
+(`tile_rho`, `tile_candidate_ctas`, `tile_sm_count`, `tile_compiled`). This
+extends the 0.4.2 dense mechanism above rather than adding a parallel one — the
+same tensor-free, sync-free, last-write-wins attributes the A/B harness already
+reads back — and the three original dense attributes keep their names. Writes
+are two-phase (`error` before the launch, `served` after), so "raised
+mid-launch" is distinguishable from "never launched". `tile_rho` is what makes
+a tile choice auditable offline: a report reader can re-derive the verdict
+without the GPU.
+
 The current dense Qwen3-0.6B K24 same-process result is deliberately reported
 at two levels. Exact 6×128 quality passed every predeclared gate and offline
 one-token wall time improved `1.478x`; exact 2×512 with real chunking improved
@@ -180,6 +249,69 @@ serialized activation contract, so its LSQ attempt correctly fails closed
 before kernel dispatch rather than inventing runtime scales.
 
 ### FP8-CB fused decode-in-prologue (the 1× fix)
+
+#### Rung coverage: what this lane can and cannot serve (K1.2)
+
+The FP8-CB product ladder is **every integer `k` in [28, 48]** (3.5–6.0 bpw in
+0.125 steps; `runtime_contract.json` carries all 21, and Gridbook serves all 21).
+The fused mid-M lane backs **the multiples of 4 — `k ∈ {28, 32, 36, 40, 44, 48}`
+— and no others.** That is a property of the format and of TMA, not a missing
+template instantiation:
+
+1. **TMA box.** Packed B is fetched with a box of `(TileN, type_size)` *bytes*,
+   where `type_size = 4k` is one 256-weight superblock. TMA requires the box's
+   contiguous extent to be a 16-byte multiple, so `4k % 16 == 0` ⟺ `k % 4 == 0`.
+2. **Uniform sub-table width.** The fused mainloop decodes a codeword with a
+   *single* width `CbSubW = k/4` and indexes the flat codebook at
+   `(s << CbSubW) + idx`. The format splits `k` over `n_sub = 4` **raggedly**
+   (`csrc/cb_gemv.cu` `SubSplit`: widths are `k//4 + (i < k%4)`), so at `k = 37`
+   the true widths are `(10, 9, 9, 9)` with non-uniform offsets. A uniform decode
+   would be *wrong*, not merely unaligned.
+
+Both conditions coincide, so one law expresses them, and the six compiled rungs
+are already the maximum this collective admits. Supporting the other 15 would
+need a different packed-B TMA schedule (a box spanning 4 superblocks is the
+smallest 16-byte-aligned one for odd `k`, and its shared-memory cost is far over
+budget) *and* a ragged-width decode — i.e. a new kernel and a producer-layout
+conversation, not an instantiation.
+
+Consequence for dispatch, and what ROADMAP K1.2 actually delivered: its first
+arm ("instantiate every product rung") is closed by the laws above, so the
+second is the live one — **encode the concrete route so an allocator cannot
+price an unbacked fast path.** The compiled set is therefore *queryable*
+(`cb_fused_kbits()`), Python gates on the derived law
+(`codec.FP8_FUSED_KBITS`) and then confirms against the module rather than
+carrying a duplicated literal, every switch in the kernel is generated from one
+rung list, and an off-law rung is refused with a message naming the law and
+pointing at the routes that do serve it. Rungs off the law are not unsupported —
+they take the decode GEMV and the expand + CUTLASS quality bridge, exactly as
+before.
+
+Measured shared memory, `GemmKernel::SharedStorageSize` at TileN=64 / TileK=128
+/ Stages=2 against the 101,376 B `sm_120` ceiling (regenerated 2026-08-02 from
+`csrc/tools/smem_probe_tilem.cu`; the previously published table quoted the
+pre-R6 base and was stale by up to 16,384 B once the LUT stage landed):
+
+| TileM | k28 | k32 | k36 | k40 | k44 | k48 |
+|---|---|---|---|---|---|---|
+| 128 | 67,584 | 70,656 | 74,752 | 80,896 | 91,136 | 93,184 |
+| 256 | 100,352 | **101,376** | 103,424 | 105,472 | 107,520 | 109,568 |
+
+TileM=128 fits at every rung; **TileM=256 fits only at k28 and k32**, and the
+k32 cell lands on *exactly* the ceiling (zero margin), so the tile selector will
+not choose it until it is launch-verified. TileM must be a multiple of the
+TiledMma's 128-row M, so 128/256/384 are the only candidates at all and 384 is
+infeasible everywhere (`smem_A` alone is 98,304 B). The kernel encodes this as a
+closed form that is `static_assert`ed cell-by-cell against those twelve measured
+numbers, so a storage-policy change becomes a compile error rather than a stale
+table.
+
+Build cost: instantiating the six rungs × (dense unscaled, dense scaled, grouped
+128) plus grouped 256 × {k28, k32} is **20 kernel instantiations, ~76 s cold-cache
+JIT** in the GB10 container. The K1.2 work changed no instantiation, so the build
+time is unchanged.
+
+#### Measured status
 
 A fused collective mainloop that **decodes CB indices inside the GEMM's
 global→shared prologue** — never writing the expanded tile to HBM — exists and is
@@ -498,6 +630,17 @@ The routed path still pays one host read of the per-expert block offsets
 (the decoded weight transient is chunked over experts), which is also where
 the packing order gets its histogram for free.
 
+Both are **wired through the routed dispatch**, not merely available: stage
+one of `moe._apply_prefill_native_bf16_sm120` calls the gather entry point
+with the routing's own `dest` vector as `row_src` (real rows name their
+token, padding rows name the throwaway row `T`, and the kernel reads zeros for
+any id outside `[0, T)`), so the `[Mp, K]` copy is not built at all. Stage two
+deliberately stays in padded mode — its A operand *is* the padded intermediate,
+so there is no compact form to gather from. The packed expert order is applied
+only when one expert chunk covers every expert; a narrower chunk indexes blocks
+as `block_offsets[c0]..block_offsets[c1]` and therefore assumes expert-major
+contiguity, which a permutation would break.
+
 **Measured against its target: met on every cell at both token counts.** The
 P1 target was "≥ segmented-BF16 parity warm". With the gather mode and the
 packed order (GB10, whole operator, warm medians): **1.032–1.051× segmented
@@ -737,7 +880,7 @@ too.
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
 | MoE grouped decode GEMV, smem-resident dictionary | **Opt-in** (`PRISMAQUANT_CB_GEMV=v2`), never a default. Wins 1.13–1.58× on k13/k16/k20 in a 16-cell GB10 sweep; loses on k24 at K≥2048 (occupancy wall), where a compiled predicate routes the cell back to the shipped kernel. Reassociation-class output difference vs the default schedule (9/204 synthetic cells, worst `max_rel` 5.88e-03) — **not** bit-exact. Live GB10 validation on Jason Wong's 117B Laguna release dispatched all 94 expert stacks to v2 with no fallback and measured 24.993 vs 23.585 tok/s (+5.97%); long-prefill, concurrency, and soak requests completed without Gridbook errors |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
-| FP8-CB fused decode-in-prologue prefill | **Bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128**; native transient expansion + CUTLASS serves ineligible and large-M shapes |
+| FP8-CB fused decode-in-prologue prefill | **Bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128**; native transient expansion + CUTLASS serves ineligible and large-M shapes. **Rung surface: `k ∈ {28,32,36,40,44,48}` — the multiples of 4 in the product range, which is the complete set the packed-B TMA box (`type_size = 4k` must be 16-byte aligned) and the mainloop's uniform `CbSubW = k/4` sub-table width admit.** The other 15 integer rungs are served (decode GEMV + expand/CUTLASS bridge), just not by this lane; the compiled set is reported by `cb_fused_kbits()` and dispatch derives eligibility from it rather than from a literal ladder |
 | FP4-CB v2 fused mid-M prefill (dense) | **Opt-in** (`PRISMAQUANT_CB_FP4_FUSED_MIDM`), contract-preserving. The in-prologue decode is proven **bit-identical to `cb_expand_v2` for the whole decoded tile at all 13 K12–K24 rungs** (one-hot read-out, no tolerance), so only the FP32 reduction order moves. Measured 1.06–4.37× the shipping expand + bridge route at M ∈ {9,16,32,64,128} on 27B/DSV4-class shapes, every cell bit-equal to the same-config oracle — a wider band than the fp8 twin because the fp4 quality expand writes BF16 (4× the fp8 expand's transient bytes). Served NATIVE-PARITY protocol **not run**; an unexplained M ≤ 12 latency cliff is open. Ineligible shapes (M ≤ 8, M > 128, multi-dictionary fused modules, uncompiled rungs) fall through to today's exact path unchanged |
 | NVFP4-CB fused native-FP4 prefill (dense and MoE) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, MoE routed-quality, and p95 served gates remain open |
 | MoE persistent-B decode-in-mainloop prefill (FP4-CB v2) | **Opt-in** (`PRISMAQUANT_CB_MOE_PERSISTENT_B=1`), ROADMAP K1.1. Decodes each expert weight tile once and streams that expert's exact routed segment through it, eliminating the `[E,N,K]` BF16 transient and all work for unrouted experts. Weight decode bit-identical to `cb_expand_v2` (`torch.equal`); reduction-order-class output difference vs the bridge, gated at parity with per-segment `F.linear`. Whole-routed-operator microbenchmark wins; served protocol **not run** |

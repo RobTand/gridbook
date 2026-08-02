@@ -35,15 +35,25 @@ from importlib.resources import files
 PKG = "gridbook"
 ENTRY_POINT_GROUP = "vllm.general_plugins"
 
+# The runtime-required floor. Keep in lockstep with check_dist.py's REQUIRED
+# and tests/test_release_metadata.py's WHEEL_REQUIRED — three mirrors of one
+# list, and the 2026-08-02 reconciliation found this one a wave behind.
 REQUIRED_SOURCES = [
     "csrc/cb_gemv.cu",
     "csrc/cb_gemv_v2.cu",
     "csrc/cb_bf16_grouped_gemm.cu",
     "csrc/cb_fused_gemm.cu",
     "csrc/cb_fused_fp4_gemm.cu",
+    "csrc/cb_fused_fp4v2_gemm.cu",
+    "csrc/cb_moe_persistent_b.cu",
+    # Shared by all four fused/grouped loaders (EVT trees, AssertSmemFits, the
+    # grouped host validation). Missing from the wheel until 2026-08-02.
+    "csrc/cb_grouped_common.hpp",
     "csrc/cutlass_fork/sm120_cb_mma_tma.hpp",
     "csrc/cutlass_fork/sm120_cb_fused_mma.hpp",
     "csrc/cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
+    "csrc/cutlass_fork/sm120_cb_fp4v2_bf16_mma.hpp",
+    "csrc/cutlass_fork/sm120_bf16_expert_mma.hpp",
     "csrc/cutlass_fork/sm120_expert_row_broadcast.hpp",
 ]
 

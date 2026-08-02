@@ -520,6 +520,9 @@ artifact — a ±17% swing from allocator-address-induced reduction-order drift,
 from the CB kernels (both prefill paths are bit-identical offline). Under **either**
 reading the verdict is unchanged: −45% to −53% confident-KL, −56% to −58% ALL-KL,
 PPL gap 2-3× smaller. See [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing).
+To match residency, set `PRISMAQUANT_PRELOAD_FUSED=1` on **both** arms: it now warms
+*every* native extension family at plugin registration (previously only the two fused
+ones), so neither arm can drift by loading a module the other never touched.
 
 ### Two sessions, two builds: why the model card says 77% and this page says 58.3%
 
@@ -713,8 +716,9 @@ exists.
 - **Measurement-arithmetic sensitivity (~±17%).** Loading extra CUDA extensions
   shifts allocator addresses and perturbs FP reduction order, moving the *measured*
   KL even when the served bytes are identical. A/B arms must match extension
-  residency. This is why the 27B confident-KL is quoted as a range under both
-  readings.
+  residency — set `PRISMAQUANT_PRELOAD_FUSED=1` on both arms, which now warms every
+  native extension family, not only the two fused ones. This is why the 27B
+  confident-KL is quoted as a range under both readings.
 - **The 295B has no quality-vs-teacher number** — only load/fit/coherence, TEB
   parity vs GGUF, and speed. Do not infer a KL or PPL win at that scale.
 - **TEB is base-model-dominated at matched bytes.** Tool-use parity across

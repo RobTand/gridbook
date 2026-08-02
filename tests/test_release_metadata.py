@@ -41,9 +41,18 @@ WHEEL_REQUIRED = (
     "cb_bf16_grouped_gemm.cu",
     "cb_fused_gemm.cu",
     "cb_fused_fp4_gemm.cu",
+    "cb_fused_fp4v2_gemm.cu",
+    "cb_moe_persistent_b.cu",
+    # Gridbook-owned headers. Each is a declared ``_*_BUILD_INPUTS`` entry, so
+    # it is #included by a JIT-compiled translation unit AND hashed into that
+    # module's build identity; a wheel without it cannot build the lane.
+    # cb_grouped_common.hpp is shared by all four fused/grouped loaders.
+    "cb_grouped_common.hpp",
     "cutlass_fork/sm120_cb_mma_tma.hpp",
     "cutlass_fork/sm120_cb_fused_mma.hpp",
     "cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
+    "cutlass_fork/sm120_cb_fp4v2_bf16_mma.hpp",
+    "cutlass_fork/sm120_bf16_expert_mma.hpp",
     "cutlass_fork/sm120_expert_row_broadcast.hpp",
 )
 

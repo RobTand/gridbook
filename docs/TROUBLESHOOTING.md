@@ -526,6 +526,13 @@ elsewhere in the model and perturbs floating-point reduction order. On the 27B
 artifact that produced a **±17%** swing in a measured KL evaluation with
 byte-identical served weights.
 
-Match extension residency across arms, or the comparison is confounded. Details:
+Match extension residency across arms, or the comparison is confounded.
+
+Fix: run **both** arms with `PRISMAQUANT_PRELOAD_FUSED=1`. At plugin registration
+that now builds and loads *every* native extension family — the decode GEMV,
+GEMV-v2, grouped BF16, both fused FP8/NVFP4 modules, fused FP4-v2 and persistent-B
+MoE — rather than only the two fused ones it warmed before, so an arm cannot drift
+by loading a module the other never touched. Individual loaders stay fail-soft: one
+that will not build on this box leaves the others warmed. Details:
 [KERNELS.md](KERNELS.md#a-measurement-side-effect-worth-knowing) and
 [BENCHMARKS.md](BENCHMARKS.md#caveats--read-these).

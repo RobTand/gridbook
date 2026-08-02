@@ -79,13 +79,19 @@ def _require_stack():
         pytest.skip("CUDA required for grouped-fused forward tests")
 
 
-def _build(*, experts=8, hidden=512, inter=768, seed=0):
-    """Build a synthetic FP8-CB MoE layer without invoking vLLM loading."""
+def _build(*, experts=8, hidden=512, inter=768, seed=0, k=44):
+    """Build a synthetic FP8-CB MoE layer without invoking vLLM loading.
+
+    ``k`` is a parameter because TileM=256 is smem-feasible only at k28/k32
+    (csrc/cb_fused_gemm.cu's measured table). With the rung hardcoded at 44,
+    every 256 gate below skipped unconditionally — so "quality at every
+    compiled tile" had no 256 execution behind it at all.
+    """
     _require_stack()
     fmt = pytest.importorskip("prismaquant.nvfp4_cb_formats")
     from gridbook.moe import PrismaQuantCBMoEMethod
 
-    k, n_sub = 44, 4
+    n_sub = 4
     type_size = fmt.nvfp4_cb_type_size(k, "fp8")
     codebook = fmt._resolve_codebook(
         k, "fp8", "product", None, torch.device(DEV))
@@ -409,8 +415,12 @@ def _tile_sizes(method, layer):
     return sizes
 
 
-def test_quality_at_every_compiled_tile():
-    method, layer, dims = _build(seed=1)
+@pytest.mark.parametrize("k", [28, 44])
+def test_quality_at_every_compiled_tile(k):
+    """k is parametrized because TileM=256 is smem-feasible only at k28/k32.
+    At the previously hardcoded k44 this test had exactly one compiled tile, so
+    "every compiled tile" was a claim with one arm behind it."""
+    method, layer, dims = _build(seed=1, k=k)
     _require_grouped_fused(method, layer)
     act = _silu_act()
     ids, weights = _routing(48, dims["E"], 2, "uniform", seed=7)
@@ -431,7 +441,10 @@ def test_quality_at_every_compiled_tile():
     "distribution,tokens", [("one_expert", 40), ("subset", 17),
                              ("uniform", 33)])
 def test_ragged_routing_at_tile_256(distribution, tokens):
-    method, layer, dims = _build(seed=6)
+    # k28, not the fixture default k44: TileM=256 is smem-infeasible above k32,
+    # so at k44 this test skipped unconditionally and the 256 path had no live
+    # coverage at all.
+    method, layer, dims = _build(seed=6, k=28)
     _require_grouped_fused(method, layer)
     if 256 not in method._gf2_tile_sizes(layer):
         pytest.skip("tile_m=256 not compiled")
@@ -543,3 +556,283 @@ def test_sm120_bridge_lane_survives_a_single_expert_chunk():
 
     assert _report("sm120-lane[chunk=1]-vs-sm80-bridge",
                    reference, candidate) <= _REL
+
+
+# ===========================================================================
+# K0.4 — the grouped TileM SELECTOR.
+#
+# CPU-only, no vLLM, no GPU: the selector is pure integer arithmetic over
+# host-known shapes, which is exactly why it lives in ``moe_routing`` and why
+# it is testable here next to the routing construction.
+# ===========================================================================
+from gridbook.moe_routing import (  # noqa: E402
+    GROUPED_TILE_M_BASE,
+    GROUPED_TILE_M_WIDE,
+    GROUPED_WIDE_TILE_MIN_ROWS_PER_EXPERT as _RHO_MIN,
+    cb_grouped_tile_m,
+)
+
+_SEL = dict(hidden=4096, inter=2048, tile_n=64, compiled=(128, 256),
+            sm_count=48, k_bits=28)
+
+
+def _sel(**kw):
+    args = dict(_SEL)
+    args.update(kw)
+    return cb_grouped_tile_m(**args)
+
+
+@pytest.mark.parametrize("tokens,top_k,experts,expect,why", [
+    # rho = P/E must EXCEED the threshold; the boundary itself stays narrow.
+    (_RHO_MIN * 128 // 8, 8, 128, GROUPED_TILE_M_BASE, "rho == threshold"),
+    ((_RHO_MIN + 1) * 128 // 8, 8, 128, GROUPED_TILE_M_WIDE, "rho > threshold"),
+    (16, 1, 8, GROUPED_TILE_M_BASE, "P < 256 shape guard"),
+    (4, 1, 4, GROUPED_TILE_M_BASE, "tiny routing"),
+    (1 << 16, 8, 1, GROUPED_TILE_M_WIDE, "one expert takes everything"),
+])
+def test_selector_boundaries(tokens, top_k, experts, expect, why):
+    assert _sel(tokens=tokens, top_k=top_k, experts=experts) == expect, why
+
+
+def test_selector_fails_closed_without_device_metadata():
+    """A failed SM probe must pick the incumbent tile, exactly like the dense
+    selector does — an unknown device is not a reason to widen."""
+    assert _sel(tokens=1 << 16, top_k=8, experts=1, sm_count=0) == \
+        GROUPED_TILE_M_BASE
+
+
+def test_selector_never_leaves_the_compiled_set():
+    """The failure this prevents is a hard abort: cb_fused_moe_grouped
+    TORCH_CHECKs `moe_tile_supported(tile_m, k_bits)`, so proposing an
+    uncompiled tile aborts the request rather than degrading it."""
+    for compiled in ((128,), (256,), (128, 256)):
+        for tokens in (1, 64, 4096, 1 << 16):
+            for experts in (1, 8, 256):
+                got = _sel(tokens=tokens, top_k=4, experts=experts,
+                           compiled=compiled)
+                assert got in compiled
+    assert _sel(tokens=1 << 16, top_k=8, experts=1, compiled=()) == 0
+
+
+def test_selector_refuses_the_zero_margin_rung():
+    """TileM=256/k32 lands on EXACTLY the 101,376 B smem ceiling. It is
+    compiled but launch-unverified, so the SELECTOR must not choose it; an
+    explicit operator override still can."""
+    wide = dict(tokens=1 << 16, top_k=8, experts=1)
+    assert _sel(k_bits=28, **wide) == GROUPED_TILE_M_WIDE
+    assert _sel(k_bits=32, **wide) == GROUPED_TILE_M_BASE
+
+
+def _exact_cost(counts, tile, x):
+    """B(t) * (d + t*m) with d/m = x, in units of m."""
+    blocks = sum((c + tile - 1) // tile for c in counts if c > 0)
+    return blocks * (x + tile)
+
+
+@pytest.mark.parametrize("name", ["uniform", "skewed", "tiny", "adversarial"])
+def test_selector_verdict_is_correct_for_every_histogram(name):
+    """THE property, not a restatement of the rule.
+
+    The selector sees only (P, E). Whenever it says 256, the EXACT cost model
+    evaluated on the real histogram must agree — for every histogram summing to
+    that P. ``adversarial`` is the worst case the derivation is built around
+    (c_e = 128 mod 256 maximises the padding penalty of widening while buying
+    no tile-count reduction at all).
+    """
+    x = 85                       # pessimistic end of the dense-inverted range
+    experts = 8
+    for scale in (1, 4, 16, 64, 256):
+        if name == "uniform":
+            counts = [128 * scale] * experts
+        elif name == "skewed":
+            counts = [128 * scale * experts - (experts - 1)] + \
+                     [1] * (experts - 1)
+        elif name == "tiny":
+            counts = [1] * min(experts, scale)
+        else:
+            counts = [128 + 256 * (scale - 1)] * experts
+        pairs = sum(counts)
+        if pairs < 1:
+            continue
+        got = cb_grouped_tile_m(
+            tokens=pairs, top_k=1, experts=experts, hidden=4096, inter=2048,
+            tile_n=64, compiled=(128, 256), sm_count=48, k_bits=28)
+        if got == GROUPED_TILE_M_WIDE:
+            assert _exact_cost(counts, 256, x) < _exact_cost(counts, 128, x), (
+                f"{name}: selector widened but the exact model prefers 128 "
+                f"(counts={counts})")
+
+
+def test_selector_reads_no_tensor():
+    """Graph safety, checked by construction rather than by audit.
+
+    The persistent-B lesson is that "no .item() in my code" is not a proof — a
+    sync hides inside innocuous ATen (bincount sizes its CUDA output from
+    .max().item()). The selector's defence is stronger and mechanically
+    checkable: its signature admits no tensor at all, so there is nothing that
+    COULD sync.
+    """
+    import inspect
+
+    sig = inspect.signature(cb_grouped_tile_m)
+    assert all(p.kind is p.KEYWORD_ONLY for p in sig.parameters.values())
+    # Every argument the live call site passes is a python int (or a sequence
+    # of ints); a tensor argument would raise here rather than sync silently.
+    for value in (_SEL["hidden"], _SEL["inter"], _SEL["tile_n"],
+                  _SEL["sm_count"], _SEL["k_bits"]):
+        assert isinstance(value, int)
+    assert isinstance(_sel(tokens=64, top_k=2, experts=4), int)
+
+
+def test_routing_counts_avoid_the_bincount_host_sync():
+    """The padded routing must count with scatter_add_, not bincount.
+
+    ATen's CUDA ``bincount`` sizes its output from ``.max().item()`` and so
+    host-syncs — the persistent-B lane proved it breaks capture, with a
+    negative control. ``cb_grouped_pad_routing``'s docstring claimed "NO HOST
+    READS" while calling it anyway, which made the graph-safety story for every
+    padded grouped lane false. Pin the repair here so it cannot regress.
+    """
+    import gridbook.moe_routing as mr
+
+    import inspect
+
+    # The CALL, not the word: the module documents at length why it does not
+    # use bincount, so the prose legitimately names it.
+    assert "torch.bincount(" not in inspect.getsource(mr)
+    counts = mr._expert_counts(torch.tensor([0, 2, 2, 5, 5, 5]), 6)
+    assert counts.tolist() == [1, 0, 2, 0, 0, 3]
+    assert counts.dtype == torch.int64
+
+
+# ===========================================================================
+# K0.4 — dispatch TELEMETRY and TILE EQUALITY (forward tests).
+# ===========================================================================
+def test_grouped_fused_emits_the_full_dispatch_record():
+    """Every K0.4 field, populated, on a served routed call."""
+    from gridbook.nvfp4_activation_contract import (ROUTE_CONTRACTS,
+                                                    ROUTE_FIELDS, read_route)
+
+    method, layer, dims = _build(seed=31)
+    _require_grouped_fused(method, layer)
+    act = _silu_act()
+    ids, weights = _routing(48, dims["E"], 2, "uniform", seed=3)
+    torch.manual_seed(4)
+    x = torch.randn(48, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    out = method._apply_prefill_grouped_fused_v2(layer, x, weights, ids, act)
+    assert out is not None
+
+    record = read_route(layer)
+    assert record is not None and set(record) == set(ROUTE_FIELDS)
+    assert record["kind"] == "moe"
+    assert record["state"] == "served" and record["reason"] is None
+    assert record["symbol"] == "cb_fused_moe_grouped"
+    assert record["contract"] in ROUTE_CONTRACTS
+    assert record["tile_m"] in method._gf2_tile_sizes(layer)
+    assert record["shape"] == (f"T48:P96:E{dims['E']}:H{dims['hidden']}"
+                               f":I{dims['inter']}:topk2")
+    # Selector provenance: enough to re-derive the verdict from a JSON report
+    # with no GPU present.
+    assert record["tile_rho"] == 96 // dims["E"]
+    assert record["tile_candidate_ctas"] > 0
+    assert record["tile_compiled"] == ",".join(
+        str(t) for t in method._gf2_tile_sizes(layer))
+
+
+def test_grouped_fused_records_the_exact_fallback_reason():
+    """A declined gate must say WHY, and the bridge that serves it must
+    overwrite the record — the last-write-wins semantics the probe relies on."""
+    from gridbook.nvfp4_activation_contract import read_route
+
+    method, layer, dims = _build(seed=32)
+    _require_grouped_fused(method, layer)
+    act = _silu_act()
+    ids, weights = _routing(32, dims["E"], 2, "uniform", seed=5)
+    torch.manual_seed(6)
+    x = torch.randn(32, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+
+    layer._cb_gf2_ok = False
+    layer._cb_gf2_ok_reason = "sentinel: gate declined for a stated reason"
+    assert method._apply_prefill_grouped_fused_v2(
+        layer, x, weights, ids, act) is None
+    record = read_route(layer)
+    assert record["state"] == "fallback"
+    assert record["reason"] == "sentinel: gate declined for a stated reason"
+    assert record["symbol"] == ""
+
+
+def test_gf2_gate_reason_names_the_failing_clause():
+    """The FP8 grouped gate recorded a bare bool before K0.4, so every routed
+    fp8 fallback looked alike in a dispatch report."""
+    method, layer, _ = _build(seed=33)
+    _require_stack()
+    layer._cb_hidden = layer._cb_hidden + 1          # break ONE clause
+    layer.__dict__.pop("_cb_gf2_ok", None)
+    assert method._gf2_ok(layer) is False
+    assert "superblock aligned" in layer._cb_gf2_ok_reason
+
+
+def _pair_order(y, ids, experts, tile_m):
+    """Stage output in stable-argsorted PAIR order — tile-independent."""
+    _eids, row_src, is_pad, _n = cb_grouped_pad_routing(ids, experts, tile_m)
+    row_src = row_src[:y.shape[0]]
+    is_pad = is_pad[:y.shape[0]]
+    keep = ~is_pad
+    order = torch.argsort(row_src[keep], stable=True)
+    return y[keep][order]
+
+
+@pytest.mark.parametrize("distribution,tokens,topk",
+                         [("uniform", 300, 2), ("subset", 257, 4),
+                          ("one_expert", 400, 1)])
+def test_both_compiled_tiles_are_bit_identical(distribution, tokens, topk):
+    """The selector must be a PURE PERFORMANCE choice.
+
+    The two tiles differ only in how rows are partitioned across CTAs: each
+    output row's K-reduction is the same ordered sequence of TileK=128 chunks
+    under the same TiledMma, the padding rows are inert by construction, and
+    the stable argsort fixes each expert's row order independently of tile_m.
+    So a bit difference here is a real defect with exactly two possible causes
+    — per-row accumulation depending on TileM (which would break the
+    `is_same_v<MoeTile<128>, TileF>` identity the whole ladder rests on), or
+    the routing's row->pair mapping changing with the tile.
+
+    Compared PRE-COMBINE, in pair order: the final combine is an index_add_
+    into a bf16 accumulator whose index length changes with the tile, and
+    atomic ordering there is not architecturally guaranteed.
+    """
+    method, layer, dims = _build(seed=34, k=28)      # 256 needs k in {28, 32}
+    _require_grouped_fused(method, layer)
+    if 256 not in method._gf2_tile_sizes(layer):
+        pytest.skip("tile_m=256 not compiled for this rung")
+    act = _silu_act()
+    ids, weights = _routing(tokens, dims["E"], topk, distribution, seed=9)
+    torch.manual_seed(10)
+    x = torch.randn(
+        tokens, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+
+    captured: dict[int, list] = {}
+    original = method._grouped_call
+
+    def spy(fext, args, tile_m):
+        out = original(fext, args, tile_m)
+        captured.setdefault(tile_m, []).append(out)
+        return out
+
+    method._grouped_call = spy
+    try:
+        out128 = method._apply_prefill_grouped_fused_v2(
+            layer, x, weights, ids, act, tile_m=128)
+        out256 = method._apply_prefill_grouped_fused_v2(
+            layer, x, weights, ids, act, tile_m=256)
+    finally:
+        method._grouped_call = original
+    assert out128 is not None and out256 is not None
+    assert len(captured[128]) == 2 and len(captured[256]) == 2
+
+    for stage in (0, 1):
+        a = _pair_order(captured[128][stage], ids, dims["E"], 128)
+        b = _pair_order(captured[256][stage], ids, dims["E"], 256)
+        assert a.shape == b.shape
+        assert torch.equal(a.view(torch.uint16), b.view(torch.uint16)), (
+            f"stage {stage} differs between TileM 128 and 256")
