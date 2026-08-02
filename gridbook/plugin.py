@@ -100,6 +100,25 @@ def _install_toplevel_cb_expert_loaders() -> None:
         _install_on_module_classes(module_path)
 
 
+_PRELOAD_FLAG = "PRISMAQUANT_PRELOAD_FUSED"
+
+
+def _preload_requested() -> bool:
+    """Whether to warm every native extension, parsed like the lane flags.
+
+    This used to be a bare ``== "1"``, so ``true``, ``yes`` and ``" 1 "`` all
+    warmed nothing while the operator believed both arms of an A/B were
+    residency-matched. That failure is invisible in the results — it shows up
+    only as the ±17% measurement-arithmetic confound the flag exists to remove
+    — so it must be an error, not a no-op.
+    """
+    from .lane_select import latched_bool
+
+    return latched_bool(
+        _PRELOAD_FLAG,
+        meaning="the residency-matched warm-up of every native extension")
+
+
 def register() -> None:
     # Residency-matched A/B support: force-build+load every native extension
     # even when its dispatch env is off, so both arms of a served logprob
@@ -107,8 +126,16 @@ def register() -> None:
     # session-arithmetic-drift mechanism otherwise confounds the gate). The
     # env var keeps its published name; what it warms is now the FULL module
     # inventory, not only the two fused ones (2026-08-01 audit §3 P4).
-    if os.environ.get("PRISMAQUANT_PRELOAD_FUSED") == "1":
+    if _preload_requested():
         from .cuda_ext import preload_native_extensions
+
+        # The status is deliberately not inspected here: warming is best-effort
+        # by design (the modules gate on different capabilities), and a failed
+        # family must not stop a serve from starting. What must not happen is
+        # it failing SILENTLY, since a half-warmed process is the residency
+        # mismatch this flag exists to remove — so the loader itself now names
+        # every family that did not warm, and separates a registry defect from
+        # an unbuildable module.
         preload_native_extensions()
     for quant_method in _QUANTIZATION_METHODS:
         try:

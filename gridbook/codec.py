@@ -1,9 +1,10 @@
 """Self-contained (no `prismaquant` import at serve time) CB codec helpers:
 
-* load-time preprocessing that turns the shipped layout (LAYOUT.md) into the
-  small resident tensors the native CUDA/CUTLASS kernels consume — the flat codebook, the
-  pre-decoded fp4 scale plane, and an 8-byte-padded index stream. None of these
-  is a dense [N,K] weight (INV-1 holds);
+* load-time preprocessing that turns the shipped superblock layout
+  (docs/SPEC.md §1) into the small resident tensors the native CUDA/CUTLASS
+  kernels consume — the flat codebook, the pre-decoded fp4 scale plane, and an
+  8-byte-padded index stream. None of these is a dense [N,K] weight (INV-1
+  holds);
 * activation QDQ that reproduces the emulation gate's served-activation buckets
   (fp4 group-16 RTN / fp8 dynamic per-token) so served KL is comparable to the
   emulated prediction.
@@ -26,8 +27,10 @@ FP8_ELEMENT_MAX = 448.0
 # E2M1 element grid (sorted ascending), for the fp4 activation RTN.
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
-# Two-tier v2 scale coding (docs/lanes/nvfp4-cb/two-tier-scale-spec.md §1). Kept
-# in sync with prismaquant.nvfp4_cb_formats (the reference the kernel matches).
+# Two-tier v2 scale coding (docs/SPEC.md §1.2 defines the E8M0 super bias and
+# names this exact 16-entry table T4_2oct8m; §5 is where it ships per artifact).
+# Kept in sync with prismaquant.nvfp4_cb_formats (the reference the kernel
+# matches).
 SCALE_CODING_TWO_TIER = "two_tier"
 TWO_TIER_SUPER_BIAS = 127
 TWO_TIER_SUB_TABLE = (1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875,
@@ -165,11 +168,14 @@ def flat_codebook_fp8(flat: torch.Tensor,
 
 
 def build_compose_table(sub_table) -> torch.Tensor:
-    """Two-tier v2 (docs/lanes/nvfp4-cb/two-tier-scale-spec.md §1): the (256,16)
-    compose table ``T[c]·2^(E-127)`` flattened to (4096,) fp32, bit-exact to
-    ``nvfp4_cb_formats._two_tier_tables`` (float64 product -> fp32). The kernel
-    gathers ``compose[super_e*16 + code]`` per group — no resident fp32 plane
-    (spec §4/G4), just this 16 KiB constant table."""
+    """Two-tier v2 (docs/SPEC.md §1.2): the (256,16) compose table
+    ``T[c]·2^(E-127)`` flattened to (4096,) fp32, bit-exact to
+    ``nvfp4_cb_formats._two_tier_tables`` (float64 product -> fp32).
+    Precomputing the product as an (E, c)-indexed table is the optimization
+    §1.2 explicitly permits, and it MUST produce bytes identical to the
+    normative per-group formula. The kernel gathers
+    ``compose[super_e*16 + code]`` per group — no resident fp32 plane
+    (docs/SPEC.md §7, INV-1), just this 16 KiB constant table."""
     T = torch.tensor(list(sub_table), dtype=torch.float64)
     exps = torch.arange(256, dtype=torch.float64)
     compose = (T[None, :] * torch.pow(2.0, exps[:, None] - 127.0)).to(
@@ -255,11 +261,15 @@ def fp4_group16_act_qdq(x: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# fp4-MMA fused-prefill helpers (docs/lanes/nvfp4-cb/fp4-fused-prefill.md).
+# fp4-MMA fused-prefill helpers for csrc/cb_fused_fp4_gemm.cu. The format
+# contract they encode lives in that kernel's header comment and its host-side
+# TORCH_CHECKs; tests/test_fused_fp4_prefill.py builds every fused input
+# through these helpers, so it is what keeps the two sides from drifting.
 # The fused kernel consumes the CB codebook as E2M1 NIBBLE CODES (the fp4
 # codebook is e2m1-grid-valued by construction, nvfp4_cb_formats._snap_to_grid,
 # so this re-encoding is lossless) and the two-tier compose table as E4M3
-# BYTES (exact by construction, two-tier-scale-spec.md §1.2).
+# BYTES (exact by construction — docs/SPEC.md §1.2 makes E4M3-exactness of every
+# composed (E, c) pair normative, and required of any conforming encoder).
 # ---------------------------------------------------------------------------
 
 def fp4_e2m1_codes(t: torch.Tensor) -> torch.Tensor:
@@ -334,7 +344,7 @@ def build_fp4_value_lut(cb_flat: torch.Tensor, k_bits: int,
 
 def build_compose_u8(sub_table=TWO_TIER_SUB_TABLE) -> torch.Tensor:
     """The (256*16) two-tier compose table as E4M3 BYTES. Legal (E, c) pairs
-    are e4m3-exact by construction (spec §1.2); illegal pairs are never
+    are e4m3-exact by construction (docs/SPEC.md §1.2); illegal pairs are never
     emitted by the encoder, so their bytes are clamped placeholders."""
     comp = build_compose_table(sub_table).clamp(0.0, FP8_ELEMENT_MAX)
     return comp.to(_E4M3).view(torch.uint8).contiguous()

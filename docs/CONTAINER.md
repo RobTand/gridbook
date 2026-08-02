@@ -12,6 +12,19 @@ expander module, the required grouped-BF16 quality bridge, and the optional
 FP8 fused specialization on Blackwell. Experimental fused FP4 remains an
 explicit, default-off build option.
 
+**Two opt-in lanes are not prewarmed at all**: the fused FP4-CB v2 mid-M lane
+(`PRISMAQUANT_CB_FP4_FUSED_MIDM`) and the persistent-B grouped MoE lane
+(`PRISMAQUANT_CB_MOE_PERSISTENT_B`). Neither has a prewarm step or a build-arg
+in the Dockerfile, so there are five prewarm targets for seven build-cache
+modules. Operationally: "resolved at model load" means that if you set either
+flag, the **first model load in that container runs `nvcc` in-image and pays a
+cold CUTLASS/CUDA build inside the load**, not at image-build time — several
+minutes, on the request path, with the model already being read. It is a
+one-time cost per cache, so the mitigation is the usual one: mount a persistent
+volume over `PRISMAQUANT_CB_EXT_DIR` (see [Volumes](#volumes)) and do a
+throwaway load with the flag set before serving traffic. Both lanes fail the
+load rather than silently falling back, so a failed build is loud, not slow.
+
 **Fused FP8 module build cost (measured, GB10 / cc 12.1, cold cache, 2026-08-02).**
 `get_fused_ext()` compiles 20 kernel instantiations — six `k_bits` rungs ×
 {dense unscaled, dense scaled, grouped TileM=128}, plus grouped TileM=256 at

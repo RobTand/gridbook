@@ -59,36 +59,23 @@
   shipped `delegated_preflight` already refuses an unaudited or
   activation-scale-dropping backend for any stock region that might appear.
 
-- Stop the CPU suite needing NumPy. `test_validate_fused_nvfp4_ab.py`'s K0.2
-  fixture writer built its artifact with `safetensors.torch.save_file`, whose
-  **write** path imports NumPy — which Gridbook deliberately does not depend on
-  (`gridbook/cb_digest.py`), so it is absent from the one environment that
-  matters here: the wheel's own closure, which is what `cpu-tests` and
-  `release.yml`'s `verify` install the suite into from outside the checkout.
-  The fixture therefore passed on every developer host and failed all four CI
-  legs on master — `ModuleNotFoundError: No module named 'numpy'` from
-  `safetensors/torch.py`, 4 failed / 49 passed. It now serializes its two F32
-  scalars directly, exactly as `test_codebook_digest.py` has always done for
-  its F16 sidecar and for the same written reason, and a scan asserts no test
-  or script reaches for `save_file` again. Nothing in the wheel changes: the
-  read path, which is all Gridbook ever uses, was never NumPy-bound.
-- Make the no-Triton ratchet independent of the directory the suite is staged
-  in. `release.yml`'s `verify installed wheel` job copies `tests` to
-  `$RUNNER_TEMP/gbtests` — so the checkout cannot shadow the installed wheel —
-  and failed there on the ratchet itself (`gbtests/test_no_triton_runtime.py:89
-  [mention] executable definition _is_triton_module`, and 23 more across it and
-  `test_delegated_preflight.py`) on a tree CI had just passed. The `mention`
-  exemptions were keyed on a literal `tests/` prefix, so under any other
-  staging name the two files that name Triton *because* they are the
-  anti-Triton machinery stopped being exempt. Those keys are now anchors —
-  resolved inside the scanned package and inside the ratchet's own directory,
-  matched by resolved path rather than by a rendered string. The same three
-  files are exempt, from the `mention` rules only, and the meta-test that an
-  exemption can never hide a reaching import now runs on all three under
-  staging instead of silently skipping two. Scan-root discovery treats a staged
-  tree with no sibling `scripts/` as a smaller scan rather than a failed one,
-  and a new test reproduces the release job's layout exactly: copy the suite
-  into a `gbtests/`, load the copy, make it scan itself.
+- Retire `PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE` and the `torch.Tag.cudagraph_unsafe`
+  tagging it controlled. Nothing observable changes: the knob has been a silent
+  no-op since the M-branch hoist (`5b4e5e7`, 2026-07-21). The tag only ever
+  partitions an **inductor** graph, and only under
+  `use_inductor_graph_partition=True` combined with piecewise cudagraphs —
+  which is off at every vLLM optimization level, and which FULL capture ignores
+  outright. Since the hoist, dynamo sees only `cb_linear_forward` /
+  `cb_moe_forward`; the 18 tagged kernel ops run inside those two ops' eager
+  implementations and are never graph nodes, so their tags were metadata no
+  compiler read. The end state is that **no Gridbook op carries the tag, ever**
+  — moving it onto the two whole-dispatch ops would not preserve anything, it
+  would make every CB layer an eager partition boundary, i.e. the 2026-07-21
+  corruption configuration at worse granularity. Those two ops are capture-safe
+  by construction: the M-branch resolves host-side and the host-syncing arms are
+  unreachable at captured decode sizes. Reproducing the historical corruption
+  now needs the hoist reverted *and* inductor graph partitioning enabled with
+  piecewise cudagraphs on a torch predating pytorch#165815.
 
 ## 0.6.0 — 2026-08-02
 
@@ -141,6 +128,17 @@
   offline. The FP8 grouped gate recorded a bare bool before this; it now names
   the failing clause. Both tiles are gated **bit-identical** pre-combine in
   stable-argsorted pair order — the selector is a pure performance choice.
+- Split the fused MoE quality envelope from the reassociation one (tests only).
+  `_REL = 2.1e-2` had been fitted to four hand-picked routing cases; across 224
+  configurations the fused-vs-bridge disagreement runs 1.566e-2–2.316e-2 and is
+  **cross-representation** — the two lanes' per-token E4M3 activation
+  quantizers put 0.82% of elements on different codes — not reassociation, so
+  the four cross-representation gates move to `_REL_FUSED = 2.5e-2` while
+  `_REL` keeps the same-representation comparisons. It was never a TileM=256
+  defect: at the failing cell both compiled tiles are bit-identical. Two
+  sharper gates replace what the tolerance stopped gating — both lanes measured
+  against the exact FP32 computation (0.89–1.05×, gated at 1.25×), and a ragged
+  arm on the both-tiles-bit-identical test.
 - **Fixed a CUDA-graph capture defect in the padded grouped routing.**
   `cb_grouped_pad_routing` documented "NO HOST READS" while calling
   `torch.bincount`, which sizes its CUDA output from `.max().item()` and
@@ -178,7 +176,9 @@
 
 - Close the sm12x grouped-BF16 lane's ragged-padding tax with two
   construction changes to the SAME compiled collective (schedule, tile,
-  stages and smem untouched; audit §3 P1 follow-through):
+  stages and smem untouched; audit §3 P1 follow-through, and the
+  supersession of "Add an **sm12x-native CUTLASS 3.x lane**" below —
+  its `T=512` deficit and its "next step" both resolve here):
   **an in-mainloop A-row gather** — the mainloop fork gains a fourth marked
   addition: the producer warp reads each padded row through ``row_src[m]``
   from the COMPACT activation with predicated zero-filling 16-byte
@@ -330,6 +330,9 @@
   is a TileM ladder or an in-mainloop A gather, not more tuning. Proposal data
   only, served protocol not run; `scripts/bench_bf16_grouped_sm120.py`
   reproduces the tables.
+  (**Superseded within this release** by "Close the sm12x grouped-BF16 lane's
+  ragged-padding tax" above: the gather was built and the TileM ladder was
+  measured-dead, and the `T=512` numbers here are the pre-gather ones.)
 - Key the grouped-BF16 module's JIT identity like the two fused modules: its
   packaged sources, Gridbook headers, compiled-in lane macro, target and
   toolchain ABI decide the module name and the `bf16_grouped/<digest>` build
@@ -368,6 +371,36 @@
   `runtime_contract.json`'s dynamically imported model-module list to a
   reviewed allow-list, and add a GPU-lane assertion that executing a
   Gridbook-owned op imports no Triton module vLLM had not already loaded.
+- Make the no-Triton ratchet independent of the directory the suite is staged
+  in. `release.yml`'s `verify installed wheel` job copies `tests` to
+  `$RUNNER_TEMP/gbtests` — so the checkout cannot shadow the installed wheel —
+  and failed there on the ratchet itself (`gbtests/test_no_triton_runtime.py:89
+  [mention] executable definition _is_triton_module`, and 23 more across it and
+  `test_delegated_preflight.py`) on a tree CI had just passed. The `mention`
+  exemptions were keyed on a literal `tests/` prefix, so under any other
+  staging name the two files that name Triton *because* they are the
+  anti-Triton machinery stopped being exempt. Those keys are now anchors —
+  resolved inside the scanned package and inside the ratchet's own directory,
+  matched by resolved path rather than by a rendered string. The same three
+  files are exempt, from the `mention` rules only, and the meta-test that an
+  exemption can never hide a reaching import now runs on all three under
+  staging instead of silently skipping two. Scan-root discovery treats a staged
+  tree with no sibling `scripts/` as a smaller scan rather than a failed one,
+  and a new test reproduces the release job's layout exactly: copy the suite
+  into a `gbtests/`, load the copy, make it scan itself.
+- Stop the CPU suite needing NumPy. `test_validate_fused_nvfp4_ab.py`'s K0.2
+  fixture writer built its artifact with `safetensors.torch.save_file`, whose
+  **write** path imports NumPy — which Gridbook deliberately does not depend on
+  (`gridbook/cb_digest.py`), so it is absent from the one environment that
+  matters here: the wheel's own closure, which is what `cpu-tests` and
+  `release.yml`'s `verify` install the suite into from outside the checkout.
+  The fixture therefore passed on every developer host and failed all four CI
+  legs on master — `ModuleNotFoundError: No module named 'numpy'` from
+  `safetensors/torch.py`, 4 failed / 49 passed. It now serializes its two F32
+  scalars directly, exactly as `test_codebook_digest.py` has always done for
+  its F16 sidecar and for the same written reason, and a scan asserts no test
+  or script reaches for `save_file` again. Nothing in the wheel changes: the
+  read path, which is all Gridbook ever uses, was never NumPy-bound.
 - Correct the staged HF card blocks and the README's no-Triton sentence: the
   cards no longer describe a Triton decode fallback or quote its retired
   warning string, the Hy3 card documents `TRITON_ATTN` as the attention backend

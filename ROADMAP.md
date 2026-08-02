@@ -26,9 +26,32 @@ still describe some of them as future work.
   GEMM is the quality-preserving production lane. Its predecessor CUDA
   chunk-expander path measured 293 → **1,821 tok/s** at 8k and 207 → **1,822
   tok/s** at 63k on Laguna-S-2.1 (commit `8829c16`); those historical numbers
-  are not measurements of the new owned grouped bridge. The bridge's current
+  are not measurements of the new owned grouped bridge. The bridge's DEFAULT
   generic SM80-compatible schedule is not Blackwell-optimized and measured
   **6–17% slower** than segmented BF16 matmuls on warm synthetic DSV4 shapes.
+  That deficit belongs to the default lane only: the bridge now has a second,
+  sm12x-native compiled lane (next entry) that closes it.
+- **sm12x-native grouped BF16 lane**, **OPT-IN** behind
+  `PRISMAQUANT_CB_BF16_SM120=1` (cc 12.0/12.1). A CUTLASS 3.x TMA
+  warp-specialized collective replacing the SM80 `DefaultGemmGrouped` on the
+  quality-preserving bridge, with an in-mainloop A-row gather and a
+  swizzle-group-aligned expert order. Measured 1.13–1.37× the default bridge
+  and, against segmented BF16 matmuls, **1.03–1.05× at `T=128` and 1.10–1.15×
+  at `T=512`** — the 6–17% deficit above, closed at the construction level. It
+  is bit-gated against the torch reference but changes the FP32 REDUCTION ORDER
+  of every default NVFP4-CB prefill, so what remains open is the served
+  [NATIVE-PARITY](docs/NATIVE-PARITY.md) gate, not the kernel. See
+  [KERNELS](docs/KERNELS.md#sm12x-native-grouped-bf16-opt-in-prismaquant_cb_bf16_sm120).
+- **FP4-CB v2 fused mid-M lane** (dense, 9 ≤ M ≤ 128), **OPT-IN** behind
+  `PRISMAQUANT_CB_FP4_FUSED_MIDM=1` (cc 12.0/12.1). Decodes packed CB rows to
+  BF16 inside the CUTLASS producer/consumer stage, so the `[N,K]` BF16
+  transient never reaches HBM — the audit's structural cause (c), that FP4 had
+  no mid-M lane at all. Contract-preserving: the decoded values are bit-identical
+  to `cb_expand_v2` at all 13 rungs and the activations are unchanged, so only
+  the FP32 reduction order moves. Measured **1.06–4.37×** the shipping expand +
+  bridge route at M ∈ {9,16,32,64,128}, with an unexplained M ≤ 12 latency
+  cliff recorded as open. Proposal data; served gate not run. See
+  [KERNELS](docs/KERNELS.md#fp4-cb-v2-fused-mid-m-opt-in-prismaquant_cb_fp4_fused_midm).
 - **Native FP8 operator ownership.** FP8 activation quantization and CUTLASS
   scaled GEMM call vLLM's registered native CUDA operators directly after ABI
   and shape attestation; the fallback-capable `vllm._custom_ops` wrapper is not
@@ -37,10 +60,12 @@ still describe some of them as future work.
   nested/collapsed MTP forms, resolve to native CB Linears. A CB tensor that can
   resolve only to a plain BF16 Linear now stops model load.
 - **Mid-M fused prefill** (FP8-CB dispatch band 9 ≤ M ≤ 128): a CUTLASS decode-in-prologue GEMM with
-  an fp32 epilogue, promoted to DEFAULT after measuring **1.40× in its niche**
-  at the promotion gate (1.04–1.45× across M = 32/64/128 on GB10) with the
-  quality gate preserved. `sm_120`-family only; other devices use native CUDA
-  expansion + CUTLASS.
+  an fp32 epilogue, promoted to DEFAULT at the promotion gate with the quality
+  gate preserved. The measured figure is a **band, not a headline**:
+  **1.04× / 1.26× / 1.45× at M = 32 / 64 / 128** on the GB10, and ≈0.22× at
+  M≈1400 — which is why the lane is gated at M ≤ 128 rather than promoted
+  outright ([KERNELS](docs/KERNELS.md#measured-status)). `sm_120`-family only;
+  other devices use native CUDA expansion + CUTLASS.
 - **Quantized MTP draft head.** The 295B artifact ships an FP8-CB K44 draft
   block; speculative decode at k=1 measured 14.6 → **16.1 tok/s** on prose. (The
   remaining upside needs vLLM to capture drafter CUDA graphs — upstream work, see
@@ -208,6 +233,19 @@ resident weight copy, decoder, or matmul merely to create another route.
   exact-byte 27B streaming gate for `FULL_DECODE_ONLY` CUDA graphs, and qualify
   `cb_gemv_v2` on `sm_120` with same-session quality, telemetry, long prefill,
   concurrency, and soak coverage before considering a default change.
+- [ ] **K1.5 — Pack expert blocks *within* a chunk, not only across a whole
+  layer.** The sm12x grouped-BF16 lane's swizzle-group-aligned expert order is
+  gated on `chunk >= E`, because a narrower chunk indexes blocks as
+  `block_off[c0]..block_off[c1]` and therefore assumes expert-major
+  contiguity. That chunk is the decoded-transient budget
+  (`PRISMAQUANT_CB_PREFILL_CHUNK_BYTES`, 1 GiB) divided by one expert's `w13`
+  BF16 bytes, so a layer with enough experts to need more than one chunk — the
+  production shape, and the `E=128` benchmark cells — takes the in-mainloop
+  gather but **not** the tile order, whose isolated effect measured 13.9–16.9%
+  at `T=512` on the `E=32` cells
+  ([BENCHMARKS](docs/BENCHMARKS.md#2026-08-02-sm12x-grouped-bf16-lane-in-mainloop-a-row-gather--swizzle-aligned-tile-order-proposal-data)).
+  Packing inside each chunk's own block range would restore it without
+  reordering across a chunk boundary.
 
 #### P2 — completeness and wider qualification
 

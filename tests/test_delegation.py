@@ -1,6 +1,7 @@
 """Mixed-container dispatch: CB groups (with a "scheme" key) stay ours; stock
 compressed-tensors groups (no "scheme" key) are delegated to a real
-CompressedTensorsConfig (serving-kernel.md §2). vLLM-only, so skip-guarded —
+CompressedTensorsConfig (docs/SPEC.md §6, whose dispatch rules name this
+"mixed container" case). vLLM-only, so skip-guarded —
 run in the vllm-node container:
 
   docker run --rm --gpus all -v /home/rob/gridbook:/gridbook --entrypoint bash \

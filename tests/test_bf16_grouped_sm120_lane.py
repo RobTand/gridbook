@@ -97,23 +97,36 @@ def test_require_lane_fails_closed_without_the_extension(monkeypatch):
         lane.require_lane("routed quality prefill")
 
 
+def _complete_stub(*, omit=(), tile_m=128):
+    """A stand-in carrying exactly what ``cuda_ext`` requires, minus ``omit``.
+
+    Built FROM the loader's tuples rather than listed here. The lane used to
+    keep its own six-name list while the loader enforced seven — the missing
+    one was ``cb_bf16_grouped_sm120_tile_sizes`` — under a comment asserting
+    "the two lists now agree", and a hand-written stub in this file is what let
+    that pass. A stub derived from the source of truth cannot.
+    """
+    from gridbook import cuda_ext
+
+    symbols = {name: (lambda *a, **k: None)
+               for name in (cuda_ext._BF16_GROUPED_SYMBOLS
+                            + cuda_ext._BF16_GROUPED_SM120_SYMBOLS)}
+    symbols["cb_bf16_grouped_sm120_tile_m"] = lambda: tile_m
+    symbols["cb_bf16_grouped_sm120_tile_sizes"] = lambda: [tile_m]
+    # The forward path reads the swizzle group on every routed prefill (the
+    # packed expert order's group size), so a module without a usable config
+    # query is not COMPLETE: accepting one would let `require_lane` call a
+    # build good that then AttributeErrors at first forward, which is exactly
+    # what attesting at load exists to prevent.
+    symbols["cb_bf16_grouped_sm120_config"] = (
+        lambda: [64, 128, 64, 3, 0, 0, 128, 1, 8, 64, 1])
+    for name in omit:
+        del symbols[name]
+    return types.SimpleNamespace(**symbols)
+
+
 def test_require_lane_accepts_a_complete_module(monkeypatch):
-    stub = types.SimpleNamespace(
-        cb_bf16_grouped_mm=lambda *a, **k: None,
-        cb_bf16_grouped_mm_out=lambda *a, **k: None,
-        cb_bf16_grouped_mm_sm120=lambda *a, **k: None,
-        cb_bf16_grouped_mm_sm120_out=lambda *a, **k: None,
-        cb_bf16_grouped_mm_sm120_gather=lambda *a, **k: None,
-        cb_bf16_grouped_mm_sm120_gather_out=lambda *a, **k: None,
-        cb_bf16_grouped_sm120_tile_m=lambda: 128,
-        # The forward path reads the swizzle group on every routed prefill
-        # (the packed expert order's group size), so a stub without it is not
-        # a COMPLETE module — accepting one here would have let `require_lane`
-        # call a build complete that then AttributeErrors at first forward,
-        # which is exactly what attesting at load exists to prevent.
-        cb_bf16_grouped_sm120_config=lambda: [64, 128, 64, 3, 0, 0, 128, 1,
-                                              8, 64, 1],
-    )
+    stub = _complete_stub()
     monkeypatch.setattr("gridbook.cuda_ext.get_bf16_grouped_ext",
                         lambda: stub)
     assert lane.require_lane("routed quality prefill") is stub
@@ -121,47 +134,45 @@ def test_require_lane_accepts_a_complete_module(monkeypatch):
     assert lane.swizzle_group(stub) == 8
 
 
-def test_require_lane_fails_closed_without_the_gather_mode(monkeypatch):
-    """A module carrying only the padded-copy entry points is incomplete:
-    serving a partial lane would silently reintroduce the padded copy."""
-    stub = types.SimpleNamespace(
-        cb_bf16_grouped_mm=lambda *a, **k: None,
-        cb_bf16_grouped_mm_out=lambda *a, **k: None,
-        cb_bf16_grouped_mm_sm120=lambda *a, **k: None,
-        cb_bf16_grouped_mm_sm120_out=lambda *a, **k: None,
-        cb_bf16_grouped_sm120_tile_m=lambda: 64,
-    )
-    monkeypatch.setattr("gridbook.cuda_ext.get_bf16_grouped_ext",
-                        lambda: stub)
-    with pytest.raises(NativeKernelUnavailableError,
-                       match="cb_bf16_grouped_mm_sm120_gather"):
-        lane.require_lane("routed quality prefill")
+@pytest.mark.parametrize("missing", [
+    "cb_bf16_grouped_mm_sm120_gather",
+    "cb_bf16_grouped_mm_sm120_gather_out",
+    "cb_bf16_grouped_sm120_config",
+    "cb_bf16_grouped_sm120_tile_sizes",
+    "cb_bf16_grouped_sm120_tile_m",
+    "cb_bf16_grouped_mm_sm120",
+    "cb_bf16_grouped_mm_sm120_out",
+])
+def test_require_lane_fails_closed_on_any_missing_lane_binding(monkeypatch,
+                                                               missing):
+    """EVERY sm120 binding the loader requires is required here too.
 
-
-def test_require_lane_fails_closed_without_the_config_query(monkeypatch):
-    """Every GEMM entry point, but no config query, is still incomplete.
-
-    ``swizzle_group`` reads ``cb_bf16_grouped_sm120_config`` on EVERY routed
-    prefill to size the packed expert order, so a module without it would pass
-    a load-time attestation and then ``AttributeError`` at the first forward —
-    the one failure mode attesting at load exists to make impossible. This is
-    the case that keeps the lane's own required-symbol list from drifting back
-    behind the list ``cuda_ext`` enforces on the compiled module.
+    Two of these are the reason this is parametrized rather than spelled out.
+    ``cb_bf16_grouped_mm_sm120_gather*`` absent means serving a partial lane
+    that silently reintroduces the padded activation copy. And
+    ``cb_bf16_grouped_sm120_tile_sizes`` was in the loader's tuple but NOT in
+    the lane's local list until 2026-08-02, so a module missing it passed this
+    gate — the drift a shared tuple makes impossible.
     """
-    stub = types.SimpleNamespace(
-        cb_bf16_grouped_mm=lambda *a, **k: None,
-        cb_bf16_grouped_mm_out=lambda *a, **k: None,
-        cb_bf16_grouped_mm_sm120=lambda *a, **k: None,
-        cb_bf16_grouped_mm_sm120_out=lambda *a, **k: None,
-        cb_bf16_grouped_mm_sm120_gather=lambda *a, **k: None,
-        cb_bf16_grouped_mm_sm120_gather_out=lambda *a, **k: None,
-        cb_bf16_grouped_sm120_tile_m=lambda: 128,
-    )
+    stub = _complete_stub(omit=(missing,))
     monkeypatch.setattr("gridbook.cuda_ext.get_bf16_grouped_ext",
                         lambda: stub)
-    with pytest.raises(NativeKernelUnavailableError,
-                       match="cb_bf16_grouped_sm120_config"):
+    with pytest.raises(NativeKernelUnavailableError, match=missing):
         lane.require_lane("routed quality prefill")
+
+
+def test_the_lane_checks_exactly_the_loaders_symbol_contract():
+    """No local restatement of the required set can exist to drift."""
+    import inspect
+
+    from gridbook import cuda_ext
+
+    source = inspect.getsource(lane.require_lane)
+    assert "_BF16_GROUPED_SM120_SYMBOLS" in source
+    for name in cuda_ext._BF16_GROUPED_SM120_SYMBOLS:
+        assert f'"{name}"' not in source, (
+            f"{name} is restated inside require_lane; spell the contract "
+            f"against cuda_ext's tuple so the two cannot disagree")
 
 
 def test_dense_helper_pads_to_one_tile_and_slices_back(monkeypatch):
@@ -734,7 +745,15 @@ def test_expert_chunking_turns_the_packed_order_off(monkeypatch):
     assert seen[-1].route.expert_ids.tolist() != sorted(
         seen[-1].route.expert_ids.tolist())
 
+    # The chunk knob is process-stable since 2026-08-02 — it gates the packed
+    # expert ORDER, so changing it mid-run would silently change the FP32
+    # reduction order between two forwards. An operator changes it by
+    # restarting; clearing the latch is this test's stand-in for that restart,
+    # and comparing the two halves is the whole point of the case.
+    from gridbook import lane_select
+
     monkeypatch.setenv("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", "1")
+    lane_select.reset_for_tests("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
     assert method._native_bf16_chunk(layer) == 1 < dims["E"]
     chunked = method._apply_prefill_native_bf16(layer, x, weights, ids, act)
 

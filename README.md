@@ -21,7 +21,7 @@ list](#published-artifacts).
 | | Requirement |
 |---|---|
 | **GPU** | NVIDIA **Blackwell `sm_120` / `sm_121`** for the complete native path (GB10 / DGX Spark is the reference; RTX 5090 is user-reported). Some FP8-only paths may work on older NVIDIA cards; FP4-CB 0.5 serving does not — read the [compatibility table](#compatibility). |
-| **CUDA toolchain** | `nvcc` on `PATH` **in the process that serves**, matching your torch build. Kernels are **JIT-compiled on first model load** (~30 s once, then cached), *not* at `pip install` time. `nvcc` 13.0 is the tested toolchain. A required extension that cannot be built is a serving error. |
+| **CUDA toolchain** | `nvcc` on `PATH` **in the process that serves**, matching your torch build. Kernels are **JIT-compiled on first model load** (once per module, then cached), *not* at `pip install` time. `nvcc` 13.0 is the tested toolchain. A required extension that cannot be built is a serving error. |
 | **PyTorch** | whatever build your vLLM uses (measured: `2.11.0+cu130`). |
 | **vLLM** | already installed — gridbook is a plugin, not a runtime. Measured against `0.23.1rc1.dev764+g54b16d8a9`; see [compatibility](#compatibility). |
 | **Parallelism** | **`tp=1` only.** The plugin has no tensor-parallel handling; multi-GPU sharding of CB weights is not implemented. |
@@ -116,8 +116,12 @@ contract, so a missing required extension is explicit:
   when its diagnostic names a separately qualified native CUDA/CUTLASS route.
   (Grep your vLLM log for `[prismaquant-cb]`, not for `gridbook` — the runtime
   log prefix still uses the project's older name.)
-- **Good** — no such line, and the first model load pauses ~30 s the first time
-  ever on that machine (the JIT build) and not on subsequent starts.
+- **Good** — no such line, and the first model load pauses while the JIT builds
+  run, then does not pause again. Each native module is built and cached
+  independently in its own subdirectory of the build cache, so what you pay is
+  one build per module that load actually reaches — a cold container with an
+  ephemeral cache pays them all; a persistent `PRISMAQUANT_CB_EXT_DIR` pays
+  them once ever on that machine.
 - A definitive check that does not require serving anything is in
   [`docs/INSTALL.md`](docs/INSTALL.md#verify-the-install).
 

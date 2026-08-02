@@ -501,3 +501,379 @@ def test_rowwise_phase_override_cannot_change_weight_compose_bytes(
     assert activation_contract.rowwise_range_multiplier() == 256.0
     assert codec.FP8_ELEMENT_MAX == 448.0
     assert torch.equal(codec.build_compose_u8(), expected)
+
+
+def _rowwise_dense_method():
+    """A dense FP4 method whose rowwise fused mode is ATTESTED, as at load."""
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    method.is_v2 = True
+    method.is_fp4 = True
+    method.prefix = "model.layers.0.mlp.gate_up_proj"
+    method._sub_table = [1.0] * 16
+    method._fused_fp4_ok = (
+        lambda layer, K, *, rowwise=False, static_lsq=False: True
+    )
+    return method
+
+
+@pytest.mark.parametrize("mode,dtype", [
+    ("rowwise", torch.float32),
+    ("static_lsq", torch.float32),
+    ("rowwise", torch.float64),
+])
+def test_dense_fused_fp4_raises_instead_of_serving_a_different_contract(
+    monkeypatch, mode, dtype,
+):
+    """A call-time miss must fail, exactly as the MoE twin already does.
+
+    The mode is attested at model load, so ``_try_fused_fp4`` returning None
+    means the lane declined THIS call — here through the rowwise/static-LSQ
+    quantizers' half-precision guard. Falling through would have served the
+    exact BF16 quality route, whose activation bucket is the fp32-emulated
+    group QDQ rather than the format's native ue4m3 scale factors: a different
+    served activation contract than the operator selected, chosen silently.
+    """
+    from gridbook.cuda_ext import NativeKernelUnavailableError
+
+    method = _rowwise_dense_method()
+    layer = types.SimpleNamespace(
+        _cb_N=8, _cb_K=256, _cb_fused_fp4_mode=mode,
+        _cb_fp4_input_global_scale=torch.tensor([3.0]),
+        _cb_fp4_input_global_scale_f32=3.0,
+        _cb_fp4_lut=torch.ones(1),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(8),
+        _cb_qw_padded=torch.ones(8, 73, dtype=torch.uint8),
+    )
+    from gridbook import cuda_ext
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext",
+                        lambda: types.SimpleNamespace())
+    # Anything downstream of the raise would be a fall-through, so make the
+    # exact BF16 route loudly unreachable rather than merely unlikely.
+    monkeypatch.setattr(
+        method, "_require_fp4_v2_product",
+        lambda *_a: pytest.fail(
+            "fell through to the emulated-QDQ quality route"))
+
+    x = torch.zeros(32, 256, dtype=dtype)
+    with pytest.raises(NativeKernelUnavailableError) as exc_info:
+        method._apply_inline(layer, x)
+    message = str(exc_info.value)
+    assert "became unavailable after model load" in message
+    assert repr(mode) in message
+    assert str(dtype) in message
+
+
+def test_dense_fused_fp4_still_serves_the_contract_it_attested(monkeypatch):
+    """The negative control: half-precision activations take the lane."""
+    method = _rowwise_dense_method()
+    layer = types.SimpleNamespace(
+        _cb_N=8, _cb_K=256, _cb_fused_fp4_mode="rowwise",
+        _cb_fp4_lut=torch.ones(1),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(8),
+        _cb_qw_padded=torch.ones(8, 73, dtype=torch.uint8),
+    )
+    from gridbook import cuda_ext
+
+    class Ext:
+        @staticmethod
+        def cb_nvfp4_quantize_rows(x, multiplier):
+            return (x[:, :128].to(torch.uint8),
+                    torch.zeros(x.shape[0] * 16, dtype=torch.uint8),
+                    torch.ones(x.shape[0], dtype=torch.float32))
+
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(aq, *args, **kwargs):
+            return torch.zeros(aq.shape[0], 8, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: Ext())
+    monkeypatch.setattr(
+        method, "_require_fp4_v2_product",
+        lambda *_a: pytest.fail("the attested lane must serve this call"))
+
+    y = method._apply_inline(
+        layer, torch.zeros(32, 256, dtype=torch.bfloat16))
+    assert y.shape == (32, 8)
+
+
+# --- K0.4 telemetry: every dense route records what it served --------------
+
+
+def test_dense_fused_fp4_records_the_served_route(monkeypatch):
+    """The fused NVFP4 dense lane had only its three TileM integers.
+
+    A report could see WHICH tile ran but not whether the fused route ran at
+    all — and the alternative serves a different activation contract, which is
+    the one distinction the record exists to make.
+    """
+    from gridbook.nvfp4_activation_contract import (ROUTE_CONTRACTS,
+                                                    ROUTE_FIELDS, read_route)
+
+    method = _rowwise_dense_method()
+    layer = types.SimpleNamespace(
+        _cb_N=8, _cb_K=256, _cb_fused_fp4_mode="rowwise",
+        _cb_fp4_lut=torch.ones(1),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(8),
+        _cb_qw_padded=torch.ones(8, 73, dtype=torch.uint8),
+    )
+    from gridbook import cuda_ext
+
+    class Ext:
+        @staticmethod
+        def cb_nvfp4_quantize_rows(x, multiplier):
+            return (x[:, :128].to(torch.uint8),
+                    torch.zeros(x.shape[0] * 16, dtype=torch.uint8),
+                    torch.ones(x.shape[0], dtype=torch.float32))
+
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(aq, *args, **kwargs):
+            # The two-phase write must already name the symbol when the launch
+            # is entered, so a raise mid-launch stays attributable.
+            record = read_route(layer)
+            assert record["state"] == "error"
+            assert record["symbol"] == "cb_fused_fp4_prefill_mm_scaled"
+            return torch.zeros(aq.shape[0], 8, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: Ext())
+    method._try_fused_fp4(
+        layer, torch.zeros(32, 256, dtype=torch.bfloat16), 8, 256, 32,
+        rowwise=True)
+
+    record = read_route(layer)
+    assert set(record) == set(ROUTE_FIELDS)
+    assert record["kind"] == "dense"
+    assert record["state"] == "served" and record["reason"] is None
+    assert record["policy"] == "rowwise"
+    assert record["contract"] == "nvfp4_rowwise"
+    assert record["contract"] in ROUTE_CONTRACTS
+    assert record["symbol"] == "cb_fused_fp4_prefill_mm_scaled"
+    assert record["shape"] == "M32:N8:K256"
+    assert record["tile_m"] in (128, 256)
+    assert record["tile_candidate_ctas"] > 0
+    assert record["tile_compiled"] == "256,128"
+
+
+@pytest.mark.parametrize("mode,flags,contract", [
+    ("rowwise", {"rowwise": True}, "nvfp4_rowwise"),
+    ("static_lsq", {"static_lsq": True}, "nvfp4_static_lsq"),
+])
+def test_dense_fused_fp4_records_the_exact_fallback_reason(
+    monkeypatch, mode, flags, contract,
+):
+    """A declined call must say WHY, in the vocabulary the report validates."""
+    from gridbook.nvfp4_activation_contract import read_route
+
+    method = _rowwise_dense_method()
+    layer = types.SimpleNamespace(
+        _cb_N=8, _cb_K=256, _cb_fused_fp4_mode=mode,
+        _cb_fp4_input_global_scale_f32=3.0,
+        _cb_fp4_lut=torch.ones(1),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(8),
+        _cb_qw_padded=torch.ones(8, 73, dtype=torch.uint8),
+    )
+    from gridbook import cuda_ext
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext",
+                        lambda: types.SimpleNamespace())
+    assert method._try_fused_fp4(
+        layer, torch.zeros(32, 256, dtype=torch.float32), 8, 256, 32,
+        **flags) is None
+
+    record = read_route(layer)
+    assert record["state"] == "fallback"
+    assert record["symbol"] == ""
+    assert record["policy"] == mode
+    assert record["contract"] == contract
+    assert "torch.float32" in record["reason"]
+    assert "half precision" in record["reason"]
+
+
+def test_the_eligibility_gate_declining_is_also_recorded(monkeypatch):
+    from gridbook.nvfp4_activation_contract import read_route
+
+    method = _rowwise_dense_method()
+    method._fused_fp4_ok = (
+        lambda layer, K, *, rowwise=False, static_lsq=False: False)
+    layer = types.SimpleNamespace(_cb_N=8, _cb_K=256,
+                                  _cb_fused_fp4_mode="rowwise")
+    assert method._try_fused_fp4(
+        layer, torch.zeros(32, 256, dtype=torch.bfloat16), 8, 256, 32,
+        rowwise=True) is None
+    record = read_route(layer)
+    assert record["state"] == "fallback"
+    assert record["reason"] == "fused fp4 dense eligibility gate declined"
+
+
+# --- dense dispatch truth table (fp4v2 mid-M, sm12x, precedence) ------------
+
+
+def _quality_dense_method():
+    """A dense FP4-v2 method with no fused-NVFP4 mode selected."""
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    method.is_v2 = True
+    method.is_fp4 = True
+    method.prefix = "model.layers.0.mlp.gate_up_proj"
+    method._sub_table = [1.0] * 16
+    method._require_fp4_v2_product = lambda *_a: None
+    method._expand_fp4_quality_weight = (
+        lambda layer, N, K: torch.zeros(N, K, dtype=torch.bfloat16))
+    return method
+
+
+def _quality_dense_layer(**overrides):
+    layer = types.SimpleNamespace(
+        _cb_N=2048, _cb_K=4096, _cb_fused_fp4_mode="",
+        _cb_flat=torch.zeros(1, dtype=torch.bfloat16),
+        _cb_fp4v2_midm=None, _cb_bf16_sm120=None,
+        _cb_qw_padded=torch.ones(2048, 73, dtype=torch.uint8),
+        _cb_compose=torch.zeros(4096), _cb_row_offset=torch.zeros(2048),
+    )
+    for name, value in overrides.items():
+        setattr(layer, name, value)
+    return layer
+
+
+def _dense_route(monkeypatch, method, layer, M=64):
+    """Run one dense prefill with every native leaf replaced by a marker."""
+    from gridbook import linear as cb_linear
+
+    taken = []
+    monkeypatch.setattr(cb_linear, "fp4_act_qdq_or_codec", lambda x: x)
+    monkeypatch.setattr(
+        cb_linear, "fp4v2_midm_fused_mm",
+        lambda *a, **k: taken.append("fp4v2_midm")
+        or torch.zeros(M, layer._cb_N, dtype=torch.bfloat16))
+    monkeypatch.setattr(
+        cb_linear, "bf16_sm120_dense_mm",
+        lambda *a, **k: taken.append("sm120")
+        or torch.zeros(M, layer._cb_N, dtype=torch.bfloat16))
+    monkeypatch.setattr(
+        cb_linear, "cb_bf16_grouped_mm",
+        lambda *a, **k: taken.append("bridge")
+        or torch.zeros(M, layer._cb_N, dtype=torch.bfloat16))
+    method._apply_inline(
+        layer, torch.zeros(M, layer._cb_K, dtype=torch.bfloat16))
+    return taken
+
+
+def _midm_ext(*, max_m=128, kbits=(12, 16, 20, 24)):
+    return types.SimpleNamespace(
+        cb_fused_fp4v2_max_m=lambda: max_m,
+        cb_fused_fp4v2_kbits=lambda: list(kbits))
+
+
+def test_dense_default_takes_the_expand_plus_bridge_route(monkeypatch):
+    method, layer = _quality_dense_method(), _quality_dense_layer()
+    assert _dense_route(monkeypatch, method, layer) == ["bridge"]
+
+
+def test_dense_fp4v2_midm_lane_serves_when_resolved_and_eligible(monkeypatch):
+    """Zero coverage existed for this call-dispatch decision."""
+    method = _quality_dense_method()
+    layer = _quality_dense_layer(
+        _cb_fp4v2_midm=_midm_ext(),
+        _cb_flat=torch.zeros(4 * (1 << 8) + 4 * (1 << 8),
+                             dtype=torch.bfloat16))
+    assert _dense_route(monkeypatch, method, layer) == ["fp4v2_midm"]
+
+
+@pytest.mark.parametrize("M,why", [
+    (8, "at or below the decode-GEMV boundary"),
+    (256, "above the HARD mid-M ceiling"),
+])
+def test_dense_fp4v2_midm_falls_through_outside_the_mid_m_band(
+    monkeypatch, M, why,
+):
+    """The M band is the ONE documented call-time fall-through.
+
+    Every other condition became a load-time gate; this one is a property of
+    the REQUEST and is what makes this a mid-M lane.
+    """
+    del why
+    method = _quality_dense_method()
+    layer = _quality_dense_layer(
+        _cb_fp4v2_midm=_midm_ext(),
+        _cb_flat=torch.zeros(4 * (1 << 8) + 4 * (1 << 8),
+                             dtype=torch.bfloat16))
+    method._require_fp4_cuda_gemv = lambda *_a: None
+    from gridbook import linear as cb_linear
+
+    monkeypatch.setattr(
+        cb_linear, "cb_gemv_fp4_v2",
+        lambda *a, **k: torch.zeros(M, layer._cb_N, dtype=torch.bfloat16))
+    taken = _dense_route(monkeypatch, method, layer, M=M)
+    assert "fp4v2_midm" not in taken
+
+
+def test_dense_sm120_lane_serves_the_e1_gemm_when_resolved(monkeypatch):
+    """Dense E=1 through the sm12x lane had no dispatch coverage."""
+    method = _quality_dense_method()
+    layer = _quality_dense_layer(_cb_bf16_sm120=object())
+    assert _dense_route(monkeypatch, method, layer) == ["sm120"]
+
+
+@pytest.mark.parametrize("mode", ["1", "rowwise", "static_lsq"])
+def test_dense_precedence_fused_fp4_outranks_midm_and_sm120(monkeypatch, mode):
+    """PIN THE DOCUMENTED CHAIN: FUSED_FP4 > MIDM > SM120 > bridge.
+
+    The rule is what each flag CHANGES: PRISMAQUANT_CB_FUSED_FP4 changes the
+    served ACTIVATION CONTRACT, so it outranks the two lanes below it, which
+    only move the GEMM schedule behind the contract the artifact declares.
+    Every losing lane is still resolved and attested at load.
+    """
+    method = _quality_dense_method()
+    method._fused_fp4_ok = (
+        lambda layer, K, *, rowwise=False, static_lsq=False: True)
+    layer = _quality_dense_layer(
+        _cb_fused_fp4_mode=mode,
+        _cb_fp4v2_midm=_midm_ext(), _cb_bf16_sm120=object(),
+        _cb_flat=torch.zeros(4 * (1 << 8) + 4 * (1 << 8),
+                             dtype=torch.bfloat16),
+        _cb_fp4_input_global_scale=torch.tensor([3.0]),
+        _cb_fp4_input_global_scale_f32=3.0,
+        _cb_fp4_lut=torch.ones(1),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(2048))
+    from gridbook import cuda_ext, linear as cb_linear
+
+    class Ext:
+        @staticmethod
+        def cb_nvfp4_quantize_rows(x, multiplier):
+            return (x[:, :128].to(torch.uint8),
+                    torch.zeros(x.shape[0] * 16, dtype=torch.uint8),
+                    torch.ones(x.shape[0], dtype=torch.float32))
+
+        cb_nvfp4_quantize_static_lsq = cb_nvfp4_quantize_rows
+
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(aq, *a, **k):
+            return torch.zeros(aq.shape[0], 2048, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: Ext())
+    monkeypatch.setattr(cb_linear, "native_fp4_quant",
+                        lambda x, gs: (x[:, :128].to(torch.uint8),
+                                       torch.zeros(x.shape[0], 1)))
+    monkeypatch.setattr(
+        cb_linear, "_nvfp4_reciprocal_vector",
+        lambda layer, **k: torch.ones(64, dtype=torch.float32))
+    assert _dense_route(monkeypatch, method, layer) == []
+
+
+def test_dense_precedence_midm_outranks_sm120(monkeypatch):
+    """With both schedule lanes resolved, the fused mid-M lane wins."""
+    method = _quality_dense_method()
+    layer = _quality_dense_layer(
+        _cb_fp4v2_midm=_midm_ext(), _cb_bf16_sm120=object(),
+        _cb_flat=torch.zeros(4 * (1 << 8) + 4 * (1 << 8),
+                             dtype=torch.bfloat16))
+    assert _dense_route(monkeypatch, method, layer) == ["fp4v2_midm"]

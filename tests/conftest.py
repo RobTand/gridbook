@@ -2,9 +2,70 @@
 
 from __future__ import annotations
 
+import os
+import re
 import sys
 
 import pytest
+
+
+# Gridbook-owned includes are quoted and either sit beside the ``.cu`` (``cb_``)
+# or in the vendored fork tree; everything else is CUTLASS/CuTe, whose complete
+# graph ninja's generated depfile owns inside a digest-keyed build directory.
+_OWNED_INCLUDE = re.compile(r'#include\s+"((?:cutlass_fork/|cb_)[^"]+)"')
+
+
+def gridbook_include_closure(csrc_dir: str, root: str) -> set[str]:
+    """Every Gridbook-owned header reachable from ``root``, TRANSITIVELY.
+
+    A build identity that hashes only the includes written in the ``.cu`` is
+    one shared header away from being wrong: ``cb_grouped_common.hpp`` includes
+    ``cutlass_fork/sm120_expert_row_broadcast.hpp``, so an edit to the latter
+    changes four modules' binaries while naming none of them. The grouped-BF16
+    module carried exactly that hole until 2026-08-02 (its declared inputs
+    covered its direct includes and stopped there), which is why the five
+    "declared inputs cover the includes" tests walk this closure instead.
+
+    ``root`` is package-relative, as the declared build-input tuples are.
+    Returns the reachable set EXCLUDING ``root`` itself. A named include that
+    does not exist on disk is reported by the caller's set comparison rather
+    than silently skipped, so a typo in a source cannot hide here.
+    """
+    seen: set[str] = set()
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        path = os.path.join(csrc_dir, current)
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as handle:
+            for name in _OWNED_INCLUDE.findall(handle.read()):
+                if name not in seen:
+                    seen.add(name)
+                    pending.append(name)
+    seen.discard(root)
+    return seen
+
+
+@pytest.fixture(autouse=True)
+def _fresh_env_latches():
+    """Give each test a process that has never read a dispatch flag.
+
+    Gridbook latches every dispatch-selecting environment variable to the first
+    value it observes, so a later change raises instead of mixing two kernel
+    behaviours inside one run. That is exactly right in a serve and exactly
+    wrong across a test session, where one file's ``monkeypatch.setenv`` would
+    otherwise pin the value every subsequent test sees. Each test starts from
+    the unread state a fresh process would have.
+    """
+    try:
+        from gridbook import lane_select
+    except Exception:  # noqa: BLE001 — gridbook may not be importable here
+        yield
+        return
+    lane_select.reset_for_tests()
+    yield
+    lane_select.reset_for_tests()
 
 
 _VLLM_BOUND_GRIDBOOK_MODULES = {

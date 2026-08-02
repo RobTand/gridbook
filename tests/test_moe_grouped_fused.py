@@ -378,10 +378,19 @@ def test_padding_trim_is_bit_identical(monkeypatch):
     torch.manual_seed(12)
     x = torch.randn(
         33, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    # The trim flag is process-stable since 2026-08-02, so flipping it mid-run
+    # raises rather than taking effect. An operator switches arms by
+    # restarting; clearing that one latch is this test's stand-in for the
+    # restart, and running both arms in one process is what makes the
+    # bit-identity claim checkable at all.
+    from gridbook import lane_select
+
     monkeypatch.setenv("PRISMAQUANT_CB_GROUPED_TRIM", "1")
+    lane_select.reset_for_tests("PRISMAQUANT_CB_GROUPED_TRIM")
     trimmed = method._apply_prefill_grouped_fused_v2(
         layer, x, weights, ids, act)
     monkeypatch.setenv("PRISMAQUANT_CB_GROUPED_TRIM", "0")
+    lane_select.reset_for_tests("PRISMAQUANT_CB_GROUPED_TRIM")
     full = method._apply_prefill_grouped_fused_v2(
         layer, x, weights, ids, act)
     assert torch.equal(trimmed, full)
@@ -701,8 +710,14 @@ def test_sm120_bridge_lane_survives_a_single_expert_chunk():
 
     layer._cb_bf16_sm120 = None
     reference = method._apply_prefill_native_bf16(layer, x, weights, ids, act)
+    # Same restart stand-in as the trim A/B above: the chunk knob is latched
+    # process-stable because it gates the packed expert ORDER, and this case
+    # deliberately runs both settings in one process to compare them.
+    from gridbook import lane_select
+
     previous = os.environ.get("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
     os.environ["PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK"] = "1"
+    lane_select.reset_for_tests("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
     layer._cb_bf16_sm120 = ext
     try:
         candidate = method._apply_prefill_native_bf16(
@@ -713,6 +728,7 @@ def test_sm120_bridge_lane_survives_a_single_expert_chunk():
             os.environ.pop("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", None)
         else:
             os.environ["PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK"] = previous
+        lane_select.reset_for_tests("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
 
     assert _report("sm120-lane[chunk=1]-vs-sm80-bridge",
                    reference, candidate) <= _REL
@@ -844,25 +860,63 @@ def test_selector_reads_no_tensor():
     assert isinstance(_sel(tokens=64, top_k=2, experts=4), int)
 
 
+def _gridbook_source(name: str) -> str:
+    """One packaged module's TEXT, without importing it.
+
+    ``gridbook.moe`` imports vLLM at module scope, so a source-level ratchet
+    that used ``inspect.getsource`` would silently not run on a vLLM-free host
+    — which is most of CI, and exactly where a ratchet has to hold.
+    """
+    import os
+
+    import gridbook.moe_routing as anchor
+
+    path = os.path.join(os.path.dirname(anchor.__file__), name)
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
 def test_routing_counts_avoid_the_bincount_host_sync():
-    """The padded routing must count with scatter_add_, not bincount.
+    """No serving module may count routed pairs with bincount.
 
     ATen's CUDA ``bincount`` sizes its output from ``.max().item()`` and so
     host-syncs — the persistent-B lane proved it breaks capture, with a
     negative control. ``cb_grouped_pad_routing``'s docstring claimed "NO HOST
     READS" while calling it anyway, which made the graph-safety story for every
-    padded grouped lane false. Pin the repair here so it cannot regress.
+    padded grouped lane false.
+
+    The ratchet scanned ``moe_routing`` ONLY, which is how the 2026-08-02 sweep
+    could land while ``moe.py``'s DEFAULT routed prefill — the most-served path
+    in the file — still called ``torch.bincount`` on every request. Both
+    modules are scanned now.
     """
     import gridbook.moe_routing as mr
 
-    import inspect
-
-    # The CALL, not the word: the module documents at length why it does not
+    # The CALL, not the word: both modules document at length why they do not
     # use bincount, so the prose legitimately names it.
-    assert "torch.bincount(" not in inspect.getsource(mr)
+    for name in ("moe_routing.py", "moe.py"):
+        assert "torch.bincount(" not in _gridbook_source(name), (
+            f"{name} counts routed pairs with bincount, which host-syncs and "
+            f"cannot be captured")
     counts = mr._expert_counts(torch.tensor([0, 2, 2, 5, 5, 5]), 6)
     assert counts.tolist() == [1, 0, 2, 0, 0, 3]
     assert counts.dtype == torch.int64
+
+
+def test_every_routed_count_goes_through_the_one_shared_helper():
+    """One implementation, not three copies that can each drift.
+
+    ``moe.py`` had a hand-written ``scatter_add_`` in the persistent-B lane and
+    a ``bincount`` in the default lane; the helper's own docstring records the
+    sweep that was supposed to unify them. Spelling the ratchet against the
+    HELPER rather than against the absence of one call means a fourth lane
+    cannot reintroduce the sync under a different spelling.
+    """
+    source = _gridbook_source("moe.py")
+    assert source.count("_expert_counts(") >= 2
+    assert ".scatter_add_(" not in source, (
+        "a routed-count scatter_add_ was open-coded again instead of calling "
+        "moe_routing._expert_counts")
 
 
 # ===========================================================================

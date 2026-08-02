@@ -35,7 +35,8 @@ from .fp8_fused_lane import rung_eligible as fp8_fused_rung_eligible
 from .fp4v2_fused_midm_lane import (eligible as fp4v2_midm_eligible,
                                     fused_mm as fp4v2_midm_fused_mm,
                                     require_lane as fp4v2_midm_require_lane,
-                                    requested as fp4v2_midm_requested)
+                                    requested as fp4v2_midm_requested,
+                                    supports as fp4v2_midm_supports)
 from .native_cutlass import (native_cutlass_scaled_mm, native_fp4_quant,
                              native_fp8_quant, require_native_fp4_quant,
                              require_native_fp8_cutlass)
@@ -43,7 +44,9 @@ from .ops import (cb_bf16_grouped_mm, cb_gemv_fp4_v2, cb_gemv_fp8,
                   fp4_act_qdq_or_codec)
 from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
+    bridge_contract as _route_bridge_contract,
     emit_route,
+    fused_fp4_contract as _route_fused_fp4_contract,
     reciprocal_vector as _nvfp4_reciprocal_vector,
     require_identical_loaded_scales,
     rowwise_range_multiplier as _nvfp4_rowwise_range_multiplier,
@@ -132,6 +135,23 @@ FP4_FUSED_TILE_M_WIDE = 256
 # removes that query from steady-state dispatch.  A failed query is cached as
 # zero so shape selection fails closed to the long-standing TileM=128 kernel.
 _FP4_DENSE_SM_COUNTS: dict[int, int] = {}
+
+
+def _fp8_fused_midm_enabled() -> bool:
+    """The FP8-CB mid-M fused lane's OPT-OUT flag, parsed like every other.
+
+    ``PRISMAQUANT_CB_FUSED_MIDM`` is default-ON, so it used to be spelled
+    ``!= "0"`` — which made ``false``, ``off`` and ``no`` all ENABLE the lane
+    they read as disabling, and it was evaluated unlatched at three separate
+    sites that could disagree. It is now the same strict tri-state parse and
+    the same process-stable latch as the opt-in lanes, with ``default=True``
+    carrying the opt-out sense instead of an inverted comparison.
+    """
+    from .lane_select import latched_bool
+
+    return latched_bool(
+        "PRISMAQUANT_CB_FUSED_MIDM", default=True,
+        meaning="the FP8-CB fused mid-M decode-in-prologue lane")
 
 
 def _fp4_dense_sm_count(device: torch.device) -> int:
@@ -477,9 +497,9 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         layer._cb_fp8_fused_lut_ok = len(blocks) == 1
         dummy = torch.zeros(1, dtype=torch.float32, device=dev)
         if self.is_fp4 and self.is_v2:
-            # v2: NO resident fp32 plane (spec §4/G4). The kernel composes the
-            # E4M3 scales in-register from the packed 9 bytes via this (256,16)
-            # table; the 9-byte plane stays inside cb_qweight.
+            # v2: NO resident fp32 plane (docs/SPEC.md §7, INV-1). The kernel
+            # composes the E4M3 scales in-register from the packed 9 bytes via
+            # this (256,16) table; the 9-byte plane stays inside cb_qweight.
             layer._cb_compose = codec.build_compose_table(self._sub_table).to(dev)
             layer._cb_scale = dummy
             # Warm the CUDA-GEMV JIT build at LOAD time — otherwise the ~30 s
@@ -488,7 +508,20 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # below).
             self._cuda_gemv_ok()
         elif self.is_fp4:
-            layer._cb_scale = codec.decode_fp4_scale_plane(qw, self.k).to(dev)
+            # LEGACY FP4-CB v1. This branch used to materialize
+            # ``decode_fp4_scale_plane(qw, k)`` — a DENSE fp32 ``[rows, K/16]``
+            # tensor, held on the layer for its lifetime, which is precisely
+            # the "resident per-superblock FP32 scale plane" docs/SPEC.md §7
+            # INV-1 forbids by name. At K=12 it was as large as the packed
+            # weight it accompanied.
+            #
+            # It was also read by nothing: every ``_cb_scale`` read in this
+            # file sits in ``_apply_inline`` BELOW the ``if self.is_fp4``
+            # branch, i.e. on the FP8 path. And ``_require_fp4_v2_product``
+            # a few dozen lines below rejects this exact layout, so a v1 layer
+            # allocated the plane and then failed the load anyway. Removing it
+            # cannot change any behaviour that survives the load.
+            layer._cb_scale = dummy
             layer._cb_compose = dummy
         else:
             layer._cb_scale = layer.weight_scale.data.reshape(-1).to(
@@ -542,8 +575,16 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 f"{self.prefix}: native {family} quality prefill requires "
                 f"N divisible by {required_n_alignment}, got N={rows}")
         require_ext(f"{self.prefix} dense CB decode/QDQ/expansion")
+        # PARSE EVERY DISPATCH FLAG, on every layer, regardless of format. A
+        # typo must raise on an FP8-only model too: these selectors used to be
+        # read only inside the ``is_fp4`` branch below, so on an FP8 serve
+        # ``PRISMAQUANT_CB_FP4_FUSED_MIDM=ture`` was never parsed and the
+        # operator got a silent baseline run instead of an error. Parsing is
+        # separated from ACTING on the value, which stays per-format.
+        fused_mode = _fp4_fused_mode()
+        midm_requested = fp4v2_midm_requested()
+        sm120_requested = bf16_sm120_requested()
         if self.is_fp4:
-            fused_mode = _fp4_fused_mode()
             layer._cb_fused_fp4_mode = fused_mode
             self._require_fp4_v2_product("model load")
             from .cuda_ext import (require_bf16_grouped_ext,
@@ -558,7 +599,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # than silently serve the SM80 schedule (a different reduction
             # order than the one the operator asked to measure).
             layer._cb_bf16_sm120 = None
-            if bf16_sm120_requested():
+            if sm120_requested:
                 layer._cb_bf16_sm120 = bf16_sm120_require_lane(
                     f"{self.prefix} dense FP4-v2 quality prefill", device=dev)
             # OPT-IN contract-preserving fused mid-M lane (audit §3 P2a):
@@ -569,10 +610,33 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # the LOAD rather than quietly serve the expand + bridge route,
             # which would answer a different question than the operator asked.
             layer._cb_fp4v2_midm = None
-            if fp4v2_midm_requested():
-                layer._cb_fp4v2_midm = fp4v2_midm_require_lane(
+            if midm_requested:
+                lane = fp4v2_midm_require_lane(
                     f"{self.prefix} dense FP4-v2 fused mid-M prefill",
                     device=dev)
+                # PER-LAYER gate, at LOAD, exactly as the sibling persistent-B
+                # lane does (moe.py). Attesting only that the EXTENSION exists
+                # left every M-independent layer property — an uncompiled rung,
+                # K not superblock-aligned, N not 8-aligned, a projection
+                # spanning two interned dictionaries — to be discovered per
+                # call and answered by silently serving expand + bridge for
+                # every request, which is the substitution this flag exists to
+                # forbid. The M band stays a call-time fall-through: that is a
+                # property of the REQUEST, it is what makes this a mid-M lane,
+                # and PLUGIN.md documents it.
+                reason = fp4v2_midm_supports(
+                    lane, layer, N=layer._cb_N, K=layer._cb_K, k_bits=self.k,
+                    n_sub=self.n_sub, type_size=self.type_size,
+                    is_v2=self.is_v2)
+                if reason is not None:
+                    from .cuda_ext import NativeKernelUnavailableError
+                    raise NativeKernelUnavailableError(
+                        f"{self.prefix}: requested the FP4-CB fused mid-M lane "
+                        f"(PRISMAQUANT_CB_FP4_FUSED_MIDM=1), but this layer "
+                        f"cannot use it ({reason}); Gridbook does not "
+                        "substitute a different kernel behind an explicit lane "
+                        "selection")
+                layer._cb_fp4v2_midm = lane
             if fused_mode:
                 rowwise = fused_mode in _FP4_FUSED_ROWWISE_MODES
                 static_lsq = fused_mode in _FP4_FUSED_STATIC_LSQ_MODES
@@ -594,8 +658,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # Optional fused decode-in-prologue is resolved now even when it
             # misses. get_fused_ext memoizes that result, so first prefill can
             # neither JIT-compile nor silently discover a different path.
-            fused_midm = (
-                os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0")
+            fused_midm = _fp8_fused_midm_enabled()
             layer._cb_fp8_fused_midm = fused_midm
             if fused_midm:
                 get_fused_ext()
@@ -785,7 +848,23 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # Preserve the historical call shape for instrumentation and
             # compatibility wrappers that know only the rowwise flag.
             eligible = self._fused_fp4_ok(layer, K, rowwise=rowwise)
+        # K0.4 dense record for the fused NVFP4 lane. The lane carried only the
+        # three TileM integers, so a report could see WHICH tile ran but not
+        # whether the fused route ran at all — and the alternative serves a
+        # DIFFERENT activation contract, which is the one distinction the
+        # record exists to make. Tensor-free and sync-free, like the FP8 twin.
+        route_common = dict(
+            kind="dense",
+            policy=(getattr(layer, "_cb_fused_fp4_mode", None)
+                    or ("rowwise" if rowwise else
+                        "static_lsq" if static_lsq else "1")),
+            contract=_route_fused_fp4_contract(
+                rowwise=rowwise, static_lsq=static_lsq),
+            shape=f"M{int(M)}:N{int(N)}:K{int(K)}")
         if not eligible:
+            emit_route(layer, symbol="", state="fallback", tile_m=0,
+                       reason="fused fp4 dense eligibility gate declined",
+                       **route_common)
             return None
         from .cuda_ext import get_fused_fp4_ext
         fext = get_fused_fp4_ext()
@@ -820,6 +899,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         x2 = x.reshape(-1, K)
         if rowwise:
             if x2.dtype not in (torch.bfloat16, torch.float16):
+                emit_route(layer, symbol="", state="fallback", tile_m=0,
+                           reason=(f"activation dtype {x2.dtype} is not half "
+                                   f"precision; cb_nvfp4_quantize_rows "
+                                   f"requires it"),
+                           **route_common)
                 return None
             # Full UE4M3 range per row. The extension returns the exact three
             # operands consumed by the existing fused GEMM; no weight decoder,
@@ -829,6 +913,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             )
         elif static_lsq:
             if x2.dtype not in (torch.bfloat16, torch.float16):
+                emit_route(layer, symbol="", state="fallback", tile_m=0,
+                           reason=(f"activation dtype {x2.dtype} is not half "
+                                   f"precision; "
+                                   f"cb_nvfp4_quantize_static_lsq requires it"),
+                           **route_common)
                 return None
             # Keep the producer-attested G and its native E2M1/SFA payload.
             # The shared activation kernel changes only the existing per-row
@@ -860,11 +949,21 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             * ((N + FP4_FUSED_TILE_N - 1) // FP4_FUSED_TILE_N)
         )
         layer._cb_fp4_fused_sm_count = sm_count
+        route_common["tile_m"] = int(tile_m)
+        route_common["tile_candidate_ctas"] = int(
+            layer._cb_fp4_fused_tile_candidate_ctas)
+        route_common["tile_sm_count"] = int(sm_count)
+        route_common["tile_compiled"] = f"{FP4_FUSED_TILE_M_WIDE},128"
+        emit_route(layer, symbol="cb_fused_fp4_prefill_mm_scaled",
+                   state="error", reason="launch did not return",
+                   **route_common)
         y = fext.cb_fused_fp4_prefill_mm_scaled(
             aq, sfa.view(torch.uint8).reshape(-1), layer._cb_qw_padded,
             layer._cb_fp4_lut, layer._cb_fp4_compose_u8, a_scales,
             layer._cb_fp4_ones, N, K, self.k, self.n_sub, self.type_size,
             self.is_v2, lut_tile_ids, tile_m)
+        emit_route(layer, symbol="cb_fused_fp4_prefill_mm_scaled",
+                   state="served", reason=None, **route_common)
         return y.reshape(*x.shape[:-1], N)
 
     def _expand_fp4_quality_weight(self, layer, N: int,
@@ -955,6 +1054,22 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                     layer, x, N, K, M, **mode_kwargs)
                 if y is not None:
                     return y
+                # SAME rule as the MoE twin (moe.py::_apply_inline). The mode
+                # was ATTESTED at model load, so a None here means the lane
+                # declined this concrete CALL — in practice the rowwise /
+                # static-LSQ activation quantizers' half-precision guard
+                # (``_try_fused_fp4``'s dtype checks). Falling through would
+                # serve the exact BF16 quality route, whose activation bucket
+                # is the fp32-emulated group QDQ rather than the format's
+                # native ue4m3 scale factors: a DIFFERENT served activation
+                # contract than the one the operator explicitly selected, and
+                # silently so. Gridbook does not substitute an activation
+                # contract, so this is an error, exactly as it is for MoE.
+                from .cuda_ext import NativeKernelUnavailableError
+                raise NativeKernelUnavailableError(
+                    f"{self.prefix}: requested native fused dense FP4 mode "
+                    f"{fused_mode!r} became unavailable after model load "
+                    f"(activation dtype {x.dtype}, M={M}, N={N}, K={K})")
 
             self._require_fp4_v2_product("dense execution")
             xq = fp4_act_qdq_or_codec(x)
@@ -974,6 +1089,14 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 # xq, so only the FP32 reduction order differs. Unset (the
                 # default) leaves the route below byte-for-byte unchanged.
                 midm = getattr(layer, "_cb_fp4v2_midm", None)
+                # K0.4: all three routes below serve the SAME activation
+                # contract and differ only in GEMM schedule, so the symbol is
+                # the only field that separates them in a report — which is
+                # exactly what an opt-in schedule A/B needs to read back.
+                quality_route = dict(
+                    kind="dense", shape=f"M{int(M)}:N{int(N)}:K{int(K)}",
+                    contract=_route_bridge_contract(True),
+                    state="served", reason=None, tile_m=0)
                 if midm is not None and fp4v2_midm_eligible(
                         midm, layer, M=M, N=N, K=K, k_bits=self.k,
                         n_sub=self.n_sub, type_size=self.type_size,
@@ -981,6 +1104,9 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                     y = fp4v2_midm_fused_mm(
                         midm, xq.reshape(M, K).contiguous(), layer,
                         N=N, K=K, k_bits=self.k)
+                    emit_route(layer, policy="fp4v2_midm",
+                               symbol="cb_fused_fp4v2_prefill_mm",
+                               **quality_route)
                 else:
                     # Exact FP4-CB-v2 -> BF16 expansion followed by the same
                     # owned device-scheduled CUTLASS grouped kernel as MoE
@@ -998,11 +1124,18 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                         # single bf16 round; only the fp32 reduction order
                         # differs.
                         y = bf16_sm120_dense_mm(lane, xq2, W)
+                        emit_route(
+                            layer, policy="bf16_sm120",
+                            symbol="cb_bf16_grouped_mm_sm120_gather",
+                            **quality_route)
                     else:
                         expert_ends = torch.full(
                             (1,), M, dtype=torch.int32, device=x.device)
                         y = cb_bf16_grouped_mm(
                             xq2, W.unsqueeze(0), expert_ends, 0)
+                        emit_route(layer, policy="bf16_grouped_bridge",
+                                   symbol="cb_bf16_grouped_mm",
+                                   **quality_route)
                     del W
                 y = y.reshape(*x.shape[:-1], N)
             if bias is not None:
@@ -1060,16 +1193,17 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # in hand, `fused_fp8_kbits` is the authority and the law is only a
         # filter over it. Rungs off the law are not "unsupported" — they take
         # the exact expand + CUTLASS route below, which serves all 21.
-        fused_midm = getattr(
-            layer, "_cb_fp8_fused_midm",
-            os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0")
-        live_fused_midm = (
-            os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0")
-        if live_fused_midm != fused_midm:
-            raise RuntimeError(
-                "PRISMAQUANT_CB_FUSED_MIDM changed after this CB layer was "
-                "loaded; restart the process instead of changing the native "
-                "kernel set during serving")
+        # ONE latched read (see ``_fp8_fused_midm_enabled``), taken on the
+        # dispatch path as well as at load so a mid-serve change RAISES instead
+        # of being silently ignored. The value USED is the layer's, fixed at
+        # load; this read exists to make the change loud. That was previously
+        # three unlatched reads of the raw environment compared against each
+        # other — the right instinct with the wrong mechanism, since the
+        # comparison could only notice a change straddling those two lines, and
+        # every one of the three accepted "false" and "off" as ENABLED because
+        # they tested ``!= "0"``.
+        live = _fp8_fused_midm_enabled()
+        fused_midm = getattr(layer, "_cb_fp8_fused_midm", live)
         if (bias is None and FP8_CUDA_GEMV_M_MAX < x2.shape[0] <= 128
                 and codec.fp8_fused_rung_supported(self.k)
                 and fused_midm

@@ -1,5 +1,6 @@
 """Correctness gate for the FP8_CB TRANSIENT-EXPANSION prefill path
-(docs/lanes/nvfp4-cb/serving-kernel.md §1a, prototype ii+).
+(docs/KERNELS.md, "Prefill / non-GEMV path (M > 8): native transient
+expansion"; the INV-1 bound asserted in Part B is docs/SPEC.md §7).
 
 Two parts, split by the ``-k`` selector so each runs where it can:
 

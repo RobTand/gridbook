@@ -7,10 +7,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gridbook"
 dynamic = ["version"]          # single source of truth: gridbook.__version__
-# Bit-rate range is the union of the two format families' rung ladders, from
-# docs/nvfp4-cb-plan/STANDARDS.md: NVFP4_CB K12-K24 = 2.0-3.28 bpw (2.28-3.53
-# effective) and FP8_CB K28-K48 = 3.5-6.0 bpw. The published artifacts sit at
-# 2.9 / 5.5 / 6 bit, so "sub-4-bit" would be wrong for most of the family.
+# Bit-rate range is the union of the two format families' rung ladders, quoted
+# from the PrismaQuant producer project's kernel standard (STANDARDS.md) — a
+# SEPARATE repository, not a path in this one, and not verifiable from here.
+# NVFP4_CB K12-K24 = 2.0-3.28 bpw (2.28-3.53 effective) and FP8_CB K28-K48 =
+# 3.5-6.0 bpw. The in-repo normative definition is docs/SPEC.md §1.4: its fp8
+# formula (k/8) reproduces 3.5-6.0 exactly, while the fp4 figures fold v1 and
+# v2 scale accounting together and are not derivable from §1.4 alone. The
+# published artifacts sit at 2.9 / 5.5 / 6 bit, so "sub-4-bit" would be wrong
+# for most of the family.
 description = "vLLM plugin for the NVFP4-CB / FP8-CB product-codebook weight formats: 2-6 bit-per-weight LLM quantization served by dedicated CUDA decode and prefill kernels."
 readme = "README.md"
 license = "Apache-2.0"

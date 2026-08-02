@@ -30,6 +30,8 @@ import types
 
 import pytest
 
+from conftest import gridbook_include_closure
+
 torch = pytest.importorskip("torch")
 cuda_ext = pytest.importorskip(
     "gridbook.cuda_ext", reason="gridbook not importable")
@@ -457,11 +459,14 @@ def test_declared_build_inputs_cover_every_gridbook_include():
 
     Adding a Gridbook include to ``cb_moe_persistent_b.cu`` without declaring
     it here would leave that header out of the cache key — the stale-kernel
-    class the identity mechanism exists to prevent.
+    class the identity mechanism exists to prevent. TRANSITIVE since
+    2026-08-02: this source includes no Gridbook header today, so the closure
+    is empty and the assertion is a standing guard rather than a live check —
+    but if it ever grows one that itself includes another, both must land in
+    the tuple, which is precisely the case the grouped-BF16 module got wrong.
     """
-    with open(_source_path(), encoding="utf-8") as source:
-        included = set(re.findall(
-            r'#include\s+"((?:cutlass_fork/|cb_)[^"]+)"', source.read()))
+    included = gridbook_include_closure(cuda_ext.csrc_dir(),
+                                        "cb_moe_persistent_b.cu")
     declared = set(cuda_ext._MOE_PERSISTENT_B_BUILD_INPUTS)
     assert "cb_moe_persistent_b.cu" in declared
     assert included <= declared, (
@@ -643,14 +648,25 @@ def test_prefill_still_requires_bf16_activations(monkeypatch):
 def test_persistent_b_loader_is_one_additive_block_at_the_end_of_cuda_ext():
     """The loader is appended, never interleaved.
 
-    Everything this lane adds to ``cuda_ext`` lives between two marker
-    comments at the very end of the file, so the module keeps a single
-    contiguous, self-contained diff surface: nothing above the BEGIN marker
-    mentions the lane, and nothing follows the END marker.
+    Every line of this lane's IMPLEMENTATION lives between two marker comments
+    at the very end of the file, so the module keeps a single contiguous,
+    self-contained diff surface: no code above the BEGIN marker mentions the
+    lane, and nothing follows the END marker.
+
+    PROSE IS EXEMPT (2026-08-02). The check used to reject any mention at all,
+    which put it in direct conflict with the module docstring's job of
+    enumerating cuda_ext's seven build-cache subdirectories and five
+    digest-keyed modules — this lane is one of each, and a docstring that
+    omitted it to satisfy a test would be a false docstring. The invariant that
+    earns its keep is about CODE: the lane must remain revertible as one block,
+    which a comment naming it does not affect.
     """
+    import ast
+
     path = os.path.abspath(cuda_ext.__file__)
     with open(path, encoding="utf-8") as handle:
-        lines = handle.read().splitlines()
+        text = handle.read()
+    lines = text.splitlines()
     begin = [i for i, line in enumerate(lines)
              if "BEGIN ADDITIVE BLOCK — persistent-B grouped MoE loader" in
              line]
@@ -660,9 +676,25 @@ def test_persistent_b_loader_is_one_additive_block_at_the_end_of_cuda_ext():
     assert len(end) == 1, f"expected one END marker, found {len(end)}"
     assert begin[0] < end[0]
 
-    above = "\n".join(lines[:begin[0]]).lower()
-    assert "persistent_b" not in above
-    assert "persistent-b" not in above
+    # Every docstring — module, class or function — plus every ``#`` comment
+    # is prose; what remains is code.
+    prose = set()
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", None)
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            prose.update(range(body[0].lineno, body[0].end_lineno + 1))
+    for number, line in enumerate(lines[:begin[0]], start=1):
+        if number in prose:
+            continue
+        code = line.split("#", 1)[0].lower()
+        assert "persistent_b" not in code and "persistent-b" not in code, (
+            f"cuda_ext.py:{number} references the lane in CODE above the "
+            f"additive block: {line.strip()!r}")
 
     trailer = lines[end[0] + 1:]
     for line in trailer:

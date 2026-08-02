@@ -38,6 +38,8 @@ import types
 
 import pytest
 
+from conftest import gridbook_include_closure
+
 torch = pytest.importorskip("torch")
 
 from gridbook import cuda_ext  # noqa: E402
@@ -131,17 +133,24 @@ def test_the_lane_probes_nothing_while_the_flag_is_unset(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _ext_stub(*, max_m: int = 128, kbits=_COMPILED_KBITS, omit=()):
+def _ext_stub(*, max_m: int = 128, kbits=_COMPILED_KBITS, omit=(),
+              prepare=None):
     """A stand-in for the loaded fused FP4-v2 module.
+
+    Carries the loader's FULL strict tuple rather than the three entry points
+    this module dereferences: ``require_lane`` checks against
+    ``cuda_ext._FUSED_FP4V2_SYMBOLS`` since 2026-08-02, precisely so a local
+    list cannot drift below what the loader enforces.
 
     ``cb_fused_fp4v2_kbits`` deliberately returns a LIST: the accessor's job
     includes normalizing whatever pybind hands back into a tuple of ints.
     """
-    symbols = {
-        "cb_fused_fp4v2_prefill_mm": lambda *a, **k: None,
-        "cb_fused_fp4v2_max_m": lambda: max_m,
-        "cb_fused_fp4v2_kbits": lambda: list(kbits),
-    }
+    symbols = {name: (lambda *a, **k: None)
+               for name in cuda_ext._FUSED_FP4V2_SYMBOLS}
+    symbols["cb_fused_fp4v2_max_m"] = lambda: max_m
+    symbols["cb_fused_fp4v2_kbits"] = lambda: list(kbits)
+    if prepare is not None:
+        symbols["cb_fused_fp4v2_prepare"] = prepare
     for name in omit:
         del symbols[name]
     return types.SimpleNamespace(**symbols)
@@ -159,7 +168,7 @@ def test_require_lane_fails_closed_without_the_extension(monkeypatch):
     assert "does not substitute a different kernel" in message
 
 
-@pytest.mark.parametrize("missing", lane._REQUIRED_SYMBOLS)
+@pytest.mark.parametrize("missing", cuda_ext._FUSED_FP4V2_SYMBOLS)
 def test_require_lane_fails_closed_on_an_incomplete_module(monkeypatch,
                                                            missing):
     """A partial module is a broken build, not an older one.
@@ -167,12 +176,48 @@ def test_require_lane_fails_closed_on_an_incomplete_module(monkeypatch,
     The loader keys both the module name and the build directory on the source
     identity, so anything that imports at all was compiled from exactly these
     sources; a missing binding therefore cannot mean "a previous release".
+
+    Parametrized over the LOADER's tuple, not a local restatement: the lane's
+    private list used to be a strict subset, so a module missing a binding the
+    loader required could still pass this gate.
     """
     monkeypatch.setattr(cuda_ext, "get_fused_fp4v2_ext",
                         lambda: _ext_stub(omit=(missing,)))
     with pytest.raises(NativeKernelUnavailableError) as exc_info:
         lane.require_lane("FP4 quality dense prefill")
     assert missing in str(exc_info.value)
+
+
+def test_require_lane_opts_the_smem_in_at_load_not_first_launch(monkeypatch):
+    """``cb_fused_fp4v2_prepare`` must be called by the LOAD-time resolution.
+
+    Every compiled class exceeds the 48 KiB static limit, so CUTLASS's
+    ``initialize()`` performs a ``cudaFuncSetAttribute`` — not stream-ordered
+    work — from inside ``run_fused``, i.e. inside a forward, possibly a
+    CUDA-graph capture. Attesting here is what moves it.
+    """
+    calls = []
+    stub = _ext_stub(prepare=lambda: calls.append("prepare"))
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4v2_ext", lambda: stub)
+
+    assert lane.require_lane("FP4 quality dense prefill") is stub
+    assert calls == ["prepare"]
+
+
+def test_require_lane_fails_closed_when_prepare_rejects_the_device(monkeypatch):
+    """The device gate is the kernel's; a failure is normalized, never
+    deferred to the first prefill."""
+    def prepare():
+        raise RuntimeError("needs 51200 B of opt-in shared memory")
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4v2_ext",
+                        lambda: _ext_stub(prepare=prepare))
+    with pytest.raises(NativeKernelUnavailableError) as exc_info:
+        lane.require_lane("FP4 quality dense prefill")
+    message = str(exc_info.value)
+    assert "load-time device attestation failed" in message
+    assert "51200" in message
+    assert "does not defer this failure to first prefill" in message
 
 
 def test_require_lane_accepts_a_complete_module(monkeypatch):
@@ -417,19 +462,20 @@ def test_the_declared_inputs_cover_the_fork_and_the_shared_glue():
 def test_the_declared_inputs_are_read_from_the_source_not_restated():
     """Adding a Gridbook include without declaring it must fail here.
 
-    The same gate the FP8 and grouped-BF16 modules carry: the declared set is
-    checked AGAINST the translation unit rather than trusted, so the one edit
-    that reintroduces the stale-kernel class cannot pass review silently.
+    The same gate the FP8 and grouped-BF16 modules carry, and TRANSITIVE since
+    2026-08-02: a header reached only through ``cb_grouped_common.hpp`` changes
+    this binary exactly as a directly included one does, and reading the
+    translation unit's own include list alone is how the grouped-BF16 module
+    lost ``sm120_expert_row_broadcast.hpp`` from its cache key.
     """
     path = os.path.join(cuda_ext.csrc_dir(), "cb_fused_fp4v2_gemm.cu")
     if not os.path.isfile(path):
         pytest.skip("cb_fused_fp4v2_gemm.cu not present in this install")
-    with open(path, encoding="utf-8") as source:
-        included = set(re.findall(
-            r'#include\s+"((?:cutlass_fork/|cb_)[^"]+)"', source.read()))
+    included = gridbook_include_closure(cuda_ext.csrc_dir(),
+                                        "cb_fused_fp4v2_gemm.cu")
     declared = set(cuda_ext._FUSED_FP4V2_BUILD_INPUTS)
     assert included <= declared, (
-        f"cb_fused_fp4v2_gemm.cu includes {sorted(included - declared)}, "
+        f"cb_fused_fp4v2_gemm.cu reaches {sorted(included - declared)}, "
         f"which do not key its build identity — a cached kernel built from "
         f"an older copy of those headers would be served")
 
@@ -495,3 +541,95 @@ def test_identity_records_the_architecture_accelerated_target(tmp_path,
 def test_only_the_blackwell_pair_is_buildable(capability, buildable):
     """Checked BEFORE include discovery, so a doomed nvcc run never starts."""
     assert cuda_ext.fused_fp4v2_buildable(capability) is buildable
+
+
+# ---------------------------------------------------------------------------
+# supports(): the LOAD-time per-layer gate (audit follow-up #7)
+# ---------------------------------------------------------------------------
+
+
+def test_supports_accepts_a_plain_fp4_cb_v2_layer():
+    ext = _ext_stub()
+    assert lane.supports(ext, _layer_stub(16), N=2048, K=4096, k_bits=16,
+                         n_sub=2, type_size=73, is_v2=True) is None
+
+
+@pytest.mark.parametrize("override,mentions", [
+    ({"k_bits": 26, "type_size": 4 * 26 + 9}, "not a rung this build"),
+    ({"K": 4095}, "superblock"),
+    ({"N": 2044}, "8-element"),
+    ({"n_sub": 1}, "two-tier v2 product mode"),
+    ({"type_size": 72}, "two-tier v2 product mode"),
+    ({"is_v2": False}, "two-tier v2 product mode"),
+])
+def test_supports_rejects_with_a_readable_reason(override, mentions):
+    """Each M-independent miss must be diagnosable at LOAD, in a sentence.
+
+    Before this gate existed the lane attested only that the EXTENSION was
+    present, so a layer that could never take it served the expand + bridge
+    route for every request while the load reported success — the silent
+    substitution behind an explicit selection that the flag forbids.
+    """
+    kwargs = dict(N=2048, K=4096, k_bits=16, n_sub=2, type_size=73,
+                  is_v2=True)
+    kwargs.update(override)
+    reason = lane.supports(_ext_stub(), _layer_stub(kwargs["k_bits"]),
+                           **kwargs)
+    assert reason is not None and mentions in reason
+
+
+def test_supports_rejects_a_multi_dictionary_fused_projection():
+    reason = lane.supports(
+        _ext_stub(), _layer_stub(16, segments=((0, 8, 0), (8, 8, 1))),
+        N=2048, K=4096, k_bits=16, n_sub=2, type_size=73, is_v2=True)
+    assert reason is not None and "interned codebook blocks" in reason
+
+
+def test_supports_deliberately_excludes_the_m_band():
+    """The M band is a property of the REQUEST, not of the layer.
+
+    Falling through for an out-of-band M is the documented behaviour and is
+    what makes this a mid-M lane; making it a load failure would reject every
+    layer, since one layer serves every M.
+    """
+    import inspect
+
+    source = inspect.getsource(lane.supports)
+    assert "MID_M_MIN" not in source and "max_m(" not in source
+
+
+def test_eligible_is_supports_plus_the_m_band():
+    """One predicate, not two that can disagree."""
+    ext = _ext_stub()
+    layer = _layer_stub(16)
+    shape = dict(N=2048, K=4096, k_bits=16, n_sub=2, type_size=73,
+                 is_v2=True)
+    assert lane.supports(ext, layer, **shape) is None
+    assert lane.eligible(ext, layer, M=64, **shape)
+    assert not lane.eligible(ext, layer, M=8, **shape)
+    assert not lane.eligible(ext, layer, M=129, **shape)
+    # A layer-level miss makes every M ineligible, including in-band ones.
+    bad = _layer_stub(16, segments=((0, 8, 0), (8, 8, 1)))
+    assert lane.supports(ext, bad, **shape) is not None
+    assert not lane.eligible(ext, bad, M=64, **shape)
+
+
+def test_facts_is_guarded_on_the_dispatch_path():
+    """A module that will not answer reads as "offers nothing", never raises.
+
+    ``eligible`` runs per prefill and its docstring promises a miss falls
+    through to the shipping route, so an unguarded read here would raise
+    mid-request at exactly the site that promises not to.
+    """
+    class Hostile:
+        def cb_fused_fp4v2_max_m(self):
+            raise RuntimeError("module went away")
+
+        def cb_fused_fp4v2_kbits(self):
+            raise RuntimeError("module went away")
+
+    ext = Hostile()
+    assert lane.max_m(ext) == 0
+    assert lane.kbits(ext) == ()
+    assert not lane.eligible(ext, _layer_stub(16), M=64, N=2048, K=4096,
+                             k_bits=16, n_sub=2, type_size=73, is_v2=True)

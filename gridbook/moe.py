@@ -54,6 +54,7 @@ from .moe_persistent_b_lane import (require_lane as persistent_b_require_lane,
                                     supports as persistent_b_supports)
 from .moe_routing import (
     GROUPED_TILE_N,
+    _expert_counts,
     cb_cached_row_offsets,
     cb_grouped_block_offsets,
     cb_grouped_pad_routing,
@@ -67,7 +68,9 @@ from .native_cutlass import (native_fp4_quant, native_fp8_quant,
                              require_native_moe_activation)
 from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
+    bridge_contract as _route_bridge_contract,
     emit_route,
+    fused_fp4_contract as _route_fused_fp4_contract,
     reciprocal_vector as _nvfp4_reciprocal_vector,
     require_identical_loaded_scales,
     rowwise_range_multiplier as _nvfp4_rowwise_range_multiplier,
@@ -243,6 +246,24 @@ _FUSED_FP4_MOE_MODES = (
     | _FUSED_FP4_MOE_ROWWISE_MODES
 )
 _FUSED_FP4_MOE_ALLOWED_MODES = frozenset(("",)) | _FUSED_FP4_MOE_MODES
+
+
+def _grouped_trim() -> bool:
+    """The padded grouped lanes' OPT-OUT trim read (one host read per layer).
+
+    Default-ON, and parsed like every other dispatch flag: the old form
+    compared ``== "1"``, so any spelling other than the literal ``1`` — a
+    stray space, ``true``, ``yes`` — silently selected the NON-default arm and
+    launched the full static-capacity tail, which is a performance change the
+    operator did not ask for and would read as a regression of the kernel.
+    Latched, because the two lanes that read it must not disagree within one
+    run.
+    """
+    from .lane_select import latched_bool
+
+    return latched_bool(
+        "PRISMAQUANT_CB_GROUPED_TRIM", default=True,
+        meaning="the padded grouped lanes' one-host-read block trim")
 
 
 def _requested_fused_fp4_moe_mode() -> str:
@@ -561,8 +582,15 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # silently serving expand+bridge instead would answer a different
         # question than the operator asked. FP4-CB v2 only — an FP8-CB layer
         # in a mixed serve keeps its own route rather than failing the load.
+        #
+        # The flag is PARSED for every layer, FP8 included: reading it only
+        # inside the ``is_fp4`` guard meant a typo on an FP8-only model was
+        # never seen, so the operator got a silent baseline run instead of an
+        # error. Parsing is separated from acting on the value.
+        persistent_b_on = persistent_b_requested()
+        fused_fp4_moe_mode = _requested_fused_fp4_moe_mode()
         layer._cb_moe_persistent_b = None
-        if persistent_b_requested() and self.is_fp4:
+        if persistent_b_on and self.is_fp4:
             reason = persistent_b_supports(
                 is_fp4=self.is_fp4, is_v2=self.is_v2, n_sub=self.n_sub,
                 k_bits=self.k, type_size=self.type_size,
@@ -581,12 +609,38 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # request that happens to carry routed rows.
             layer._cb_moe_persistent_b_cfg = persistent_b_resolve_cfg(
                 layer._cb_moe_persistent_b)
-            print(f"[prismaquant-cb] moe_prefill {self.prefix} -> "
-                  f"persistent-B decode-in-mainloop (k={self.k} "
-                  f"type_size={self.type_size} hidden={layer._cb_hidden} "
-                  f"inter={layer._cb_inter} "
-                  f"cfg={layer._cb_moe_persistent_b_cfg}); no expanded "
-                  f"[E,N,K] transient", flush=True)
+            # PRECEDENCE, announced rather than discovered. An explicit fused
+            # NVFP4 MoE mode CHANGES THE SERVED ACTIVATION CONTRACT; this lane
+            # only changes the GEMM schedule behind the contract the artifact
+            # already declares. The contract-changing selection therefore wins
+            # — that is what ``_apply_inline`` implements, and it is the
+            # deliberate rule, not an accident of ordering.
+            #
+            # Until 2026-08-02 this print announced persistent-B
+            # unconditionally, so a run with BOTH flags set logged one route at
+            # model load and served the other for every request. A dispatch log
+            # that names the wrong kernel is worse than no log: it is the
+            # artifact an A/B is read from. The lane stays resolved and
+            # attested either way, so an unserveable explicit selection still
+            # fails the LOAD rather than being quietly ignored.
+            overriding_mode = fused_fp4_moe_mode
+            if overriding_mode:
+                print(f"[prismaquant-cb] moe_prefill {self.prefix} -> fused "
+                      f"NVFP4 MoE {overriding_mode!r} (k={self.k} "
+                      f"type_size={self.type_size} hidden={layer._cb_hidden} "
+                      f"inter={layer._cb_inter}); PRECEDENCE: "
+                      f"PRISMAQUANT_CB_FUSED_FP4_MOE changes the served "
+                      f"activation contract and outranks "
+                      f"PRISMAQUANT_CB_MOE_PERSISTENT_B, which is attested "
+                      f"(cfg={layer._cb_moe_persistent_b_cfg}) but will NOT "
+                      f"serve this layer", flush=True)
+            else:
+                print(f"[prismaquant-cb] moe_prefill {self.prefix} -> "
+                      f"persistent-B decode-in-mainloop (k={self.k} "
+                      f"type_size={self.type_size} hidden={layer._cb_hidden} "
+                      f"inter={layer._cb_inter} "
+                      f"cfg={layer._cb_moe_persistent_b_cfg}); no expanded "
+                      f"[E,N,K] transient", flush=True)
         if not self._cuda_moe_ok(layer):
             raise NativeKernelUnavailableError(
                 f"{self.prefix}: routed decode layout has no native grouped "
@@ -598,7 +652,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if not self.is_fp4:
             self._gf2_ok(layer)
         else:
-            mode = _requested_fused_fp4_moe_mode()
+            mode = fused_fp4_moe_mode
             layer._cb_fused_fp4_moe_mode = mode
             if mode:
                 rowwise = mode in _FUSED_FP4_MOE_ROWWISE_MODES
@@ -676,6 +730,24 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 layer, x, topk_weights, topk_ids, act)
 
         if self.is_fp4:
+            # ROUTED FP4 PRECEDENCE (deliberate, and announced at model load —
+            # see process_weights_after_loading):
+            #
+            #   PRISMAQUANT_CB_FUSED_FP4_MOE
+            #     > PRISMAQUANT_CB_MOE_PERSISTENT_B
+            #       > PRISMAQUANT_CB_BF16_SM120
+            #         > the default expand + grouped-bridge route
+            #
+            # The rule is what each flag CHANGES, not the order they were
+            # added. The fused NVFP4 mode changes the served ACTIVATION
+            # CONTRACT, so it outranks everything below it, which only move the
+            # GEMM schedule behind the contract the artifact already declares.
+            # Persistent-B in turn outranks the sm12x bridge lane because it
+            # replaces the pair of operations that lane is one half of (see
+            # ``_apply_prefill_native_bf16``, which implements the lower two).
+            # Every one of them is still resolved and attested at load, so an
+            # unserveable explicit selection fails the LOAD even when a
+            # higher-precedence flag will be the one that serves.
             mode = getattr(layer, "_cb_fused_fp4_moe_mode", None)
             if mode is None:
                 # Production fixes this at model load. This branch supports
@@ -846,16 +918,49 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         (the swizzled SFA plane is row-block-interleaved and cannot be
         gathered), which is bit-equivalent per row at a fixed global scale.
         Returns None on any constraint miss."""
+        # K0.4 routed record for the fused NVFP4 MoE lane, which had none: a
+        # served fused routed prefill was indistinguishable in a dispatch
+        # report from one that took the bridge, which is the single thing the
+        # report exists to tell apart (the two run DIFFERENT activation
+        # contracts). Same mechanism as the FP8 grouped lane below — tensor-
+        # free, sync-free, last-write-wins.
+        route_common = dict(
+            kind="moe",
+            policy=(getattr(layer, "_cb_fused_fp4_moe_mode", None)
+                    or ("rowwise" if rowwise else
+                        "static_lsq" if static_lsq else "1")),
+            contract=_route_fused_fp4_contract(
+                rowwise=rowwise, static_lsq=static_lsq),
+            tile_m=int(tile_m), shape=_moe_shape(layer, topk_ids),
+            tile_sm_count=cb_sm_count(x.device))
         if not self._gf4_ok(
             layer, rowwise=rowwise, static_lsq=static_lsq
         ):
+            cache_attr = ("_cb_gf4_rowwise_ok_reason" if rowwise else
+                          "_cb_gf4_static_lsq_ok_reason" if static_lsq else
+                          "_cb_gf4_static_ok_reason")
+            emit_route(layer, symbol="", state="fallback",
+                       reason=(getattr(layer, cache_attr, None)
+                               or "fused fp4 MoE gate declined"),
+                       **route_common)
             return None
         if x.dtype not in (torch.bfloat16, torch.float16):
+            emit_route(layer, symbol="", state="fallback",
+                       reason=(f"activation dtype {x.dtype} is not half "
+                               f"precision; the NVFP4 quantizers require it"),
+                       **route_common)
             return None
         if tile_m not in (128, 256):
+            emit_route(layer, symbol="", state="fallback",
+                       reason=f"tile_m={tile_m} is not a compiled TileM",
+                       **route_common)
             return None
         from .cuda_ext import get_fused_fp4_ext
         fext = get_fused_fp4_ext()
+        # Phase one of the two-phase write: if either launch below raises, the
+        # record still names the symbol that was invoked and says so.
+        emit_route(layer, symbol="cb_fused_fp4_moe_grouped", state="error",
+                   reason="launch did not return", **route_common)
 
         E = layer._cb_E
         T = x.shape[0]
@@ -886,7 +991,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # the shared one — see ``_padded_route``.
         route = _padded_route(
             topk_ids, topk_weights, E, tile_m,
-            trim=os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1")
+            trim=_grouped_trim())
         expert_ids, row_src, dest = route.expert_ids, route.row_src, route.dest
         pw_sorted = route.pw_sorted
         x1 = torch.cat([x, x.new_zeros((1, Kh))])
@@ -921,6 +1026,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         y = y * pw_pad[:, None].to(y.dtype)
         out = torch.zeros((T + 1, Kh), dtype=x.dtype, device=dev)
         out.index_add_(0, dest, y.to(out.dtype))
+        emit_route(layer, symbol="cb_fused_fp4_moe_grouped", state="served",
+                   reason=None, **route_common)
         return out[:T]
 
     def _native_bf16_chunk(self, layer) -> int:
@@ -930,29 +1037,26 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         retained for measurement, while the default keeps each decoded chunk
         under one GiB. All values are model/config integers, so no device read
         or routing-dependent Python control flow enters the hot path.
+
+        BOTH KNOBS ARE PROCESS-STABLE, like every other dispatch selector, and
+        for a sharper reason than most: this chunk gates the swizzle-group
+        PACKED EXPERT ORDER on the sm12x lane (``chunk >= E``, see
+        ``_apply_prefill_native_bf16_sm120``), so a value that changed between
+        two forwards of one run would silently change the FP32 reduction order
+        mid-run and make the run's numbers describe neither setting. They were
+        read from the environment on EVERY call until 2026-08-02.
         """
+        from .lane_select import latched_int
+
         E = int(layer._cb_E)
-        override = os.environ.get("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
-        if override is not None and override.strip():
-            try:
-                value = int(override)
-            except ValueError as exc:
-                raise ValueError(
-                    "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK must be positive") \
-                    from exc
-            if value <= 0:
-                raise ValueError(
-                    "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK must be positive")
-            return min(E, value)
-        raw_budget = os.environ.get("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES")
-        try:
-            budget = int(raw_budget) if raw_budget else (1 << 30)
-        except ValueError as exc:
-            raise ValueError(
-                "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES must be positive") from exc
-        if budget <= 0:
-            raise ValueError(
-                "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES must be positive")
+        override = latched_int(
+            "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", default=0, minimum=1,
+            meaning="the expert-chunk width of the bounded BF16 bridge")
+        if override:
+            return min(E, override)
+        budget = latched_int(
+            "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES", default=(1 << 30), minimum=1,
+            meaning="the decoded-transient byte budget per expert chunk")
         per_expert = (2 * int(layer._cb_inter)
                       * int(layer._cb_hidden) * 2)  # w13 BF16 bytes
         return max(1, min(E, budget // max(1, per_expert)))
@@ -1016,6 +1120,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         precedence over the sm12x bridge lane, because it replaces the pair of
         operations the bridge lane is one half of. See
         ``_apply_prefill_native_bf16_persistent_b``.
+
+        Neither reaches this method at all when ``PRISMAQUANT_CB_FUSED_FP4_MOE``
+        names a mode: that selection changes the served ACTIVATION CONTRACT and
+        outranks both, so ``_apply_inline`` routes past this whole family. The
+        full ordering and the reason for it are stated there.
         """
         from . import ops as pq_ops
 
@@ -1037,7 +1146,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         pair_token = torch.arange(
             T, dtype=torch.int64, device=x.device).repeat_interleave(top_k)
         rows = pair_token.index_select(0, order)
-        counts = torch.bincount(pair_expert, minlength=E)
+        # scatter_add_, NOT bincount: ATen's CUDA bincount sizes its output
+        # from `self.min().item()` / `self.max().item()`, so it host-syncs and
+        # cannot be captured. The 2026-08-02 sweep that removed the same call
+        # from every padded tile-indexed lane missed THIS one — the DEFAULT
+        # NVFP4-CB routed prefill, the most-served path in the file — so the
+        # shared helper is used here too rather than a fourth local copy.
+        counts = _expert_counts(pair_expert, E)
         expert_ends = torch.cumsum(
             counts, 0, dtype=torch.int32).contiguous()
 
@@ -1075,6 +1190,15 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 pair_output, aq, weight, expert_ends, c0)
             del weight
 
+        # K0.4: the DEFAULT quality bridge records itself too. Without this a
+        # fused-lane fallback left its own "fallback" record as the last write
+        # and a report could not say which route then served the request — the
+        # last-write-wins semantics only work if every route writes.
+        emit_route(layer, kind="moe", policy="bf16_grouped_bridge",
+                   symbol="cb_bf16_grouped_mm_out", tile_m=0,
+                   shape=_moe_shape(layer, topk_ids),
+                   contract=_route_bridge_contract(self.is_fp4),
+                   state="served", reason=None)
         pair_weight = topk_weights.reshape(-1).index_select(0, order) \
             .to(pair_output.dtype)
         pair_output.mul_(pair_weight[:, None])
@@ -1148,14 +1272,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         pair_token = torch.arange(
             T, dtype=torch.int64, device=dev).repeat_interleave(top_k)
         rows = pair_token.index_select(0, order)
-        # scatter_add_, NOT bincount. ATen's CUDA bincount sizes its output
-        # from `self.min().item()` / `self.max().item()`, so it host-syncs and
-        # cannot be captured ("Cannot copy between CPU and CUDA tensors during
-        # CUDA graph capture", measured on torch 2.11.0+cu130). This form is
-        # pure device work at a static shape and produces the identical integer
-        # counts, which is what lets this lane's claim below be literally true.
-        counts = torch.zeros(E, dtype=torch.int64, device=dev).scatter_add_(
-            0, pair_expert, torch.ones_like(pair_expert))
+        # scatter_add_, NOT bincount — ATen's CUDA bincount host-syncs and
+        # cannot be captured, which is what would make this lane's no-host-read
+        # claim above false. The form lives in ``moe_routing._expert_counts``
+        # so the three call sites cannot drift apart; this lane open-coded it
+        # until 2026-08-02, which is part of why the sweep missed the default
+        # lane's surviving bincount.
+        counts = _expert_counts(pair_expert, E)
         expert_ends = torch.cumsum(counts, 0, dtype=torch.int32).contiguous()
 
         xq = pq_ops.fp4_act_qdq(x)
@@ -1189,6 +1312,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         pair_output.mul_(pair_weight[:, None])
         output = torch.zeros((T, hidden), dtype=x.dtype, device=dev)
         output.index_add_(0, rows, pair_output.to(output.dtype))
+        emit_route(layer, kind="moe", policy="moe_persistent_b",
+                   symbol="cb_moe_persistent_b_prefill", tile_m=int(cfg),
+                   shape=_moe_shape(layer, topk_ids),
+                   contract=_route_bridge_contract(self.is_fp4),
+                   state="served", reason=None)
         return output
 
     def _apply_prefill_native_bf16_sm120(self, layer, x, topk_weights,
@@ -1307,6 +1435,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         y = y * pw_pad[:, None].to(y.dtype)
         out = torch.zeros((T + 1, hidden), dtype=x.dtype, device=dev)
         out.index_add_(0, dest, y.to(out.dtype))
+        # K0.4: naming the SM120 gather symbol is the point — this lane and the
+        # default bridge serve the same activation contract and differ only in
+        # schedule, so the symbol is the only field that tells them apart.
+        emit_route(layer, kind="moe", policy="bf16_sm120",
+                   symbol="cb_bf16_grouped_mm_sm120_gather_out",
+                   tile_m=int(tile_m), shape=_moe_shape(layer, topk_ids),
+                   contract=_route_bridge_contract(self.is_fp4),
+                   state="served", reason=None)
         return out[:T]
 
     # -- prefill: grouped FUSED (decode-in-prologue, one launch/stage) ------
@@ -1606,7 +1742,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # bound still performs this same host conversion implicitly.
         route = _padded_route(
             topk_ids, topk_weights, E, tile_m,
-            trim=os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1")
+            trim=_grouped_trim())
         expert_ids, row_src, dest = route.expert_ids, route.row_src, route.dest
         pw_sorted = route.pw_sorted
 

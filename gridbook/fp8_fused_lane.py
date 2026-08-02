@@ -7,22 +7,19 @@ was transcribed twice and could drift from it — and from itself — silently.
 This module owns the decision, the way ``bf16_grouped_lane`` and
 ``fp4v2_fused_midm_lane`` own theirs.
 
-TWO-STEP, DELIBERATELY. The law (``codec.FP8_FUSED_KBITS``) is checked first
-because it is free: it needs no extension, and asking the MODULE first would
-force a JIT build at first forward merely to learn that a rung can never take
-this path. Once a module is in hand, ``compiled_kbits`` is the AUTHORITY — it
-is what this build actually instantiated. The law can only ever be a filter
-over that answer, never a substitute for it, so dispatch can neither select an
-uncompiled rung nor silently miss a compiled one.
+TWO-STEP, DELIBERATELY. The law (``codec.fp8_fused_rung_supported``, over
+``codec.FP8_FUSED_KBITS``) is checked first because it is free: it needs no
+extension, and asking the MODULE first would force a JIT build at first forward
+merely to learn that a rung can never take this path. Once a module is in hand,
+``compiled_kbits`` is the AUTHORITY — it is what this build actually
+instantiated. The law can only ever be a filter over that answer, never a
+substitute for it, so dispatch can neither select an uncompiled rung nor
+silently miss a compiled one. ``rung_eligible`` is the only public answer; the
+law is consulted THROUGH ``codec``, so this module never re-exports it.
 """
 from __future__ import annotations
 
 from . import codec
-
-
-def law_kbits() -> tuple[int, ...]:
-    """The rungs the fused lane's format/TMA law admits. Host-only, free."""
-    return codec.FP8_FUSED_KBITS
 
 
 def compiled_kbits(ext) -> tuple[int, ...]:

@@ -62,13 +62,31 @@ logs-and-continues when a plugin fails to load — see
 
 ### CUTLASS comes from your vLLM install
 
-The mid-M fused prefill extension compiles against CUTLASS headers discovered
-under `vllm/third_party/`, not a vendored copy. That is deliberate — it
-guarantees ABI agreement with vLLM's own kernels — but it means the fused path's
-availability is a property of *your* vLLM build. If those headers are absent or
-in a different layout, Gridbook may use the separately qualified native CUDA
-transient-expand + CUTLASS route for that shape. If no qualified native route is
-available, serving fails closed.
+**Four** extensions compile against CUTLASS headers discovered under
+`vllm/third_party/`, not a vendored copy: the required grouped-BF16 quality
+bridge, the mid-M fused FP8-CB prefill lane, the fused NVFP4-CB lane, and the
+fused FP4-CB v2 mid-M lane. That is deliberate — it guarantees ABI agreement
+with vLLM's own kernels — but it means their availability is a property of
+*your* vLLM build. If those headers are absent or in a different layout,
+Gridbook may use the separately qualified native CUDA transient-expand +
+CUTLASS route for that shape. If no qualified native route is available,
+serving fails closed — and note that the grouped-BF16 bridge is **required**,
+not optional, so a build that cannot find CUTLASS at all cannot serve FP4-CB.
+
+`PRISMAQUANT_CUTLASS_INCLUDE` overrides the discovery for all four. Point it at
+the `include` directory of a CUTLASS checkout — the one holding
+`cutlass/cutlass.h`:
+
+```bash
+export PRISMAQUANT_CUTLASS_INCLUDE=/path/to/cutlass/include
+```
+
+Two situations need it: a virtualenv with no vLLM wheel to discover headers
+from, and building against a CUTLASS newer than the bundled copy. A
+set-but-wrong value **fails** with the missing header named rather than falling
+back to the bundled tree, because silently compiling against a different CUTLASS
+than the one you asked for is precisely the surprise the override exists to
+prevent.
 
 ---
 

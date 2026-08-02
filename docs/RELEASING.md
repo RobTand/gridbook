@@ -112,6 +112,16 @@ update static release metadata such as `CITATION.cff` in the same PR. A
 PrismaQuant compatibility pin is updated only after this PR merges, using the
 resulting immutable commit.
 
+**Drain `## Unreleased` into the new release section — and again just before
+the tag.** Adding the version heading is not the same as emptying the section
+above it. Anything still under `## Unreleased` when the tag is pushed ships
+inside that release while the changelog says it did not, and the record cannot
+be corrected without rewriting a published history. This is not hypothetical:
+0.6.0 was tagged at `ca0f0f5` with two fixes (`5d5c470`, `806d820`) sitting
+under `## Unreleased`. Because §2.2's pre-tag gate and any follow-up fixes land
+*after* the release commit, re-check the section immediately before §2.3 and
+move whatever accumulated there down into the release being cut.
+
 ### 2.2 Pre-tag gate that CI cannot run
 
 CI has no GPU and no CUDA toolkit, so **it cannot prove the extension compiles**.
