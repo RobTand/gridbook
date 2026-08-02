@@ -8,36 +8,48 @@ No vLLM import and no interpreted-kernel dependency lives here.
 from __future__ import annotations
 
 import itertools
-import os
 import weakref
 
 import torch
 
-# CUDA-graph capture safety (root-caused 2026-07-21).
+# CUDA-graph capture safety (root-caused 2026-07-21; re-derived 2026-08-02).
 #
-# These decode/expand ops are pure, fixed-shape-per-graph, and do NO host sync
-# in their captured kernel launches (the M-branch and env reads are host-side and
-# resolve at capture time), so they ARE cuda-graph-capturable — proven by the
-# working ``cudagraph_mode=FULL`` path, which captures them whole.
+# NO GRIDBOOK OP CARRIES ``torch.Tag.cudagraph_unsafe``, and none should.
 #
-# Tagging them ``cudagraph_unsafe`` is actively HARMFUL under
-# ``use_inductor_graph_partition=True`` + PIECEWISE cudagraphs: the tag forces
-# each op to become an inductor graph-PARTITION BOUNDARY, and this torch/vLLM
-# build mishandles the hand-off of an eager boundary op's output into the
-# following cuda-graph-captured region (stale/aliased buffer) -> DETERMINISTIC
-# output corruption ("408 408", CJK intrusions), while ``FULL_DECODE_ONLY`` (one
-# graph, no internal boundary) and the historical inline prototype stayed
-# correct. Keeping the ops INSIDE the captured partition (no tag) fixes it.
+# WHAT THE TAG DOES. Its only consumer is inductor's ``should_partition``,
+# which is itself reachable only under ``use_inductor_graph_partition=True``
+# combined with PIECEWISE cudagraphs. FULL capture ignores graph partitioning
+# entirely, and vLLM leaves the partition wrapper off at every optimization
+# level. So the tag is inert in every shipped configuration.
 #
-# Default: NOT unsafe (stay inside the partition). Set
-# ``PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE=1`` to restore the old boundary behaviour
-# for an A/B (reproduces the corruption on the compile+piecewise path).
-_PQ_UNSAFE = ((torch.Tag.cudagraph_unsafe,)
-              if os.environ.get("PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE") == "1"
-              else ())
+# WHY IT IS ALSO IRRELEVANT HERE. Since the M-branch hoist (5b4e5e7) dynamo
+# sees ONLY ``cb_linear_forward`` / ``cb_moe_forward``. Every op below runs
+# inside those two ops' eager implementations and is never a graph NODE, so
+# its tags are metadata nothing reads. The published
+# ``PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE`` knob had therefore been a silent no-op
+# since the hoist landed, and is retired rather than left as a switch that
+# looks like it does something.
+#
+# WHY NOT TAG THE TWO WHOLE-DISPATCH OPS INSTEAD. That is the one change that
+# WOULD take effect, and it recreates the 2026-07-21 defect at worse
+# granularity: every CB layer would become an eager partition boundary, and
+# this torch/vLLM build mishandles the hand-off of an eager boundary op's
+# output into the following cuda-graph-captured region (stale/aliased buffer)
+# -> DETERMINISTIC output corruption ("408 408", CJK intrusions), while
+# ``FULL_DECODE_ONLY`` (one graph, no internal boundary) and the historical
+# inline prototype stayed correct. That root-cause record is kept here
+# deliberately: it is the reason the tag must stay off, not a reason it was
+# once needed.
+#
+# WHY THE TWO DISPATCH OPS ARE CAPTURE-SAFE BY CONSTRUCTION. Their M-branch
+# and env reads resolve HOST-side at capture time, and the arms that would
+# host-sync are the prefill arms, which are unreachable at captured decode
+# sizes. Reproducing the historical corruption would now require reverting the
+# hoist AND ``use_inductor_graph_partition=True`` with piecewise cudagraphs on
+# a torch predating pytorch#165815.
 
 
-@torch.library.custom_op("prismaquant::cb_gemv_fp8", mutates_args=(), tags=_PQ_UNSAFE)
+@torch.library.custom_op("prismaquant::cb_gemv_fp8", mutates_args=())
 def cb_gemv_fp8(x: torch.Tensor, qw_padded: torch.Tensor,
                 cb_flat: torch.Tensor, cb_row_offset: torch.Tensor,
                 scale: torch.Tensor, N: int, K: int, k_bits: int, n_sub: int,
@@ -58,7 +70,7 @@ def _cb_gemv_fp8_fake(x, qw_padded, cb_flat, cb_row_offset, scale, N, K,
     return torch.empty((*x.shape[:-1], N), dtype=x.dtype, device=x.device)
 
 
-@torch.library.custom_op("prismaquant::cb_gemv_fp4_v2", mutates_args=(), tags=_PQ_UNSAFE)
+@torch.library.custom_op("prismaquant::cb_gemv_fp4_v2", mutates_args=())
 def cb_gemv_fp4_v2(xq: torch.Tensor, qw_padded: torch.Tensor,
                    cb_flat: torch.Tensor, cb_row_offset: torch.Tensor,
                    compose: torch.Tensor, N: int, K: int, k_bits: int,
@@ -81,7 +93,7 @@ def _cb_gemv_fp4_v2_fake(xq, qw_padded, cb_flat, cb_row_offset, compose, N, K,
     return torch.empty((*xq.shape[:-1], N), dtype=xq.dtype, device=xq.device)
 
 
-@torch.library.custom_op("prismaquant::cb_expand_fp8", mutates_args=(), tags=_PQ_UNSAFE)
+@torch.library.custom_op("prismaquant::cb_expand_fp8", mutates_args=())
 def cb_expand_fp8(qw_padded: torch.Tensor, cb_flat_fp8: torch.Tensor,
                   cb_row_offset: torch.Tensor, N: int, K: int, k_bits: int,
                   n_sub: int, type_size: int) -> torch.Tensor:
@@ -105,7 +117,7 @@ def _cb_expand_fp8_fake(qw_padded, cb_flat_fp8, cb_row_offset, N, K, k_bits,
 
 
 @torch.library.custom_op("prismaquant::cb_expand_fp4_v2",
-                         mutates_args=(), tags=_PQ_UNSAFE)
+                         mutates_args=())
 def cb_expand_fp4_v2(qw_flat: torch.Tensor, cb_flat: torch.Tensor,
                      compose: torch.Tensor, row0: int, nrows: int, K: int,
                      k_bits: int, type_size: int) -> torch.Tensor:
@@ -123,7 +135,7 @@ def _cb_expand_fp4_v2_fake(qw_flat, cb_flat, compose, row0, nrows, K,
 
 
 @torch.library.custom_op("prismaquant::cb_bf16_grouped_mm",
-                         mutates_args=(), tags=_PQ_UNSAFE)
+                         mutates_args=())
 def cb_bf16_grouped_mm(a: torch.Tensor, weights: torch.Tensor,
                        expert_ends: torch.Tensor,
                        expert_start: int = 0) -> torch.Tensor:
@@ -148,7 +160,7 @@ def _cb_bf16_grouped_mm_fake(a, weights, expert_ends, expert_start=0):
 
 
 @torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_out",
-                         mutates_args=("out",), tags=_PQ_UNSAFE)
+                         mutates_args=("out",))
 def cb_bf16_grouped_mm_out(out: torch.Tensor, a: torch.Tensor,
                            weights: torch.Tensor,
                            expert_ends: torch.Tensor,
@@ -167,7 +179,7 @@ def _cb_bf16_grouped_mm_out_fake(out, a, weights, expert_ends,
 
 
 @torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_sm120",
-                         mutates_args=(), tags=_PQ_UNSAFE)
+                         mutates_args=())
 def cb_bf16_grouped_mm_sm120(a: torch.Tensor, weights: torch.Tensor,
                              expert_ids: torch.Tensor,
                              tile_m: int) -> torch.Tensor:
@@ -192,7 +204,7 @@ def _cb_bf16_grouped_mm_sm120_fake(a, weights, expert_ids, tile_m):
 
 
 @torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_sm120_out",
-                         mutates_args=("out",), tags=_PQ_UNSAFE)
+                         mutates_args=("out",))
 def cb_bf16_grouped_mm_sm120_out(out: torch.Tensor, a: torch.Tensor,
                                  weights: torch.Tensor,
                                  expert_ids: torch.Tensor,
@@ -210,7 +222,7 @@ def _cb_bf16_grouped_mm_sm120_out_fake(out, a, weights, expert_ids, tile_m):
 
 
 @torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_sm120_gather",
-                         mutates_args=(), tags=_PQ_UNSAFE)
+                         mutates_args=())
 def cb_bf16_grouped_mm_sm120_gather(a: torch.Tensor, row_src: torch.Tensor,
                                     weights: torch.Tensor,
                                     expert_ids: torch.Tensor,
@@ -237,7 +249,7 @@ def _cb_bf16_grouped_mm_sm120_gather_fake(a, row_src, weights, expert_ids,
 
 
 @torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_sm120_gather_out",
-                         mutates_args=("out",), tags=_PQ_UNSAFE)
+                         mutates_args=("out",))
 def cb_bf16_grouped_mm_sm120_gather_out(out: torch.Tensor, a: torch.Tensor,
                                         row_src: torch.Tensor,
                                         weights: torch.Tensor,
@@ -259,7 +271,7 @@ def _cb_bf16_grouped_mm_sm120_gather_out_fake(out, a, row_src, weights,
 
 
 @torch.library.custom_op("prismaquant::cb_moe_persistent_b_prefill",
-                         mutates_args=("out",), tags=_PQ_UNSAFE)
+                         mutates_args=("out",))
 def cb_moe_persistent_b_prefill(out: torch.Tensor, a: torch.Tensor,
                                 qw: torch.Tensor, lut: torch.Tensor,
                                 compose: torch.Tensor,
@@ -284,7 +296,7 @@ def _cb_moe_persistent_b_prefill_fake(out, a, qw, lut, compose, expert_ends,
 
 
 @torch.library.custom_op("prismaquant::cb_moe_persistent_b_decode",
-                         mutates_args=(), tags=_PQ_UNSAFE)
+                         mutates_args=())
 def cb_moe_persistent_b_decode(qw_flat: torch.Tensor, lut: torch.Tensor,
                                compose: torch.Tensor, row0: int, nrows: int,
                                K: int, k_bits: int,
@@ -313,7 +325,7 @@ def _cb_moe_persistent_b_decode_fake(qw_flat, lut, compose, row0, nrows, K,
 # the allocating `cb_expand_fp8` above.
 
 
-@torch.library.custom_op("prismaquant::fp8_act_qdq", mutates_args=(), tags=_PQ_UNSAFE)
+@torch.library.custom_op("prismaquant::fp8_act_qdq", mutates_args=())
 def fp8_act_qdq(x: torch.Tensor) -> torch.Tensor:
     """Fused per-token fp8 dynamic QDQ (bit-exact to codec.fp8_dynamic_act_qdq)
     as a custom op for the compile path."""
@@ -326,7 +338,7 @@ def _fp8_act_qdq_fake(x):
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("prismaquant::fp4_act_qdq", mutates_args=(), tags=_PQ_UNSAFE)
+@torch.library.custom_op("prismaquant::fp4_act_qdq", mutates_args=())
 def fp4_act_qdq(x: torch.Tensor) -> torch.Tensor:
     """Fused group-16 fp4 (E2M1) activation QDQ (bit-exact to
     codec.fp4_group16_act_qdq) as a custom op for the compile path."""
@@ -366,7 +378,7 @@ def fp4_act_qdq_or_codec(x: torch.Tensor) -> torch.Tensor:
     return codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
 
 
-@torch.library.custom_op("prismaquant::cb_moe_gemv_fp4_v2", mutates_args=(), tags=_PQ_UNSAFE)
+@torch.library.custom_op("prismaquant::cb_moe_gemv_fp4_v2", mutates_args=())
 def cb_moe_gemv_fp4_v2(xq: torch.Tensor, qw: torch.Tensor,
                        cb_flat: torch.Tensor, compose: torch.Tensor,
                        pair_expert: torch.Tensor, pair_xrow: torch.Tensor,
@@ -393,17 +405,19 @@ def _cb_moe_gemv_fp4_v2_fake(xq, qw, cb_flat, compose, pair_expert, pair_xrow,
 # select the kernel's measured auto policies). The C++ launcher reads the
 # decode contract from the environment per call, like the inherited kernel.
 #
-# It MUST carry the same ``_PQ_UNSAFE`` tagging as every op above — see the
-# module header: tagging these ops ``cudagraph_unsafe`` under
-# ``use_inductor_graph_partition=True`` + PIECEWISE cudagraphs makes each a
-# graph-PARTITION BOUNDARY and this build mishandles the hand-off, giving
-# DETERMINISTIC output corruption. An op that disagreed with its neighbours on
-# this tag would partition the decode path in exactly the wrong place.
+# Like every op above it carries NO ``cudagraph_unsafe`` tag — see the module
+# header. The invariant used to be stated the other way round ("it MUST carry
+# the same tagging as every op above"), which was true of the mechanism and
+# wrong about the direction: tagging these ops makes each a graph-PARTITION
+# BOUNDARY under ``use_inductor_graph_partition=True`` + PIECEWISE cudagraphs,
+# and this build mishandles the hand-off, giving DETERMINISTIC output
+# corruption. What must hold is that no op disagrees with its neighbours, and
+# the agreed value is UNTAGGED.
 #
 # Separate JIT module (``get_ext_v2`` -> ``prismaquant_cb_v2_ext``), not a
 # second source of the inherited one: both .cu files define
 # ``PYBIND11_MODULE(TORCH_EXTENSION_NAME, ...)`` and would collide at link.
-@torch.library.custom_op("prismaquant::cb_moe_gemv_v2", mutates_args=(), tags=_PQ_UNSAFE)
+@torch.library.custom_op("prismaquant::cb_moe_gemv_v2", mutates_args=())
 def cb_moe_gemv_v2(xq: torch.Tensor, qw: torch.Tensor,
                    cb_flat: torch.Tensor, compose: torch.Tensor,
                    pair_expert: torch.Tensor, pair_xrow: torch.Tensor,
@@ -424,7 +438,7 @@ def _cb_moe_gemv_v2_fake(xq, qw, cb_flat, compose, pair_expert, pair_xrow,
                        device=xq.device)
 
 
-@torch.library.custom_op("prismaquant::cb_moe_gemv_fp8", mutates_args=(), tags=_PQ_UNSAFE)
+@torch.library.custom_op("prismaquant::cb_moe_gemv_fp8", mutates_args=())
 def cb_moe_gemv_fp8(xq: torch.Tensor, qw: torch.Tensor,
                     cb_flat_fp8: torch.Tensor, scale: torch.Tensor,
                     pair_expert: torch.Tensor, pair_xrow: torch.Tensor,
@@ -443,7 +457,7 @@ def _cb_moe_gemv_fp8_fake(xq, qw, cb_flat_fp8, scale, pair_expert, pair_xrow,
                        device=xq.device)
 
 
-@torch.library.custom_op("prismaquant::cb_moe_combine", mutates_args=(), tags=_PQ_UNSAFE)
+@torch.library.custom_op("prismaquant::cb_moe_combine", mutates_args=())
 def cb_moe_combine(y: torch.Tensor, pair_w: torch.Tensor,
                    tok_start: torch.Tensor, T: int) -> torch.Tensor:
     """Router-weighted per-token combine of grouped GEMV outputs."""
@@ -481,6 +495,61 @@ _LAYER_REGISTRY: dict[int, tuple[weakref.ReferenceType,
 _LAYER_IDS = itertools.count()
 
 
+# Warned once per process, not per layer: the condition is a property of the
+# engine's compilation config, so N identical lines per model would bury it.
+_CAPTURE_GATE_WARNED: list[bool] = []
+
+# The token counts below which each dispatch resolves to a decode kernel. Above
+# them the PREFILL arm runs, and the prefill arms take host reads (the chunked
+# bridge reads per-expert block offsets), which cannot be captured. Kept here
+# rather than imported from linear/moe so this check does not pull vLLM-bound
+# modules into ops.py's import graph; the ratchet below pins them together.
+_DENSE_DECODE_MAX = 8
+_MOE_DECODE_MAX = 16
+
+
+def warn_if_capture_sizes_exceed_the_decode_gates() -> None:
+    """Report capture sizes that would record a PREFILL arm inside a graph.
+
+    Gridbook's capture-safety argument (see this module's header) is
+    SIZE-CONDITIONAL and, until now, unenforced: the two whole-dispatch ops are
+    capture-safe because at captured decode sizes the host-syncing prefill arms
+    are unreachable. Nothing checked that the engine's configured capture sizes
+    actually stay under the gates that make that true.
+
+    WARNS RATHER THAN RAISES, deliberately. The shape of vLLM's compilation
+    config has moved across releases, so a strict read here would fail loads
+    for a config-schema reason rather than a correctness one — the opposite of
+    fail-closed's intent. Every step degrades to silence, and the message names
+    the offending sizes and the gates so the operator can act.
+    """
+    if _CAPTURE_GATE_WARNED:
+        return
+    _CAPTURE_GATE_WARNED.append(True)
+    try:
+        from vllm.config import get_current_vllm_config
+
+        compilation = get_current_vllm_config().compilation_config
+        sizes = [int(s) for s in
+                 (getattr(compilation, "cudagraph_capture_sizes", None) or ())]
+    except Exception:  # noqa: BLE001 — advisory only; never break a load
+        return
+    gate = min(_DENSE_DECODE_MAX, _MOE_DECODE_MAX)
+    over = sorted(s for s in sizes if s > gate)
+    if not over:
+        return
+    import sys
+
+    print(
+        "[prismaquant-cb] WARNING: cudagraph_capture_sizes includes "
+        f"{over}, above Gridbook's decode gates (dense M<={_DENSE_DECODE_MAX}, "
+        f"routed tokens<={_MOE_DECODE_MAX}). At those sizes the captured graph "
+        "records the PREFILL arm, which performs host reads (the chunked BF16 "
+        "bridge reads per-expert block offsets) and is not capturable. Use "
+        "cudagraph_mode=FULL_DECODE_ONLY, or keep the capture sizes at or "
+        f"below {gate}.", file=sys.stderr, flush=True)
+
+
 def register_cb_layer(method, layer) -> int:
     """Register one compiled-dispatch target without owning its model.
 
@@ -494,6 +563,10 @@ def register_cb_layer(method, layer) -> int:
     captured graph containing an expired ID can therefore never alias a newly
     loaded layer after the weakref callback removes its old entry.
     """
+    # Every CB layer, dense and routed, funnels through here at model load, so
+    # this is the one place the size-conditional capture-safety argument can be
+    # checked against the engine's actual configuration.
+    warn_if_capture_sizes_exceed_the_decode_gates()
     layer_id = next(_LAYER_IDS)
 
     def expire(_ref, *, expected_id=layer_id):

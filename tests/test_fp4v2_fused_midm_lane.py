@@ -541,3 +541,95 @@ def test_identity_records_the_architecture_accelerated_target(tmp_path,
 def test_only_the_blackwell_pair_is_buildable(capability, buildable):
     """Checked BEFORE include discovery, so a doomed nvcc run never starts."""
     assert cuda_ext.fused_fp4v2_buildable(capability) is buildable
+
+
+# ---------------------------------------------------------------------------
+# supports(): the LOAD-time per-layer gate (audit follow-up #7)
+# ---------------------------------------------------------------------------
+
+
+def test_supports_accepts_a_plain_fp4_cb_v2_layer():
+    ext = _ext_stub()
+    assert lane.supports(ext, _layer_stub(16), N=2048, K=4096, k_bits=16,
+                         n_sub=2, type_size=73, is_v2=True) is None
+
+
+@pytest.mark.parametrize("override,mentions", [
+    ({"k_bits": 26, "type_size": 4 * 26 + 9}, "not a rung this build"),
+    ({"K": 4095}, "superblock"),
+    ({"N": 2044}, "8-element"),
+    ({"n_sub": 1}, "two-tier v2 product mode"),
+    ({"type_size": 72}, "two-tier v2 product mode"),
+    ({"is_v2": False}, "two-tier v2 product mode"),
+])
+def test_supports_rejects_with_a_readable_reason(override, mentions):
+    """Each M-independent miss must be diagnosable at LOAD, in a sentence.
+
+    Before this gate existed the lane attested only that the EXTENSION was
+    present, so a layer that could never take it served the expand + bridge
+    route for every request while the load reported success — the silent
+    substitution behind an explicit selection that the flag forbids.
+    """
+    kwargs = dict(N=2048, K=4096, k_bits=16, n_sub=2, type_size=73,
+                  is_v2=True)
+    kwargs.update(override)
+    reason = lane.supports(_ext_stub(), _layer_stub(kwargs["k_bits"]),
+                           **kwargs)
+    assert reason is not None and mentions in reason
+
+
+def test_supports_rejects_a_multi_dictionary_fused_projection():
+    reason = lane.supports(
+        _ext_stub(), _layer_stub(16, segments=((0, 8, 0), (8, 8, 1))),
+        N=2048, K=4096, k_bits=16, n_sub=2, type_size=73, is_v2=True)
+    assert reason is not None and "interned codebook blocks" in reason
+
+
+def test_supports_deliberately_excludes_the_m_band():
+    """The M band is a property of the REQUEST, not of the layer.
+
+    Falling through for an out-of-band M is the documented behaviour and is
+    what makes this a mid-M lane; making it a load failure would reject every
+    layer, since one layer serves every M.
+    """
+    import inspect
+
+    source = inspect.getsource(lane.supports)
+    assert "MID_M_MIN" not in source and "max_m(" not in source
+
+
+def test_eligible_is_supports_plus_the_m_band():
+    """One predicate, not two that can disagree."""
+    ext = _ext_stub()
+    layer = _layer_stub(16)
+    shape = dict(N=2048, K=4096, k_bits=16, n_sub=2, type_size=73,
+                 is_v2=True)
+    assert lane.supports(ext, layer, **shape) is None
+    assert lane.eligible(ext, layer, M=64, **shape)
+    assert not lane.eligible(ext, layer, M=8, **shape)
+    assert not lane.eligible(ext, layer, M=129, **shape)
+    # A layer-level miss makes every M ineligible, including in-band ones.
+    bad = _layer_stub(16, segments=((0, 8, 0), (8, 8, 1)))
+    assert lane.supports(ext, bad, **shape) is not None
+    assert not lane.eligible(ext, bad, M=64, **shape)
+
+
+def test_facts_is_guarded_on_the_dispatch_path():
+    """A module that will not answer reads as "offers nothing", never raises.
+
+    ``eligible`` runs per prefill and its docstring promises a miss falls
+    through to the shipping route, so an unguarded read here would raise
+    mid-request at exactly the site that promises not to.
+    """
+    class Hostile:
+        def cb_fused_fp4v2_max_m(self):
+            raise RuntimeError("module went away")
+
+        def cb_fused_fp4v2_kbits(self):
+            raise RuntimeError("module went away")
+
+    ext = Hostile()
+    assert lane.max_m(ext) == 0
+    assert lane.kbits(ext) == ()
+    assert not lane.eligible(ext, _layer_stub(16), M=64, N=2048, K=4096,
+                             k_bits=16, n_sub=2, type_size=73, is_v2=True)
