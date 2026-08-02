@@ -251,7 +251,14 @@ GROUPED_TILE_N = {"fp8": 64, "fp4": 128}
 #   2(x+128)/(x+256) in [1.226, 1.503]) bounds x to [75, 259], putting the
 #   threshold in [254, 565]. 512 is the pessimistic end of that interval.
 # PROPOSAL DATA for this kernel family until a routed sweep pins it on the
-# grouped lanes; PRISMAQUANT_CB_GROUPED_TILE_M overrides for measurement.
+# grouped lanes. NO ENVIRONMENT VARIABLE OVERRIDES IT — the selector reads
+# host-known arguments only, which is what makes it capture-safe, and an env
+# read would put a second, undeclared input on that path. A measurement moves
+# the threshold by passing its own ``min_rows_per_expert=`` to
+# :func:`cb_grouped_tile_m`, or skips the selector outright by handing
+# ``moe.PrismaQuantCBMoEMethod._apply_prefill_grouped_fused_v2`` an explicit
+# ``tile_m=`` (there ``None`` is what means "select") — the same keyword an
+# operator override would use.
 GROUPED_WIDE_TILE_MIN_ROWS_PER_EXPERT = 512
 
 # (tile_m, k_bits) the extension compiles at ZERO shared-memory margin.

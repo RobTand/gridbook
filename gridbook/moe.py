@@ -54,6 +54,7 @@ from .moe_persistent_b_lane import (require_lane as persistent_b_require_lane,
                                     supports as persistent_b_supports)
 from .moe_routing import (
     GROUPED_TILE_N,
+    _expert_counts,
     cb_cached_row_offsets,
     cb_grouped_block_offsets,
     cb_grouped_pad_routing,
@@ -1037,7 +1038,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         pair_token = torch.arange(
             T, dtype=torch.int64, device=x.device).repeat_interleave(top_k)
         rows = pair_token.index_select(0, order)
-        counts = torch.bincount(pair_expert, minlength=E)
+        # scatter_add_, NOT bincount: ATen's CUDA bincount sizes its output
+        # from `self.min().item()` / `self.max().item()`, so it host-syncs and
+        # cannot be captured. The 2026-08-02 sweep that removed the same call
+        # from every padded tile-indexed lane missed THIS one — the DEFAULT
+        # NVFP4-CB routed prefill, the most-served path in the file — so the
+        # shared helper is used here too rather than a fourth local copy.
+        counts = _expert_counts(pair_expert, E)
         expert_ends = torch.cumsum(
             counts, 0, dtype=torch.int32).contiguous()
 
@@ -1148,14 +1155,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         pair_token = torch.arange(
             T, dtype=torch.int64, device=dev).repeat_interleave(top_k)
         rows = pair_token.index_select(0, order)
-        # scatter_add_, NOT bincount. ATen's CUDA bincount sizes its output
-        # from `self.min().item()` / `self.max().item()`, so it host-syncs and
-        # cannot be captured ("Cannot copy between CPU and CUDA tensors during
-        # CUDA graph capture", measured on torch 2.11.0+cu130). This form is
-        # pure device work at a static shape and produces the identical integer
-        # counts, which is what lets this lane's claim below be literally true.
-        counts = torch.zeros(E, dtype=torch.int64, device=dev).scatter_add_(
-            0, pair_expert, torch.ones_like(pair_expert))
+        # scatter_add_, NOT bincount — ATen's CUDA bincount host-syncs and
+        # cannot be captured, which is what would make this lane's no-host-read
+        # claim above false. The form lives in ``moe_routing._expert_counts``
+        # so the three call sites cannot drift apart; this lane open-coded it
+        # until 2026-08-02, which is part of why the sweep missed the default
+        # lane's surviving bincount.
+        counts = _expert_counts(pair_expert, E)
         expert_ends = torch.cumsum(counts, 0, dtype=torch.int32).contiguous()
 
         xq = pq_ops.fp4_act_qdq(x)

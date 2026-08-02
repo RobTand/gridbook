@@ -844,25 +844,63 @@ def test_selector_reads_no_tensor():
     assert isinstance(_sel(tokens=64, top_k=2, experts=4), int)
 
 
+def _gridbook_source(name: str) -> str:
+    """One packaged module's TEXT, without importing it.
+
+    ``gridbook.moe`` imports vLLM at module scope, so a source-level ratchet
+    that used ``inspect.getsource`` would silently not run on a vLLM-free host
+    — which is most of CI, and exactly where a ratchet has to hold.
+    """
+    import os
+
+    import gridbook.moe_routing as anchor
+
+    path = os.path.join(os.path.dirname(anchor.__file__), name)
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
 def test_routing_counts_avoid_the_bincount_host_sync():
-    """The padded routing must count with scatter_add_, not bincount.
+    """No serving module may count routed pairs with bincount.
 
     ATen's CUDA ``bincount`` sizes its output from ``.max().item()`` and so
     host-syncs — the persistent-B lane proved it breaks capture, with a
     negative control. ``cb_grouped_pad_routing``'s docstring claimed "NO HOST
     READS" while calling it anyway, which made the graph-safety story for every
-    padded grouped lane false. Pin the repair here so it cannot regress.
+    padded grouped lane false.
+
+    The ratchet scanned ``moe_routing`` ONLY, which is how the 2026-08-02 sweep
+    could land while ``moe.py``'s DEFAULT routed prefill — the most-served path
+    in the file — still called ``torch.bincount`` on every request. Both
+    modules are scanned now.
     """
     import gridbook.moe_routing as mr
 
-    import inspect
-
-    # The CALL, not the word: the module documents at length why it does not
+    # The CALL, not the word: both modules document at length why they do not
     # use bincount, so the prose legitimately names it.
-    assert "torch.bincount(" not in inspect.getsource(mr)
+    for name in ("moe_routing.py", "moe.py"):
+        assert "torch.bincount(" not in _gridbook_source(name), (
+            f"{name} counts routed pairs with bincount, which host-syncs and "
+            f"cannot be captured")
     counts = mr._expert_counts(torch.tensor([0, 2, 2, 5, 5, 5]), 6)
     assert counts.tolist() == [1, 0, 2, 0, 0, 3]
     assert counts.dtype == torch.int64
+
+
+def test_every_routed_count_goes_through_the_one_shared_helper():
+    """One implementation, not three copies that can each drift.
+
+    ``moe.py`` had a hand-written ``scatter_add_`` in the persistent-B lane and
+    a ``bincount`` in the default lane; the helper's own docstring records the
+    sweep that was supposed to unify them. Spelling the ratchet against the
+    HELPER rather than against the absence of one call means a fourth lane
+    cannot reintroduce the sync under a different spelling.
+    """
+    source = _gridbook_source("moe.py")
+    assert source.count("_expert_counts(") >= 2
+    assert ".scatter_add_(" not in source, (
+        "a routed-count scatter_add_ was open-coded again instead of calling "
+        "moe_routing._expert_counts")
 
 
 # ===========================================================================
