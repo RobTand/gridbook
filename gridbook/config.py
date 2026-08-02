@@ -35,6 +35,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from .runtime_contract import load_runtime_contract
+from .delegated_preflight import require_native_delegated_backend
 from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
     TENSOR_SUFFIX as _NVFP4_ACTIVATION_TENSOR_SUFFIX,
@@ -47,6 +48,16 @@ except Exception:  # pragma: no cover - older vLLM
     RoutedExperts = None
 
 _MOE_LEAVES = ("gate_up_proj", "down_proj", "gate_proj", "up_proj")
+# vLLM resolves a RoutedExperts stack's declared group through the *unfused*
+# per-expert projection names (``CompressedTensorsMoEMethod.get_moe_method``
+# builds ``<prefix>.0.{gate,up,down}_proj``). Gridbook's D0.2 preflight has to
+# read the same declaration vLLM read, so it probes the same spellings — plus
+# the fused/unsuffixed forms an exporter may legitimately have written.
+_MOE_DECLARATION_SUFFIXES = (
+    ".0.gate_proj", ".0.up_proj", ".0.down_proj",
+    ".gate_up_proj", ".gate_proj", ".up_proj", ".down_proj",
+    "",
+)
 _RUNTIME_CONTRACT = load_runtime_contract()
 _QUANT_METHOD_CANONICAL = _RUNTIME_CONTRACT["quant_method"]["canonical"]
 _QUANT_METHOD_ACCEPTED = frozenset(
@@ -229,6 +240,10 @@ class PrismaQuantConfig(QuantizationConfig):
         self._nvfp4_activation_contract: dict | None = None
         self._nvfp4_activation_scales: dict[str, float] | None = None
         self._target_physical_name: dict[str, str] = {}
+        # Delegated (non-CB) target -> the stock group that declares it. The
+        # D0.2 preflight needs the *declaration*, and the declaration lives in
+        # the config group, not in whatever tensors happen to be on disk.
+        self._stock_group_by_target: dict[str, str] = {}
 
     def _get_sidecar_source(self) -> tuple[str, str | None]:
         if self._sidecar_source is None:
@@ -493,6 +508,8 @@ class PrismaQuantConfig(QuantizationConfig):
                     self._cb_targets.add(t)
             else:                                    # stock CT vocabulary
                 stock_groups[name] = g
+                for t in g.get("targets", []):
+                    self._stock_group_by_target[str(t)] = name
         self._alias_collapsed_shared_prefixes()
         self.ct_config = (self._build_ct_config(stock_groups)
                           if stock_groups else None)
@@ -718,6 +735,63 @@ class PrismaQuantConfig(QuantizationConfig):
                     "formats — export union-find should prevent this")
         return schemes[0]
 
+    def _stock_group_for_prefix(
+        self, layer: torch.nn.Module, prefix: str, *, moe: bool = False
+    ) -> tuple[str | None, dict | None]:
+        """The delegated config group that declares *prefix*, or ``(None, None)``.
+
+        Resolution is delegated wholesale to compressed-tensors'
+        ``find_matched_target`` — the same helper vLLM itself uses — so a
+        regex target, a fused shard, or a module-class target means the same
+        thing on both sides of one mixed artifact. ``_is_ignored`` made the
+        opposite choice once (a local near-copy) and the two lists drifted;
+        this does not repeat that.
+        """
+
+        if not self._stock_group_by_target:
+            return None, None
+        from vllm.model_executor.layers.quantization.compressed_tensors.utils import (  # noqa: E501
+            find_matched_target,
+        )
+        fused = dict(_FUSED_FALLBACK)
+        fused.update(getattr(self, "packed_modules_mapping", {}) or {})
+        targets = list(self._stock_group_by_target)
+        suffixes = _MOE_DECLARATION_SUFFIXES if moe else ("",)
+        for base in _candidate_bases(prefix):
+            for suffix in suffixes:
+                matched = find_matched_target(base + suffix, layer, targets,
+                                              fused)
+                if matched is None:
+                    continue
+                group_name = self._stock_group_by_target[matched]
+                return group_name, self.config_groups.get(group_name)
+        return None, None
+
+    def _delegate(self, layer: torch.nn.Module, prefix: str, *,
+                  moe: bool = False) -> "QuantizeMethodBase | None":
+        """Hand *prefix* to the stock compressed-tensors config, fail-closed.
+
+        THE delegation choke point (ROADMAP D0.2). vLLM resolves a delegated
+        group through its own backend ladder, and that ladder can silently
+        rewrite a declared W4A4 into weight-only W4A16 (Marlin) or land on a
+        Triton-backed backend (``emulation``). Both are decided *inside* the
+        call below — ``CompressedTensorsW4A4Nvfp4MoEMethod.__init__`` calls
+        ``select_nvfp4_moe_backend`` and stores the winner, and the dense path
+        attaches its resolved scheme/kernel to the layer — so the moment the
+        call returns is the earliest point at which the resolved backend is a
+        fact rather than a prediction, and it is still model-load time.
+        Checking here (rather than in ``moe.py``/``linear.py``, which never see
+        a delegated layer) also keeps every delegated layer class on one rule.
+        """
+
+        method = self.ct_config.get_quant_method(layer, prefix)
+        group_name, group = self._stock_group_for_prefix(layer, prefix, moe=moe)
+        require_native_delegated_backend(
+            prefix=prefix, group_name=group_name, group=group,
+            method=method, layer=layer,
+        )
+        return method
+
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> "QuantizeMethodBase | None":
         self._require_supported_tensor_parallel()
@@ -747,13 +821,12 @@ class PrismaQuantConfig(QuantizationConfig):
             # 3) stock NVFP4 / FP8_DYNAMIC -> compressed-tensors delegation
             #    (canonical prefix — CT targets are serving-namespace names).
             if self.ct_config is not None:
-                return self.ct_config.get_quant_method(
-                    layer, _canonical_prefix(prefix))
+                return self._delegate(layer, _canonical_prefix(prefix))
             return UnquantizedLinearMethod()
 
         if isinstance(layer, VocabParallelEmbedding):
             if self.ct_config is not None:
-                method = self.ct_config.get_quant_method(layer, prefix)
+                method = self._delegate(layer, prefix)
                 if method is not None:
                     return method
             return UnquantizedEmbeddingMethod()
@@ -768,7 +841,7 @@ class PrismaQuantConfig(QuantizationConfig):
                 return PrismaQuantCBMoEMethod(
                     self, layer.moe_config, scheme, prefix)
             if self.ct_config is not None:
-                return self.ct_config.get_quant_method(layer, prefix)
+                return self._delegate(layer, prefix, moe=True)
             return None
         return None
 
@@ -870,5 +943,20 @@ class PrismaQuantConfig(QuantizationConfig):
         )
         self._cb_targets = set(
             hf_to_vllm_mapper.apply_list(sorted(self._cb_targets)))
+        # The delegated-group index is matched against serving prefixes exactly
+        # like the CT config's own targets, so it moves into the mapper
+        # namespace with them. Regex entries are left alone for the same reason
+        # compressed-tensors leaves them alone: a name mapper cannot safely
+        # rewrite regex syntax. A stale index would not mis-serve — the D0.2
+        # preflight would just lose the declaration and fall back to its
+        # unconditional Triton rule — but it would silently weaken the check.
+        literal_targets = {name: group
+                           for name, group in self._stock_group_by_target.items()
+                           if not name.startswith("re:")}
+        regex_targets = {name: group
+                         for name, group in self._stock_group_by_target.items()
+                         if name.startswith("re:")}
+        self._stock_group_by_target = {
+            **hf_to_vllm_mapper.apply_dict(literal_targets), **regex_targets}
         if self.ct_config is not None:
             self.ct_config.apply_vllm_mapper(hf_to_vllm_mapper)
