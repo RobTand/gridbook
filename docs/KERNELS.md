@@ -197,10 +197,17 @@ collective, packed-B TMA load + consumer-side smem decode). Its honest status:
   starts from the fresh roofline in the canonical TODO, while the serial
   transient path remains the large-M default.
 
-A **baseline-parity gate** precedes all fork work: a plain `sm_120` block-scaled
-GEMM built from vendored CUTLASS headers matches the runtime's native
+A **baseline-parity gate** preceded all fork work: a plain `sm_120` block-scaled
+GEMM built from vendored CUTLASS headers matched the runtime's native
 `cutlass_scaled_mm` to within 0.91-0.99×, proving the toolchain and the tile-layout
-understanding before touching the mainloop. Note the fork uses a **fixed-config**
+understanding before the mainloop was touched. That gate has served its purpose
+and its source (`csrc/sm120_fp8_gemm.cu`) was deleted on 2026-08-01 — it had zero
+references and its binding validated per-token/per-channel scales it then ignored
+(the epilogue was hardcoded to `{1.0f, 0.0f}`), which is a misleading thing to
+keep around. The forks it de-risked are the live artifacts:
+`sm120_fp8_mm_fork`/`fork64` in `csrc/cb_fused_gemm.cu`, both test-exercised.
+See [`audits/ultraplan_perf_2026-08-01.md`](audits/ultraplan_perf_2026-08-01.md)
+§4. Note the fork uses a **fixed-config**
 GEMM: the runtime's `cutlass_scaled_mm` reconfigures on narrow N and is not
 bit-exact across configs, so an N-chunked expand+GEMM overlap was tried and
 **rejected** (0.46× and not bit-exact).

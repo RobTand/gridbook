@@ -606,7 +606,7 @@ and release workflow reviewed in the PR are exactly the tree being released.
       assert os.path.basename(d) == "csrc", d
       assert os.path.basename(os.path.dirname(d)) == "gridbook", d
       cu = ("cb_gemv.cu", "cb_fused_gemm.cu", "cb_persistent_prefill.cu",
-            "cb_persistent_tc.cu", "sm120_fp8_gemm.cu", "smem_probe_tilem.cu",
+            "cb_persistent_tc.cu", "smem_probe_tilem.cu",
             "toolchain_probe.cu")
       assert not [f for f in cu if not os.path.exists(os.path.join(d, f))]
       assert len([f for f in os.listdir(os.path.join(d, "cutlass_fork"))
@@ -661,7 +661,7 @@ false of (B) for several hours on 2026-07-28.
 - [ ] Confirm on the **built artifacts** (not the source tree) that every
       runtime-required native source is present: `cb_gemv.cu`,
       `cb_fused_gemm.cu`, `cb_persistent_prefill.cu`, `cb_persistent_tc.cu`,
-      `sm120_fp8_gemm.cu`, `smem_probe_tilem.cu`, `toolchain_probe.cu`, and the 5
+      `smem_probe_tilem.cu`, `toolchain_probe.cu`, and the 5
       `csrc/cutlass_fork/*.hpp` headers. A `package-data` glob that silently
       matches nothing is the exact failure mode this gate exists for.
 - [ ] The CUTLASS question is **decided and written down**: `cuda_ext.py`
