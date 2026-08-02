@@ -331,6 +331,170 @@ def test_fp8_contract_requires_the_grouped_family(monkeypatch, capsys,
 
 
 # ---------------------------------------------------------------------------
+# P1: the grouped BF16 module is header-bearing and lane-conditional
+# ---------------------------------------------------------------------------
+
+
+def _bf16_identity_fixture(tmp_path):
+    """A stand-in packaged tree holding every declared BF16 build input."""
+    src = tmp_path / "csrc"
+    (src / "cutlass_fork").mkdir(parents=True)
+    for name in cuda_ext._BF16_GROUPED_BUILD_INPUTS:
+        (src / name).write_text(f"// {name} v1\n")
+    cutlass = _cutlass_tree(tmp_path)
+    util = tmp_path / "cutlass-src" / "tools" / "util" / "include"
+    packed = util / "cutlass" / "util" / "packed_stride.hpp"
+    packed.parent.mkdir(parents=True)
+    packed.write_text("// packed v1\n")
+    return src, cutlass, util
+
+
+def test_bf16_identity_names_every_packaged_build_input():
+    """Declared inputs are read from the source, not restated.
+
+    Adding an include to ``cb_bf16_grouped_gemm.cu`` without declaring it here
+    would leave that header out of the cache key — the stale-kernel class the
+    identity mechanism exists to prevent.
+    """
+    path = os.path.join(cuda_ext.csrc_dir(), "cb_bf16_grouped_gemm.cu")
+    if not os.path.isfile(path):
+        pytest.skip("cb_bf16_grouped_gemm.cu not present in this install")
+    with open(path, encoding="utf-8") as source:
+        included = set(re.findall(
+            r'#include\s+"((?:cutlass_fork/|cb_)[^"]+)"', source.read()))
+    declared = set(cuda_ext._BF16_GROUPED_BUILD_INPUTS)
+    assert "cb_bf16_grouped_gemm.cu" in declared
+    assert included <= declared, (
+        f"cb_bf16_grouped_gemm.cu includes {sorted(included - declared)}, "
+        f"which do not key its build identity")
+
+
+def test_shared_grouping_header_keys_every_module_that_includes_it():
+    """cb_grouped_common.hpp is a build input of all three CUTLASS modules."""
+    for source, declared in (
+        ("cb_fused_gemm.cu", cuda_ext._FUSED_BUILD_INPUTS),
+        ("cb_fused_fp4_gemm.cu", cuda_ext._FUSED_FP4_BUILD_INPUTS),
+        ("cb_bf16_grouped_gemm.cu", cuda_ext._BF16_GROUPED_BUILD_INPUTS),
+    ):
+        path = os.path.join(cuda_ext.csrc_dir(), source)
+        if not os.path.isfile(path):
+            pytest.skip(f"{source} not present in this install")
+        with open(path, encoding="utf-8") as handle:
+            assert '#include "cb_grouped_common.hpp"' in handle.read()
+        assert "cb_grouped_common.hpp" in declared, (
+            f"{source} includes the shared grouping header without keying it "
+            f"into its build identity")
+
+
+@pytest.mark.parametrize("mutated", cuda_ext._BF16_GROUPED_BUILD_INPUTS)
+def test_bf16_identity_moves_when_any_build_input_changes(tmp_path, mutated):
+    src, cutlass, util = _bf16_identity_fixture(tmp_path)
+    fake_cpp = types.SimpleNamespace(
+        CUDA_HOME="/toolkit", get_cxx_compiler=lambda: "c++")
+
+    def identity(sm120_lane=True):
+        return cuda_ext._bf16_grouped_build_identity(
+            _fake_torch(), fake_cpp, src_dir=str(src),
+            cutlass_include=str(cutlass), util_include=str(util),
+            capability=(12, 1), sm120_lane=sm120_lane)
+
+    before, payload = identity()
+    assert set(payload["inputs"]) == set(cuda_ext._BF16_GROUPED_BUILD_INPUTS)
+    assert payload["schema"] == cuda_ext._BF16_GROUPED_ABI_SCHEMA
+
+    (src / mutated).write_text(f"// {mutated} v2 — one byte of schedule\n")
+    after, _ = identity()
+    assert after != before, (
+        f"editing {mutated} left the module identity unchanged; the stale "
+        f"cached kernel would still be loaded")
+    (src / mutated).write_text(f"// {mutated} v1\n")
+    assert identity()[0] == before
+
+
+def test_bf16_identity_separates_the_two_compiled_lane_sets(tmp_path):
+    """A build WITHOUT the sm12x lane can never be served as one that has it."""
+    src, cutlass, util = _bf16_identity_fixture(tmp_path)
+    fake_cpp = types.SimpleNamespace(
+        CUDA_HOME="/toolkit", get_cxx_compiler=lambda: "c++")
+
+    def identity(sm120_lane):
+        return cuda_ext._bf16_grouped_build_identity(
+            _fake_torch(), fake_cpp, src_dir=str(src),
+            cutlass_include=str(cutlass), util_include=str(util),
+            capability=(12, 1), sm120_lane=sm120_lane)
+
+    with_lane, with_payload = identity(True)
+    without_lane, without_payload = identity(False)
+    assert with_lane != without_lane
+    assert with_payload["defines"] == {"PRISMAQUANT_CB_BF16_SM120": "1"}
+    assert "defines" not in without_payload
+    # The lane needs the arch-conditional target; the generic build must not
+    # silently inherit it.
+    assert with_payload["target"]["code"] == "sm_121a"
+    assert without_payload["target"]["code"] == "sm_121"
+
+
+def test_bf16_identity_keys_both_the_module_name_and_the_build_dir(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _patch_capability(monkeypatch, (12, 1))
+    monkeypatch.setattr(cuda_ext, "_find_cutlass_include",
+                        lambda: str(_cutlass_tree(tmp_path)))
+    good = _stub(cuda_ext._BF16_GROUPED_SYMBOLS +
+                 cuda_ext._BF16_GROUPED_SM120_SYMBOLS)
+    calls = _patch_load(monkeypatch, good)
+
+    assert cuda_ext.get_bf16_grouped_ext() is good
+    kwargs = calls[0][1]
+    assert re.fullmatch(r"pq_cb_bf16_grouped_[0-9a-f]{64}", kwargs["name"])
+    identity = kwargs["name"].removeprefix("pq_cb_bf16_grouped_")
+    assert kwargs["build_directory"] == str(
+        tmp_path / "bf16_grouped" / identity)
+    assert good.__gridbook_jit_identity__ == identity
+    assert good.__gridbook_jit_abi_schema__ == cuda_ext._BF16_GROUPED_ABI_SCHEMA
+    assert "-DPRISMAQUANT_CB_BF16_SM120=1" in kwargs["extra_cuda_cflags"]
+    assert "-gencode=arch=compute_121a,code=sm_121a" in \
+        kwargs["extra_cuda_cflags"]
+
+
+def test_bf16_bridge_stays_generic_off_blackwell(monkeypatch, tmp_path):
+    """cc 8.9 compiles the SM80 lane only: no macro, no conditional target.
+
+    An arch-conditional binary refuses to load on any other capability, and
+    the sm12x collective does not exist there at all.
+    """
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _patch_capability(monkeypatch, (8, 9))
+    monkeypatch.setattr(cuda_ext, "_find_cutlass_include",
+                        lambda: str(_cutlass_tree(tmp_path)))
+    good = _stub(cuda_ext._BF16_GROUPED_SYMBOLS)
+    calls = _patch_load(monkeypatch, good)
+
+    assert cuda_ext.get_bf16_grouped_ext() is good
+    flags = calls[0][1]["extra_cuda_cflags"]
+    assert "-gencode=arch=compute_89,code=sm_89" in flags
+    assert not any(flag.startswith("-DPRISMAQUANT_CB_BF16_SM120")
+                   for flag in flags)
+    assert not any("a," in flag or flag.endswith("a") for flag in flags)
+
+
+def test_bf16_bridge_requires_the_sm120_bindings_where_it_compiles_them(
+        monkeypatch, capsys, tmp_path):
+    """On 12.x a module missing the lane is a broken build, so it is refused."""
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _patch_capability(monkeypatch, (12, 1))
+    monkeypatch.setattr(cuda_ext, "_find_cutlass_include",
+                        lambda: str(_cutlass_tree(tmp_path)))
+    _patch_load(monkeypatch, _stub(cuda_ext._BF16_GROUPED_SYMBOLS))
+
+    assert cuda_ext.get_bf16_grouped_ext() is None
+    error = capsys.readouterr().err
+    assert "incompatible CUTLASS grouped BF16" in error
+    for name in cuda_ext._BF16_GROUPED_SM120_SYMBOLS:
+        assert name in error
+
+
+# ---------------------------------------------------------------------------
 # P0.4: PRISMAQUANT_CUTLASS_INCLUDE, honoured everywhere and never guessed at
 # ---------------------------------------------------------------------------
 

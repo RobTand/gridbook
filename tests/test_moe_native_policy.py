@@ -543,6 +543,76 @@ def test_dense_persistent_experiment_is_not_serving_reachable():
     assert not hasattr(PrismaQuantCBLinearMethod, "_ptc_ok")
 
 
+# --- OPT-IN sm12x-native BF16 bridge lane (audit §3 P1) --------------------
+
+
+def test_bridge_keeps_the_sm80_schedule_when_the_lane_is_unresolved():
+    """Flag off is the DEFAULT and must not reach the padded lane at all.
+
+    The layer attribute is what ``process_weights_after_loading`` sets; with
+    the flag unset it stays None and the bridge runs exactly the code it ran
+    before the lane existed.
+    """
+    method = _method()
+    layer = _layer()
+    layer._cb_bf16_sm120 = None
+    method._apply_prefill_native_bf16_sm120 = (
+        lambda *_a, **_k: pytest.fail(
+            "the padded sm12x lane must not run with the flag unset"))
+    x = torch.zeros(4, layer._cb_hidden, dtype=torch.bfloat16)
+    ids = torch.zeros(4, 2, dtype=torch.int32)
+    weights = torch.ones(4, 2)
+    # The default arm proceeds into the exact-segment path and stops at the
+    # first native op, which is the proof that it took that arm.
+    with pytest.raises(Exception) as exc_info:
+        method._apply_prefill_native_bf16(layer, x, weights, ids, "silu")
+    assert "sm120" not in str(exc_info.value)
+
+
+def test_bridge_takes_the_padded_lane_once_it_is_resolved():
+    method = _method()
+    layer = _layer()
+    layer._cb_bf16_sm120 = types.SimpleNamespace(
+        cb_bf16_grouped_sm120_tile_m=lambda: 128)
+    seen = []
+    method._apply_prefill_native_bf16_sm120 = (
+        lambda *args, **kwargs: seen.append(args) or "sm120")
+    x = torch.zeros(4, layer._cb_hidden, dtype=torch.bfloat16)
+    ids = torch.zeros(4, 2, dtype=torch.int32)
+    weights = torch.ones(4, 2)
+    assert method._apply_prefill_native_bf16(
+        layer, x, weights, ids, "silu") == "sm120"
+    assert len(seen) == 1
+
+
+def test_padded_route_layout_is_shared_and_block_offsets_agree():
+    """One helper builds the layout for all three grouped lanes.
+
+    The block offsets the BF16 bridge slices its chunked launches with must
+    name the same tiles ``expert_ids`` does, or a chunk would multiply rows by
+    another chunk's weights.
+    """
+    tile_m, E = 128, 6
+    torch.manual_seed(11)
+    ids = torch.randint(0, E, (300, 2), dtype=torch.int32)
+    w = torch.rand(300, 2)
+    route = moe._padded_route(ids, w, E, tile_m, trim=True,
+                              block_offsets=True)
+    counts = torch.bincount(ids.reshape(-1).long(), minlength=E)
+    blocks = ((counts + tile_m - 1) // tile_m).tolist()
+
+    assert route.block_offsets[0] == 0
+    assert route.block_offsets[E] == sum(blocks)
+    assert int(route.expert_ids.numel()) == sum(blocks)
+    for e in range(E):
+        b0, b1 = route.block_offsets[e], route.block_offsets[e + 1]
+        assert b1 - b0 == blocks[e]
+        assert route.expert_ids[b0:b1].tolist() == [e] * blocks[e]
+    assert route.dest.numel() == sum(blocks) * tile_m
+    # Padding rows point at the throwaway destination T.
+    assert int(route.dest.max()) <= ids.shape[0]
+
+
 def test_native_bf16_chunk_is_bounded_by_the_larger_w13_tile(monkeypatch):
     method = _method()
     layer = types.SimpleNamespace(_cb_E=256, _cb_hidden=4096,

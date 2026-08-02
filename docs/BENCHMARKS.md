@@ -104,6 +104,68 @@ specialization. Until that work is measured end-to-end, this bridge is a
 quality/native-ownership result, not a prefill speed claim or a
 Blackwell-optimized kernel.
 
+That CUTLASS 3.x collective now exists as an **opt-in second lane**
+(`PRISMAQUANT_CB_BF16_SM120`, [KERNELS](KERNELS.md#sm12x-native-grouped-bf16-opt-in-prismaquant_cb_bf16_sm120));
+the measurements above are unchanged and still describe the DEFAULT lane. The
+new lane's own numbers are immediately below.
+
+## 2026-08-01 sm12x-native grouped-BF16 lane microbenchmark (PROPOSAL DATA)
+
+Same kind of measurement and the same exclusions as the section above, so the
+two are comparable, and the same caveat applies twice over: a kernel
+microbenchmark **proposes**, only the [NATIVE-PARITY](NATIVE-PARITY.md) served
+protocol promotes. Nothing here is a TTFT result or grounds for a default
+change; the lane ships opt-in.
+
+Execution identity: one GB10 (`sm_121`), Torch `2.11.0+cu130`, CUDA 13.0,
+`gridbook:test`, CUTLASS 4.3.4, lane config `128×128×64`, 2 stages, 75,776 B of
+the 101,376-byte sm120 budget. Reproduce with
+`python3 scripts/bench_bf16_grouped_sm120.py [--tokens T]`. Seed-731 uniform
+router, `E=32`, `top_k=8`; warm = median of 30 CUDA-event samples after 10
+warmups. **The sm12x column includes its padded-gather**, because the lane is
+what requires the padding; `Mp` is the padded row count against `P` real routed
+rows. Ratios above 1 mean the sm12x lane is faster.
+
+| T | shape | P | Mp | sm12x warm | SM80 warm | segmented warm | sm12x / SM80 | sm12x / segmented |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 128 | `w13` K=4096 N=4096 | 1,024 | 4,096 | 6.602 ms | 6.974 ms | 5.038 ms | **1.056×** | 0.763× |
+| 128 | `w2` K=2048 N=4096 | 1,024 | 4,096 | 2.842 ms | 3.130 ms | 2.655 ms | **1.102×** | 0.934× |
+| 128 | Laguna s1 K=3072 N=2048 | 1,024 | 4,096 | 2.192 ms | 2.375 ms | 2.045 ms | **1.083×** | 0.933× |
+| 128 | Laguna s2 K=1024 N=3072 | 1,024 | 4,096 | 1.120 ms | 1.348 ms | 1.060 ms | **1.203×** | 0.946× |
+| 512 | `w13` K=4096 N=4096 | 4,096 | 6,144 | 9.737 ms | 8.091 ms | 6.936 ms | 0.831× | 0.712× |
+| 512 | `w2` K=2048 N=4096 | 4,096 | 6,144 | 3.219 ms | 3.513 ms | 3.128 ms | **1.091×** | 0.972× |
+| 2048 | `w13` K=4096 N=4096 | 16,384 | 18,176 | 27.406 ms | 18.585 ms | 11.368 ms | 0.678× | 0.415× |
+| 2048 | `w2` K=2048 N=4096 | 16,384 | 18,176 | 5.769 ms | 7.199 ms | 4.602 ms | **1.248×** | 0.798× |
+
+**Interpretation, stated against the target it was given.** The P1 target was
+"≥ segmented-BF16 parity warm". **It is not met.** The lane beats the DEFAULT
+SM80 bridge on six of eight cells (1.06–1.25×) and is closest to segmented
+parity on the shorter-`K` `w2`/Laguna projections (0.93–0.97× at T=128), but
+segmented BF16 matmuls remain ahead everywhere, and on the long-`K`
+`w13` shape the lane degrades with M — at T=2048 it is 0.68× of the SM80 lane
+and 0.42× of segmented.
+
+Two mechanisms, both recorded rather than guessed at:
+
+- **Occupancy.** At 75,776 B per CTA only ONE CTA is resident per SM, so the
+  two-stage pipeline has no cross-CTA latency hiding. A sweep of every feasible
+  alternative (`128×128×32` at 2/3/5 stages, `128×64×64` at 2/3 stages) moved
+  the long-`K` large-M cell only between 25.1 and 33.0 ms — the tile shape is
+  not the lever, and `128×128×64` was best or near-best on four of six sweep
+  rows, which is why it is the compiled rung.
+- **Padding.** At `T=128` with `E=32` the padded layout is 4× the real rows.
+  That is not a new tax relative to the SM80 grouped kernel (its threadblock
+  tile is also 128×128, so a 4-row expert wastes the same tile), which is why
+  the lane still wins that comparison — but it is a real tax against segmented
+  matmuls, whose per-expert GEMM picks a tile that fits `m≈4`.
+
+The lane therefore stays **opt-in on measured grounds, not only on
+qualification grounds**: it is a structural prerequisite (a real sm12x
+collective now exists, with the grouping construction shared with the fused
+lanes) and a win against the kernel it would replace, but it does not yet clear
+the bar that would justify promoting it, and the served protocol has not been
+run.
+
 ## What is being compared, and how
 
 - **Matched-rate baseline.** Quality rows compare the same model family against a

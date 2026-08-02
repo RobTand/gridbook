@@ -235,6 +235,24 @@ or point the variable somewhere persistent:
 
 The directory must be writable by the serving process. It is never `/tmp`.
 
+**Every module owns a subdirectory** of that root, so no two ninja workspaces
+share artefacts:
+
+```
+main                    # cb_gemv.cu           (decode GEMV / QDQ / expanders)
+v2                      # cb_gemv_v2.cu        (FP4-v2 GEMV + exact expander)
+bf16_grouped/<digest>   # cb_bf16_grouped_gemm.cu  (quality prefill bridge)
+fused/<digest>          # cb_fused_gemm.cu     (FP8-CB fused prefill)
+fused_fp4/<digest>      # cb_fused_fp4_gemm.cu (NVFP4-CB fused prefill)
+```
+
+The three CUTLASS modules key their directory (and their module name) by a
+digest of their packaged sources, Gridbook headers, compiled-in lane macros,
+target capability and toolchain ABI. That is what makes an edited header
+impossible to serve from a stale cached kernel — and it means **upgrading
+Gridbook costs one rebuild per affected module**, landing in a new digest
+directory. The old directories are inert; delete them to reclaim the space.
+
 ---
 
 ## Verify the install

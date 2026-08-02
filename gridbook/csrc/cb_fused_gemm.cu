@@ -251,23 +251,6 @@ static_assert(
                     0, TileF, float, float, Stride<_1, _0, _0>>,
                 cutlass::epilogue::fusion::Sm90AccFetch>>>,
     "shared ScaledFusion must reproduce the pre-extraction EVT node tree");
-static_assert(
-    cute::is_same_v<
-        typename MoeScaledFusion<TileF>::type,
-        cutlass::epilogue::fusion::Sm90EVT<
-            cutlass::epilogue::fusion::Sm90Compute<
-                cutlass::multiplies, ElementD, ElementAcc,
-                cutlass::FloatRoundStyle::round_to_nearest>,
-            cutlass::epilogue::fusion::Sm120CbExpertRowBroadcast<
-                0, TileF, float, float, Stride<_0, _1, _0>>,
-            cutlass::epilogue::fusion::Sm90EVT<
-                cutlass::epilogue::fusion::Sm90Compute<
-                    cutlass::multiplies, ElementAcc, ElementAcc,
-                    cutlass::FloatRoundStyle::round_to_nearest>,
-                cutlass::epilogue::fusion::Sm90ColBroadcast<
-                    0, TileF, float, float, Stride<_1, _0, _0>>,
-                cutlass::epilogue::fusion::Sm90AccFetch>>>,
-    "shared MoeScaledFusion must reproduce the pre-extraction EVT node tree");
 
 torch::Tensor sm120_fp8_mm_fork(torch::Tensor a, torch::Tensor b) {
   return run_dense<Tile128, Fork128>(a, b);
@@ -454,6 +437,26 @@ torch::Tensor cb_fused_prefill_mm_scaled(torch::Tensor a, torch::Tensor packed,
 template <class TileShape>
 using MoeScaledFusion = gridbook::grouped::MoeScaledFusion<TileShape,
                                                            ElementAcc, ElementD>;
+
+// BIT-IDENTITY PROOF (see the ScaledFusion assert above): the expert-indexed
+// tree from the shared header is the type this file spelled verbatim before.
+static_assert(
+    cute::is_same_v<
+        typename MoeScaledFusion<TileF>::type,
+        cutlass::epilogue::fusion::Sm90EVT<
+            cutlass::epilogue::fusion::Sm90Compute<
+                cutlass::multiplies, ElementD, ElementAcc,
+                cutlass::FloatRoundStyle::round_to_nearest>,
+            cutlass::epilogue::fusion::Sm120CbExpertRowBroadcast<
+                0, TileF, float, float, Stride<_0, _1, _0>>,
+            cutlass::epilogue::fusion::Sm90EVT<
+                cutlass::epilogue::fusion::Sm90Compute<
+                    cutlass::multiplies, ElementAcc, ElementAcc,
+                    cutlass::FloatRoundStyle::round_to_nearest>,
+                cutlass::epilogue::fusion::Sm90ColBroadcast<
+                    0, TileF, float, float, Stride<_1, _0, _0>>,
+                cutlass::epilogue::fusion::Sm90AccFetch>>>,
+    "shared MoeScaledFusion must reproduce the pre-extraction EVT node tree");
 
 template <class TileShape>
 struct CfgMoeScaled {
