@@ -1,6 +1,14 @@
 // Minimal CUTLASS+CUDA toolchain probe for GB10 sm_121 (sm_120 family).
 // Confirms: nvcc builds for the target arch, CUTLASS 4.x sub-byte FP4 (E2M1)
 // types + numeric headers compile, and a trivial device kernel links.
+//
+// A standalone main() developer tool, NOT a serving source: nothing loads it,
+// and everything under csrc/tools/ is kept in the repo and the sdist but
+// excluded from the wheel (see pyproject.toml / MANIFEST.in).
+//
+// build (from the repo root):
+//   nvcc -std=c++17 -arch=sm_121a -O3 -I$CUTLASS/include \
+//     gridbook/csrc/tools/toolchain_probe.cu -o toolchain_probe
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/float_subbyte.h>

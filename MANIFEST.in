@@ -15,6 +15,14 @@ recursive-include tests *.py
 include scripts/prepare_lfm_fused_validation.py
 include scripts/validate_fused_nvfp4_ab.py
 
+# Developer tools that live inside the package directory but are NOT package
+# data: standalone main() binaries (gridbook/csrc/tools/) that nothing loads at
+# runtime. The pyproject package-data globs are single-level and therefore skip
+# them, which is what keeps them out of the wheel; this rule puts them back in
+# the SDIST, where the full auditable source tree belongs. Their output ships
+# (the smem table baked into cb_fused_gemm.cu), the binaries do not.
+recursive-include gridbook/csrc/tools *.cu
+
 # ...but `graft docs` is indiscriminate, and two things under docs/ are internal
 # working material, not documentation for someone who ran `pip install gridbook`.
 # A published sdist is permanent (a PyPI file cannot be re-uploaded), so these

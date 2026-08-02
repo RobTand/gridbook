@@ -605,20 +605,29 @@ and release workflow reviewed in the PR are exactly the tree being released.
       d = csrc_dir()
       assert os.path.basename(d) == "csrc", d
       assert os.path.basename(os.path.dirname(d)) == "gridbook", d
-      cu = ("cb_gemv.cu", "cb_fused_gemm.cu",
-            "cb_persistent_tc.cu", "smem_probe_tilem.cu",
-            "toolchain_probe.cu")
+      cu = ("cb_gemv.cu", "cb_gemv_v2.cu", "cb_bf16_grouped_gemm.cu",
+            "cb_fused_gemm.cu", "cb_fused_fp4_gemm.cu", "cb_persistent_tc.cu")
       assert not [f for f in cu if not os.path.exists(os.path.join(d, f))]
-      assert len([f for f in os.listdir(os.path.join(d, "cutlass_fork"))
-                  if f.endswith(".hpp")]) == 5
+      hpp = ("sm120_cb_mma_tma.hpp", "sm120_cb_fused_mma.hpp",
+             "sm120_cb_fused_fp4_mma.hpp", "sm120_expert_row_broadcast.hpp")
+      fork = os.path.join(d, "cutlass_fork")
+      assert not [f for f in hpp if not os.path.exists(os.path.join(fork, f))]
+      # csrc/tools/ is sdist-only (standalone developer binaries): present in a
+      # checkout, absent from an installed wheel. Assert the wheel-side half of
+      # that split only where it is meaningful.
+      if "site-packages" in d:
+          assert not os.path.isdir(os.path.join(d, "tools")), d
       print("ok", gridbook.__version__, d)
       PY
       ```
 
       Measured in (B) 2026-07-28 18:10 UTC: `csrc_dir()` →
-      `<repo>/gridbook/csrc`, 0 missing `.cu`, 5 `cutlass_fork/*.hpp`. Run the
-      same block again *after* a non-editable install from a directory that is not
-      the repo (§3.2) — that is the case the release actually ships.
+      `<repo>/gridbook/csrc`, 0 missing `.cu`, 5 `cutlass_fork/*.hpp` (the
+      block asserted a *count* then; it asserts the named runtime set now, and
+      the set changed with the 2026-08-01 dead-code ledger — see
+      `audits/ultraplan_perf_2026-08-01.md` §4). Run the same block again
+      *after* a non-editable install from a directory that is not the repo
+      (§3.2) — that is the case the release actually ships.
 - [ ] **The build under test was produced from (B).** Not from (A), not from a
       copy of (A). If a build command in §3.2 was run somewhere else, the boxes it
       ticked are void.
@@ -659,11 +668,14 @@ false of (B) for several hours on 2026-07-28.
       which also lands them in the sdist. *Verified in (B): 12 `csrc` members in
       both wheel and sdist.*
 - [ ] Confirm on the **built artifacts** (not the source tree) that every
-      runtime-required native source is present: `cb_gemv.cu`,
-      `cb_fused_gemm.cu`, `cb_persistent_tc.cu`,
-      `smem_probe_tilem.cu`, `toolchain_probe.cu`, and the 5
-      `csrc/cutlass_fork/*.hpp` headers. A `package-data` glob that silently
-      matches nothing is the exact failure mode this gate exists for.
+      runtime-required native source is present: `cb_gemv.cu`, `cb_gemv_v2.cu`,
+      `cb_bf16_grouped_gemm.cu`, `cb_fused_gemm.cu`, `cb_fused_fp4_gemm.cu`,
+      the retained research source `cb_persistent_tc.cu`, and the
+      `csrc/cutlass_fork/` fork headers. A `package-data` glob that silently
+      matches nothing is the exact failure mode this gate exists for; the
+      opposite failure — a glob that matches *too much* — is gated by the
+      sdist-only list in `check_dist.py` (`csrc/tools/`), which must be present
+      in the sdist and absent from the wheel.
 - [ ] The CUTLASS question is **decided and written down**: `cuda_ext.py`
       currently globs CUTLASS headers out of the *installed vLLM's* directory
       (`_find_cutlass_include()`), and in the tested image two different CUTLASS

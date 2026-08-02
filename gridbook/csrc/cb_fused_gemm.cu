@@ -473,7 +473,7 @@ constexpr int64_t kMoeTileM = size<0>(TileF{});
 // FEASIBILITY IS SMEM-BOUND, and the bound bites the HIGH rungs first, because
 // smem grows with BOTH TileM (smem_A = TileM*TileK*Stages) and k_bits
 // (smem_BP = TileN*4*k_bits*Stages). Measured exactly by
-// csrc/smem_probe_tilem.cu (host-only, no launch) against CUTLASS's
+// csrc/tools/smem_probe_tilem.cu (host-only, no launch) against CUTLASS's
 // cutlass::arch::sm120_smem_capacity_bytes = 101376 (= 99 KiB, the CUDA
 // cc-12.0 max opt-in dynamic smem per block):
 //

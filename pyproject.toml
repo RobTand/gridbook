@@ -84,6 +84,13 @@ include = ["gridbook*"]
 # including a non-editable wheel. They live under gridbook/csrc (inside the
 # package) precisely so this glob can reach them; package-data also lands in
 # the sdist automatically. Do not move csrc back to the repo root.
+#
+# These globs are single-level ON PURPOSE. `csrc/tools/` holds standalone
+# main() developer binaries (a smem-budget probe and a toolchain probe) that
+# no runtime path loads: they belong in the repo and the sdist, not in every
+# user's site-packages. A `csrc/**/*.cu` recursive glob would silently ship
+# them again -- MANIFEST.in re-adds that directory to the sdist alone, and
+# .github/scripts/check_dist.py asserts the split in both directions.
 [tool.setuptools.package-data]
 gridbook = [
     "runtime_contract.json",
@@ -92,3 +99,22 @@ gridbook = [
     "csrc/*.h",
     "csrc/cutlass_fork/*.hpp",
 ]
+
+# ...and the wheel-side subtraction. `include-package-data` defaults to TRUE
+# under a pyproject.toml config, so every MANIFEST.in rule that names a file
+# INSIDE the package would otherwise put it in the wheel as well as the sdist.
+# These entries are what make "sdist yes, wheel no" hold; they are asserted in
+# both directions by .github/scripts/check_dist.py, which fails if any of them
+# reaches the wheel or goes missing from the sdist.
+#
+# BOTH keys are load-bearing, and the reason is not obvious. `packages.find`
+# defaults to namespaces = true, so setuptools treats `gridbook/csrc/tools`
+# as its own (namespace) package: a MANIFEST.in file under it is attributed to
+# the package `gridbook.csrc.tools`, while the same file reached through the
+# `gridbook` package-data globs is attributed to `gridbook`. An exclusion only
+# filters the attribution it names, so a single key silently half-works.
+[tool.setuptools.exclude-package-data]
+gridbook = [
+    "csrc/tools/*",
+]
+"gridbook.csrc.tools" = ["*"]
