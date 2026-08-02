@@ -67,6 +67,108 @@ SOURCE_SUPPLEMENTAL_MODULE_INPUT = "supplemental_module_input_sample"
 SOURCE_SUPPLEMENTAL_ROUTED_REPLAY = "supplemental_routed_intermediate_replay"
 SOURCE_SUPPLEMENTAL_MAX_ABS = "supplemental_max_abs"
 SOURCE_PACKED_EXPERT_RENDER = "packed_expert_render_max_abs"
+# ===========================================================================
+# K0.4 — LATEST-ROUTE DISPATCH TELEMETRY (dense AND routed).
+#
+# What K0.4 asks to be attestable on every fused call: the requested activation
+# POLICY, the ACTUAL kernel symbol invoked, TileM, the problem SHAPE, the
+# activation CONTRACT, the fallback STATE, and the exact fallback REASON.
+#
+# MECHANISM: the one already in the tree. The 0.4.2 dense TileM route telemetry
+# is three plain integers written onto the ``layer`` object at each fused
+# success, which ``scripts/validate_fused_nvfp4_ab.py``'s probe reads back
+# immediately after the call it wrapped. That is deliberately tensor-free and
+# sync-free — a probe must not be able to change what the model executed — and
+# it is last-write-wins per layer, because "the latest route" is the question.
+# This extends that surface to the full field list and to the routed lanes; it
+# does NOT introduce a parallel registry, logger, or counter store, and the
+# three original dense attributes keep their names and meanings so the existing
+# gate and its tests are untouched.
+#
+# It lives in this module because ``linear.py`` and ``moe.py`` both already
+# import it, so no new module edge is created — and because the activation
+# CONTRACT vocabulary belongs with the contract.
+# ===========================================================================
+
+# What RAN, as opposed to what was asked for (that is ``policy``). Closed set:
+# both the writer and the report validate against this one tuple, so a typo
+# cannot invent a contract that no gate is checking.
+ROUTE_CONTRACTS = frozenset((
+    "nvfp4_static_G",
+    "nvfp4_static_lsq",
+    "nvfp4_rowwise",
+    "fp8_per_token_dynamic",
+    "fp4_group16_rtn",
+    "fp32_emulated_group_qdq",
+))
+
+ROUTE_STATES = frozenset(("served", "fallback", "error"))
+
+# The record's field names, in report order. The probe reads exactly these.
+ROUTE_FIELDS = (
+    "kind",                  # "dense" | "moe"
+    "policy",                # requested activation policy, verbatim
+    "symbol",                # the kernel entry point actually invoked
+    "tile_m",                # int; 0 where the route has no tile (GEMV)
+    "shape",                 # compact problem-shape key
+    "contract",              # what RAN, from ROUTE_CONTRACTS
+    "state",                 # from ROUTE_STATES
+    "reason",                # exact fallback reason; None when served
+    "tile_candidate_ctas",   # selector provenance
+    "tile_sm_count",         # selector provenance
+    "tile_rho",              # selector provenance: P // E (0 for dense)
+    "tile_compiled",         # selector provenance: "128,256"
+)
+
+
+def emit_route(layer, *, kind: str, policy: str, symbol: str, tile_m: int = 0,
+               shape: str = "", contract: str = "", state: str = "served",
+               reason=None, tile_candidate_ctas: int = 0,
+               tile_sm_count: int = 0, tile_rho: int = 0,
+               tile_compiled: str = "") -> None:
+    """Record the latest dispatch route on ``layer``. Never raises.
+
+    Twelve ``setattr``s of Python scalars — no tensor is touched, so this can
+    sit on the hot path without a sync and cannot perturb what executed.
+
+    TWO-PHASE USE. Write ``state="error"`` with a reason before a launch and
+    rewrite ``state="served"`` after it returns; then "raised mid-launch" is
+    distinguishable from "never launched", and ``symbol`` stays an honest record
+    of what was INVOKED even when it threw. A gate miss writes ``symbol=""``,
+    ``state="fallback"`` and the exact reason.
+
+    Selector provenance (``tile_rho`` above all) is what makes a tile choice
+    auditable offline: given rho, the candidate CTA count, the SM count and the
+    compiled set, a report reader can re-derive the verdict without the GPU.
+    """
+    try:
+        values = {
+            "kind": str(kind), "policy": str(policy), "symbol": str(symbol),
+            "tile_m": int(tile_m), "shape": str(shape),
+            "contract": str(contract), "state": str(state),
+            "reason": None if reason is None else str(reason),
+            "tile_candidate_ctas": int(tile_candidate_ctas),
+            "tile_sm_count": int(tile_sm_count), "tile_rho": int(tile_rho),
+            "tile_compiled": str(tile_compiled),
+        }
+        for field in ROUTE_FIELDS:
+            setattr(layer, f"_cb_route_{field}", values[field])
+    except Exception:  # noqa: BLE001 — telemetry must never break a request
+        pass
+
+
+def read_route(layer):
+    """The latest route record as a plain dict, or ``None`` if never written.
+
+    Pure ``getattr`` over Python scalars. Returning ``None`` (rather than a
+    partial dict) is what lets a consumer count a MISSING record as a probe
+    error instead of silently passing a gate that never observed a route.
+    """
+    if getattr(layer, "_cb_route_state", None) is None:
+        return None
+    return {f: getattr(layer, f"_cb_route_{f}", None) for f in ROUTE_FIELDS}
+
+
 SUPPORTED_CALIBRATION_SOURCES = frozenset((
     SOURCE_TARGET_CACHE,
     SOURCE_PARENT_MODULE_CACHE,
@@ -653,6 +755,11 @@ __all__ = [
     "CONTRACT_SCHEMA",
     "CONTRACT_SCHEMA_V2",
     "EXECUTION_CONTRACT",
+    "ROUTE_CONTRACTS",
+    "ROUTE_FIELDS",
+    "ROUTE_STATES",
+    "emit_route",
+    "read_route",
     "FULL_E4M3_POLICY",
     "GROUP_SIZE",
     "LEGACY_POLICY",

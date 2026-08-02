@@ -96,6 +96,25 @@ def cb_cached_row_offsets(layer, rows: int, device) -> torch.Tensor:
     return cache.setdefault(key, value)
 
 
+def _expert_counts(pair_expert: torch.Tensor, E: int) -> torch.Tensor:
+    """``[E]`` int64 routed-pair counts per expert, WITHOUT a host sync.
+
+    scatter_add_, NOT bincount. ATen's CUDA ``bincount`` sizes its output from
+    ``self.min().item()`` / ``self.max().item()``, so it host-syncs and cannot
+    be captured ("Cannot copy between CPU and CUDA tensors during CUDA graph
+    capture", measured on torch 2.11.0+cu130). The persistent-B lane hit this
+    exact trap: its docstring claimed no host read while a bincount two lines
+    away made the operator uncapturable, and the fix — this form — is now gated
+    with a negative control (tests/test_cb_moe_persistent_b.py). The padded
+    tile-indexed lanes carried the same latent bincount until 2026-08-02; the
+    "NO HOST READS" paragraph below was false for as long as they did.
+
+    Pure device work at a static shape, producing the identical integers.
+    """
+    return torch.zeros(E, dtype=torch.int64, device=pair_expert.device) \
+        .scatter_add_(0, pair_expert, torch.ones_like(pair_expert))
+
+
 def cb_grouped_block_offsets(topk_ids: torch.Tensor, E: int, tile_m: int):
     """``[E+1]`` cumulative TileM-block offsets of the padded row layout.
 
@@ -111,7 +130,7 @@ def cb_grouped_block_offsets(topk_ids: torch.Tensor, E: int, tile_m: int):
     :func:`cb_grouped_pad_routing` so the fused paths, which launch the whole
     collective at once, keep their single optional sync.
     """
-    counts = torch.bincount(topk_ids.reshape(-1).to(torch.long), minlength=E)
+    counts = _expert_counts(topk_ids.reshape(-1).to(torch.long), E)
     blocks_e = (counts + (tile_m - 1)) // tile_m
     return torch.cat([blocks_e.new_zeros(1), torch.cumsum(blocks_e, 0)])
 
@@ -148,14 +167,18 @@ def cb_grouped_pad_routing(topk_ids: torch.Tensor, E: int, tile_m: int):
 
     NO HOST READS. Block->expert is a ``searchsorted`` over the block-offset
     cumsum rather than a ``repeat_interleave`` by a tensor count, because the
-    latter has a data-dependent output size and would itself sync.
+    latter has a data-dependent output size and would itself sync — and the
+    per-expert counts come from :func:`_expert_counts`, not ``bincount``, for
+    the same reason. Until 2026-08-02 this paragraph was FALSE: a
+    ``torch.bincount`` here host-synced on every call, so the padded grouped
+    lanes could not be captured no matter what their callers did.
     """
     dev = topk_ids.device
     pair_expert = topk_ids.reshape(-1).to(torch.long)              # [P]
     P = pair_expert.numel()
     cap_blocks = P // tile_m + E
 
-    counts = torch.bincount(pair_expert, minlength=E)              # [E]
+    counts = _expert_counts(pair_expert, E)                        # [E]
     pair_off = torch.cat([counts.new_zeros(1), torch.cumsum(counts, 0)])
     blocks_e = (counts + (tile_m - 1)) // tile_m                   # [E]
     block_off = torch.cat([blocks_e.new_zeros(1),
@@ -182,3 +205,175 @@ def cb_grouped_pad_routing(topk_ids: torch.Tensor, E: int, tile_m: int):
     row_src = torch.where(is_pad, torch.zeros_like(rank),
                           pair_off[e_row] + rank)
     return expert_ids, row_src, is_pad, n_blocks
+
+
+# ===========================================================================
+# K0.4 — the grouped-MoE TileM SELECTOR.
+#
+# It replaces two hand choices: the FP8 grouped path resolved ``tile_m=None``
+# to the kernel's compiled default (so serving could never reach 256 at all),
+# and the FP4 grouped path read its tile off the SUFFIX of an activation POLICY
+# env string ("static_lsq256") — a performance knob riding on a numerics
+# selector.
+#
+# It lives here, not in moe.py, for the reason this module exists: it is pure
+# integer arithmetic over shapes, so it is testable on CPU with no vLLM and no
+# GPU — which is where the risk in this kind of code actually is.
+# ===========================================================================
+
+# Keep in lockstep with the compiled tile shapes — csrc/cb_fused_gemm.cu
+# (MoeTile<TM>, moe_tile_supported) and csrc/cb_fused_fp4_gemm.cu. Python never
+# ASSUMES the compiled set: the caller passes what the extension reports
+# (``moe._gf2_tile_sizes``). These two names exist so the arithmetic can talk
+# about the pair without hardcoding a ladder.
+GROUPED_TILE_M_BASE = 128
+GROUPED_TILE_M_WIDE = 256
+
+# TileN is a property of the compiled tile shape, not of the layer: the fp8
+# grouped tile is Shape<TM,_64,_128>; the fp4 grouped tile is
+# Shape<TM,_128,_128> (TileN pinned at 128 by the blockscaled scale-factor smem
+# atom).
+GROUPED_TILE_N = {"fp8": 64, "fp4": 128}
+
+# The one calibrated constant. Derivation (also in docs/KERNELS.md):
+#   Per CTA at tile t: decode TileN*K weights ONCE, then issue t*TileN*K MACs.
+#   With d = per-tile decode cost and m = per-row MMA+traffic cost,
+#   T(t) ~ B(t) * (d + t*m), where B(t) = sum_e ceil(c_e/t) is the M-tile count.
+#   Exact padding lemma: pad_256(c) - pad_128(c) = 128 iff (c mod 256) lies in
+#   [1,128], else 0. So with q = #{e : (c_e mod 256) in [1,128]},
+#   B(128) = 2*B(256) - q, and TileM=256 wins iff (B128 - q)/q > 256/x for
+#   x = d/m. The decode:MMA ratio is 1:t independent of N and K, so BOTH stages
+#   give the same condition. Minimising the left side over EVERY histogram with
+#   sum c_e = P (worst case c_e = 128 mod 256, which maximises q and minimises
+#   B128) gives the host-knowable sufficient condition
+#       rho = P/E  >  128 * (1 + 256/x).
+#   Inverting the dense fused TileM A/B (22.57-50.32% at fixed occupancy =>
+#   2(x+128)/(x+256) in [1.226, 1.503]) bounds x to [75, 259], putting the
+#   threshold in [254, 565]. 512 is the pessimistic end of that interval.
+# PROPOSAL DATA for this kernel family until a routed sweep pins it on the
+# grouped lanes; PRISMAQUANT_CB_GROUPED_TILE_M overrides for measurement.
+GROUPED_WIDE_TILE_MIN_ROWS_PER_EXPERT = 512
+
+# (tile_m, k_bits) the extension compiles at ZERO shared-memory margin.
+# cb_fused_gemm.cu: "TileM=256/k_bits=32 lands on EXACTLY the 101376-byte
+# ceiling (zero margin) — it is compiled, but must be launch-verified before
+# being trusted." Until that verification lands the SELECTOR will not choose
+# it; an explicit operator override still can.
+GROUPED_TILE_M_UNVERIFIED = frozenset({(GROUPED_TILE_M_WIDE, 32)})
+
+_SM_COUNTS: dict[int, int] = {}
+
+
+def cb_sm_count(device) -> int:
+    """Multiprocessor count for ``device``, cached; 0 when unavailable.
+
+    ``get_device_properties`` reads cached runtime metadata and does NOT
+    synchronize the device; caching it here also keeps that query out of
+    steady-state dispatch. A failed probe caches 0, so every selector that
+    consumes it fails closed to the narrow tile.
+    """
+    if getattr(device, "type", None) != "cuda":
+        return 0
+    try:
+        index = device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        index = int(index)
+    except Exception:  # noqa: BLE001 — optional optimization, fail closed
+        return 0
+    cached = _SM_COUNTS.get(index)
+    if cached is not None:
+        return cached
+    try:
+        count = int(torch.cuda.get_device_properties(index)
+                    .multi_processor_count)
+        if count <= 0:
+            count = 0
+    except Exception:  # noqa: BLE001 — optional optimization, fail closed
+        count = 0
+    _SM_COUNTS[index] = count
+    return count
+
+
+def cb_grouped_tile_m(*, tokens: int, top_k: int, experts: int,
+                      hidden: int, inter: int, tile_n: int,
+                      compiled, sm_count: int, k_bits: int = 0,
+                      min_rows_per_expert: int =
+                      GROUPED_WIDE_TILE_MIN_ROWS_PER_EXPERT) -> int:
+    """Grouped-fused TileM, from HOST-KNOWN integers only.
+
+    CUDA-GRAPH SAFETY — the claim, and why it holds by construction.
+
+    Every input is a Python ``int``. ``tokens``/``top_k`` come from
+    ``topk_ids.shape`` (host tensor METADATA, never values); ``experts``,
+    ``hidden``, ``inter`` and ``k_bits`` are layer constants fixed at load;
+    ``tile_n`` and ``compiled`` are properties of the BUILD (the extension's own
+    per-rung tile list, never a hardcoded set); ``sm_count`` is the cached,
+    non-synchronizing device-property read. No ATen op runs on a device tensor,
+    so there is no device->host copy and hence no synchronization on any path —
+    and nothing for capture to trip over.
+
+    That matters because ``tile_m`` decides BOTH the kernel symbol
+    (``run_moe_grouped<TM,KB>`` is a distinct ``__global__`` per TM) and every
+    routing tensor's SHAPE (``cap_blocks = P//tile_m + E``). Both must be fixed
+    before the first node is recorded; a selector over host-known values is
+    resolved at record time by definition, so one capture gets one tile, one
+    symbol, one grid and one shape set.
+
+    THE ROUTED HISTOGRAM IS DELIBERATELY NOT AN INPUT. It is device data, and
+    ``tile_m`` is an INPUT to :func:`cb_grouped_pad_routing` while the trim read
+    is an OUTPUT of it — so a histogram-reading selector must run strictly
+    upstream, and its read would be a NEW, EARLIER sync that cannot be folded
+    into the one the trim already spends. Under capture it would make the
+    launched symbol and every routing shape a function of device data, which is
+    not a limitation to work around but outside what a graph is. This is the
+    persistent-B ``scatter_add_`` lesson applied before the fact instead of
+    after: that lane's "no host read" claim was false because a ``bincount`` two
+    lines away host-synced, and the repair was to REMOVE the read, not to guard
+    it. (The same latent ``bincount`` sat in this module until 2026-08-02; see
+    :func:`_expert_counts`.)
+
+    PRICE. A histogram-free rule must hold for EVERY histogram consistent with
+    ``(P, E)``, so it fires the wide tile later than an oracle would — rho about
+    ``128 + 32768/x`` against ``16384/x``. Both thresholds sit above ordinary
+    chunked-prefill batch sizes, so the practical loss is nil while the
+    sync-freedom is permanent.
+
+    FAIL-CLOSED ESTIMATION. Every device-unknown quantity enters at the end of
+    its provable interval that favours the INCUMBENT narrow tile: the number of
+    routed experts becomes ``E`` (maximum padding), and the grid becomes
+    ``ceil(P/t)`` (minimum occupancy). Both criteria are monotone in that
+    direction, so a wide-tile verdict is justified UNIFORMLY — for every
+    histogram — rather than on average.
+
+    Returns a member of ``compiled``, or ``0`` when the build offers no tile —
+    which the caller must treat as "no fused route", never as "use the default".
+    """
+    legal = sorted({int(t) for t in compiled if int(t) > 0})
+    if not legal:
+        return 0
+    base = GROUPED_TILE_M_BASE if GROUPED_TILE_M_BASE in legal else legal[0]
+    wide = GROUPED_TILE_M_WIDE
+    if wide not in legal:
+        return base                       # not compiled for this rung/build
+    if k_bits and (wide, int(k_bits)) in GROUPED_TILE_M_UNVERIFIED:
+        return base                       # zero smem margin, not yet verified
+    if sm_count <= 0:
+        return base                       # device metadata unavailable
+
+    pairs = int(tokens) * int(top_k)      # P, exactly host-known
+    if pairs < wide:
+        return base                       # shape guard (mirrors the dense one)
+    rho = pairs // max(1, int(experts))
+    if rho <= int(min_rows_per_expert):
+        return base
+
+    # OCCUPANCY. Both projection stages share ONE tile and ONE row layout
+    # (``expert_ids`` is built once and reused), but their N differs — stage 1
+    # is N=2*inter, stage 2 is N=hidden. The NARROWER projection bounds the
+    # grid, and ceil(P/t) lower-bounds the real tile count for every histogram,
+    # so this is a lower bound on the true occupancy of the worse stage.
+    n_min = min(2 * int(inter), int(hidden))
+    grid_lo = ((pairs + wide - 1) // wide) * ((n_min + tile_n - 1) // tile_n)
+    occupancy_floor = (2 * int(sm_count) + 2) // 3
+    return wide if grid_lo >= occupancy_floor else base

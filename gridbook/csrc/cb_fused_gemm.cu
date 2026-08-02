@@ -392,6 +392,12 @@ void check_fused_kbits(int64_t k_bits) {
 void check_fused_inputs(torch::Tensor a, torch::Tensor packed,
                         torch::Tensor lut, int64_t N, int64_t K,
                         int64_t k_bits) {
+  // FIRST, before any shape check. Every downstream bound is a function of
+  // k_bits (row_bytes = (K/256)*4*k_bits above all), so an off-law rung makes
+  // the shape checks fire first and report a stride mismatch — burying the
+  // actual reason under a symptom. The rung is the most fundamental
+  // precondition and carries the most informative message.
+  check_fused_kbits(k_bits);
   TORCH_CHECK(a.is_cuda() && a.scalar_type() == torch::kFloat8_e4m3fn,
               "a must be fp8 e4m3 [M,K]");
   TORCH_CHECK(a.dim() == 2 && a.size(1) == K && a.stride(1) == 1 &&
@@ -404,7 +410,6 @@ void check_fused_inputs(torch::Tensor a, torch::Tensor packed,
   TORCH_CHECK(packed.stride(0) >= (K / 256) * 4 * k_bits);
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8);
   TORCH_CHECK(K % 256 == 0);
-  check_fused_kbits(k_bits);
 }
 
 torch::Tensor cb_fused_prefill_mm(torch::Tensor a, torch::Tensor packed,
@@ -769,6 +774,7 @@ torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
                                    int64_t K, int64_t k_bits,
                                    int64_t tile_m = kMoeTileM) {
   // --- mirrors check_fused_inputs, but packed is [E, N, row_bytes] ---
+  check_fused_kbits(k_bits);   // first, for the reason given in that function
   TORCH_CHECK(a.is_cuda() && a.scalar_type() == torch::kFloat8_e4m3fn,
               "a must be fp8 e4m3 [Mp,K]");
   TORCH_CHECK(a.dim() == 2 && a.size(1) == K && a.stride(1) == 1 &&
@@ -776,7 +782,6 @@ torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
               "a must be contiguous [Mp,K]");
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8);
   TORCH_CHECK(K % 256 == 0);
-  check_fused_kbits(k_bits);
   TORCH_CHECK(moe_tile_supported(tile_m, k_bits),
               "grouped tile_m=", tile_m, " is not compiled for k_bits=", k_bits,
               " (smem-infeasible on sm_120: limit 101376 B). Query "

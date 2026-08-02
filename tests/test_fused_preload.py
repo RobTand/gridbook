@@ -31,9 +31,13 @@ def _patch_all(monkeypatch, calls, *, resident=(), raises=()):
 
     All seven must be stubbed in every test: the warm-up really does call all
     of them now, so an unpatched loader would start a real multi-minute nvcc
-    build inside the test run.
+    build inside the test run. Any family the implementation has grown past
+    this file is stubbed too, so inventory drift is reported by the coverage
+    assertions instead of compiling CUDA in the middle of a unit test.
     """
-    for family, attr in LOADERS.items():
+    inventory = dict(LOADERS)
+    inventory.update(dict(cuda_ext._PRELOAD_FAMILIES))
+    for family, attr in inventory.items():
         def stub(family=family):
             calls.append(family)
             if family in raises:
@@ -41,6 +45,14 @@ def _patch_all(monkeypatch, calls, *, resident=(), raises=()):
                     "one failed loader must not suppress the others")
             return object() if family in resident else None
         monkeypatch.setattr(cuda_ext, attr, stub)
+
+
+def test_registry_names_exactly_the_seven_loader_families():
+    """The warm-up inventory is all seven modules — no more, no fewer."""
+    assert dict(cuda_ext._PRELOAD_FAMILIES) == LOADERS
+    assert len(cuda_ext._PRELOAD_FAMILIES) == len(LOADERS)  # no duplicate keys
+    for attr in LOADERS.values():
+        assert callable(getattr(cuda_ext, attr))
 
 
 def test_preload_attempts_every_loader_family(monkeypatch):

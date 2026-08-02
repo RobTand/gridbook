@@ -1019,6 +1019,27 @@ def get_fused_fp4_ext():
         return _load_fused_fp4_ext_locked()
 
 
+# The full inventory the residency warm-up attempts: ``(status key, loader
+# attribute of this module)``, architecture-generic production modules first
+# (cheapest, and the ones a decode A/B always touches), then the arch-pinned
+# specializations. The keys are the stable status/report names — ``fp8`` and
+# ``fp4`` keep the names they were published with.
+#
+# Loaders are held BY NAME and resolved against this module at call time, for
+# two reasons: several are defined further down the file, and a lane whose
+# loader lives in a self-contained additive block at the end of this file
+# appends its own entry there (see the bottom of this file) instead of forcing
+# an edit up here. A monkeypatched loader is therefore also the one that runs.
+_PRELOAD_FAMILIES: list[tuple[str, str]] = [
+    ("gemv", "get_ext"),                        # cb_gemv.cu
+    ("gemv_v2", "get_ext_v2"),                  # cb_gemv_v2.cu
+    ("bf16_grouped", "get_bf16_grouped_ext"),   # cb_bf16_grouped_gemm.cu
+    ("fp8", "get_fused_ext"),                   # cb_fused_gemm.cu
+    ("fp4", "get_fused_fp4_ext"),               # cb_fused_fp4_gemm.cu
+    ("fp4v2", "get_fused_fp4v2_ext"),           # cb_fused_fp4v2_gemm.cu
+]
+
+
 def preload_native_extensions(*, strict: bool = False) -> dict[str, bool]:
     """Attempt EVERY independent native JIT module, for residency-matched A/Bs.
 
@@ -1028,8 +1049,9 @@ def preload_native_extensions(*, strict: bool = False) -> dict[str, bool]:
     docs/KERNELS.md "a measurement side-effect worth knowing"), so an arm that
     warms only the two fused modules is still residency-MISmatched against an
     arm that later touches ``cb_gemv_v2`` or the grouped BF16 bridge. This
-    warms all seven loaders so both arms of an A/B carry the same set
-    (2026-08-01 performance audit §3 P4, "preload completeness").
+    warms every loader in ``_PRELOAD_FAMILIES`` — all seven modules — so both
+    arms of an A/B carry the same set (2026-08-01 performance audit §3 P4,
+    "preload completeness").
 
     Each loader is fail-soft in normal operation, but keep the attempts
     INDEPENDENT even if a monkeypatch, import failure, or future strict mode
@@ -1043,23 +1065,12 @@ def preload_native_extensions(*, strict: bool = False) -> dict[str, bool]:
     """
     status: dict[str, bool] = {}
     errors: dict[str, Exception] = {}
-    # Architecture-generic production modules first (cheapest, and the ones a
-    # decode A/B always touches), then the arch-pinned specializations. The
-    # keys are the stable status names; ``fp8``/``fp4`` keep the names they
-    # were published with. Resolved as globals at CALL time — three of these
-    # loaders are defined below this point, and a monkeypatched loader must be
-    # the one that actually runs.
-    for family, load_ext in (
-        ("gemv", get_ext),                                # cb_gemv.cu
-        ("gemv_v2", get_ext_v2),                          # cb_gemv_v2.cu
-        ("bf16_grouped", get_bf16_grouped_ext),           # cb_bf16_grouped_gemm.cu
-        ("fp8", get_fused_ext),                           # cb_fused_gemm.cu
-        ("fp4", get_fused_fp4_ext),                       # cb_fused_fp4_gemm.cu
-        ("fp4v2", get_fused_fp4v2_ext),                   # cb_fused_fp4v2_gemm.cu
-        ("moe_persistent_b", get_moe_persistent_b_ext),   # cb_moe_persistent_b.cu
-    ):
+    for family, loader_name in tuple(_PRELOAD_FAMILIES):
         try:
-            status[family] = load_ext() is not None
+            # Resolved inside the try: a registry entry naming something this
+            # module does not define is one broken family to report, not a
+            # reason to skip the warm-up of the ones after it.
+            status[family] = globals()[loader_name]() is not None
         except Exception as exc:  # noqa: BLE001 — report after every attempt
             status[family] = False
             errors[family] = exc
@@ -1075,10 +1086,10 @@ def preload_native_extensions(*, strict: bool = False) -> dict[str, bool]:
 def preload_fused_extensions(*, strict: bool = False) -> dict[str, bool]:
     """The published name for :func:`preload_native_extensions`; delegates.
 
-    Kept because it is a documented public surface (``PRISMAQUANT_PRELOAD_FUSED``
-    in docs/PLUGIN.md) and an external caller may hold the name. It is no
-    longer accurate — the warm-up now covers every native module, not just the
-    two fused ones — so new code should call
+    Kept because it is a documented public surface
+    (``PRISMAQUANT_PRELOAD_FUSED``, docs/PLUGIN.md) and an external caller may
+    still hold the name. The name is no longer accurate — the warm-up covers
+    every native module, not just the two fused ones — so new code should call
     :func:`preload_native_extensions`. Behaviour is identical, including the
     ``fp8``/``fp4`` status keys, which now arrive alongside the other five.
     """
@@ -1629,6 +1640,14 @@ def _load_moe_persistent_b_ext_locked():
     finally:
         _moe_persistent_b_tried = True
     return _moe_persistent_b
+
+
+# This lane is part of the residency warm-up: a benchmark arm that builds it
+# and one that does not are not extension-residency-matched, which is the
+# ±17% measurement-arithmetic confound (2026-08-01 audit §3 P4). Registered
+# from inside the block, by name, so `preload_native_extensions` picks it up
+# without this lane leaking a mention above the BEGIN marker.
+_PRELOAD_FAMILIES.append(("moe_persistent_b", "get_moe_persistent_b_ext"))
 # ===========================================================================
 # END ADDITIVE BLOCK — persistent-B grouped MoE loader
 # ===========================================================================

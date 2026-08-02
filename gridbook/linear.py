@@ -43,6 +43,7 @@ from .ops import (cb_bf16_grouped_mm, cb_gemv_fp4_v2, cb_gemv_fp8,
                   fp4_act_qdq_or_codec)
 from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
+    emit_route,
     reciprocal_vector as _nvfp4_reciprocal_vector,
     require_identical_loaded_scales,
     rowwise_range_multiplier as _nvfp4_rowwise_range_multiplier,
@@ -1076,11 +1077,24 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             from .cuda_ext import get_fused_ext
             fext = get_fused_ext()
             if fp8_fused_rung_eligible(fext, self.k):
+                # K0.4 dense route record. The dense mid-M FP8 lane had NO
+                # telemetry at all (only the fp4 lane's three tile attributes),
+                # so a served FP8 prefill was indistinguishable in a dispatch
+                # report from one that quietly took the expand+GEMM route.
+                shape = f"M{int(x2.shape[0])}:N{int(N)}:K{int(K)}"
+                emit_route(layer, kind="dense", policy="fp8_cb_midm",
+                           symbol="cb_fused_prefill_mm_scaled", tile_m=128,
+                           shape=shape, contract="fp8_per_token_dynamic",
+                           state="error", reason="launch did not return")
                 y = fext.cb_fused_prefill_mm_scaled(
                     xq, layer.cb_qweight.data, layer._cb_flat_fp8,
                     sa.reshape(-1).to(torch.float32).contiguous(),
                     layer._cb_scale.reshape(-1).to(torch.float32).contiguous(),
                     N, K, self.k)
+                emit_route(layer, kind="dense", policy="fp8_cb_midm",
+                           symbol="cb_fused_prefill_mm_scaled", tile_m=128,
+                           shape=shape, contract="fp8_per_token_dynamic",
+                           state="served", reason=None)
                 return y.reshape(*x.shape[:-1], N)
 
         # Native exact route for every FP8-CB shape the fused kernel cannot
