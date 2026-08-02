@@ -265,7 +265,90 @@ The grouped-BF16 bridge is a generic SM80-compatible
 **6–17% slower on warm GPU time** than segmented BF16 matmuls across the recorded
 synthetic DSV4 shapes. It removes an unowned serving dispatch and preserves the
 quality contract, but it is not yet a prefill-speed result; the next optimization
-target is a measured CUTLASS 3.x SM100/SM121 grouped collective.
+target is a measured CUTLASS 3.x SM100/SM121 grouped collective — which now
+exists as the opt-in lane described next.
+
+### sm12x-native grouped BF16 (opt-in, `PRISMAQUANT_CB_BF16_SM120`)
+
+`csrc/cb_bf16_grouped_gemm.cu` carries a **second lane** for the same bridge: a
+CUTLASS 3.x collective on `arch::Sm120` with a TMA warp-specialized mainloop,
+stages carved out of the 101,376-byte sm120 shared-memory budget, and the
+plain `alpha=1/beta=0` epilogue the bridge has always had. It is the
+2026-08-01 performance audit's §3 P1 item, and it exists because *every*
+default NVFP4-CB prefill — dense `E=1` and routed MoE — plus the FP8-CB
+fallback flows through this file.
+
+**Design.** Upstream CUTLASS 4.3.4 has no sm120 ptr-array/grouped collective,
+and its sm120 dense `CollectiveBuilder` refuses 16-bit input outright
+(`static_assert(... "SM120 TmaWarpSpecialized builder currently only supports
+F8F6F4 MMA")`, and `rr_op_selector_sm120` returns an 8-bit atom
+unconditionally). The mainloop itself is type-generic, so the collective is
+assembled by hand from the 16-bit forms of the four choices that builder makes:
+the `SM80_16x8x16_F32BF16BF16F32_TN` bf16 tensor-core atom (register-sourced,
+which is what this mainloop requires), a 4×2×1 cooperative warp layout,
+`Tile<128,32,16>` so one `ldmatrix.x4` fills a thread's B fragment, and
+CUTLASS's own K-major `rs_smem_selector` for a swizzled tile that TMA writes
+and LDSM reads. Stages come from the builder's own `StageCountAutoCarveout`.
+
+**Grouping** is the row-padded, TILE-INDEXED construction the two fused
+kernels already use, extracted into `csrc/cb_grouped_common.hpp`: the caller
+pre-gathers and PADS activation rows so each expert's segment spans whole
+`TileM` blocks, B carries a batch mode of per-expert stride `N*K` (exactly a
+contiguous `[E,N,K]` stack), and each M-tile reads `expert_ids[m_tile]` as its
+B `l`-coordinate. That one selection lives in a thin fork of the standard
+sm120 TMA mainloop (`csrc/cutlass_fork/sm120_bf16_expert_mma.hpp`, three marked
+additions). No packed-B or LUT machinery: B is plain BF16.
+
+**Measured configuration** (GB10, cc 12.1, CUTLASS 4.3.4): `128×128×64`, 2
+mainloop stages, 75,776 B of the 101,376-byte budget. `256×128×64`,
+`128×256×64` and `128×64×128` each carve down to ONE stage and are infeasible,
+so the compiled ladder is deliberately a single rung — and unlike the fused
+lanes, where a larger `TileM` amortizes a per-tile B *decode*, a larger `TileM`
+here buys no arithmetic and costs only padded rows. The lane needs the
+`sm_12Xa` arch-conditional target even though its MMA is architecture-generic:
+the sm90-family cooperative *kernel layer* compiles its body only under
+`__CUDA_ARCH_FEAT_SM12x_ALL` and otherwise aborts every launch. Built as plain
+`sm_121` it compiles and loads, then faults; the loader comment records both
+measurements.
+
+**Requalification surface: FP32 reduction order, and nothing else.** Both lanes
+accumulate in FP32 with no scales and round once to BF16 from the same
+operands. What differs is the order of the accumulation (tile shape,
+K-iteration, warp partitioning) — the same class of change the promoted FP8
+mid-M fused kernel cleared. Measured across the shapes gated in
+`tests/test_bf16_grouped_cutlass.py` plus DSV4/Laguna projections, both lanes
+and a per-segment BF16 `F.linear` land on the *same* relative L2 against an
+FP32 reference (1.612e-3 – 1.663e-3, ratio 1.0000), and the two lanes' BF16
+outputs were bit-identical on every one of them. That is not a promise the
+kernels make — bf16×bf16 products are exact in fp32, so the lanes differ only
+in the ~2⁻²⁴ rounding of their partial sums, an order of magnitude below the
+2⁻⁸ quantum of the bf16 result — so the tests gate a bound, not equality.
+
+**Cost the lane adds.** The padded layout means a padded activation gather the
+exact-segment lane does not pay (an activation-side transient of the same class
+the promoted routed fused path already allocates — never a second weight copy),
+and one host read of the per-expert block offsets, because the decoded weight
+transient is chunked over experts and each chunk launches over its own
+contiguous block range.
+
+**Measured, and it did not clear its target.** The P1 target was "≥
+segmented-BF16 parity warm". The lane beats the DEFAULT SM80 bridge on six of
+eight benchmarked cells (1.06–1.25× warm, whole operator including its padded
+gather) but stays behind segmented BF16 matmuls everywhere, and on the long-`K`
+`w13` shape it degrades with M (0.68× of the SM80 lane at T=2048). Occupancy is
+the mechanism — 75,776 B/CTA is one CTA per SM — and a sweep of every feasible
+alternative tile/stage combination moved that cell by under 25%. Full table,
+methodology and the padding analysis:
+[BENCHMARKS](BENCHMARKS.md#2026-08-01-sm12x-native-grouped-bf16-lane-microbenchmark-proposal-data).
+
+**Status: OPT-IN** behind `PRISMAQUANT_CB_BF16_SM120=1`, resolved at model load
+(never at first forward) and failing the load if the flag is on where the lane
+cannot serve. With the flag unset the dispatch is byte-for-byte what it was.
+**Promotion checklist:** bit-level unit gate — **done** (the file above);
+kernel-level speed target — **not met**, measured (above);
+whole-routed-operator [NATIVE-PARITY](NATIVE-PARITY.md) protocol — **not run**,
+and there is no case for running it until the kernel-level result improves;
+`scripts/bench_bf16_grouped_sm120.py` produces proposal data only.
 
 MoE dispatch is separate from the dense M boundary: `M≤16` uses the owned
 grouped CUDA GEMV. Above 16, FP8-CB first attempts its quality-green fused
@@ -369,5 +452,5 @@ too.
 | FP8-CB fused decode-in-prologue prefill | **Bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128**; native transient expansion + CUTLASS serves ineligible and large-M shapes |
 | NVFP4-CB fused native-FP4 prefill (dense and MoE) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, MoE routed-quality, and p95 served gates remain open |
 | Persistent-N large-M dense prefill | **RETIRED FROM SERVING; MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. The serving selector, custom op, package loader, and switch are deleted. The `.cu` remains accessible only to the explicit direct research test. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
-| MoE prefill | **Native-only production lane**: grouped CUDA GEMV at M≤16; above 16, eligible quality-green FP8 fused CUTLASS or exact CUDA expansion + owned CUTLASS grouped GEMM. The current generic SM80-compatible grouped bridge is not Blackwell-optimized and measured 6–17% slower than segmented BF16 matmuls on warm synthetic DSV4 shapes. Historical Laguna-S-2.1 measurements for the predecessor native chunk-expander path were 293 → 1,821 tok/s @8k and 207 → 1,822 @63k; they must not be relabelled as measurements of the new bridge. The v0.4.2 fused native-NVFP4 route remains an explicit A/B opt-in without MoE quality qualification |
+| MoE prefill | **Native-only production lane**: grouped CUDA GEMV at M≤16; above 16, eligible quality-green FP8 fused CUTLASS or exact CUDA expansion + owned CUTLASS grouped GEMM. The current generic SM80-compatible grouped bridge is not Blackwell-optimized and measured 6–17% slower than segmented BF16 matmuls on warm synthetic DSV4 shapes; an sm12x-native CUTLASS 3.x collective for the same bridge exists **opt-in** (`PRISMAQUANT_CB_BF16_SM120`) and measured 1.06–1.25× that bridge on six of eight cells while still trailing segmented matmuls — bit-gated, served protocol not run. Historical Laguna-S-2.1 measurements for the predecessor native chunk-expander path were 293 → 1,821 tok/s @8k and 207 → 1,822 @63k; they must not be relabelled as measurements of the new bridge. The v0.4.2 fused native-NVFP4 route remains an explicit A/B opt-in without MoE quality qualification |
 | Missing required native kernel | **Fails closed** with an operation-specific diagnostic; no Triton dependency or serving fallback |

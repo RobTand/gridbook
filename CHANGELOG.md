@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Add an **sm12x-native CUTLASS 3.x lane** to the quality-preserving BF16
+  grouped bridge (`csrc/cb_bf16_grouped_gemm.cu`, audit §3 P1): TMA
+  warp-specialized mainloop, stages carved out of the sm120 shared-memory
+  budget, and the row-padded tile-indexed grouping the two fused kernels
+  already use — now extracted into `csrc/cb_grouped_common.hpp` and consumed by
+  all three, with static_asserts proving the shared EVT/gate types are the ones
+  each file spelled verbatim before. Upstream has no sm120 grouped collective
+  and its sm120 builder refuses 16-bit input, so the collective is assembled
+  from the 16-bit forms of the builder's own choices and the expert
+  `l`-coordinate selection lives in a thin mainloop fork
+  (`csrc/cutlass_fork/sm120_bf16_expert_mma.hpp`). The DEFAULT SM80-schedule
+  lane is unchanged on every device. The new lane is **opt-in** behind
+  `PRISMAQUANT_CB_BF16_SM120=1`, resolved at model load and failing closed:
+  it is bit-gated against the torch reference (both lanes and a per-segment
+  `F.linear` share one relative-L2 band), but it changes the FP32 reduction
+  order, and its measured 1.06–1.25× over the bridge it would replace still
+  trails segmented BF16 matmuls — proposal data only, served protocol not run.
+  `scripts/bench_bf16_grouped_sm120.py` reproduces the table.
+- Key the grouped-BF16 module's JIT identity like the two fused modules: its
+  packaged sources, Gridbook headers, compiled-in lane macro, target and
+  toolchain ABI decide the module name and the `bf16_grouped/<digest>` build
+  directory. One rebuild per user, once.
+
 - Delete the unreachable native sources identified by the dead-code ledger in
   `docs/audits/ultraplan_perf_2026-08-01.md` §4: `csrc/sm120_fp8_gemm.cu` (the
   spent CUTLASS baseline-parity gate, whose binding validated per-token/

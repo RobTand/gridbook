@@ -17,8 +17,8 @@ extension build fails.
 
 Build cache: ``PRISMAQUANT_CB_EXT_DIR`` if set, else ``~/.cache/prismaquant-
 cb-ext``. EVERY module builds in its own subdirectory of that root — ``main``,
-``v2``, ``bf16_grouped``, ``fused/<identity>``, ``fused_fp4/<identity>`` — so
-no two ninja workspaces share artefacts. Inside the container the root is
+``v2``, ``bf16_grouped/<identity>``, ``fused/<identity>``,
+``fused_fp4/<identity>`` — so no two ninja workspaces share artefacts. Inside the container the root is
 ephemeral (one ~30 s build per container start; mount a host dir over it to
 persist). Never ``/tmp``. (~30 s is measured: cold ``get_ext()`` in
 ``vllm-node:latest`` with ``TORCH_CUDA_ARCH_LIST=12.1`` -> 29.4 s / 29.7 s on
@@ -41,10 +41,11 @@ Every loader validates the symbols its callers will use before returning a
 module. Strict call contracts use :func:`_require_symbols`; fused FP4 uses
 independent symbol families because its dense and grouped call sites are
 separately guarded. An incompatible module would otherwise fail with
-``AttributeError`` mid-forward, or silently disable a probed fast path. Both
-fused modules additionally hash their packaged sources, ``cutlass_fork``
-headers, target and toolchain ABI into the module name and build directory, so
-a loaded fused module is always built from the current sources.
+``AttributeError`` mid-forward, or silently disable a probed fast path. The
+two fused modules and the grouped BF16 bridge additionally hash their packaged
+sources, Gridbook headers, target, compiled-in lane macros and toolchain ABI
+into the module name and build directory, so a loaded module of those three is
+always built from the current sources.
 
 No fast-math: the QDQ kernel's division/conversion rounding must match torch
 bit-for-bit.
@@ -626,10 +627,50 @@ def _find_cutlass_include() -> str:
 _bf16_grouped = None
 _bf16_grouped_tried = False
 _bf16_grouped_lock = threading.Lock()
+
+# The packaged files that define the grouped BF16 bridge: the translation unit,
+# the shared grouping glue and the expert-indexed mainloop fork. All three are
+# hashed into the module identity — the module is now header-bearing, and
+# torch's extension versioner hashes only the ``.cu`` it is handed (2026-08-01
+# performance audit, §3 P0.3/P1).
+_BF16_GROUPED_BUILD_INPUTS = (
+    "cb_bf16_grouped_gemm.cu",
+    "cb_grouped_common.hpp",
+    "cutlass_fork/sm120_bf16_expert_mma.hpp",
+)
+# Starts at 1: this module's identity payload is new.
+_BF16_GROUPED_ABI_SCHEMA = 1
+
+# Every device gets the SM80-compatible device-scheduled lane; it is the
+# default and its two entry points are dereferenced without a probe.
 _BF16_GROUPED_SYMBOLS = (
     "cb_bf16_grouped_mm",
     "cb_bf16_grouped_mm_out",
 )
+# Additionally required when the module was BUILT for cc 12.x, where the
+# sm12x-native lane is compiled in. Strict, not "any useful family": the
+# identity keys both the module name and the build directory, so a module that
+# loads at all was built from exactly these sources — a missing sm120 binding
+# is a broken build, not an older one.
+_BF16_GROUPED_SM120_SYMBOLS = (
+    "cb_bf16_grouped_mm_sm120",
+    "cb_bf16_grouped_mm_sm120_out",
+    "cb_bf16_grouped_sm120_tile_m",
+    "cb_bf16_grouped_sm120_tile_sizes",
+    "cb_bf16_grouped_sm120_config",
+)
+# The capabilities whose kernel layer the sm12x lane needs. Same set the two
+# fused modules gate on.
+_BF16_GROUPED_SM120_CAPABILITIES = ((12, 0), (12, 1))
+# nvcc macro that compiles the sm12x lane in. It is part of the build identity
+# (see ``_bf16_grouped_build_identity``) so a cache entry built without the
+# lane can never be served as one that has it.
+_BF16_GROUPED_SM120_DEFINE = "PRISMAQUANT_CB_BF16_SM120"
+
+
+def bf16_grouped_sm120_buildable(capability) -> bool:
+    """Whether the sm12x-native BF16 lane is compiled for ``capability``."""
+    return tuple(capability) in _BF16_GROUPED_SM120_CAPABILITIES
 
 
 def get_bf16_grouped_ext():
@@ -660,13 +701,33 @@ def require_bf16_grouped_ext(operation: str = "this operation"):
     return ext
 
 
+def _bf16_grouped_build_identity(torch, cpp_extension, *, src_dir: str,
+                                 cutlass_include: str, util_include: str,
+                                 capability: tuple[int, int],
+                                 sm120_lane: bool):
+    """``(digest, payload)`` for the grouped BF16 module's binary ABI."""
+    return _fused_build_identity(
+        torch, cpp_extension, src_dir=src_dir,
+        cutlass_include=cutlass_include, util_include=util_include,
+        capability=capability, build_inputs=_BF16_GROUPED_BUILD_INPUTS,
+        bindings=(("grouped BF16 bridge", _BF16_GROUPED_SYMBOLS),
+                  ("sm12x-native lane",
+                   _BF16_GROUPED_SM120_SYMBOLS if sm120_lane else ())),
+        abi_schema=_BF16_GROUPED_ABI_SCHEMA,
+        # The sm12x lane needs the architecture-CONDITIONAL target — see the
+        # loader below for the measured reason — while every other capability
+        # keeps the portable generic one.
+        accelerated=sm120_lane,
+        defines=({_BF16_GROUPED_SM120_DEFINE: "1"} if sm120_lane else {}))
+
+
 def _load_bf16_grouped_ext_locked():
     """Build and publish grouped BF16 with ``_bf16_grouped_lock`` held."""
     global _bf16_grouped, _bf16_grouped_tried
     build_dir = "<unresolved>"
     try:
         import torch  # noqa: F401  (must import before cpp_extension)
-        from torch.utils.cpp_extension import load
+        from torch.utils import cpp_extension
 
         cc = _target_capability(
             "the CUTLASS grouped BF16 extension (cb_bf16_grouped_gemm.cu)")
@@ -674,23 +735,51 @@ def _load_bf16_grouped_ext_locked():
             raise RuntimeError(
                 f"CUTLASS grouped BF16 requires compute capability >= 8.0, "
                 f"got {cc[0]}.{cc[1]}")
-        src_dir = _require_csrc("cb_bf16_grouped_gemm.cu")
+        sm120_lane = bf16_grouped_sm120_buildable(cc)
+        src_dir = _require_csrc(*_BF16_GROUPED_BUILD_INPUTS)
         cut_inc = _find_cutlass_include()
+        util_inc = os.path.join(os.path.dirname(cut_inc), "tools", "util",
+                                "include")
+        identity, _identity_payload = _bf16_grouped_build_identity(
+            torch, cpp_extension, src_dir=src_dir, cutlass_include=cut_inc,
+            util_include=util_inc, capability=cc, sm120_lane=sm120_lane)
+        module_name = f"pq_cb_bf16_grouped_{identity}"
         build_root = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
-        build_dir = os.path.join(build_root, "bf16_grouped")
+        build_dir = os.path.join(build_root, "bf16_grouped", identity)
         os.makedirs(build_dir, exist_ok=True)
-        mod = load(
-            name="pq_cb_bf16_grouped",
+        flags = ["-O3", "--expt-relaxed-constexpr"]
+        if sm120_lane:
+            flags.append(f"-D{_BF16_GROUPED_SM120_DEFINE}=1")
+        # MEASURED (GB10, cc 12.1, CUTLASS 4.3.4): the sm12x lane needs the
+        # ``a``-suffixed target even though its MMA (`m16n8k16` bf16) is
+        # architecture-GENERIC. The reason is the kernel LAYER, not the
+        # instruction: sm90_gemm_tma_warpspecialized_cooperative.hpp compiles
+        # its operator() body only under __CUDA_ARCH_FEAT_SM90/120/121_ALL (or
+        # a conditional/family target), and otherwise emits
+        # CUTE_INVALID_CONTROL_PATH. Built as plain ``sm_121`` the module
+        # compiles and loads, then every launch aborts with "Arch conditional
+        # MMA instruction used without targeting appropriate compute
+        # capability". Built as ``sm_121a`` the same source passes its bit
+        # tests. Non-12.x devices keep the portable generic target, since they
+        # compile only the SM80 lane.
+        flags.append(_gencode_flag(cc, accelerated=sm120_lane))
+        mod = cpp_extension.load(
+            name=module_name,
             sources=[os.path.join(src_dir, "cb_bf16_grouped_gemm.cu")],
-            extra_include_paths=[cut_inc],
-            extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr",
-                               _gencode_flag(cc, accelerated=False)],
+            extra_include_paths=[cut_inc, util_inc, src_dir],
+            extra_cuda_cflags=flags,
             build_directory=build_dir,
             verbose=False)
-        _bf16_grouped = _require_symbols(
-            mod, _BF16_GROUPED_SYMBOLS, build_dir=build_dir,
+        required = _BF16_GROUPED_SYMBOLS + (
+            _BF16_GROUPED_SM120_SYMBOLS if sm120_lane else ())
+        mod = _require_symbols(
+            mod, required, build_dir=build_dir,
             source="cb_bf16_grouped_gemm.cu")
+        _bf16_grouped = _require_fused_identity(
+            mod, expected_name=module_name, identity=identity,
+            abi_schema=_BF16_GROUPED_ABI_SCHEMA,
+            build_dir=build_dir, source="cb_bf16_grouped_gemm.cu")
     except StaleExtensionError as exc:
         print("[prismaquant-cb] ERROR: incompatible CUTLASS grouped BF16 "
               f"extension — {exc} Native quality prefill is unavailable and "
@@ -737,15 +826,25 @@ def _fused_build_identity(torch, cpp_extension, *, src_dir: str,
                           capability: tuple[int, int],
                           build_inputs: tuple[str, ...],
                           bindings,
-                          abi_schema: int):
+                          abi_schema: int,
+                          accelerated: bool = True,
+                          defines: dict[str, str] | None = None):
     """Return ``(digest, payload)`` for every practical binary ABI input.
 
     ``build_inputs`` are package-relative paths under ``src_dir`` (the ``.cu``
-    plus every ``cutlass_fork`` header it includes). ``bindings`` is the
-    module's symbol contract as ``(label, names)`` pairs, so a change to what
-    the loader requires also invalidates the cache. ``abi_schema`` is the
-    module's own revision counter for this payload's SHAPE — bump it when the
-    meaning of a field changes rather than its value.
+    plus every Gridbook header it includes). ``bindings`` is the module's
+    symbol contract as ``(label, names)`` pairs, so a change to what the loader
+    requires also invalidates the cache. ``abi_schema`` is the module's own
+    revision counter for this payload's SHAPE — bump it when the meaning of a
+    field changes rather than its value.
+
+    ``accelerated`` selects the architecture-conditional (``a``-suffixed)
+    target recorded in the identity; both fused modules always use it, while
+    the grouped BF16 module uses it only where it compiles its sm12x lane.
+    ``defines`` are nvcc ``-D`` macros that change which code is compiled —
+    a lane compiled out is a different binary and must be a different cache
+    entry. The key is OMITTED when empty so a module that passes no macros
+    keeps the payload shape it had before this parameter existed.
     """
     c_ext = getattr(torch, "_C", None)
     cuda_home = getattr(cpp_extension, "CUDA_HOME", None)
@@ -777,9 +876,7 @@ def _fused_build_identity(torch, cpp_extension, *, src_dir: str,
             _sha256_file(path) if os.path.isfile(path) else None)
 
     major, minor = capability
-    # Both fused modules pin the architecture-CONDITIONAL target; a future
-    # generic consumer of this helper must parameterize the suffix.
-    compute, code = _arch_target((major, minor), accelerated=True)
+    compute, code = _arch_target((major, minor), accelerated=accelerated)
     payload = {
         "schema": abi_schema,
         "bindings": [
@@ -824,6 +921,8 @@ def _fused_build_identity(torch, cpp_extension, *, src_dir: str,
         "host_compiler": _compiler_identity(
             None if cxx is None else os.fspath(cxx)),
     }
+    if defines:
+        payload["defines"] = {str(k): str(v) for k, v in defines.items()}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
                          ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest(), payload
@@ -854,11 +953,16 @@ _fused_fp4_tried = False
 _fused_fp4_lock = threading.Lock()
 
 
-# These two packaged files define the Gridbook-owned fused FP4 implementation.
-# Both are explicit build inputs (see the shared identity block above).
+# The packaged files that define the Gridbook-owned fused FP4 implementation.
+# All are explicit build inputs (see the shared identity block above);
+# ``cb_grouped_common.hpp`` joined them when the row-padded tile-indexed
+# grouping glue was extracted, and ``sm120_expert_row_broadcast.hpp`` comes in
+# through it — exactly the stale-kernel class this mechanism exists to prevent.
 _FUSED_FP4_BUILD_INPUTS = (
     "cb_fused_fp4_gemm.cu",
     "cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
+    "cb_grouped_common.hpp",
+    "cutlass_fork/sm120_expert_row_broadcast.hpp",
 )
 # Unchanged at 4: extracting the mechanism altered neither this module's digest
 # inputs nor the meaning of any payload field, so every already-built FP4 cache
@@ -1023,6 +1127,8 @@ _FUSED_BUILD_INPUTS = (
     "cutlass_fork/sm120_cb_mma_tma.hpp",
     "cutlass_fork/sm120_cb_fused_mma.hpp",
     "cutlass_fork/sm120_expert_row_broadcast.hpp",
+    # Shared grouping glue (EVT trees, smem gate, host validation).
+    "cb_grouped_common.hpp",
 )
 # Starts at 1: this module's identity payload is new, so there is no older
 # schema of it to distinguish from. (FP4 keeps its own counter at 4.)

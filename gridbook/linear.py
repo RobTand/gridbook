@@ -27,6 +27,9 @@ from vllm.model_executor.parameter import (
 )
 
 from . import codec
+from .bf16_grouped_lane import (dense_mm as bf16_sm120_dense_mm,
+                                require_lane as bf16_sm120_require_lane,
+                                requested as bf16_sm120_requested)
 from .expand import expand_fp4_v2_to_weight
 from .native_cutlass import (native_cutlass_scaled_mm, native_fp4_quant,
                              native_fp8_quant, require_native_fp4_quant,
@@ -543,6 +546,15 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 f"{self.prefix} dense FP4-v2 expansion", device=dev)
             require_bf16_grouped_ext(
                 f"{self.prefix} dense FP4-v2 quality prefill")
+            # OPT-IN sm12x-native bridge lane. Resolved HERE, at model load:
+            # the repo's rule is that nothing resolves at first forward, and
+            # with the flag on an unavailable lane must fail the load rather
+            # than silently serve the SM80 schedule (a different reduction
+            # order than the one the operator asked to measure).
+            layer._cb_bf16_sm120 = None
+            if bf16_sm120_requested():
+                layer._cb_bf16_sm120 = bf16_sm120_require_lane(
+                    f"{self.prefix} dense FP4-v2 quality prefill", device=dev)
             if fused_mode:
                 rowwise = fused_mode in _FP4_FUSED_ROWWISE_MODES
                 static_lsq = fused_mode in _FP4_FUSED_STATIC_LSQ_MODES
@@ -943,10 +955,17 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 # FP32 accumulation order may differ.
                 W = self._expand_fp4_quality_weight(layer, N, K)
                 xq2 = xq.reshape(M, K).contiguous()
-                expert_ends = torch.full(
-                    (1,), M, dtype=torch.int32, device=x.device)
-                y = cb_bf16_grouped_mm(
-                    xq2, W.unsqueeze(0), expert_ends, 0)
+                lane = getattr(layer, "_cb_bf16_sm120", None)
+                if lane is not None:
+                    # OPT-IN sm12x-native lane: one expert, M padded up to a
+                    # tile, every tile's expert id 0. Same operands, same
+                    # single bf16 round; only the fp32 reduction order differs.
+                    y = bf16_sm120_dense_mm(lane, xq2, W)
+                else:
+                    expert_ends = torch.full(
+                        (1,), M, dtype=torch.int32, device=x.device)
+                    y = cb_bf16_grouped_mm(
+                        xq2, W.unsqueeze(0), expert_ends, 0)
                 del W
                 y = y.reshape(*x.shape[:-1], N)
             if bias is not None:
