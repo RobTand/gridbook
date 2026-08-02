@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.7.0 — 2026-08-02
+
+- Release status note: the `deepseek_v4` contract below is validated by
+  fixture and instantiated-class tests; no released DSV4 artifact had
+  loaded through it at tag time (the first CB artifact was still being
+  produced). If the first real load surfaces contract gaps, a follow-up
+  release will carry them.
 - **D0.1 — register `deepseek_v4` and pin the DeepSeek-V4 serving contract.**
   Established against vLLM **0.24.0** and the released
   `deepseek-ai/DeepSeek-V4-Flash-0731` config (43 layers, all MoE, 256 routed +
