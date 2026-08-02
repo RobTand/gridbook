@@ -272,20 +272,26 @@ tooling and model cards — see the README's naming section.)
 | `PRISMAQUANT_DEBUG_PREFIXES` | off | `1` prints, per Linear, whether it resolved to a CB scheme or to a config-declared non-CB group — the first tool to reach for when memory use is higher than expected. |
 | `PRISMAQUANT_PRELOAD_FUSED` | off | `1` independently attempts to build/preload both fused extensions (FP8-CB and NVFP4-CB) at registration so both arms of a served A/B can carry identical extension residency. Registration treats this as a capability probe; a serving caller still requires its selected native operation and fails closed (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |
 
-**Variables that no longer exist.** `PRISMAQUANT_CB_DECODE` and
+**Variables that no longer select anything.** `PRISMAQUANT_CB_DECODE` and
 `PRISMAQUANT_CB_EXPAND` (whose `=triton` values are the ones you will find in
 old scripts and model cards), the former
 `PRISMAQUANT_CB_PREFILL={auto,stock,loop,batched,...}` family, and the former
-dispatch-mode variable have **no reader in the code** — they are not retired
-*values* of live variables, they are gone entirely, so setting one has no
-effect whatsoever, not even a warning. Opaque whole-call dispatch is
-unconditional. Delete these settings from old scripts and model-card commands
-rather than carrying them forward as inert text. (`PRISMAQUANT_CB_EXPAND`'s
-last reader went with the Triton removal; its documentation row outlived it by
-one release and was deleted per
+dispatch-mode variable are **not retired *values* of live variables — no
+dispatch reads any of them at all**, so setting one has no effect whatsoever,
+not even a warning. Opaque whole-call dispatch is unconditional. Delete these
+settings from old scripts and model-card commands rather than carrying them
+forward as inert text.
+
+The two `=triton` names have no reader whatsoever;
+`PRISMAQUANT_CB_EXPAND`'s last one went with the Triton removal, and its
+documentation row outlived it by a release until
 [`audits/ultraplan_perf_2026-08-01.md`](audits/ultraplan_perf_2026-08-01.md)
-§4. The regeneration command below is what keeps this section honest — a
-documented variable that the grep does not find is a ghost.)
+§4 removed it. `PRISMAQUANT_CB_PREFILL` is still *named* in one place —
+`scripts/validate_fused_nvfp4_ab.py` and the fused-NVFP4 validation harness
+strip it from the environment and record that they did, so an inherited value
+from an old shell cannot be mistaken for a measurement condition. That is a
+sanitizer, not a selector. The regeneration command below is what keeps this
+section honest: a documented variable the grep does not find is a ghost.
 
 ### The rest of them
 
