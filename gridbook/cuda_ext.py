@@ -16,16 +16,35 @@ in site-packages, so a repo-root-relative path does not exist and every native
 extension build fails.
 
 Build cache: ``PRISMAQUANT_CB_EXT_DIR`` if set, else ``~/.cache/prismaquant-
-cb-ext`` (inside the container that is ephemeral — one ~30 s build per
-container start; mount a host dir over it to persist). Never ``/tmp``.
-(~30 s is measured: cold ``get_ext()`` in ``vllm-node:latest``, no ``--gpus``,
-``TORCH_CUDA_ARCH_LIST=12.1`` -> 29.4 s / 29.7 s on two runs.)
+cb-ext``. EVERY module builds in its own subdirectory of that root — ``main``,
+``v2``, ``bf16_grouped``, ``fused/<identity>``, ``fused_fp4/<identity>`` — so
+no two ninja workspaces share artefacts. Inside the container the root is
+ephemeral (one ~30 s build per container start; mount a host dir over it to
+persist). Never ``/tmp``. (~30 s is measured: cold ``get_ext()`` in
+``vllm-node:latest`` with ``TORCH_CUDA_ARCH_LIST=12.1`` -> 29.4 s / 29.7 s on
+two runs. That measurement predates both the ``main`` subdirectory and the
+device-derived ``-gencode`` below, each of which costs one further rebuild of
+an existing cache — accepted once per user.)
+
+Architecture: every module is compiled for exactly the live device's compute
+capability instead of inheriting ``TORCH_CUDA_ARCH_LIST``. The stock vLLM base
+image ships ``"8.0 8.7 8.9 9.0 10.0 11.0 12.0"``, which OMITS 12.1, so outside
+the Gridbook Dockerfile (which bakes ``12.1a`` globally) an inherited target
+left a GB10 running production decode from PTX JIT or a mismatched SASS target
+— the 2026-08-01 performance audit's §3 P0.1. A build host with no visible GPU
+consequently has no defensible target and each loader reports itself
+unavailable; a compile-only environment with nvcc and no GPU pins the target by
+overriding ``torch.cuda.get_device_capability`` for the duration of the build
+(see the Dockerfile's ``load_for_build``).
 
 Every loader validates the symbols its callers will use before returning a
 module. Strict call contracts use :func:`_require_symbols`; fused FP4 uses
 independent symbol families because its dense and grouped call sites are
 separately guarded. An incompatible module would otherwise fail with
-``AttributeError`` mid-forward, or silently disable a probed fast path.
+``AttributeError`` mid-forward, or silently disable a probed fast path. Both
+fused modules additionally hash their packaged sources, ``cutlass_fork``
+headers, target and toolchain ABI into the module name and build directory, so
+a loaded fused module is always built from the current sources.
 
 No fast-math: the QDQ kernel's division/conversion rounding must match torch
 bit-for-bit.
@@ -129,6 +148,54 @@ def _sha256_file(path: str) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _target_capability(module: str) -> tuple[int, int]:
+    """The compute capability a native module is compiled for.
+
+    Gridbook targets the live device explicitly rather than inheriting
+    ``TORCH_CUDA_ARCH_LIST`` (the module docstring records the measured
+    reason).
+    A host with no visible CUDA device therefore has no defensible target: the
+    failure is normalized here into one actionable sentence and lands in the
+    caller's fail-soft arm, which reports the module unavailable rather than
+    shipping SASS for the wrong chip.
+    """
+    import torch
+
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception as exc:  # noqa: BLE001 — one diagnosis for every cause
+        raise RuntimeError(
+            f"cannot determine which CUDA architecture to compile {module} "
+            f"for ({type(exc).__name__}: {exc}); Gridbook compiles for the "
+            f"live device instead of inheriting TORCH_CUDA_ARCH_LIST, so a "
+            f"visible GPU is required at build time. A compile-only build "
+            f"host (nvcc, no GPU) must pin torch.cuda.get_device_capability "
+            f"to its intended target for the duration of the build — see the "
+            f"Dockerfile's prewarm step.") from exc
+    return int(major), int(minor)
+
+
+def _arch_target(capability: tuple[int, int], *,
+                 accelerated: bool) -> tuple[str, str]:
+    """``(compute_XY, sm_XY)`` for one capability.
+
+    ``accelerated`` appends nvcc's ``a`` suffix, selecting the architecture-
+    CONDITIONAL target. Only the two fused CUTLASS modules may use it: their
+    tensor-core instructions (the block-scaled MMA above all) exist solely in
+    that arch-specific family. The architecture-generic modules must not, since
+    an ``a`` binary refuses to load on any other capability at all.
+    """
+    major, minor = capability
+    suffix = "a" if accelerated else ""
+    return (f"compute_{major}{minor}{suffix}", f"sm_{major}{minor}{suffix}")
+
+
+def _gencode_flag(capability: tuple[int, int], *, accelerated: bool) -> str:
+    """The one ``-gencode`` nvcc flag that pins a build to a single target."""
+    arch, code = _arch_target(capability, accelerated=accelerated)
+    return f"-gencode=arch={arch},code={code}"
 
 
 def _compiler_identity(command: str | None) -> dict[str, object]:
@@ -303,12 +370,23 @@ def _load_ext_locked():
         from torch.utils.cpp_extension import load
 
         src = os.path.join(_require_csrc("cb_gemv.cu"), "cb_gemv.cu")
-        build_dir = os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+        # cb_gemv.cu is architecture-GENERIC (sm_80+): plain compute_XY/sm_XY,
+        # no arch-conditional 'a' target and no cc floor beyond what the source
+        # itself supports. This is the hot decode module, so an inherited
+        # TORCH_CUDA_ARCH_LIST miss costs production throughput directly.
+        cc = _target_capability("the CUDA decode-GEMV extension (cb_gemv.cu)")
+        build_root = os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext")
+        # Own subdirectory, like every sibling module: building at the cache
+        # root shares one ninja workspace with nothing to distinguish it, and
+        # invites artefact collisions with any module added later.
+        build_dir = os.path.join(build_root, "main")
         os.makedirs(build_dir, exist_ok=True)
         mod = load(name="prismaquant_cb_ext", sources=[src],
                    build_directory=build_dir,
-                   extra_cuda_cflags=["-O3"], verbose=False)
+                   extra_cuda_cflags=[
+                       "-O3", _gencode_flag(cc, accelerated=False)],
+                   verbose=False)
         # Assign only after the symbol set checks out: a module missing one of
         # these must never become the value `get_ext()` returns.
         _ext = _require_symbols(mod, _EXT_SYMBOLS, build_dir=build_dir,
@@ -389,6 +467,11 @@ def get_ext_v2():
 
             src = os.path.join(
                 _require_csrc("cb_gemv_v2.cu"), "cb_gemv_v2.cu")
+            # Architecture-generic like the main module: the 99 KiB dynamic
+            # smem contract is a DEVICE attestation done at load
+            # (require_fp4_v2_expander), not a compile-time arch pin.
+            cc = _target_capability(
+                "the CB-GEMV-v2 extension (cb_gemv_v2.cu)")
             build_dir = os.environ.get(
                 "PRISMAQUANT_CB_EXT_DIR") or os.path.join(
                     os.path.expanduser("~"), ".cache", "prismaquant-cb-ext")
@@ -396,7 +479,9 @@ def get_ext_v2():
             os.makedirs(build_dir, exist_ok=True)
             mod = load(name="prismaquant_cb_v2_ext", sources=[src],
                        build_directory=build_dir,
-                       extra_cuda_cflags=["-O3"], verbose=False)
+                       extra_cuda_cflags=[
+                           "-O3", _gencode_flag(cc, accelerated=False)],
+                       verbose=False)
             _ext_v2 = _require_symbols(
                 mod, _V2_SYMBOLS, build_dir=build_dir,
                 source="cb_gemv_v2.cu")
@@ -443,6 +528,17 @@ def require_fp4_v2_expander(operation: str = "this operation", *, device=None):
     contract.  That contract is qualified only for CUDA compute capability
     12.0/12.1 and is device-specific, so production loaders call this function
     before first forward or graph capture.
+
+    KNOWN COUPLING (2026-08-01 performance audit, §4 "Dispatch-surface gaps"):
+    because every FP4-CB load path needs this exact expander, this one device
+    attestation narrows FP4-CB's hardware floor to cc 12.0/12.1 for the WHOLE
+    format — including layers that would otherwise serve happily from the
+    inherited (non-v2) GEMV, which has no such requirement. That makes FP4-CB's
+    floor strictly narrower than FP8-CB's. It is deliberate: Blackwell
+    (sm_120/sm_121) is the target and the v2 module owns the bit-exact
+    expander, so there is no second exact FP4 decode to fall back to. Recorded
+    here so it stays a documented coupling rather than an accidental discovery
+    on an Ada or Hopper box.
     """
     ext = require_ext_v2(operation)
     try:
@@ -469,16 +565,42 @@ _fused_lock = threading.Lock()
 
 
 def _find_cutlass_include() -> str:
-    """Locate the vLLM-bundled CUTLASS include dir (same discovery the
-    fused ext uses), without importing vLLM's runtime package.
+    """Locate the CUTLASS include dir every owned CUTLASS module compiles with.
 
-    Importing ``vllm`` merely to locate its files eagerly initializes optional
-    compiler backends, including Triton on some releases. Gridbook does not
-    need any of that state to compile an owned CUTLASS translation unit; module
-    discovery gives us the package directory without executing ``__init__``.
+    ``PRISMAQUANT_CUTLASS_INCLUDE`` wins when set — it is the only way to build
+    these modules in a venv that has no vLLM wheel, or against a CUTLASS newer
+    than the bundled copy — and it is read HERE rather than in one loader so
+    the grouped-BF16, fused-FP8 and fused-FP4 modules all honour it (before
+    2026-08-01 only the fused-FP4 loader did, so the other two simply could not
+    build without vLLM's bundled tree). A set-but-wrong override FAILS instead
+    of falling back to the bundled copy: silently compiling against different
+    headers than the operator asked for is exactly the class of surprise the
+    override exists to prevent.
+
+    Otherwise discover vLLM's bundled copy WITHOUT importing vLLM's runtime
+    package: importing ``vllm`` merely to locate its files eagerly initializes
+    optional compiler backends, including Triton on some releases. Gridbook
+    needs none of that state to compile an owned CUTLASS translation unit;
+    module discovery gives us the package directory without executing
+    ``__init__``.
     """
     import glob
     import importlib.util
+
+    override = os.environ.get("PRISMAQUANT_CUTLASS_INCLUDE")
+    if override:
+        override = os.path.abspath(os.path.expanduser(os.fspath(override)))
+        if not os.path.isfile(
+                os.path.join(override, "cutlass", "cutlass.h")):
+            raise FileNotFoundError(
+                f"PRISMAQUANT_CUTLASS_INCLUDE={override!r} does not contain "
+                f"cutlass/cutlass.h. Point it at the `include` directory of a "
+                f"CUTLASS checkout (the one holding `cutlass/cutlass.h`), or "
+                f"unset it to use the CUTLASS bundled with vLLM. Gridbook "
+                f"does not fall back silently: an override that names the "
+                f"wrong tree must not compile against a different CUTLASS "
+                f"than the one requested.")
+        return override
 
     spec = importlib.util.find_spec("vllm")
     if spec is None:
@@ -543,10 +665,11 @@ def _load_bf16_grouped_ext_locked():
     global _bf16_grouped, _bf16_grouped_tried
     build_dir = "<unresolved>"
     try:
-        import torch
+        import torch  # noqa: F401  (must import before cpp_extension)
         from torch.utils.cpp_extension import load
 
-        cc = torch.cuda.get_device_capability()
+        cc = _target_capability(
+            "the CUTLASS grouped BF16 extension (cb_bf16_grouped_gemm.cu)")
         if cc < (8, 0):
             raise RuntimeError(
                 f"CUTLASS grouped BF16 requires compute capability >= 8.0, "
@@ -557,14 +680,12 @@ def _load_bf16_grouped_ext_locked():
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
         build_dir = os.path.join(build_root, "bf16_grouped")
         os.makedirs(build_dir, exist_ok=True)
-        arch = f"compute_{cc[0]}{cc[1]}"
-        code = f"sm_{cc[0]}{cc[1]}"
         mod = load(
             name="pq_cb_bf16_grouped",
             sources=[os.path.join(src_dir, "cb_bf16_grouped_gemm.cu")],
             extra_include_paths=[cut_inc],
             extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr",
-                               f"-gencode=arch={arch},code={code}"],
+                               _gencode_flag(cc, accelerated=False)],
             build_directory=build_dir,
             verbose=False)
         _bf16_grouped = _require_symbols(
@@ -592,49 +713,39 @@ def _load_bf16_grouped_ext_locked():
     return _bf16_grouped
 
 
-_fused_fp4 = None
-_fused_fp4_tried = False
-_fused_fp4_lock = threading.Lock()
-
-
-# These two packaged files define the Gridbook-owned fused FP4 implementation.
-# Both are explicit build inputs: torch's extension versioner hashes the source
-# passed to ``load`` but does not make an included header part of its stable
-# module name or caller-selected build-directory identity.
-_FUSED_FP4_BUILD_INPUTS = (
-    "cb_fused_fp4_gemm.cu",
-    "cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
-)
-_FUSED_FP4_ABI_SCHEMA = 4
-
-
-# All families are guarded independently at their call sites
-# (linear._try_fused_fp4 and moe._gf4_ok). A binary containing any one family
-# remains useful and must not be rejected merely because another was built
-# from a different revision.
-_FUSED_FP4_SYMBOL_FAMILIES = (
-    ("row-wise activation", (
-        "cb_nvfp4_quantize_rows", "cb_nvfp4_quantize_rows_out")),
-    ("static-LSQ activation", (
-        "cb_nvfp4_quantize_static_lsq",
-        "cb_nvfp4_quantize_static_lsq_out")),
-    ("dense prefill", ("cb_fused_fp4_prefill_mm_scaled",)),
-    ("grouped MoE prefill", ("cb_fused_fp4_moe_grouped",)),
-)
-
-
-def _fused_fp4_build_identity(torch, cpp_extension, *, src_dir: str,
-                              cutlass_include: str,
-                              util_include: str,
-                              capability: tuple[int, int]):
+# --------------------------------------------------------------------------
+# Shared fused-JIT build identity (ROADMAP K0.3)
+#
+# torch's extension versioner hashes the ``.cu`` passed to ``load``, but an
+# INCLUDED header is invisible to the stable module name and to a
+# caller-selected build directory. Both fused modules include Gridbook-owned
+# ``cutlass_fork`` headers, so without this a header edit silently serves the
+# previously cached kernel. The fused-FP4 loader solved that in 0.4.2; the
+# facility is parameterized here and applied to the fused-FP8 module too
+# (2026-08-01 performance audit, §3 P0.3).
+#
+# The digest keys BOTH the extension module name and the build directory, so a
+# persistent cache can never reuse a binary across a change to the packaged
+# sources/headers, the target architecture, the Python/Torch ABI, the CUDA
+# toolkit, or the host compiler. A small set of external CUTLASS sentinels is
+# hashed as well; inside a digest-keyed directory ninja's generated dependency
+# file remains authoritative for the complete external include graph.
+# --------------------------------------------------------------------------
+def _fused_build_identity(torch, cpp_extension, *, src_dir: str,
+                          cutlass_include: str,
+                          util_include: str,
+                          capability: tuple[int, int],
+                          build_inputs: tuple[str, ...],
+                          bindings,
+                          abi_schema: int):
     """Return ``(digest, payload)`` for every practical binary ABI input.
 
-    The digest keys both the build directory and extension module name.  That
-    keeps persistent caches from reusing an FP4 binary across changes to the
-    included Gridbook header, target architecture, Python/Torch ABI, CUDA
-    toolkit, or host compiler.  A small set of external CUTLASS sentinels is
-    also hashed; Ninja's generated dependency file remains authoritative for
-    the complete external include graph inside a keyed directory.
+    ``build_inputs`` are package-relative paths under ``src_dir`` (the ``.cu``
+    plus every ``cutlass_fork`` header it includes). ``bindings`` is the
+    module's symbol contract as ``(label, names)`` pairs, so a change to what
+    the loader requires also invalidates the cache. ``abi_schema`` is the
+    module's own revision counter for this payload's SHAPE — bump it when the
+    meaning of a field changes rather than its value.
     """
     c_ext = getattr(torch, "_C", None)
     cuda_home = getattr(cpp_extension, "CUDA_HOME", None)
@@ -650,7 +761,7 @@ def _fused_fp4_build_identity(torch, cpp_extension, *, src_dir: str,
 
     packaged_inputs = {
         name: _sha256_file(os.path.join(src_dir, name))
-        for name in _FUSED_FP4_BUILD_INPUTS
+        for name in build_inputs
     }
     cutlass_inputs = {}
     for label, path in (
@@ -666,18 +777,20 @@ def _fused_fp4_build_identity(torch, cpp_extension, *, src_dir: str,
             _sha256_file(path) if os.path.isfile(path) else None)
 
     major, minor = capability
+    # Both fused modules pin the architecture-CONDITIONAL target; a future
+    # generic consumer of this helper must parameterize the suffix.
+    compute, code = _arch_target((major, minor), accelerated=True)
     payload = {
-        "schema": _FUSED_FP4_ABI_SCHEMA,
+        "schema": abi_schema,
         "bindings": [
-            [label, list(names)]
-            for label, names in _FUSED_FP4_SYMBOL_FAMILIES
+            [label, list(names)] for label, names in bindings
         ],
         "inputs": packaged_inputs,
         "cutlass_inputs": cutlass_inputs,
         "target": {
             "capability": [major, minor],
-            "compute": f"compute_{major}{minor}a",
-            "code": f"sm_{major}{minor}a",
+            "compute": compute,
+            "code": code,
         },
         "python": {
             "cache_tag": getattr(sys.implementation, "cache_tag", None),
@@ -716,8 +829,8 @@ def _fused_fp4_build_identity(torch, cpp_extension, *, src_dir: str,
     return hashlib.sha256(encoded).hexdigest(), payload
 
 
-def _require_fused_fp4_identity(mod, *, expected_name: str, identity: str,
-                                build_dir: str, source: str):
+def _require_fused_identity(mod, *, expected_name: str, identity: str,
+                            abi_schema: int, build_dir: str, source: str):
     """Validate the identity-bearing ``PyInit_*`` module ABI.
 
     ``TORCH_EXTENSION_NAME`` makes the requested name part of the compiled
@@ -732,8 +845,53 @@ def _require_fused_fp4_identity(mod, *, expected_name: str, identity: str,
             requirement=(f"JIT ABI identity mismatch: expected module "
                          f"{expected_name!r}, loaded {actual!r}")))
     mod.__gridbook_jit_identity__ = identity
-    mod.__gridbook_jit_abi_schema__ = _FUSED_FP4_ABI_SCHEMA
+    mod.__gridbook_jit_abi_schema__ = abi_schema
     return mod
+
+
+_fused_fp4 = None
+_fused_fp4_tried = False
+_fused_fp4_lock = threading.Lock()
+
+
+# These two packaged files define the Gridbook-owned fused FP4 implementation.
+# Both are explicit build inputs (see the shared identity block above).
+_FUSED_FP4_BUILD_INPUTS = (
+    "cb_fused_fp4_gemm.cu",
+    "cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
+)
+# Unchanged at 4: extracting the mechanism altered neither this module's digest
+# inputs nor the meaning of any payload field, so every already-built FP4 cache
+# entry stays valid. Bumping it here would have thrown away good binaries.
+_FUSED_FP4_ABI_SCHEMA = 4
+
+
+# All families are guarded independently at their call sites
+# (linear._try_fused_fp4 and moe._gf4_ok). A binary containing any one family
+# remains useful and must not be rejected merely because another was built
+# from a different revision.
+_FUSED_FP4_SYMBOL_FAMILIES = (
+    ("row-wise activation", (
+        "cb_nvfp4_quantize_rows", "cb_nvfp4_quantize_rows_out")),
+    ("static-LSQ activation", (
+        "cb_nvfp4_quantize_static_lsq",
+        "cb_nvfp4_quantize_static_lsq_out")),
+    ("dense prefill", ("cb_fused_fp4_prefill_mm_scaled",)),
+    ("grouped MoE prefill", ("cb_fused_fp4_moe_grouped",)),
+)
+
+
+def _fused_fp4_build_identity(torch, cpp_extension, *, src_dir: str,
+                              cutlass_include: str,
+                              util_include: str,
+                              capability: tuple[int, int]):
+    """``(digest, payload)`` for the fused NVFP4-CB module's binary ABI."""
+    return _fused_build_identity(
+        torch, cpp_extension, src_dir=src_dir,
+        cutlass_include=cutlass_include, util_include=util_include,
+        capability=capability, build_inputs=_FUSED_FP4_BUILD_INPUTS,
+        bindings=_FUSED_FP4_SYMBOL_FAMILIES,
+        abi_schema=_FUSED_FP4_ABI_SCHEMA)
 
 
 def get_fused_fp4_ext():
@@ -791,9 +949,19 @@ def _load_fused_fp4_ext_locked():
         import torch
         from torch.utils import cpp_extension
 
-        cut_inc = os.environ.get("PRISMAQUANT_CUTLASS_INCLUDE")
-        if not cut_inc:
-            cut_inc = _find_cutlass_include()
+        # FIRST, before any include discovery or build work: the block-scaled
+        # MMA this module is built around exists only on sm_120a/sm_121a, so
+        # every other capability is a doomed multi-minute nvcc run inside the
+        # user's first request. Same early rejection the fused FP8 loader has
+        # (2026-08-01 performance audit §3 P0.2; ROADMAP "architecture
+        # precheck before the fused CUTLASS build").
+        cc = _target_capability(
+            "the fused NVFP4-CB prefill extension (cb_fused_fp4_gemm.cu)")
+        if cc not in ((12, 0), (12, 1)):
+            raise RuntimeError(
+                "fused NVFP4-CB prefill requires compute capability 12.0 or "
+                f"12.1, got {cc[0]}.{cc[1]}")
+        cut_inc = _find_cutlass_include()
         # cutlass/util/packed_stride.hpp lives in the tools tree of a CUTLASS
         # checkout (vLLM's bundled copy keeps the same shape).
         incs = [cut_inc]
@@ -802,7 +970,6 @@ def _load_fused_fp4_ext_locked():
         if os.path.isdir(util_inc):
             incs.append(util_inc)
         src_dir = _require_csrc(*_FUSED_FP4_BUILD_INPUTS)
-        cc = torch.cuda.get_device_capability()
         identity, _identity_payload = _fused_fp4_build_identity(
             torch, cpp_extension, src_dir=src_dir,
             cutlass_include=cut_inc, util_include=util_inc,
@@ -812,20 +979,19 @@ def _load_fused_fp4_ext_locked():
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
         build_dir = os.path.join(build_root, "fused_fp4", identity)
         os.makedirs(build_dir, exist_ok=True)
-        arch = f"compute_{cc[0]}{cc[1]}a"
-        code = f"sm_{cc[0]}{cc[1]}a"
         mod = cpp_extension.load(
             name=module_name,
             sources=[os.path.join(src_dir, "cb_fused_fp4_gemm.cu")],
             extra_include_paths=incs + [src_dir],
             extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr",
-                               f"-gencode=arch={arch},code={code}"],
+                               _gencode_flag(cc, accelerated=True)],
             build_directory=build_dir, verbose=False)
         mod = _require_any_symbol_family(
             mod, _FUSED_FP4_SYMBOL_FAMILIES, build_dir=build_dir,
             source="cb_fused_fp4_gemm.cu")
-        _fused_fp4 = _require_fused_fp4_identity(
+        _fused_fp4 = _require_fused_identity(
             mod, expected_name=module_name, identity=identity,
+            abi_schema=_FUSED_FP4_ABI_SCHEMA,
             build_dir=build_dir, source="cb_fused_fp4_gemm.cu")
     except StaleExtensionError as exc:
         print(f"[prismaquant-cb] ERROR: incompatible fused fp4 prefill "
@@ -848,20 +1014,47 @@ def _load_fused_fp4_ext_locked():
     return _fused_fp4
 
 
-# `_gf_ok` is the prerequisite for both the dense and grouped FP8 fused paths,
-# and it dereferences this binding after its capability probe. Grouped bindings
-# remain optional additions: `_gf2_ok` requires `_gf_ok` first, then probes
-# `cb_fused_moe_grouped` and `cb_fused_moe_tile_m` separately.
-_FUSED_SYMBOLS = ("cb_fused_prefill_mm_scaled",)
+# The packaged files that define the fused FP8-CB implementation: the
+# translation unit plus every Gridbook-owned header it includes. Each is hashed
+# into the module identity, so editing a fork header can no longer serve a
+# stale cached kernel (2026-08-01 performance audit §3 P0.3).
+_FUSED_BUILD_INPUTS = (
+    "cb_fused_gemm.cu",
+    "cutlass_fork/sm120_cb_mma_tma.hpp",
+    "cutlass_fork/sm120_cb_fused_mma.hpp",
+    "cutlass_fork/sm120_expert_row_broadcast.hpp",
+)
+# Starts at 1: this module's identity payload is new, so there is no older
+# schema of it to distinguish from. (FP4 keeps its own counter at 4.)
+_FUSED_ABI_SCHEMA = 1
+
+
+# STRICT, not "any useful family". Because the identity above keys both the
+# module name and the build directory, a module that loads at all was built
+# from exactly these sources — so a missing grouped binding is not an older
+# build, it is a broken one, and accepting it would silently downgrade routed
+# prefill. `moe._gf2_ok` therefore dereferences the grouped family after a
+# capability probe alone, and `linear` dereferences the dense entry point.
+_FUSED_SYMBOLS = (
+    "cb_fused_prefill_mm_scaled",          # dense mid-M + linear.py prefill
+    "cb_fused_moe_grouped",                # routed prefill, one launch/stage
+    "cb_fused_moe_tile_m",                 # the kernel's default TileM
+    "cb_fused_moe_tile_sizes",             # every compiled TileM
+    "cb_fused_moe_tile_sizes_for_kbits",   # ... that this rung can serve
+)
 
 
 def get_fused_ext():
     """The CUTLASS decode-in-prologue prefill extension (cb_fused_gemm.cu),
     or None. Separate module from the GEMV ext: it needs the CUTLASS headers
-    (taken from the vLLM install's bundled copy), a longer JIT build, and the
-    architecture-accelerated ``sm_120a``/``sm_121a`` target required by its
-    conditional tensor-core instructions. Fail-soft like get_ext — serving
-    falls back to the exact native expansion path."""
+    (``PRISMAQUANT_CUTLASS_INCLUDE``, else the vLLM install's bundled copy), a
+    longer JIT build, and the architecture-accelerated ``sm_120a``/``sm_121a``
+    target required by its conditional tensor-core instructions. Its packaged
+    sources, ``cutlass_fork`` headers and toolchain ABI key both the module
+    name and the build directory, so what loads is always built from the
+    current sources — which is what lets the dense AND grouped bindings be
+    required strictly. Fail-soft like get_ext — serving falls back to the exact
+    native expansion path."""
     if _fused_tried:
         return _fused
     with _fused_lock:
@@ -870,41 +1063,61 @@ def get_fused_ext():
         return _load_fused_ext_locked()
 
 
+def _fused_build_identity_fp8(torch, cpp_extension, *, src_dir: str,
+                              cutlass_include: str,
+                              util_include: str,
+                              capability: tuple[int, int]):
+    """``(digest, payload)`` for the fused FP8-CB module's binary ABI."""
+    return _fused_build_identity(
+        torch, cpp_extension, src_dir=src_dir,
+        cutlass_include=cutlass_include, util_include=util_include,
+        capability=capability, build_inputs=_FUSED_BUILD_INPUTS,
+        bindings=(("fused FP8-CB prefill", _FUSED_SYMBOLS),),
+        abi_schema=_FUSED_ABI_SCHEMA)
+
+
 def _load_fused_ext_locked():
     """Build and publish fused FP8 with ``_fused_lock`` held."""
     global _fused, _fused_tried
     try:
         import torch
-        from torch.utils.cpp_extension import load
+        from torch.utils import cpp_extension
 
-        cc = torch.cuda.get_device_capability()
+        cc = _target_capability(
+            "the fused FP8-CB prefill extension (cb_fused_gemm.cu)")
         if cc not in ((12, 0), (12, 1)):
             raise RuntimeError(
                 "fused FP8-CB prefill requires compute capability 12.0 or "
                 f"12.1, got {cc[0]}.{cc[1]}")
         cut_inc = _find_cutlass_include()
         cut_root = os.path.dirname(cut_inc)
-        src_dir = _require_csrc("cb_fused_gemm.cu")
-        build_dir = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+        util_inc = os.path.join(cut_root, "tools", "util", "include")
+        src_dir = _require_csrc(*_FUSED_BUILD_INPUTS)
+        identity, _identity_payload = _fused_build_identity_fp8(
+            torch, cpp_extension, src_dir=src_dir,
+            cutlass_include=cut_inc, util_include=util_inc,
+            capability=cc)
+        module_name = f"pq_cb_fused_{identity}"
+        build_root = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
-        build_dir = os.path.join(build_dir, "fused")
+        build_dir = os.path.join(build_root, "fused", identity)
         os.makedirs(build_dir, exist_ok=True)
-        arch = f"compute_{cc[0]}{cc[1]}a"
-        code = f"sm_{cc[0]}{cc[1]}a"
-        mod = load(name="pq_cb_fused",
-                   sources=[os.path.join(src_dir, "cb_fused_gemm.cu")],
-                   extra_include_paths=[cut_inc,
-                                        os.path.join(cut_root, "tools", "util",
-                                                     "include"),
-                                        src_dir],
-                   extra_cuda_cflags=[
-                       "-O3", "--expt-relaxed-constexpr",
-                       f"-gencode=arch={arch},code={code}",
-                   ],
-                   build_directory=build_dir, verbose=False)
-        _fused = _require_symbols(mod, _FUSED_SYMBOLS,
-                                  build_dir=build_dir,
-                                  source="cb_fused_gemm.cu")
+        mod = cpp_extension.load(
+            name=module_name,
+            sources=[os.path.join(src_dir, "cb_fused_gemm.cu")],
+            extra_include_paths=[cut_inc, util_inc, src_dir],
+            extra_cuda_cflags=[
+                "-O3", "--expt-relaxed-constexpr",
+                _gencode_flag(cc, accelerated=True),
+            ],
+            build_directory=build_dir, verbose=False)
+        mod = _require_symbols(mod, _FUSED_SYMBOLS,
+                               build_dir=build_dir,
+                               source="cb_fused_gemm.cu")
+        _fused = _require_fused_identity(
+            mod, expected_name=module_name, identity=identity,
+            abi_schema=_FUSED_ABI_SCHEMA,
+            build_dir=build_dir, source="cb_fused_gemm.cu")
     except StaleExtensionError as exc:
         print(f"[prismaquant-cb] ERROR: incompatible fused prefill "
               f"extension — {exc} Fused dense and grouped prefill stay on "
