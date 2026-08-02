@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Make the no-Triton ratchet independent of the directory the suite is staged
+  in. `release.yml`'s `verify installed wheel` job copies `tests` to
+  `$RUNNER_TEMP/gbtests` — so the checkout cannot shadow the installed wheel —
+  and failed there on the ratchet itself (`gbtests/test_no_triton_runtime.py:89
+  [mention] executable definition _is_triton_module`, and 23 more across it and
+  `test_delegated_preflight.py`) on a tree CI had just passed. The `mention`
+  exemptions were keyed on a literal `tests/` prefix, so under any other
+  staging name the two files that name Triton *because* they are the
+  anti-Triton machinery stopped being exempt. Those keys are now anchors —
+  resolved inside the scanned package and inside the ratchet's own directory,
+  matched by resolved path rather than by a rendered string. The same three
+  files are exempt, from the `mention` rules only, and the meta-test that an
+  exemption can never hide a reaching import now runs on all three under
+  staging instead of silently skipping two. Scan-root discovery treats a staged
+  tree with no sibling `scripts/` as a smaller scan rather than a failed one,
+  and a new test reproduces the release job's layout exactly: copy the suite
+  into a `gbtests/`, load the copy, make it scan itself.
+
 ## 0.6.0 — 2026-08-02
 
 - **K1.2 — the FP8-CB fused mid-M rung surface, and why it is already
