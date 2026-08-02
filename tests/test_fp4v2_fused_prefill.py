@@ -183,6 +183,48 @@ def test_decode_bit_exact_across_superblocks_and_an_n_residue():
                            W[:, k0:k0 + M].contiguous().view(torch.uint16))
 
 
+@pytest.mark.parametrize("mode,name", [(1, "tile row"),
+                                       (2, "column within the K-tile"),
+                                       (3, "absolute K-tile index")])
+def test_the_decode_write_view_addresses_exactly_what_the_mma_reads(mode,
+                                                                    name):
+    """REGRESSION for a measured swizzle-view bug, pinned by construction.
+
+    ``debug_mode`` makes the decoder store the COORDINATE it used instead of
+    the decoded value, so the one-hot read-out recovers the decoder's
+    (row, column, K-tile) -> smem mapping directly. All three must come back
+    as the identity.
+
+    The first implementation built the decode-write view by slicing the pipe
+    mode BEFORE calling ``as_position_independent_swizzle_tensor`` — the
+    expression the fp8 fork uses, whose layout aliases differently. For this
+    bf16 128-byte swizzle atom that produced a DIFFERENT physical mapping than
+    the reader's: columns permuted by XOR 8 on odd rows, and rows 8/9
+    transposed. Nothing in a value-level comparison says WHICH of the codeword
+    extraction, the scale compose or the address arithmetic is wrong; this
+    probe separates them, and keeping it means the two views cannot silently
+    diverge again.
+    """
+    N, K, M = 64, 512, 128
+    p = _prep(16, N, K, seed=11)
+    for k0 in range(0, K, M):
+        y = ext.cb_fused_fp4v2_prefill_mm(
+            _one_hot(M, K, k0), p["qwp"], p["cb_flat"], p["compose"],
+            N, K, 16, -1, mode)
+        got = y.t().contiguous().float()             # [N, M] over (n, kglob)
+        cols = torch.arange(M, device=DEV) + k0
+        if mode == 1:
+            want = torch.arange(N, device=DEV, dtype=torch.float32)
+            want = want[:, None].expand(N, M)
+        elif mode == 2:
+            want = (cols % 64).to(torch.float32)[None, :].expand(N, M)
+        else:
+            want = (cols // 64).to(torch.float32)[None, :].expand(N, M)
+        assert torch.equal(got, want.contiguous()), (
+            f"decode write view disagrees with the MMA read view in {name} "
+            f"(K window [{k0}, {k0 + M}))")
+
+
 # ---------------------------------------------------------------------------
 # 2. Whole-tile GEMM equality against the passthrough oracle.
 # ---------------------------------------------------------------------------

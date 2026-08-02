@@ -65,10 +65,15 @@ def _reset_for_tests() -> None:
     _STATE.clear()
 
 
+# Exactly the entry points THIS module dereferences. The loader's
+# ``_require_symbols`` is what enforces the module's full binding contract (it
+# is strict, because the build identity keys the module name and directory);
+# this is the lane's own defence in depth, so it stays scoped to what a miss
+# here would actually break.
 _REQUIRED_SYMBOLS = (
-    "cb_fused_fp4v2_prefill_mm",
-    "cb_fused_fp4v2_max_m",
-    "cb_fused_fp4v2_kbits",
+    "cb_fused_fp4v2_prefill_mm",       # fused_mm
+    "cb_fused_fp4v2_max_m",            # eligible (via _facts)
+    "cb_fused_fp4v2_kbits",            # eligible (via _facts)
 )
 
 
@@ -110,14 +115,34 @@ def require_lane(operation: str = "this operation", *, device=None):
     return ext
 
 
+def _facts(ext) -> tuple[int, tuple[int, ...]]:
+    """``(max_m, compiled rungs)``, read from the module ONCE.
+
+    ``eligible`` runs on the per-prefill dispatch path, so the two attestation
+    queries are memoized on the extension object itself: they are compile-time
+    constants of a loaded binary, and this lane exists to save microseconds at
+    mid M. The cache lives on the module (not in a dict keyed by identity) so
+    it dies exactly when the module does.
+    """
+    cached = getattr(ext, "_gridbook_fp4v2_facts", None)
+    if cached is None:
+        cached = (int(ext.cb_fused_fp4v2_max_m()),
+                  tuple(int(k) for k in ext.cb_fused_fp4v2_kbits()))
+        try:
+            ext._gridbook_fp4v2_facts = cached
+        except Exception:  # noqa: BLE001 — a read-only stub still works
+            pass
+    return cached
+
+
 def max_m(ext) -> int:
     """The lane's hard mid-M ceiling, as the kernel reports it."""
-    return int(ext.cb_fused_fp4v2_max_m())
+    return _facts(ext)[0]
 
 
 def kbits(ext) -> tuple[int, ...]:
     """Every rung the loaded module actually compiled a kernel for."""
-    return tuple(int(k) for k in ext.cb_fused_fp4v2_kbits())
+    return _facts(ext)[1]
 
 
 def cb_elems(k_bits: int) -> int:

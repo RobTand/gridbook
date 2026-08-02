@@ -213,6 +213,64 @@ binding and dispatch helper already parameterise), or an A-side row-gather
 inside the mainloop. The served [NATIVE-PARITY](NATIVE-PARITY.md) protocol has
 not been run.
 
+## 2026-08-02 FP4-CB v2 fused mid-M lane microbenchmark (PROPOSAL DATA)
+
+**PROPOSAL DATA ONLY.** Per [NATIVE-PARITY](NATIVE-PARITY.md) a kernel
+microbenchmark proposes; only the served protocol promotes. Nothing below is a
+serving claim, a TTFT number, or grounds for changing a default — the lane
+stays behind `PRISMAQUANT_CB_FP4_FUSED_MIDM`.
+
+**What is timed.** The two ways the same dense FP4-CB v2 prefill GEMM can be
+executed at mid M, each as the WHOLE operator the serving path would run:
+
+* `fused` — one launch of `cb_fused_fp4v2_prefill_mm`; the packed CB rows are
+  decoded inside the CUTLASS producer/consumer stage and the `[N,K]` BF16 tile
+  never exists in HBM.
+* `bridge` — today's shipping route: `expand_fp4_v2_to_weight` writes the
+  decoded `[N,K]` BF16 tile to HBM, then the owned CUTLASS grouped kernel
+  (`E=1`) multiplies it. **The expand is inside the timed region**, because the
+  transient it writes is exactly what the lane removes; charging only the GEMM
+  would measure a different claim.
+
+The shared upstream work (activation group-16 QDQ, reshape) is excluded, as the
+DSV4 bridge table above excludes it. Every cell is **bit-checked before it is
+timed**: the harness asserts the fused result equals the passthrough oracle
+(`sm120_fp4v2_bf16_mm_fork`, same tile/TiledMma/epilogue, plain BF16 B) fed the
+expander's tile, so a regressed kernel cannot report a fast wrong number.
+
+GB10, cc 12.1, CUTLASS 4.3.4, torch 2.11.0+cu130, k_bits = 16, tile
+`128×64×64`/2 stages. Warm median of 30 CUDA-event samples after 10 warmups;
+`scripts/bench_fp4v2_fused_midm.py`, run under the host GPU bench lock.
+
+| shape | M=9 | M=16 | M=32 | M=64 | M=128 |
+|---|---|---|---|---|---|
+| 27B qkv/o `K=5376 N=5376` | **1.97–2.00×** | 3.54× | 3.55× | 3.54× | 3.57× |
+| 27B gate `K=5376 N=14336` | 2.25× | 3.70× | 3.55× | 3.35× | 3.08× |
+| 27B down `K=14336 N=5376` | 4.34× | 4.37× | 4.08× | 3.43× | 3.37× |
+| DSV4 w13 `K=4096 N=4096` | 1.72× | 2.93× | 2.99× | 3.05× | 3.11× |
+| DSV4 w2 `K=2048 N=4096` | 1.06× | 1.12× | 1.79× | 1.78× | 1.84× |
+
+Ratios > 1 mean the fused lane is faster. All 30 cells bit-equal to the oracle.
+
+**Why the band is wider than the fp8 mid-M twin's 1.04–1.45×.** Structural, not
+tuning: the fp4 *quality* expand materializes **BF16** (2 bytes/weight — 4× the
+transient traffic of fp8-CB's direct-to-E4M3 expand), so deleting it is worth
+proportionally more. This is the same asymmetry the 2026-08-01 audit names as
+cause (b).
+
+**Open item — an unexplained M ≤ 12 cliff.** On the 27B qkv shape the fused
+lane's warm median is ~0.37 ms for M = 8…12 and ~0.20 ms for M = 13…128:
+
+| M | 8 | 9 | 10 | 11 | 12 | 13 | 16 | 24 | 32 | 9 (repeat) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| fused warm (ms) | 0.372 | 0.367 | 0.382 | 0.365 | 0.342 | 0.201 | 0.201 | 0.201 | 0.201 | 0.359 |
+
+The work is identical at every M in that range (one M-tile, the same
+`N/64` CTAs, the same decode), the repeat rules out measurement ordering, and
+the bridge column is flat across the same sweep — so this is a property of the
+fused kernel, not of the harness. It costs the lane roughly half its win at
+M ≤ 12 and it should be profiled (ncu) before any promotion argument is made.
+
 ## What is being compared, and how
 
 - **Matched-rate baseline.** Quality rows compare the same model family against a

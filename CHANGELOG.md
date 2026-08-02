@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Add the **FP4-CB v2 fused mid-M lane** (`csrc/cb_fused_fp4v2_gemm.cu` +
+  `csrc/cutlass_fork/sm120_cb_fp4v2_bf16_mma.hpp`, audit §3 P2a), closing the
+  audit's structural cause (c): FP8-CB owned M = 9–128 with a fused
+  decode-in-prologue kernel while FP4 had **no mid-M lane at all**. The new
+  lane decodes packed CB rows to BF16 inside the CUTLASS producer/consumer
+  stage, so the `[N,K]` BF16 transient never reaches HBM. It is
+  **contract-preserving**: the decoded values are proven bit-identical to
+  `cb_expand_v2` — the whole decoded tile, at all 13 K12–K24 rungs, via a
+  one-hot read-out that turns the GEMM into a direct dump of the decoded
+  weights (no tolerance anywhere) — and the activations are the same BF16
+  group-16 QDQ output the bridge already consumes, so only the FP32 GEMM
+  reduction order moves. Separate module from the native-NVFP4 fused lane,
+  whose payload and served numerics are different; nothing there is touched.
+  fp4-v2's odd `type_size = 4k+9` makes TMA structurally unusable for B, so the
+  producer publishes a per-stage descriptor under the mbarrier and the
+  consumers gather packed bytes from gmem with aligned-u32 windows — which also
+  makes `k_bits` a runtime parameter, so four compiled kernels serve the whole
+  rung ladder (they differ only in the codebook smem-stage size). Shipped tile
+  `128×64×64`/2 stages, measured against the 101,376-byte budget by the new
+  host-only `csrc/tools/smem_probe_fp4v2_bf16.cu`; the zero-margin 48 KiB stage
+  is deliberately not compiled. **Opt-in** behind
+  `PRISMAQUANT_CB_FP4_FUSED_MIDM=1`, resolved at model load and failing closed;
+  with the flag unset the dispatch is byte-for-byte what it was. `M ≤ 128` is a
+  HARD gate the kernel enforces itself. Measured 1.06–4.37× the shipping expand
+  + bridge route at M ∈ {9,16,32,64,128} on 27B/DSV4-class shapes, every cell
+  bit-equal to a same-config passthrough oracle — a wider band than the fp8
+  twin's 1.04–1.45× because the fp4 quality expand writes BF16, 4× the fp8
+  expand's transient bytes. Proposal data only, served NATIVE-PARITY protocol
+  not run, and an unexplained M ≤ 12 latency cliff is recorded as open;
+  `scripts/bench_fp4v2_fused_midm.py` reproduces the table.
 - Add an **sm12x-native CUTLASS 3.x lane** to the quality-preserving BF16
   grouped bridge (`csrc/cb_bf16_grouped_gemm.cu`, audit §3 P1): TMA
   warp-specialized mainloop, stages carved out of the sm120 shared-memory

@@ -212,6 +212,118 @@ GEMM: the runtime's `cutlass_scaled_mm` reconfigures on narrow N and is not
 bit-exact across configs, so an N-chunked expand+GEMM overlap was tried and
 **rejected** (0.46× and not bit-exact).
 
+### FP4-CB v2 fused mid-M (opt-in, `PRISMAQUANT_CB_FP4_FUSED_MIDM`)
+
+`csrc/cb_fused_fp4v2_gemm.cu` is the **contract-preserving** twin of the FP8-CB
+mid-M lane above, for the *quality* FP4-CB path. It closes the 2026-08-01
+performance audit's §3 P2a item and its structural cause (c): FP8-CB owned
+M = 9–128 with a fused kernel; FP4 had **no mid-M lane at all** — M = 9–16
+always took the BF16 bridge, and so did everything above it, because the only
+fused FP4 kernel in the tree (`cb_fused_fp4_gemm.cu`) serves a *different*
+activation contract behind its own six promotion gates.
+
+**What it does.** Packed FP4-v2 CB rows are decoded to BF16 inside the CUTLASS
+producer/consumer stage, so the `[N, K]` BF16 transient never reaches HBM. The
+decoded values are **bit-identical to `cb_expand_v2`** and the activations are
+the same BF16 group-16 QDQ output the bridge already consumes, so the served
+weight values and the served activation bucket are untouched — the only thing
+that moves is the **FP32 GEMM reduction order**, the same requalification class
+the promoted FP8 mid-M kernel cleared.
+
+**Design.** The collective is hand-assembled from the 16-bit forms of the four
+choices upstream's `CollectiveBuilder` makes for F8F6F4 (it refuses 16-bit
+input; see the sm12x BF16 lane below for the full reasoning) — the same
+selection, on the **cooperative** kernel layer. The B side departs from the FP8
+fork because fp4-v2 rows carry an **odd `type_size = 4k+9`**: the packed row
+stride is never a 16-byte multiple, so TMA is structurally unusable for B. The
+producer instead publishes a 16-byte per-stage descriptor (the CTA's first
+output row) into smem under the stage's mbarrier, and the consumer threads
+gather the packed bytes straight from gmem with aligned-u32 windows — the
+construction `sm120_cb_fused_fp4_mma.hpp` already ships for this payload.
+Because the packed stream never touches a TMA descriptor or a k-sized smem
+layout, **`k_bits` is a runtime parameter** and the whole K12–K24 product
+ladder is served by four compiled kernels.
+
+**Tile and smem** (measured by `csrc/tools/smem_probe_fp4v2_bf16.cu`,
+host-only, no launch). Shipped: **`128×64×64`, 2 stages**. `TileM=128` is the
+cooperative layer's floor; narrow N is the fp8 mid-M lane's proven pattern and
+is what buys the codebook its headroom; `TileK=64` keeps the 128-byte K-major
+swizzle atom (64 bf16 = 128 B) and divides the 256-weight CB superblock exactly
+four ways.
+
+| TileN×TileK / stages | Lut 0 | Lut 4 KiB | Lut 16 KiB | Lut 32 KiB | Lut 48 KiB |
+|---|---|---|---|---|---|
+| **64×64 / 2 (shipped)** | 52,224 | 56,320 | 68,608 | 84,992 | 101,376 (0 margin) |
+| 64×64 / 3 | 68,608 | 72,704 | 84,992 | 101,376 (0 margin) | OVER |
+| 64×128 / 2 | 93,184 | 97,280 | OVER | OVER | OVER |
+| 128×64 / 2 | 60,416 | 64,512 | 76,800 | 93,184 | OVER |
+
+Budget is 101,376 B. The 48 KiB stage lands on **exactly** the ceiling with
+zero margin and is deliberately not compiled — the fp8 lane's `TileM=256/k32`
+entry is the precedent for treating a zero-margin config as untrusted. Every
+shipped configuration is 1 CTA/SM, which is also what the fp8 mid-M twin runs
+at while winning; at M ≤ 128 there is exactly ONE M-tile, so the grid is
+`N/64` CTAs and per-SM occupancy is not the limiter the P1 grouped lane found
+it to be.
+
+**Codebook residency ladder.** The fp4-v2 product dictionary is BF16 *values* —
+`(8 << ceil(k/2)) + (8 << floor(k/2))` bytes, 1 KiB at k12 rising to 64 KiB at
+k24 — so it cannot be staged whole at the top of the ladder. The smem stage
+holds a **prefix** of the flat `[sub0 | sub1]` codebook and the mainloop selects
+its two gather pointers from the staged length **once per decode**, so a
+partially staged table costs a pointer select and never a per-gather branch.
+Full staging holds to k22; k23/k24 stage `sub0` only and read `sub1` from
+global. The (256,16) fp32 compose table stays in global with `__ldg`, exactly as
+`cb_expand_v2` and the decode GEMV do.
+
+**Mid-M only, and the gate is in the kernel.** Decode-in-prologue re-decodes B
+once per M-tile, so beyond one tile the redundancy dominates (the fp8 twin
+measured 0.22× at M ≈ 1400). The binding itself `TORCH_CHECK`s
+`1 ≤ M ≤ cb_fused_fp4v2_max_m()` (= 128), so a drifted python gate cannot
+quietly serve a slow schedule; python reads the ceiling back from the kernel.
+
+**Evidence.**
+
+- **Decode bit-exactness — DONE.** `tests/test_fp4v2_fused_prefill.py` proves it
+  three ways. The primary gate feeds a one-hot `A` (`a[m, k0+m] = 1`), which
+  makes the GEMM a *read-out* of the decoded tile (`y[m,n] = W[n, k0+m]`
+  exactly), and sweeps `k0` so the **entire** decoded `[64, 512]` tile is
+  compared to `cb_expand_v2` **bit-for-bit at all 13 rungs** — a tolerance is
+  never used. It is repeated with the codebook forced entirely to global
+  (`force_lut_bytes=0`) at the three smem-tightest rungs, so the residency
+  choice is proven not to move a bit. A `debug_mode` coordinate-write probe
+  pins the decode write view against the MMA read view (it is what found a real
+  swizzle-view bug: slicing the pipe mode before
+  `as_position_independent_swizzle_tensor` produced a different physical
+  mapping than the reader's — columns XOR-8 on odd rows, rows 8/9 transposed).
+  Finally `sm120_fp4v2_bf16_mm_fork` — the same tile/TiledMma/epilogue with
+  plain BF16 B, hence the identical FP32 reduction order — must reproduce the
+  fused output bit-for-bit on the `cb_expand_v2` tile.
+- **Served NATIVE-PARITY — PENDING.** The reduction-order change is gated only
+  by unit tests (relative-L2 vs fp32, capped at 2e-3 and required to be no worse
+  than a BF16 `F.linear` on the same operands, at M ∈ {9,16,32,64,128}). That is
+  why the lane is OPT-IN.
+
+**Promotion checklist**: decode bit-gate ✅ · smem table measured ✅ ·
+end-to-end tolerance band ✅ · **served NATIVE-PARITY protocol ❌ (pending)** ·
+the M ≤ 12 latency cliff below explained ❌.
+
+**Measured** (GB10, cc 12.1, k16, warm medians, PROPOSAL DATA — see
+[BENCHMARKS](BENCHMARKS.md#2026-08-02-fp4-cb-v2-fused-mid-m-lane-microbenchmark-proposal-data)):
+**1.06×–4.37×** the shipping expand + bridge route across 27B/DSV4-class dense
+shapes at M ∈ {9,16,32,64,128}, every cell bit-equal to the oracle. The band is
+far above the fp8 twin's 1.04–1.45× for a structural reason: the fp4 quality
+expand writes **BF16** (2 bytes/weight, 4× the fp8-CB expand's transient
+traffic), so deleting it is worth more. One **unexplained cliff**: the fused
+lane costs ~0.37 ms at M ≤ 12 and ~0.20 ms at M ≥ 13 on the 27B qkv shape
+(reproducible, order-independent, and absent from the bridge) — profile it
+before promotion.
+
+**Related dispatch note.** The audit's §3 P3.5 item — extend the *native*-NVFP4
+fused gate from `M > 16` to `M ≥ 9` so opt-in users do not hit the bridge at
+M = 9–16 — is **moot for the quality path** now that this lane exists. That gate
+is untouched here; it still matters only if P3 promotes first.
+
 ---
 
 ## MoE path: grouped (token, expert) GEMV
@@ -466,6 +578,7 @@ too.
 | MoE grouped decode GEMV, smem-resident dictionary | **Opt-in** (`PRISMAQUANT_CB_GEMV=v2`), never a default. Wins 1.13–1.58× on k13/k16/k20 in a 16-cell GB10 sweep; loses on k24 at K≥2048 (occupancy wall), where a compiled predicate routes the cell back to the shipped kernel. Reassociation-class output difference vs the default schedule (9/204 synthetic cells, worst `max_rel` 5.88e-03) — **not** bit-exact. Live GB10 validation on Jason Wong's 117B Laguna release dispatched all 94 expert stacks to v2 with no fallback and measured 24.993 vs 23.585 tok/s (+5.97%); long-prefill, concurrency, and soak requests completed without Gridbook errors |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
 | FP8-CB fused decode-in-prologue prefill | **Bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128**; native transient expansion + CUTLASS serves ineligible and large-M shapes |
+| FP4-CB v2 fused mid-M prefill (dense) | **Opt-in** (`PRISMAQUANT_CB_FP4_FUSED_MIDM`), contract-preserving. The in-prologue decode is proven **bit-identical to `cb_expand_v2` for the whole decoded tile at all 13 K12–K24 rungs** (one-hot read-out, no tolerance), so only the FP32 reduction order moves. Measured 1.06–4.37× the shipping expand + bridge route at M ∈ {9,16,32,64,128} on 27B/DSV4-class shapes, every cell bit-equal to the same-config oracle — a wider band than the fp8 twin because the fp4 quality expand writes BF16 (4× the fp8 expand's transient bytes). Served NATIVE-PARITY protocol **not run**; an unexplained M ≤ 12 latency cliff is open. Ineligible shapes (M ≤ 8, M > 128, multi-dictionary fused modules, uncompiled rungs) fall through to today's exact path unchanged |
 | NVFP4-CB fused native-FP4 prefill (dense and MoE) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, MoE routed-quality, and p95 served gates remain open |
 | Persistent-N large-M dense prefill | **RETIRED FROM SERVING; MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. The serving selector, custom op, package loader, and switch are deleted. The `.cu` remains accessible only to the explicit direct research test. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
 | MoE prefill | **Native-only production lane**: grouped CUDA GEMV at M≤16; above 16, eligible quality-green FP8 fused CUTLASS or exact CUDA expansion + owned CUTLASS grouped GEMM. The current generic SM80-compatible grouped bridge is not Blackwell-optimized and measured 6–17% slower than segmented BF16 matmuls on warm synthetic DSV4 shapes; an sm12x-native CUTLASS 3.x collective for the same bridge exists **opt-in** (`PRISMAQUANT_CB_BF16_SM120`, pingpong 64×128×64): measured 1.18–1.27× that bridge and 1.02–1.05× segmented matmuls at T=128, but only 0.83–0.92× segmented at T=512, where the ragged row-padding tax of the tile-indexed construction binds — bit-gated, served protocol not run. Historical Laguna-S-2.1 measurements for the predecessor native chunk-expander path were 293 → 1,821 tok/s @8k and 207 → 1,822 @63k; they must not be relabelled as measurements of the new bridge. The v0.4.2 fused native-NVFP4 route remains an explicit A/B opt-in without MoE quality qualification |

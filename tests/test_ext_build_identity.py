@@ -34,6 +34,7 @@ _LOADER_STATE = (
     ("_bf16_grouped", "_bf16_grouped_tried"),
     ("_fused", "_fused_tried"),
     ("_fused_fp4", "_fused_fp4_tried"),
+    ("_fused_fp4v2", "_fused_fp4v2_tried"),
 )
 
 
@@ -507,10 +508,11 @@ def test_cutlass_include_override_is_honoured(monkeypatch, tmp_path):
 
 def test_cutlass_include_override_reaches_every_cutlass_loader(
         monkeypatch, tmp_path):
-    """bf16-grouped, fused-FP8 and fused-FP4 all read the same override.
+    """Every CUTLASS loader reads the same override.
 
-    Before 2026-08-01 only the fused-FP4 loader did, so the other two simply
-    could not build in a venv without vLLM's bundled tree.
+    Before 2026-08-01 only the fused-FP4 loader did, so the others simply
+    could not build in a venv without vLLM's bundled tree. The fused FP4-v2
+    quality lane (audit §3 P2a) joined the set when it was added.
     """
     include = _cutlass_tree(tmp_path)
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
@@ -527,6 +529,7 @@ def test_cutlass_include_override_reaches_every_cutlass_loader(
         (cuda_ext.get_fused_ext, cuda_ext._FUSED_SYMBOLS),
         (cuda_ext.get_fused_fp4_ext,
          cuda_ext._FUSED_FP4_SYMBOL_FAMILIES[0][1]),
+        (cuda_ext.get_fused_fp4v2_ext, cuda_ext._FUSED_FP4V2_SYMBOLS),
     ):
         for value_name, tried_name in _LOADER_STATE:
             setattr(cuda_ext, value_name, None)
