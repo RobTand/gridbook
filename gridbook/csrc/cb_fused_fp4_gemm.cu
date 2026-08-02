@@ -7,8 +7,11 @@
 // k=64 — twice the per-instruction K of fp8's QMMA.16832). The trap this file
 // exists to avoid: kind::f8f6f4 also ACCEPTS e2m1 operands but issues at the
 // fp8 k=32 rate; the fork static_asserts the NVF4 atom, and the SASS gate in
-// docs/lanes/nvfp4-cb/fp4-fused-prefill.md disassembles the built module to
-// prove OMMA.SF.16864 is present and QMMA is not.
+// tests/test_fused_fp4_prefill.py disassembles the built module to prove
+// OMMA.SF.16864 is present in BOTH concrete fused symbols (TileM=128 and
+// TileM=256) and that QMMA appears in neither — a module-wide search would
+// pass on the stock reference kernel's own OMMA. docs/RELEASING.md §2.2 makes
+// running that suite on the release GPU image a pre-tag gate.
 //
 // Entry points:
 //  - sm120_nvf4_mm_scaled: STOCK block-scaled collective (dense packed-e2m1
@@ -92,7 +95,8 @@ template <class TileShape>
 using ScaledFusion = gridbook::grouped::ScaledFusion<TileShape, ElementAcc,
                                                      ElementD>;
 
-// BIT-IDENTITY PROOF for the §4-dedupe extraction: the shared tree is the SAME
+// BIT-IDENTITY PROOF for the dedupe extraction in
+// docs/audits/ultraplan_perf_2026-08-01.md §4: the shared tree is the SAME
 // TYPE this file spelled before it, so the epilogue collective, its smem
 // layout and its rounding order are unchanged.
 static_assert(

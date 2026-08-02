@@ -44,8 +44,8 @@ def cb_gemv_fp8(x: torch.Tensor, qw_padded: torch.Tensor,
                 type_size: int) -> torch.Tensor:
     """CUDA decode-GEMV for FP8_CB (prototype ii): takes RAW bf16 activations
     and fuses the per-token fp8 dynamic QDQ + the bandwidth-bound dequant-GEMV
-    into one op (two kernel launches vs the Triton path's ~7). Caller must
-    fails closed when the native extension is unavailable."""
+    into one op (two kernel launches vs the Triton path's ~7). The op fails
+    closed when the native extension is unavailable."""
     from .cuda_ext import require_ext
     return require_ext("FP8-CB decode GEMV").cb_gemv_fp8(
         x, qw_padded, cb_flat, cb_row_offset, scale,
@@ -67,8 +67,8 @@ def cb_gemv_fp4_v2(xq: torch.Tensor, qw_padded: torch.Tensor,
     bf16 activations (fp4 group-16 RTN runs in ``codec``, OUTSIDE the kernel —
     same as the Triton fp4 path — so CUDA-vs-Triton numerics stay aligned) and
     runs the bandwidth-bound dequant-GEMV, composing the two-tier weight scale
-    in-register from the packed 9-byte plane. Caller must check
-    the native extension is unavailable."""
+    in-register from the packed 9-byte plane. The op fails closed when the
+    native extension is unavailable."""
     from .cuda_ext import require_ext
     return require_ext("FP4-CB v2 decode GEMV").cb_gemv_fp4_v2(
         xq, qw_padded, cb_flat, cb_row_offset, compose,
@@ -256,6 +256,8 @@ def cb_bf16_grouped_mm_sm120_gather_out(out: torch.Tensor, a: torch.Tensor,
 def _cb_bf16_grouped_mm_sm120_gather_out_fake(out, a, row_src, weights,
                                               expert_ids, tile_m):
     return None
+
+
 @torch.library.custom_op("prismaquant::cb_moe_persistent_b_prefill",
                          mutates_args=("out",), tags=_PQ_UNSAFE)
 def cb_moe_persistent_b_prefill(out: torch.Tensor, a: torch.Tensor,
@@ -477,6 +479,8 @@ def _cb_moe_combine_fake(y, pair_w, tok_start, T):
 _LAYER_REGISTRY: dict[int, tuple[weakref.ReferenceType,
                                  weakref.ReferenceType]] = {}
 _LAYER_IDS = itertools.count()
+
+
 def register_cb_layer(method, layer) -> int:
     """Register one compiled-dispatch target without owning its model.
 

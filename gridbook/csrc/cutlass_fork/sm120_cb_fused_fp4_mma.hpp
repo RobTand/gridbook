@@ -24,7 +24,7 @@
  *     (packed nibbles — the codebook is E2M1-grid-valued by construction,
  *     nvfp4_cb_formats._snap_to_grid) and (b) the standard SmemLayoutSFB
  *     ue4m3 buffer (two-tier v2 compose is EXACT e4m3 by construction,
- *     two-tier-scale-spec.md §1.2; v1 plane bytes are already e4m3).
+ *     docs/SPEC.md §1.2; v1 plane bytes are already e4m3).
  *     Single decoded buffer + NamedBarrier serialization per K-tile — the
  *     sm120_cb_fused_mma.hpp pattern verbatim.
  *   - The MMA is the UNCHANGED block-scaled path: zipped (B,SFB) fragments
@@ -45,8 +45,12 @@
  * activation side is native NVFP4 quantization (per-tensor fp32 global scale
  * x per-group-16 ue4m3 SF), which is a DIFFERENT activation bucket from the
  * Triton path's fp32-scale group-16 QDQ — the hardware SF operand is ue4m3,
- * so an fp32 group scale is unrepresentable. See the parity notes in
- * docs/lanes/nvfp4-cb/fp4-fused-prefill.md.
+ * so an fp32 group scale is unrepresentable. That bucket split, not a kernel
+ * defect, is what any fused-vs-quality delta measures: see the "Decision
+ * basis" section of docs/audits/fused_nvfp4_enablement_2026-07-31.md, and the
+ * tolerance contract stated in tests/test_fused_fp4_prefill.py's module
+ * docstring (that suite also pins the fused-vs-stock bit-exactness that holds
+ * once BOTH sides consume the same E2M1/UE4M3 activation bytes).
  **************************************************************************************************/
 #pragma once
 
@@ -190,15 +194,17 @@ struct CollectiveMma<
   static_assert(TileK == 128, "CB fused fp4 mainloop assumes TileK = 128 (half a 256-weight superblock)");
   static_assert(TileN == 128, "blockscaled SF smem atoms require TileN == Blk_MN == 128");
 
-  // Per-stage packed-B DESCRIPTOR (attempt-2 of the staging design, measured
-  // — see fp4-fused-prefill.md §7): the producer warp does NOT stage packed
-  // bytes (a single 32-thread warp staging ~9 KB/K-tile was the pipeline
-  // bottleneck: ~13x off native at one-M-tile shapes). It publishes 16 bytes
-  // per stage — the M-tile's packed base pointer (expert-resolved) and the
-  // CTA's first output row — and the 256 MMA threads gather the packed
-  // bytes STRAIGHT FROM GMEM during decode (L1/L2-hot; the decode-GEMV
-  // pattern). All gmem windows stay inside the row's own superblock (u8
-  // loads for the scale plane), so NO tail slack is required of the buffer.
+  // Per-stage packed-B DESCRIPTOR (attempt-2 of the staging design; the
+  // number below is the whole surviving record of why attempt-1 was rejected,
+  // because the lane doc that carried the measurement is not part of this
+  // repo): the producer warp does NOT stage packed bytes (a single 32-thread
+  // warp staging ~9 KB/K-tile was the pipeline bottleneck: ~13x off native
+  // at one-M-tile shapes). It publishes 16 bytes per stage — the M-tile's
+  // packed base pointer (expert-resolved) and the CTA's first output row —
+  // and the 256 MMA threads gather the packed bytes STRAIGHT FROM GMEM
+  // during decode (L1/L2-hot; the decode-GEMV pattern). All gmem windows
+  // stay inside the row's own superblock (u8 loads for the scale plane), so
+  // NO tail slack is required of the buffer.
   // The final u32 carries the dense projection's N-tile -> interned LUT-block
   // identity.  It is published under the same mbarrier as the packed pointer
   // and row base, so consumers cannot stage a LUT for the wrong projection
