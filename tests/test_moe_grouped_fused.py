@@ -58,7 +58,11 @@ def _isolate_process_stable_moe_selectors():
 # exactly the loop path's per-expert row selection, in the loop's order.        #
 # --------------------------------------------------------------------------- #
 DEV = "cuda"
-# GB10/CUDA 13.0 measured 2.015–2.040e-2 on the four fixed routing cases.
+# GB10/CUDA 13.0, grouped-fused vs the native BF16 bridge: 1.906–2.039e-2 over
+# the four fixed routing cases (measured 2026-08-01, torch 2.11+cu130). Moving
+# the oracle off the retired per-expert round did not move this bound: that
+# round measured 1.906–2.040e-2 against the same bridge, and the two rounds
+# differed from each other by only 2.9–3.9e-4.
 # Keep a narrow 2.1e-2 reassociation envelope: the fused path and native BF16
 # bridge quantize the same values, but accumulate them in different tensor-core
 # types/orders. This is a regression bound, not a claim of bit equivalence.
