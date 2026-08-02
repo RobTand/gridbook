@@ -12,6 +12,17 @@ expander module, the required grouped-BF16 quality bridge, and the optional
 FP8 fused specialization on Blackwell. Experimental fused FP4 remains an
 explicit, default-off build option.
 
+**Fused FP8 module build cost (measured, GB10 / cc 12.1, cold cache):**
+`get_fused_ext()` compiles 20 kernel instantiations — six `k_bits` rungs ×
+{dense unscaled, dense scaled, grouped TileM=128}, plus grouped TileM=256 at
+k28/k32 — in **~76 s**. The K1.2 rung-surface work (2026-08-02) changed *no*
+instantiation, because the six compiled rungs were already the complete set the
+packed-B TMA box and the uniform sub-table width admit (see
+[KERNELS](KERNELS.md#rung-coverage-what-this-lane-can-and-cannot-serve-k12)), so
+the build-time delta against the previous release is **zero within measurement
+noise**. Every rung that *could* be added would need a different TMA schedule,
+not another template instantiation.
+
 ---
 
 ## Quick start

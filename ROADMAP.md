@@ -110,11 +110,30 @@ resident weight copy, decoder, or matmul merely to create another route.
   key every affected module and cache. Reject non-`sm_120`/`sm_121` targets
   before either fused build starts, and make required validation fail when the
   requested call route—not merely its module—does not execute.
-- [ ] **K0.4 — Finish grouped-MoE routing and telemetry.** Replace the manual
-  TileM128/256 choice with a CUDA-graph-safe selector that accounts for routed
-  token counts, padding, both stages' shapes, and occupancy. Emit the requested
-  activation policy, actual kernel symbol, TileM, shape, activation contract,
-  fallback state, and exact fallback reason for dense and MoE calls.
+- [x] **K0.4 — Finish grouped-MoE routing and telemetry. IMPLEMENTED
+  (2026-08-02).** `moe_routing.cb_grouped_tile_m` replaces the manual choice —
+  which was worse than "manual": the FP8 grouped path resolved `tile_m=None` to
+  the kernel's compiled default, so serving could never reach TileM=256 at all,
+  and the FP4 path read its tile off the *suffix* of an activation-policy env
+  string. The selector accounts for routed token counts (`P = tokens × top_k`,
+  exactly host-known), per-expert padding waste at each tile (through the exact
+  `pad₂₅₆ − pad₁₂₈` lemma), both projection stages' shapes (their decode:MMA
+  ratio is `1:t` independent of N and K, so one condition serves both, and the
+  narrower N bounds the occupancy), and occupancy (the dense selector's
+  `ceil(2·SM/3)` floor). It is CUDA-graph-safe **by construction**: every input
+  is a host-known integer, so there is no device read to sync on — which matters
+  because `tile_m` fixes both the kernel symbol and every routing tensor's
+  shape. Fixing this surfaced and repaired a real capture defect: the padded
+  routing called `torch.bincount`, which host-syncs, while documenting "NO HOST
+  READS". **K0.4's telemetry list is satisfied in full** — requested activation
+  policy, actual kernel symbol, TileM, problem shape, activation contract,
+  fallback state and the exact fallback reason are emitted for dense *and* MoE
+  calls through `nvfp4_activation_contract.emit_route`, which extends the
+  existing 0.4.2 dense mechanism rather than adding a parallel one, plus
+  selector provenance so a tile choice is auditable offline. See
+  [KERNELS](docs/KERNELS.md#grouped-moe-tilem-selection-k04). The calibrated
+  `ρ > 512` threshold remains proposal data for the grouped lanes until a routed
+  sweep pins it.
 - [ ] **K0.5 — Profile and close the fused-NVFP4 raw operator gap.** Split
   activation quantization, packed-B decode, synchronization, MMA, epilogue,
   and launch costs and compare against the matching stock
@@ -150,11 +169,28 @@ resident weight copy, decoder, or matmul merely to create another route.
   **what remains open on this item is the served
   [NATIVE-PARITY](docs/NATIVE-PARITY.md) gate, not the kernel.** See
   [KERNELS](docs/KERNELS.md#persistent-b-decode-in-mainloop-opt-in-prismaquant_cb_moe_persistent_b).
-- [ ] **K1.2 — Cover the complete FP8-CB mid-M production rung surface.** The
-  fused kernel currently instantiates only K28/32/36/40/44/48 while production
-  permits every K28 through K48. Either instantiate and test every product rung
-  or encode the concrete route/fallback in the candidate identity and timing
-  surface so the allocator cannot price an unbacked fast path.
+- [x] **K1.2 — Cover the complete FP8-CB mid-M production rung surface.
+  RESOLVED (2026-08-02) — second arm.** Production does permit every K28–K48,
+  but the first arm ("instantiate and test every product rung") is **closed by a
+  format + TMA law**, not by effort: `type_size = 4k` is the packed-B TMA box's
+  contiguous extent and must be a 16-byte multiple (`k % 4 == 0`), and the fused
+  mainloop's single `CbSubW = k/4` sub-table width is the format's real layout
+  only on those same rungs — the format splits `k` over `n_sub = 4` raggedly
+  (`csrc/cb_gemv.cu` `SubSplit`), so a uniform decode at k37 would be *wrong*,
+  not merely unaligned. The six compiled rungs were therefore already the
+  maximum this collective admits, and the published 27B artifact's 8-rung
+  K36–K47 ladder hits exactly the three multiples of 4 it contains.
+  **The second arm is implemented:** the compiled set is queryable
+  (`cb_fused_kbits()`), Python gates on the derived law and confirms against the
+  module instead of carrying duplicated literals, every kernel switch is
+  generated from one rung list, the smem feasibility predicate is a closed form
+  `static_assert`ed against the probe's measured cells, the published smem table
+  was regenerated (it quoted the stale pre-R6 base), an off-law rung is refused
+  with a message naming the law and the routes that *do* serve it, and per-rung
+  bit-exact gates are parametrized from the module's own reported surface. See
+  [KERNELS](docs/KERNELS.md#rung-coverage-what-this-lane-can-and-cannot-serve-k12).
+  Serving all 21 rungs through this lane would need a new packed-B TMA schedule
+  *and* a ragged-width decode — a new kernel, tracked separately if ever wanted.
 - [ ] **K1.3 — Reassess large-M dense FP8-CB from a fresh roofline.** The
   transient path remains about 1.44x native, but the existing persistent-N
   implementation was 2–5.7x slower. Profile current traffic and synchronization

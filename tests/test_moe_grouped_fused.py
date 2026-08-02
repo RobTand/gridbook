@@ -415,8 +415,12 @@ def _tile_sizes(method, layer):
     return sizes
 
 
-def test_quality_at_every_compiled_tile():
-    method, layer, dims = _build(seed=1)
+@pytest.mark.parametrize("k", [28, 44])
+def test_quality_at_every_compiled_tile(k):
+    """k is parametrized because TileM=256 is smem-feasible only at k28/k32.
+    At the previously hardcoded k44 this test had exactly one compiled tile, so
+    "every compiled tile" was a claim with one arm behind it."""
+    method, layer, dims = _build(seed=1, k=k)
     _require_grouped_fused(method, layer)
     act = _silu_act()
     ids, weights = _routing(48, dims["E"], 2, "uniform", seed=7)
@@ -437,7 +441,10 @@ def test_quality_at_every_compiled_tile():
     "distribution,tokens", [("one_expert", 40), ("subset", 17),
                              ("uniform", 33)])
 def test_ragged_routing_at_tile_256(distribution, tokens):
-    method, layer, dims = _build(seed=6)
+    # k28, not the fixture default k44: TileM=256 is smem-infeasible above k32,
+    # so at k44 this test skipped unconditionally and the 256 path had no live
+    # coverage at all.
+    method, layer, dims = _build(seed=6, k=28)
     _require_grouped_fused(method, layer)
     if 256 not in method._gf2_tile_sizes(layer):
         pytest.skip("tile_m=256 not compiled")
