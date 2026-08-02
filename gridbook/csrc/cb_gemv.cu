@@ -1,5 +1,7 @@
 // CUDA decode-GEMV for the FP8_CB codebook format (prototype ii — the
-// production decode path; docs/lanes/nvfp4-cb/serving-kernel.md §1b).
+// production decode path; docs/KERNELS.md, "Decode path (small M):
+// bandwidth-bound fused GEMV", which records this kernel's design and the
+// 4.2 -> ~10.3 tok/s result quoted below).
 //
 // Replaces the Triton `_cb_decode_gemm_kernel` in the decode regime (M<=16).
 // The Triton prototype is ~2.4x below the bandwidth bound on GB10 (4.20 tok/s
@@ -1106,10 +1108,12 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp8_kernel(
 
 // ---------------------------------------------------------------------------
 // Grouped MoE decode GEMV for the fp4 two-tier (v2) codebook format
-// (docs/lanes/nvfp4-cb/two-tier-scale-spec.md §4/§5, moe_cb_design.md). Same
-// grouped design as cb_moe_gemv_fp8_kernel (one block per routed (pair, out);
-// warps stride the 256-weight superblocks; lane v owns codeword v, 32 per
-// superblock). Two structural differences from the fp8 path:
+// (docs/SPEC.md §1.2 for the two-tier coding restated below, and §7 INV-1,
+// which requires exactly the in-register composition this kernel does;
+// docs/KERNELS.md, "MoE path: grouped (token, expert) GEMV", for the grouped
+// design). Same grouped design as cb_moe_gemv_fp8_kernel (one block per routed
+// (pair, out); warps stride the 256-weight superblocks; lane v owns codeword v,
+// 32 per superblock). Two structural differences from the fp8 path:
 //   * decode is n_sub=2 sub-codebooks of sub_dim=4, gathered from the BF16 flat
 //     codebook (_cb_flat), not the e4m3-byte LUT — the fp4 grid values live in
 //     bf16 and are scaled by the composed group scale;

@@ -184,7 +184,8 @@ plus CUTLASS GEMM, which is the general shipping path—not a Triton fallback.
 
 It is *expected* on any non-Blackwell GPU (the kernel is `sm_120`-family only)
 and anywhere `nvcc` is missing. It can also mean vLLM's bundled CUTLASS headers
-were not found — the fused build takes them from your vLLM install
+were not found — the fused build takes them from your vLLM install, and
+`PRISMAQUANT_CUTLASS_INCLUDE` points it elsewhere
 (see [INSTALL.md](INSTALL.md#cutlass-comes-from-your-vllm-install)).
 
 To skip the build attempt entirely: `PRISMAQUANT_CB_FUSED_MIDM=0`.
@@ -410,11 +411,11 @@ The validated candidate is:
 --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8]}'
 ```
 
-Leave `PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE` unset. On the dated close-rate 0.6B
-canary, the opaque arm improved Gridbook's 32+256 whole-request latency by
-20.1%, to within 5.9% of native; changed batch-1 and batch-4 prompts matched
-eager text, tokens, and token logprobs exactly. That run predates the current
-permanent boundary and direct registered-operator FP8 binding, so it remains
+On the dated close-rate 0.6B canary, the opaque arm improved Gridbook's 32+256
+whole-request latency by 20.1%, to within 5.9% of native; changed batch-1 and
+batch-4 prompts matched eager text, tokens, and token logprobs exactly. That
+run predates the current permanent boundary and direct registered-operator FP8
+binding, so it remains
 historical capture evidence rather than a benchmark of today's full serving
 stack. Graph capture also adds startup time and memory, so choose capture sizes
 that match the concurrency you actually serve. The 295B FP4-v2 path separately

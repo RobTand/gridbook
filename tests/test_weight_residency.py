@@ -847,6 +847,11 @@ def test_same_ref_fused_roles_enter_native_fused_kernel(monkeypatch, M):
     from gridbook import cuda_ext
     from gridbook import ops as cb_ops
 
+    # Set BEFORE the load: the flag is latched process-stable now, so a value
+    # first observed at load cannot be changed afterwards — which is the point
+    # of the latch, and is what this test was implicitly relying on not being
+    # true.
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "1")
     method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
     N, K = layer._cb_N, layer._cb_K
     _mock_fp8_ops(monkeypatch, N)
@@ -871,7 +876,6 @@ def test_same_ref_fused_roles_enter_native_fused_kernel(monkeypatch, M):
         cb_ops, "cb_expand_fp8",
         lambda *a, **kw: pytest.fail("eligible shared LUT fell back"),
     )
-    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "1")
     out = method._apply_inline(layer, torch.zeros(M, K, dtype=torch.bfloat16))
     assert len(calls) == 1
     assert calls[0][1] is layer._cb_flat_fp8
@@ -899,7 +903,6 @@ def test_distinct_ref_roles_use_native_expand_before_fused_ext(monkeypatch, M):
         return torch.zeros(N, K, dtype=torch.float32)
 
     monkeypatch.setattr(cb_ops, "cb_expand_fp8", _expand)
-    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "1")
     out = method._apply_inline(layer, torch.zeros(M, K, dtype=torch.bfloat16))
     assert len(fallback_calls) == 1
     assert torch.equal(out, torch.full_like(out, 7.0))
@@ -1142,7 +1145,8 @@ def test_fp8_fused_midm_optout_cannot_enable_jit_after_model_load(
         lambda: pytest.fail("mid-serve opt-in triggered a fused JIT"),
     )
     with pytest.raises(
-        RuntimeError, match="FUSED_MIDM changed after this CB layer was loaded"
+        RuntimeError,
+        match="PRISMAQUANT_CB_FUSED_MIDM changed after Gridbook dispatch"
     ):
         method._apply_inline(
             layer, torch.zeros(16, layer._cb_K, dtype=torch.bfloat16))

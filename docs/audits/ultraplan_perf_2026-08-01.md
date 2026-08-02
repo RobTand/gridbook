@@ -160,6 +160,23 @@ schedule also removes per-segment launch overhead).
 - The measured-negative `TileM=64` grouped prototype stays closed; this is a
   new collective, not a tile retune of the old one.
 
+**SHIPPED 2026-08-02 — OPT-IN, not DEFAULT.** `csrc/cb_bf16_grouped_gemm.cu`
+gained the sm12x-native lane behind `PRISMAQUANT_CB_BF16_SM120=1`, with the
+grouping construction extracted to `csrc/cb_grouped_common.hpp` and consumed by
+all three grouped kernels, exactly as planned. Two things this section did not
+anticipate had to follow before the target was met: the tile-indexed
+construction's **ragged row padding** cost more than the schedule won at
+`T=512` (first measurement 0.83–0.92× segmented, i.e. *below* the old bridge
+there), and closing it took an **in-mainloop A-row gather** plus a
+**swizzle-group-aligned expert order** — two construction changes to the same
+compiled collective, not more tuning. With both, the P1 target ("≥ segmented
+parity warm") is met on every cell: 1.03–1.05× at `T=128`, 1.10–1.15× at
+`T=512`, and 1.13–1.37× the bridge it replaces. Caveat this section's framing
+did not have: the expert order is gated on one chunk covering the layer
+(`chunk >= E`), so large-expert layers get the gather without it — ROADMAP
+K1.5. Bit gates hold at every boundary, but the reduction order moved, so the
+lane stays opt-in pending the served NATIVE-PARITY grouped-MoE protocol.
+
 ### P2 — contract-preserving CB→BF16 decode-in-mainloop (kill the transient round trip)
 
 The quality path's remaining structural tax is materializing the decoded tile
@@ -178,6 +195,21 @@ Two sub-items, in order:
   is contract-preserving. Known ceiling: decode-in-prologue re-decodes B per
   M-tile, so it is mid-M-only by construction (FP8's measured 0.22× at M≈1400
   is the boundary evidence); gate it at M ≤ 128 like FP8.
+  **SHIPPED 2026-08-02 — and it shipped OPT-IN, not DEFAULT.**
+  `csrc/cb_fused_fp4v2_gemm.cu` + `csrc/cutlass_fork/sm120_cb_fp4v2_bf16_mma.hpp`
+  land the lane behind `PRISMAQUANT_CB_FP4_FUSED_MIDM=1`, measuring 1.06–4.37×
+  the expand + bridge route at M ∈ {9,16,32,64,128}. "DEFAULT-eligible because
+  it is contract-preserving" was the wrong test and this note corrects it:
+  contract-preserving buys *eligibility for* the served
+  [NATIVE-PARITY](../NATIVE-PARITY.md) protocol, not a promotion — the FP32
+  reduction order still moves, which is the same requalification the FP8 mid-M
+  lane actually ran before it was promoted. The gate has not been run, so the
+  lane is default-off and the dispatch with the flag unset is byte-for-byte
+  unchanged. Two things this section did not predict: fp4-v2's `type_size = 4k+9`
+  makes TMA structurally unusable for B, so the producer publishes a per-stage
+  descriptor under the mbarrier instead; and an unexplained **M ≤ 12 latency
+  cliff** is recorded as open. `scripts/bench_fp4v2_fused_midm.py` reproduces
+  the table.
 - **P2b — ROADMAP K1.1: grouped MoE decode-in-mainloop for large M.** Decode an
   expert's weight tile **once**, stream routed/padded M rows through it —
   persistent-B along M, which is exactly what the roadmap already sanctions as
@@ -185,6 +217,24 @@ Two sub-items, in order:
   schedule (that one was CUDA-core/SM89-atom drafts with per-CTA N ownership).
   Gate: whole-routed-operator timing per NATIVE-PARITY, empty/uneven routing,
   stream- and graph-safety.
+  **SHIPPED 2026-08-02 — OPT-IN pending the served gate.** `csrc/cb_moe_persistent_b.cu`
+  behind `PRISMAQUANT_CB_MOE_PERSISTENT_B=1`: a CTA owns one `(expert, N-tile)`,
+  decodes it into smem once and runs the M-loop inside the kernel over the exact
+  `expert_ends` segments — no `[E,N,K]` transient, no padded rows, no host read,
+  launch geometry a function of `(E, N)` alone. The mainloop is hand-assembled
+  from `mma.sync` / `ldmatrix` / `cp.async`, because no CUTLASS grouping
+  construction on this architecture permits an in-kernel M-loop over one
+  expert's segment. Nine whole-routed-operator cells: **1.05–3.36×** over the
+  default bridge, winning every cell, with the deleted expansion measuring
+  20.9–46.7% of the default operator and **not** shrinking with expert count.
+  The listed gate conditions were met — empty/uneven routing, stream and graph
+  safety (capture is tested, with a negative control proving the avoided
+  `bincount` really does break it) — but the served NATIVE-PARITY protocol has
+  not run, so this is proposal data and the lane is default-off. A dedicated
+  graph/stream audit then found three defects in it, two of which no test in the
+  suite could have caught (a WAR race on the A double buffer, unclamped device
+  `expert_ends`, and the host-syncing `bincount`); all three are fixed and
+  gated. ROADMAP K1.1 stays open on the served gate, not on the kernel.
 - **Dense large-M (the 1.44×) stays behind ROADMAP K1.3**: fresh roofline
   profiling *first*; only build a dense persistent-B/stream-M variant if the
   model shows a realizable win. The prior persistent-N implementation stays

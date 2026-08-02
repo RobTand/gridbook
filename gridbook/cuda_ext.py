@@ -18,13 +18,17 @@ extension build fails.
 Build cache: ``PRISMAQUANT_CB_EXT_DIR`` if set, else ``~/.cache/prismaquant-
 cb-ext``. EVERY module builds in its own subdirectory of that root — ``main``,
 ``v2``, ``bf16_grouped/<identity>``, ``fused/<identity>``,
-``fused_fp4/<identity>`` — so no two ninja workspaces share artefacts. Inside the container the root is
-ephemeral (one ~30 s build per container start; mount a host dir over it to
-persist). Never ``/tmp``. (~30 s is measured: cold ``get_ext()`` in
-``vllm-node:latest`` with ``TORCH_CUDA_ARCH_LIST=12.1`` -> 29.4 s / 29.7 s on
-two runs. That measurement predates both the ``main`` subdirectory and the
-device-derived ``-gencode`` below, each of which costs one further rebuild of
-an existing cache — accepted once per user.)
+``fused_fp4/<identity>``, ``fused_fp4v2/<identity>`` and
+``moe_persistent_b/<identity>``, seven in all — so no two ninja workspaces
+share artefacts. Inside the container the root is ephemeral, so a cold start
+pays ONE build per module it actually reaches; mount a host dir over it to
+persist those builds across restarts. Never ``/tmp``. There is deliberately no
+single build-time figure here: the modules differ by more than an order of
+magnitude in compile cost (the CUTLASS collectives dominate the hand-written
+CUDA), what a given serve reaches depends on format and opt-in flags, and the
+one measurement this docstring used to quote was taken against a single module
+before five of the seven existed. ``docs/CONTAINER.md`` carries the measured
+image-build numbers.
 
 Architecture: every module is compiled for exactly the live device's compute
 capability instead of inheriting ``TORCH_CUDA_ARCH_LIST``. The stock vLLM base
@@ -42,10 +46,14 @@ module. Strict call contracts use :func:`_require_symbols`; fused FP4 uses
 independent symbol families because its dense and grouped call sites are
 separately guarded. An incompatible module would otherwise fail with
 ``AttributeError`` mid-forward, or silently disable a probed fast path. The
-two fused modules and the grouped BF16 bridge additionally hash their packaged
-sources, Gridbook headers, target, compiled-in lane macros and toolchain ABI
-into the module name and build directory, so a loaded module of those three is
-always built from the current sources.
+five digest-keyed modules — ``fused`` (FP8), ``fused_fp4``, ``bf16_grouped``,
+``fused_fp4v2`` and ``moe_persistent_b`` — additionally hash their packaged
+sources, Gridbook headers (transitively: a header reached only through another
+Gridbook header counts), target, compiled-in lane macros and toolchain ABI
+into the module name and build directory, so a loaded module of those five is
+always built from the current sources. ``main`` and ``v2`` are not keyed that
+way: they include no Gridbook header, so torch's own versioner over the
+``.cu`` is already complete for them.
 
 No fast-math: the QDQ kernel's division/conversion rounding must match torch
 bit-for-bit.
@@ -70,7 +78,8 @@ _NVCC_HINT = (
     "install a CUDA toolchain matching your torch build (distro `cuda-toolkit` "
     "or the `nvidia-cuda-nvcc-*` wheel) and make sure `nvcc` is on PATH or "
     "CUDA_HOME points at it; set PRISMAQUANT_CB_EXT_DIR to a writable, "
-    "persistent directory to keep the one-time ~30 s JIT build across restarts"
+    "persistent directory so each module's one-time JIT build survives a "
+    "restart"
 )
 
 
@@ -571,12 +580,14 @@ def _find_cutlass_include() -> str:
     ``PRISMAQUANT_CUTLASS_INCLUDE`` wins when set — it is the only way to build
     these modules in a venv that has no vLLM wheel, or against a CUTLASS newer
     than the bundled copy — and it is read HERE rather than in one loader so
-    the grouped-BF16, fused-FP8 and fused-FP4 modules all honour it (before
-    2026-08-01 only the fused-FP4 loader did, so the other two simply could not
-    build without vLLM's bundled tree). A set-but-wrong override FAILS instead
-    of falling back to the bundled copy: silently compiling against different
-    headers than the operator asked for is exactly the class of surprise the
-    override exists to prevent.
+    all FOUR CUTLASS-compiling modules honour it: grouped-BF16, fused-FP8,
+    fused-FP4 and the fused FP4-v2 quality lane. (Before 2026-08-01 only the
+    fused-FP4 loader read it, so the others simply could not build without
+    vLLM's bundled tree; the fp4-v2 lane joined the set when it was added, and
+    ``moe_persistent_b`` is absent because it includes no CUTLASS at all.) A
+    set-but-wrong override FAILS instead of falling back to the bundled copy:
+    silently compiling against different headers than the operator asked for is
+    exactly the class of surprise the override exists to prevent.
 
     Otherwise discover vLLM's bundled copy WITHOUT importing vLLM's runtime
     package: importing ``vllm`` merely to locate its files eagerly initializes
@@ -1081,9 +1092,16 @@ def _fused_fp4_build_identity(torch, cpp_extension, *, src_dir: str,
 def get_fused_fp4_ext():
     """The NVFP4_CB fused BLOCK-SCALED prefill extension
     (cb_fused_fp4_gemm.cu), or None. Separate module from the fp8 fused ext
-    so the SASS gate (OMMA.SF.16864 present / QMMA absent — the fp4-at-fp8-
-    rate trap, docs/lanes/nvfp4-cb/fp4-fused-prefill.md) can be run against
-    the fp4 module alone. Needs the CUTLASS headers (vLLM's bundled copy, or
+    so the SASS gate can be run against the fp4 module alone: OMMA.SF.16864
+    present in BOTH concrete fused symbols and QMMA in neither — the
+    fp4-at-fp8-rate trap. That gate is
+    ``tests/test_fused_fp4_prefill.py::test_sass_fused_symbols_issue_omma_16864
+    _and_no_qmma``, which disassembles the built module with ``cuobjdump``;
+    ``docs/RELEASING.md`` §2.2 makes running it on the release GPU image a
+    pre-tag requirement. (It used to cite a lane document that lived in the
+    producer repo and has been deleted; the executable gate is the surviving
+    specification, which is the better anchor anyway.) Needs the CUTLASS
+    headers (vLLM's bundled copy, or
     PRISMAQUANT_CUTLASS_INCLUDE for venv builds) and the sm_121a/sm_120a
     arch-specific target — the block-scaled MMA is an arch-'a' instruction,
     so the build pins the current device's compute_XYa. Fail-soft: this
@@ -1108,6 +1126,29 @@ def get_fused_fp4_ext():
 # loader lives in a self-contained additive block at the end of this file
 # appends its own entry there (see the bottom of this file) instead of forcing
 # an edit up here. A monkeypatched loader is therefore also the one that runs.
+#
+# TWO REGISTRATION CONVENTIONS EXIST, and both are legitimate. They used to be
+# documented as if only one did, which is how a block at the end of this file
+# could describe itself as touching nothing above while its family sits in the
+# literal list right here:
+#
+#   * a LITERAL ROW below, for the six modules that predate the append form;
+#   * an APPEND from inside a self-contained block at the end of the file, for
+#     lanes added after it. This is the preferred form for anything new: the
+#     whole lane, registration included, is one contiguous block that can be
+#     read or reverted as a unit.
+#
+# Neither is being migrated to the other. Rewriting the literal rows as appends
+# would change the warm-up ORDER, which the paragraph above is a deliberate
+# statement about, and would buy nothing. What matters is the same for both:
+# every registered name must resolve against this module. A name that does not
+# is a whole module silently dropped from every residency match, so
+# ``preload_native_extensions`` reports it as a Gridbook DEFECT rather than as
+# "this box could not build it", and tests/test_fused_preload.py asserts the
+# registry resolves. (The assertion is not made at import: this module is
+# imported for capability probes in environments with no CUDA at all, and an
+# import-time raise there would be the loudest possible failure for the least
+# important reason.)
 _PRELOAD_FAMILIES: list[tuple[str, str]] = [
     ("gemv", "get_ext"),                        # cb_gemv.cu
     ("gemv_v2", "get_ext_v2"),                  # cb_gemv_v2.cu
@@ -1140,22 +1181,59 @@ def preload_native_extensions(*, strict: bool = False) -> dict[str, bool]:
     The returned status names every family, so validation code can prove which
     modules are resident rather than assuming. ``strict=True`` raises only
     after every attempt has run.
+
+    NON-STRICT IS NOT SILENT. A family that fails to warm makes the two arms of
+    an A/B residency-MISmatched — which is the entire reason this function
+    exists — so every failure is named on stderr even when nothing raises. The
+    caller (``plugin.register``) does not inspect the returned status, and a
+    warm-up that quietly half-completed is exactly the confound the operator
+    set the flag to remove.
+
+    A REGISTRY DEFECT IS REPORTED SEPARATELY from a module being unbuildable
+    here. ``_PRELOAD_FAMILIES`` holds loaders BY NAME, so an entry naming
+    something this module does not define used to be recorded as a
+    plain-unavailable family and continued past: a whole module silently
+    dropped from every residency match, reported identically to a Blackwell-
+    only lane on an Ada box. The two are now distinguishable in one glance, and
+    a test asserts every registered name resolves.
     """
     status: dict[str, bool] = {}
     errors: dict[str, Exception] = {}
+    unresolved: list[str] = []
     for family, loader_name in tuple(_PRELOAD_FAMILIES):
+        loader = globals().get(loader_name)
+        if loader is None:
+            # A registry defect, not a property of this machine. Recorded and
+            # continued — one broken family must not skip the warm-up of the
+            # ones after it — but never reported as though the module merely
+            # did not build here.
+            status[family] = False
+            unresolved.append(f"{family} -> {loader_name}")
+            continue
         try:
-            # Resolved inside the try: a registry entry naming something this
-            # module does not define is one broken family to report, not a
-            # reason to skip the warm-up of the ones after it.
-            status[family] = globals()[loader_name]() is not None
+            status[family] = loader() is not None
         except Exception as exc:  # noqa: BLE001 — report after every attempt
             status[family] = False
             errors[family] = exc
-    if strict and not all(status.values()):
+    if unresolved:
+        print("[prismaquant-cb] ERROR: native extension preload registry "
+              f"names loaders that gridbook.cuda_ext does not define: "
+              f"{', '.join(unresolved)}. Those modules are absent from EVERY "
+              "residency match, so an A/B warmed through this function is not "
+              "residency-matched. This is a Gridbook defect, not a property "
+              "of this machine.", file=sys.stderr, flush=True)
+    missing = [family for family, loaded in status.items() if not loaded]
+    if missing and not strict:
         detail = ", ".join(
-            f"{family}={errors.get(family, 'unavailable')}"
-            for family, loaded in status.items() if not loaded
+            f"{family}={errors.get(family, 'unavailable')}" for family in missing
+        )
+        print("[prismaquant-cb] WARNING: native extension preload did not warm "
+              f"every family ({detail}); the arms of a residency-matched A/B "
+              "are only comparable if BOTH warm the same set.",
+              file=sys.stderr, flush=True)
+    if strict and missing:
+        detail = ", ".join(
+            f"{family}={errors.get(family, 'unavailable')}" for family in missing
         )
         raise RuntimeError(f"native extension preload failed: {detail}")
     return status
@@ -1403,7 +1481,12 @@ def _load_fused_ext_locked():
 # ===========================================================================
 # BEGIN P2a BLOCK — FP4-CB v2 fused mid-M lane loader
 # (2026-08-01 performance audit §3 P2a; csrc/cb_fused_fp4v2_gemm.cu).
-# Purely additive: nothing above this line is touched.
+# Self-contained: it adds module-level globals, constants and functions.
+# It is NOT true that nothing above this line was touched — this lane's family
+# is a literal row in _PRELOAD_FAMILIES, the older of the two registration
+# conventions documented there — and the header used to claim otherwise. What
+# holds is the property that matters: every line of this lane's IMPLEMENTATION
+# is below this marker, so it reads and reverts as one unit.
 # ===========================================================================
 _fused_fp4v2 = None
 _fused_fp4v2_tried = False
@@ -1432,6 +1515,7 @@ _FUSED_FP4V2_ABI_SCHEMA = 1
 # accepting it would let an explicit lane selection serve a different kernel.
 _FUSED_FP4V2_SYMBOLS = (
     "cb_fused_fp4v2_prefill_mm",       # the dense mid-M entry point
+    "cb_fused_fp4v2_prepare",          # load-time per-device smem opt-in
     "sm120_fp4v2_bf16_mm_fork",        # the decode bit-exactness oracle
     "cb_fused_fp4v2_max_m",            # the HARD mid-M ceiling
     "cb_fused_fp4v2_kbits",            # every compiled rung

@@ -275,6 +275,18 @@ into L2-resident compact reads (`s1` gather 2.040 ms vs 2.081 ms for the
 packed GEMM alone — the gather mode is faster than the padded GEMM even
 before counting the copy it deletes).
 
+**Status of the 13.9–16.9% figure: measured at `E=32`, where the packing is
+active.** `moe.py` applies `pack_expert_blocks` only when one expert chunk
+covers the whole layer (`chunk >= E`), because a narrower chunk indexes blocks
+as `block_off[c0]..block_off[c1]` and so assumes expert-major contiguity. The
+chunk is `PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK` if set, else the
+`PRISMAQUANT_CB_PREFILL_CHUNK_BYTES` budget (1 GiB) divided by one expert's
+`w13` BF16 bytes — the same `_native_bf16_chunk` the persistent-B table below
+runs, which is why its `E=128` cells show `chunks=2`. At those expert counts,
+and under any lowered `..._CHUNK_BYTES`, the lane takes the gather but **not**
+the tile order, so this row does not carry over to them. Packing within a
+chunk is queued in [ROADMAP](../ROADMAP.md#p1--close-the-remaining-native-parity-gaps).
+
 **Where this lands against the P1 target** ("≥ segmented-BF16 parity warm"):
 **met on every cell at both token counts** — 1.032–1.051× segmented at
 `T=128` and 1.102–1.151× at `T=512`, while beating the SM80 bridge it

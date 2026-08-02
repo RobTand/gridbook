@@ -1,5 +1,6 @@
 """``PrismaQuantConfig`` — the vLLM quantization config for the NVFP4-CB /
-FP8-CB out-of-tree lane (docs/lanes/nvfp4-cb/serving-kernel.md §2, LAYOUT.md §4).
+FP8-CB out-of-tree lane (docs/SPEC.md §5 for the config vocabulary this parses,
+§6 for the registry keys and per-module dispatch it implements).
 
 vLLM auto-detects the canonical ``quant_method == "gridbook"`` and accepts the
 legacy ``"prismaquant"`` alias declared by the packaged runtime contract. The exporter writes
@@ -10,7 +11,7 @@ sidecar **lazily** (via ``get_current_vllm_config()``, the same handle
 ``get_codebooks`` uses) since ``from_config`` runs before the model dir is
 plumbed. Inlined configs (``config_groups`` already present) are also accepted.
 
-**Mixed-container dispatch (serving-kernel.md §2).** A config group with a
+**Mixed-container dispatch (docs/SPEC.md §6).** A config group with a
 ``"scheme"`` key is a CB group (our nvfp4_cb/fp8_cb vocabulary) -> our
 ``PrismaQuantCBLinearMethod``. A group WITHOUT it uses the exact stock
 compressed-tensors vocabulary -> a real ``CompressedTensorsConfig`` we construct

@@ -133,17 +133,24 @@ def test_the_lane_probes_nothing_while_the_flag_is_unset(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _ext_stub(*, max_m: int = 128, kbits=_COMPILED_KBITS, omit=()):
+def _ext_stub(*, max_m: int = 128, kbits=_COMPILED_KBITS, omit=(),
+              prepare=None):
     """A stand-in for the loaded fused FP4-v2 module.
+
+    Carries the loader's FULL strict tuple rather than the three entry points
+    this module dereferences: ``require_lane`` checks against
+    ``cuda_ext._FUSED_FP4V2_SYMBOLS`` since 2026-08-02, precisely so a local
+    list cannot drift below what the loader enforces.
 
     ``cb_fused_fp4v2_kbits`` deliberately returns a LIST: the accessor's job
     includes normalizing whatever pybind hands back into a tuple of ints.
     """
-    symbols = {
-        "cb_fused_fp4v2_prefill_mm": lambda *a, **k: None,
-        "cb_fused_fp4v2_max_m": lambda: max_m,
-        "cb_fused_fp4v2_kbits": lambda: list(kbits),
-    }
+    symbols = {name: (lambda *a, **k: None)
+               for name in cuda_ext._FUSED_FP4V2_SYMBOLS}
+    symbols["cb_fused_fp4v2_max_m"] = lambda: max_m
+    symbols["cb_fused_fp4v2_kbits"] = lambda: list(kbits)
+    if prepare is not None:
+        symbols["cb_fused_fp4v2_prepare"] = prepare
     for name in omit:
         del symbols[name]
     return types.SimpleNamespace(**symbols)
@@ -161,7 +168,7 @@ def test_require_lane_fails_closed_without_the_extension(monkeypatch):
     assert "does not substitute a different kernel" in message
 
 
-@pytest.mark.parametrize("missing", lane._REQUIRED_SYMBOLS)
+@pytest.mark.parametrize("missing", cuda_ext._FUSED_FP4V2_SYMBOLS)
 def test_require_lane_fails_closed_on_an_incomplete_module(monkeypatch,
                                                            missing):
     """A partial module is a broken build, not an older one.
@@ -169,12 +176,48 @@ def test_require_lane_fails_closed_on_an_incomplete_module(monkeypatch,
     The loader keys both the module name and the build directory on the source
     identity, so anything that imports at all was compiled from exactly these
     sources; a missing binding therefore cannot mean "a previous release".
+
+    Parametrized over the LOADER's tuple, not a local restatement: the lane's
+    private list used to be a strict subset, so a module missing a binding the
+    loader required could still pass this gate.
     """
     monkeypatch.setattr(cuda_ext, "get_fused_fp4v2_ext",
                         lambda: _ext_stub(omit=(missing,)))
     with pytest.raises(NativeKernelUnavailableError) as exc_info:
         lane.require_lane("FP4 quality dense prefill")
     assert missing in str(exc_info.value)
+
+
+def test_require_lane_opts_the_smem_in_at_load_not_first_launch(monkeypatch):
+    """``cb_fused_fp4v2_prepare`` must be called by the LOAD-time resolution.
+
+    Every compiled class exceeds the 48 KiB static limit, so CUTLASS's
+    ``initialize()`` performs a ``cudaFuncSetAttribute`` — not stream-ordered
+    work — from inside ``run_fused``, i.e. inside a forward, possibly a
+    CUDA-graph capture. Attesting here is what moves it.
+    """
+    calls = []
+    stub = _ext_stub(prepare=lambda: calls.append("prepare"))
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4v2_ext", lambda: stub)
+
+    assert lane.require_lane("FP4 quality dense prefill") is stub
+    assert calls == ["prepare"]
+
+
+def test_require_lane_fails_closed_when_prepare_rejects_the_device(monkeypatch):
+    """The device gate is the kernel's; a failure is normalized, never
+    deferred to the first prefill."""
+    def prepare():
+        raise RuntimeError("needs 51200 B of opt-in shared memory")
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4v2_ext",
+                        lambda: _ext_stub(prepare=prepare))
+    with pytest.raises(NativeKernelUnavailableError) as exc_info:
+        lane.require_lane("FP4 quality dense prefill")
+    message = str(exc_info.value)
+    assert "load-time device attestation failed" in message
+    assert "51200" in message
+    assert "does not defer this failure to first prefill" in message
 
 
 def test_require_lane_accepts_a_complete_module(monkeypatch):

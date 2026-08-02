@@ -110,7 +110,10 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <array>
+#include <atomic>
 #include <limits>
+#include <mutex>
 #include <vector>
 
 #include "cutlass/cutlass.h"
@@ -510,6 +513,78 @@ torch::Tensor cb_fused_fp4v2_prefill_mm(torch::Tensor a, torch::Tensor packed,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Per-device preparation, on the model of `cb_moe_persistent_b.cu`'s
+// `cb_moe_persistent_b_prepare` (and `cb_gemv_v2.cu`'s).
+//
+// WHY IT IS A SEPARATE ENTRY POINT RATHER THAN A LAZY FIRST-LAUNCH SETUP.
+// Every compiled class here exceeds the 48 KiB static limit, so CUTLASS's
+// `GemmUniversalAdapter::initialize` opts the kernel in to the larger dynamic
+// budget with `cudaFuncSetAttribute` — which is NOT stream-ordered work.
+// `initialize()` runs inside `run_fused`, i.e. inside a forward, so before
+// 2026-08-02 the FIRST prefill through this lane decided where that call
+// happened, and for a prefill path that may be inside a CUDA-graph capture.
+// The loader now attests this at MODEL LOAD
+// (`fp4v2_fused_midm_lane.require_lane`), so by the time any capture or first
+// forward runs, every compiled class is already prepared on that device.
+// CUTLASS still performs its own idempotent call; the point is that it can no
+// longer be the first one.
+// ---------------------------------------------------------------------------
+constexpr int kMaxTrackedDevices = 16;
+std::array<std::atomic<bool>, kMaxTrackedDevices> fp4v2_prepared{};
+std::mutex fp4v2_prepare_mutex;
+
+template <int LutBytes>
+static void set_max_smem() {
+  using C = Cfg<TileF, kStages, LutBytes>;
+  constexpr int kSmem = (int)C::GemmKernel::SharedStorageSize;
+  if (kSmem >= (48 << 10)) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        reinterpret_cast<const void*>(
+            cutlass::device_kernel<typename C::GemmKernel>),
+        cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+  }
+}
+
+void cb_fused_fp4v2_prepare() {
+  int device = -1;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  TORCH_CHECK(device >= 0 && device < kMaxTrackedDevices,
+              "cb_fused_fp4v2 cannot track CUDA device index ", device,
+              " (maximum ", kMaxTrackedDevices - 1, ")");
+  if (fp4v2_prepared[device].load(std::memory_order_acquire)) return;
+  std::lock_guard<std::mutex> lock(fp4v2_prepare_mutex);
+  if (fp4v2_prepared[device].load(std::memory_order_relaxed)) return;
+
+  cudaDeviceProp prop{};
+  C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+  TORCH_CHECK(prop.major == 12 && (prop.minor == 0 || prop.minor == 1),
+              "cb_fused_fp4v2 supports only native compute capability "
+              "12.0/12.1, but cuda:", device, " reports ", prop.major, ".",
+              prop.minor);
+  // The REAL requirement is the largest compiled class, not the whole sm120
+  // budget: gating on the budget would reject a device this lane can serve.
+  int64_t need = 0;
+  for (const int64_t s : {(int64_t)Cfg<TileF, kStages, 0>::GemmKernel::SharedStorageSize,
+                          (int64_t)Cfg<TileF, kStages, 4096>::GemmKernel::SharedStorageSize,
+                          (int64_t)Cfg<TileF, kStages, 16384>::GemmKernel::SharedStorageSize,
+                          (int64_t)Cfg<TileF, kStages, 32768>::GemmKernel::SharedStorageSize}) {
+    if (s > need) need = s;
+  }
+  TORCH_CHECK(prop.sharedMemPerBlockOptin >= need,
+              "cb_fused_fp4v2 needs ", need,
+              " B of opt-in shared memory for its largest compiled codebook "
+              "stage class, but cuda:", device, " advertises ",
+              prop.sharedMemPerBlockOptin, " B");
+
+  set_max_smem<0>();
+  set_max_smem<4096>();
+  set_max_smem<16384>();
+  set_max_smem<32768>();
+
+  fp4v2_prepared[device].store(true, std::memory_order_release);
+}
+
 // --- attestation surface (host-only; no launch, no device needed) ----------
 
 // The HARD mid-M ceiling, read by the python dispatch so the gate can never
@@ -596,6 +671,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("a"), py::arg("packed"), py::arg("cb_flat"), py::arg("compose"),
         py::arg("N"), py::arg("K"), py::arg("k_bits"),
         py::arg("force_lut_bytes") = -1, py::arg("debug_mode") = 0);
+  m.def("cb_fused_fp4v2_prepare", &cb_fused_fp4v2_prepare,
+        "per-device attestation + dynamic shared-memory opt-in for EVERY "
+        "compiled codebook-stage class. Called at MODEL LOAD by "
+        "fp4v2_fused_midm_lane.require_lane, so that no cudaFuncSetAttribute "
+        "— which is not stream-ordered work — happens inside a first forward "
+        "or a CUDA-graph capture. Idempotent per device.");
   m.def("cb_fused_fp4v2_max_m", &cb_fused_fp4v2_max_m,
         "the HARD mid-M ceiling (one M-tile) this lane enforces");
   m.def("cb_fused_fp4v2_kbits", &cb_fused_fp4v2_kbits,

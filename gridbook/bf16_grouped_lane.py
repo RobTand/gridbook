@@ -22,11 +22,9 @@ convention is that nothing resolves at first forward), and the dense
 """
 from __future__ import annotations
 
-import os
+from . import lane_select
 
 _FLAG = "PRISMAQUANT_CB_BF16_SM120"
-_ALLOWED = frozenset(("", "0", "1"))
-_STATE: list[str] = []
 
 
 def requested() -> bool:
@@ -37,24 +35,13 @@ def requested() -> bool:
     inside one run and make an A/B unreadable. A typo raises rather than
     quietly selecting the baseline.
     """
-    current = os.environ.get(_FLAG, "").strip()
-    if current not in _ALLOWED:
-        raise ValueError(
-            f"invalid {_FLAG}={current!r}; expected '1' to enable the "
-            f"sm12x-native BF16 grouped lane, or '' / '0' for the default "
-            f"SM80-schedule bridge")
-    if not _STATE:
-        _STATE.append(current)
-    elif current != _STATE[0]:
-        raise RuntimeError(
-            f"{_FLAG} changed after Gridbook dispatch was fixed; restart the "
-            f"process instead of mixing GEMM reduction orders within one run")
-    return _STATE[0] == "1"
+    return lane_select.latched_bool(
+        _FLAG, meaning="the sm12x-native BF16 grouped lane")
 
 
 def _reset_for_tests() -> None:
     """Clear the process-stable latch (tests only)."""
-    _STATE.clear()
+    lane_select.reset_for_tests(_FLAG)
 
 
 def require_lane(operation: str = "this operation", *, device=None):
@@ -63,48 +50,31 @@ def require_lane(operation: str = "this operation", *, device=None):
     Called at model load, never at first forward. Failing closed is the point:
     with the flag on, quietly serving the SM80 lane would produce a run whose
     numbers describe the wrong kernel.
+
+    The symbol list is ``cuda_ext``'s own strict tuple, imported rather than
+    restated. This function used to carry a six-name local copy while the
+    loader enforced seven, under a comment asserting "the two lists now agree"
+    — the exact drift a shared constant makes impossible. It is passed through
+    ``lane_select.require_lane`` so the device check, which this lane used to
+    compute and then discard, is real for all three lanes at once.
     """
-    from .cuda_ext import (NativeKernelUnavailableError,
+    from .cuda_ext import (_BF16_GROUPED_SM120_SYMBOLS,
                            bf16_grouped_sm120_buildable,
-                           require_bf16_grouped_ext)
+                           get_bf16_grouped_ext, require_bf16_grouped_ext)
 
-    ext = require_bf16_grouped_ext(operation)
-    capability = None
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            capability = torch.cuda.get_device_capability(device)
-    except Exception:  # noqa: BLE001 — reported below as "unavailable"
-        capability = None
-    # Every symbol the lane's FORWARD PATH dereferences, not just its GEMM
-    # entry points. `cb_bf16_grouped_sm120_config` was missing here while
-    # `swizzle_group()` (the packed expert order's group size) reads it on
-    # every routed prefill — so a module this function called "complete" could
-    # still AttributeError at first forward, which is precisely what attesting
-    # at load is supposed to make impossible. cuda_ext's own
-    # `_BF16_GROUPED_SM120_SYMBOLS` already required it; the two lists now agree.
-    missing = [name for name in ("cb_bf16_grouped_mm_sm120",
-                                 "cb_bf16_grouped_mm_sm120_out",
-                                 "cb_bf16_grouped_mm_sm120_gather",
-                                 "cb_bf16_grouped_mm_sm120_gather_out",
-                                 "cb_bf16_grouped_sm120_tile_m",
-                                 "cb_bf16_grouped_sm120_config")
-               if not hasattr(ext, name)]
-    if missing:
-        raise NativeKernelUnavailableError(
-            f"{operation} requested the sm12x-native BF16 grouped lane "
-            f"({_FLAG}=1), but the loaded grouped-BF16 extension does not "
-            f"carry it (missing {missing}; device capability {capability}). "
-            f"The lane is compiled only for compute capability 12.0/12.1"
-            + ("" if capability is None or
-               bf16_grouped_sm120_buildable(capability)
-               else f", and this device reports "
-                    f"{capability[0]}.{capability[1]}")
-            + f". Unset {_FLAG} to use the default SM80-schedule bridge; "
-            f"Gridbook does not substitute a different kernel behind an "
-            f"explicit lane selection.")
-    return ext
+    # Keep the bridge's own fail-closed diagnostic for "no module at all": it
+    # names the nvcc hint and the default route, which a lane-level message
+    # would not.
+    require_bf16_grouped_ext(operation)
+    return lane_select.require_lane(
+        operation, flag=_FLAG,
+        lane="the sm12x-native BF16 grouped lane",
+        source="grouped-BF16 extension (cb_bf16_grouped_gemm.cu)",
+        alternative="the default SM80-schedule bridge",
+        get_ext=get_bf16_grouped_ext,
+        symbols=_BF16_GROUPED_SM120_SYMBOLS,
+        buildable=bf16_grouped_sm120_buildable,
+        device=device)
 
 
 def tile_m(ext) -> int:
@@ -148,6 +118,16 @@ def dense_mm(ext, a, weight):
     return y[:m]
 
 
+# Index of the swizzle field inside ``cb_bf16_grouped_sm120_config()``. Named
+# rather than spelled as a bare ``[8]`` at the read below — the kernel returns
+# a flat int vector, so an inserted field would silently shift the meaning of a
+# positional index and the packed expert ORDER would be aligned to the wrong
+# number with no error anywhere. The sibling lanes validate their config reads
+# the same way (``fp4v2_fused_midm_lane._facts``, ``moe_persistent_b_lane
+# .resolve_cfg``).
+_CONFIG_SWIZZLE_INDEX = 8
+
+
 def swizzle_group(ext) -> int:
     """The large-grid tile-scheduler swizzle the compiled lane uses.
 
@@ -156,7 +136,13 @@ def swizzle_group(ext) -> int:
     swizzle 1 and the order is measured neutral, so one order serves both
     regimes.
     """
-    return int(ext.cb_bf16_grouped_sm120_config()[8])
+    config = ext.cb_bf16_grouped_sm120_config()
+    if len(config) <= _CONFIG_SWIZZLE_INDEX:
+        raise IndexError(
+            f"cb_bf16_grouped_sm120_config() returned {len(config)} fields; "
+            f"the swizzle is field {_CONFIG_SWIZZLE_INDEX}. The loaded module "
+            f"and this reader disagree about the config layout")
+    return int(config[_CONFIG_SWIZZLE_INDEX])
 
 
 def pack_expert_blocks(counts, tile_m, group):

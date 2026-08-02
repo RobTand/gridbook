@@ -4,6 +4,12 @@ This module intentionally does not import any Gridbook runtime kernel.  It
 decodes the on-disk index stream, applies the declared codebook/scale contract,
 rounds each reconstructed weight to BF16, and uses a normal FP32-reference
 matmul.  Native CUDA/CUTLASS tests use it as the correctness oracle.
+
+It also SYNTHESIZES layout-v2 fixtures (see ``synth_two_tier_v2_plane``), so a
+lane whose gates compare two decoders over the same bytes does not need the
+separate ``prismaquant`` producer package installed to run at all.  Format
+constants are restated here rather than imported from ``gridbook.codec`` on
+purpose: this module is the independent side of every comparison it feeds.
 """
 from __future__ import annotations
 
@@ -11,6 +17,10 @@ import torch
 
 
 SUPERBLOCK = 256
+TWO_TIER_SUPER_BIAS = 127
+E4M3_MAX = 448.0
+# The E2M1 magnitude grid every fp4 codebook value sits on.
+E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
 def _split_widths(k_bits: int, n_sub: int) -> list[int]:
@@ -166,6 +176,132 @@ def reconstruct_cb_weight(
 
     weight = values * scales.repeat_interleave(16, dim=1)
     return weight.to(torch.bfloat16)
+
+
+# ---------------------------------------------------------------------------
+# Fixture synthesis for FP4-CB layout v2 (two-tier scale coding).
+#
+# The v2 lanes' correctness gates run one decoder against another over the SAME
+# packed bytes, so what they need from a fixture is LEGALITY, not optimality:
+# every ``(super, sub)`` pair must compose to an exact, in-range E4M3 scale
+# (two-tier-scale-spec 1.2).  An illegal pair is not something any artifact can
+# hold, and a gate that decodes one proves nothing about serving.  The producer
+# guarantees legality as a side effect of encoding real weights; the helpers
+# below guarantee it DIRECTLY, by building the legality mask from the same rule
+# and drawing only from it.  That is what lets the bit-exact gates run on any
+# CUDA box, with the producer-backed variants kept as additional tests.
+# ---------------------------------------------------------------------------
+def two_tier_v2_type_size(k_bits: int) -> int:
+    """Bytes per superblock in layout v2: ``4*k`` index + 1 super + 8 sub."""
+    return 4 * int(k_bits) + 9
+
+
+def two_tier_compose_legality(sub_table) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(compose (256,16) fp32, legal (256,16) bool)`` for v2 scales.
+
+    ``compose[E, c] = sub_table[c] * 2**(E - 127)``.  A pair is LEGAL exactly
+    when that value is finite and in ``(0, 448]``, survives a
+    ``float8_e4m3fn`` round trip bit-for-bit, and loses nothing to the fp32
+    cast — the rule the producer's encoder emits under.
+    """
+    table = torch.tensor(list(sub_table), dtype=torch.float64)
+    exact = table[None, :] * torch.pow(
+        2.0, torch.arange(256, dtype=torch.float64)[:, None]
+        - TWO_TIER_SUPER_BIAS)
+    compose = exact.to(torch.float32)
+    finite = torch.isfinite(compose)
+    trip = torch.where(finite, compose, torch.zeros_like(compose)).to(
+        torch.float8_e4m3fn).to(torch.float32)
+    legal = (finite & (compose > 0) & (compose <= E4M3_MAX)
+             & (trip == compose) & (compose.to(torch.float64) == exact))
+    return compose, legal
+
+
+def two_tier_full_legal_supers(sub_table, *, span=None) -> torch.Tensor:
+    """The super exponents whose sixteen sub codes are ALL legal (int64).
+
+    Drawing the super byte from these lets the sub nibbles be uniform over
+    ``0..15``, so a synthesized plane exercises the whole compose gather
+    without ever emitting a pair no artifact could contain.
+
+    ``span`` narrows the result to that many exponents around the middle of
+    the legal run.  A gate on BIT-EXACTNESS wants the whole run (widest
+    coverage of the gather, and decode identity does not care how the scales
+    are conditioned).  A gate on NUMERICS wants a narrow one: the super
+    exponent is per ``(row, superblock)``, so the full run makes output rows
+    differ in magnitude by up to 2**12, and a whole-matrix relative L2 would
+    then be set by the loudest rows and go blind to the quiet ones.
+    """
+    _, legal = two_tier_compose_legality(sub_table)
+    full = torch.nonzero(legal.all(dim=1)).reshape(-1)
+    if span is None:
+        return full
+    span = int(span)
+    if not 0 < span <= full.numel():
+        raise ValueError(f"span must be in 1..{full.numel()}, got {span}")
+    start = (full.numel() - span) // 2
+    return full[start:start + span]
+
+
+def synth_product_codebook(
+    k_bits: int, *, seed: int, device="cpu"
+) -> list[torch.Tensor]:
+    """Two E2M1-valued product sub-tables for rung ``k_bits``.
+
+    Shapes are ``(2**ceil(k/2), 4)`` then ``(2**floor(k/2), 4)`` — the split
+    ``decode_cb_values`` reads and the one zero-based dictionary the v2
+    kernels gather from.  Values are drawn from the signed E2M1 grid, so the
+    table is on the grid the fp4 format declares and survives BF16 exactly.
+    """
+    grid = torch.tensor(
+        sorted({v for m in E2M1_MAGNITUDES for v in (m, -m)}),
+        dtype=torch.float32)
+    generator = torch.Generator().manual_seed(int(seed))
+    tables = []
+    for width in _split_widths(int(k_bits), 2):
+        pick = torch.randint(0, grid.numel(), ((1 << width) * 4,),
+                             generator=generator)
+        tables.append(grid[pick].reshape(1 << width, 4).to(device))
+    return tables
+
+
+def synth_two_tier_v2_plane(
+    rows: int, K: int, k_bits: int, *, sub_table, seed: int, device="cpu",
+    super_span=None
+) -> torch.Tensor:
+    """A random but format-legal FP4-CB layout-v2 packed plane.
+
+    Returns ``[rows, (K // 256) * (4 * k_bits + 9)]`` uint8: per superblock,
+    ``4 * k_bits`` bytes of index stream, one super-exponent byte, and eight
+    sub-nibble bytes.  Thirty-two ``k_bits`` codewords fill exactly
+    ``4 * k_bits`` bytes, so every bit of the index section is a codeword bit
+    and any byte pattern there is a valid stream over full power-of-two
+    sub-tables.  The scale section is the part that has a legality rule, and
+    it is drawn to satisfy it.  ``super_span`` is forwarded to
+    :func:`two_tier_full_legal_supers`.  Generated from a CPU generator so the
+    fixture is reproducible and identical on every device.
+    """
+    rows, K, k_bits = int(rows), int(K), int(k_bits)
+    if K <= 0 or K % SUPERBLOCK:
+        raise ValueError("K must be a positive multiple of 256")
+    if not 0 < k_bits <= 24:
+        raise ValueError("FP4-CB layout v2 codewords are 1..24 bits")
+    type_size = two_tier_v2_type_size(k_bits)
+    n_sb = K // SUPERBLOCK
+    generator = torch.Generator().manual_seed(int(seed))
+    block = torch.empty((rows, n_sb, type_size), dtype=torch.uint8)
+    block[:, :, :4 * k_bits] = torch.randint(
+        0, 256, (rows, n_sb, 4 * k_bits), generator=generator,
+        dtype=torch.uint8)
+    supers = two_tier_full_legal_supers(sub_table, span=super_span)
+    if not supers.numel():
+        raise ValueError("no super exponent makes every sub code legal")
+    pick = torch.randint(0, supers.numel(), (rows, n_sb), generator=generator)
+    block[:, :, 4 * k_bits] = supers[pick].to(torch.uint8)
+    # Two legal nibbles per byte, so any byte is a legal sub-code pair.
+    block[:, :, 4 * k_bits + 1:] = torch.randint(
+        0, 256, (rows, n_sb, 8), generator=generator, dtype=torch.uint8)
+    return block.reshape(rows, n_sb * type_size).contiguous().to(device)
 
 
 def cb_linear_reference(

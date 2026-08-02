@@ -627,15 +627,53 @@ def test_native_bf16_chunk_is_bounded_by_the_larger_w13_tile(monkeypatch):
     "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK",
     "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES",
 ])
-@pytest.mark.parametrize("value", ["0", "-1", "not-an-int"])
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-int", "1.5", " "])
 def test_native_bf16_chunk_rejects_invalid_overrides(monkeypatch, name, value):
+    """A bad chunk knob raises, and the message names the flag.
+
+    These gate the swizzle-group packed expert ORDER on the sm12x lane, so a
+    silently ignored value would change the FP32 reduction order without
+    saying so — which is why they are parsed strictly rather than coerced.
+    """
     method = _method()
     layer = types.SimpleNamespace(_cb_E=8, _cb_hidden=256, _cb_inter=256)
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", raising=False)
     monkeypatch.delenv("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES", raising=False)
     monkeypatch.setenv(name, value)
-    with pytest.raises(ValueError, match="must be positive"):
+    if value.strip() == "":
+        # An all-whitespace value is "unset", not a typo: the default applies.
+        assert method._native_bf16_chunk(layer) == 8
+        return
+    with pytest.raises(ValueError, match=name):
         method._native_bf16_chunk(layer)
+
+
+@pytest.mark.parametrize("name", [
+    "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK",
+    "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES",
+])
+def test_native_bf16_chunk_knobs_are_process_stable(monkeypatch, name):
+    """Changing a chunk knob mid-process raises instead of taking effect.
+
+    The chunk gates ``pack_expert_blocks`` on the sm12x lane (``chunk >= E``),
+    so a value that changed between two forwards of one run would silently
+    change the packed expert order — and therefore the FP32 reduction order —
+    inside a single measurement. Both knobs were read from the environment on
+    EVERY call until 2026-08-02.
+    """
+    method = _method()
+    layer = types.SimpleNamespace(_cb_E=8, _cb_hidden=256, _cb_inter=256)
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", raising=False)
+    monkeypatch.delenv("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES", raising=False)
+    monkeypatch.setenv(name, "4" if name.endswith("CHUNK") else str(1 << 20))
+    first = method._native_bf16_chunk(layer)
+
+    monkeypatch.setenv(name, "2" if name.endswith("CHUNK") else str(1 << 30))
+    with pytest.raises(RuntimeError, match="changed after Gridbook dispatch"):
+        method._native_bf16_chunk(layer)
+    # And the latched value is still what the first call resolved.
+    monkeypatch.setenv(name, "4" if name.endswith("CHUNK") else str(1 << 20))
+    assert method._native_bf16_chunk(layer) == first
 
 
 def test_signed_fp4_experts_fail_before_any_expansion_kernel():

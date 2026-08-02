@@ -246,6 +246,24 @@ _FUSED_FP4_MOE_MODES = (
 _FUSED_FP4_MOE_ALLOWED_MODES = frozenset(("",)) | _FUSED_FP4_MOE_MODES
 
 
+def _grouped_trim() -> bool:
+    """The padded grouped lanes' OPT-OUT trim read (one host read per layer).
+
+    Default-ON, and parsed like every other dispatch flag: the old form
+    compared ``== "1"``, so any spelling other than the literal ``1`` — a
+    stray space, ``true``, ``yes`` — silently selected the NON-default arm and
+    launched the full static-capacity tail, which is a performance change the
+    operator did not ask for and would read as a regression of the kernel.
+    Latched, because the two lanes that read it must not disagree within one
+    run.
+    """
+    from .lane_select import latched_bool
+
+    return latched_bool(
+        "PRISMAQUANT_CB_GROUPED_TRIM", default=True,
+        meaning="the padded grouped lanes' one-host-read block trim")
+
+
 def _requested_fused_fp4_moe_mode() -> str:
     """Validated, process-stable fused-FP4 MoE opt-in selector.
 
@@ -562,8 +580,15 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # silently serving expand+bridge instead would answer a different
         # question than the operator asked. FP4-CB v2 only — an FP8-CB layer
         # in a mixed serve keeps its own route rather than failing the load.
+        #
+        # The flag is PARSED for every layer, FP8 included: reading it only
+        # inside the ``is_fp4`` guard meant a typo on an FP8-only model was
+        # never seen, so the operator got a silent baseline run instead of an
+        # error. Parsing is separated from acting on the value.
+        persistent_b_on = persistent_b_requested()
+        fused_fp4_moe_mode = _requested_fused_fp4_moe_mode()
         layer._cb_moe_persistent_b = None
-        if persistent_b_requested() and self.is_fp4:
+        if persistent_b_on and self.is_fp4:
             reason = persistent_b_supports(
                 is_fp4=self.is_fp4, is_v2=self.is_v2, n_sub=self.n_sub,
                 k_bits=self.k, type_size=self.type_size,
@@ -596,7 +621,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # artifact an A/B is read from. The lane stays resolved and
             # attested either way, so an unserveable explicit selection still
             # fails the LOAD rather than being quietly ignored.
-            overriding_mode = _requested_fused_fp4_moe_mode()
+            overriding_mode = fused_fp4_moe_mode
             if overriding_mode:
                 print(f"[prismaquant-cb] moe_prefill {self.prefix} -> fused "
                       f"NVFP4 MoE {overriding_mode!r} (k={self.k} "
@@ -625,7 +650,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if not self.is_fp4:
             self._gf2_ok(layer)
         else:
-            mode = _requested_fused_fp4_moe_mode()
+            mode = fused_fp4_moe_mode
             layer._cb_fused_fp4_moe_mode = mode
             if mode:
                 rowwise = mode in _FUSED_FP4_MOE_ROWWISE_MODES
@@ -931,7 +956,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # the shared one — see ``_padded_route``.
         route = _padded_route(
             topk_ids, topk_weights, E, tile_m,
-            trim=os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1")
+            trim=_grouped_trim())
         expert_ids, row_src, dest = route.expert_ids, route.row_src, route.dest
         pw_sorted = route.pw_sorted
         x1 = torch.cat([x, x.new_zeros((1, Kh))])
@@ -975,29 +1000,26 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         retained for measurement, while the default keeps each decoded chunk
         under one GiB. All values are model/config integers, so no device read
         or routing-dependent Python control flow enters the hot path.
+
+        BOTH KNOBS ARE PROCESS-STABLE, like every other dispatch selector, and
+        for a sharper reason than most: this chunk gates the swizzle-group
+        PACKED EXPERT ORDER on the sm12x lane (``chunk >= E``, see
+        ``_apply_prefill_native_bf16_sm120``), so a value that changed between
+        two forwards of one run would silently change the FP32 reduction order
+        mid-run and make the run's numbers describe neither setting. They were
+        read from the environment on EVERY call until 2026-08-02.
         """
+        from .lane_select import latched_int
+
         E = int(layer._cb_E)
-        override = os.environ.get("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
-        if override is not None and override.strip():
-            try:
-                value = int(override)
-            except ValueError as exc:
-                raise ValueError(
-                    "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK must be positive") \
-                    from exc
-            if value <= 0:
-                raise ValueError(
-                    "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK must be positive")
-            return min(E, value)
-        raw_budget = os.environ.get("PRISMAQUANT_CB_PREFILL_CHUNK_BYTES")
-        try:
-            budget = int(raw_budget) if raw_budget else (1 << 30)
-        except ValueError as exc:
-            raise ValueError(
-                "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES must be positive") from exc
-        if budget <= 0:
-            raise ValueError(
-                "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES must be positive")
+        override = latched_int(
+            "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", default=0, minimum=1,
+            meaning="the expert-chunk width of the bounded BF16 bridge")
+        if override:
+            return min(E, override)
+        budget = latched_int(
+            "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES", default=(1 << 30), minimum=1,
+            meaning="the decoded-transient byte budget per expert chunk")
         per_expert = (2 * int(layer._cb_inter)
                       * int(layer._cb_hidden) * 2)  # w13 BF16 bytes
         return max(1, min(E, budget // max(1, per_expert)))
@@ -1661,7 +1683,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # bound still performs this same host conversion implicitly.
         route = _padded_route(
             topk_ids, topk_weights, E, tile_m,
-            trim=os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1")
+            trim=_grouped_trim())
         expert_ids, row_src, dest = route.expert_ids, route.row_src, route.dest
         pw_sorted = route.pw_sorted
 

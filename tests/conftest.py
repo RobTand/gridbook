@@ -47,6 +47,27 @@ def gridbook_include_closure(csrc_dir: str, root: str) -> set[str]:
     return seen
 
 
+@pytest.fixture(autouse=True)
+def _fresh_env_latches():
+    """Give each test a process that has never read a dispatch flag.
+
+    Gridbook latches every dispatch-selecting environment variable to the first
+    value it observes, so a later change raises instead of mixing two kernel
+    behaviours inside one run. That is exactly right in a serve and exactly
+    wrong across a test session, where one file's ``monkeypatch.setenv`` would
+    otherwise pin the value every subsequent test sees. Each test starts from
+    the unread state a fresh process would have.
+    """
+    try:
+        from gridbook import lane_select
+    except Exception:  # noqa: BLE001 — gridbook may not be importable here
+        yield
+        return
+    lane_select.reset_for_tests()
+    yield
+    lane_select.reset_for_tests()
+
+
 _VLLM_BOUND_GRIDBOOK_MODULES = {
     "gridbook.config",
     "gridbook.linear",

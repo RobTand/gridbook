@@ -25,9 +25,9 @@ from __future__ import annotations
 
 import os
 
+from . import lane_select
+
 _FLAG = "PRISMAQUANT_CB_MOE_PERSISTENT_B"
-_ALLOWED = frozenset(("", "0", "1"))
-_STATE: list[str] = []
 
 
 def requested() -> bool:
@@ -38,24 +38,13 @@ def requested() -> bool:
     run and make an A/B unreadable.  A typo raises rather than quietly
     selecting the baseline.
     """
-    current = os.environ.get(_FLAG, "").strip()
-    if current not in _ALLOWED:
-        raise ValueError(
-            f"invalid {_FLAG}={current!r}; expected '1' to enable the "
-            f"persistent-B grouped MoE decode-in-mainloop lane, or '' / '0' "
-            f"for the default expand + grouped-bridge route")
-    if not _STATE:
-        _STATE.append(current)
-    elif current != _STATE[0]:
-        raise RuntimeError(
-            f"{_FLAG} changed after Gridbook dispatch was fixed; restart the "
-            f"process instead of mixing GEMM reduction orders within one run")
-    return _STATE[0] == "1"
+    return lane_select.latched_bool(
+        _FLAG, meaning="the persistent-B grouped MoE decode-in-mainloop lane")
 
 
 def _reset_for_tests() -> None:
     """Clear the process-stable latch (tests only)."""
-    _STATE.clear()
+    lane_select.reset_for_tests(_FLAG)
 
 
 def require_lane(operation: str = "this operation", *, device=None):
@@ -64,64 +53,32 @@ def require_lane(operation: str = "this operation", *, device=None):
     Called at model load, never at first forward.  Failing closed is the
     point: with the flag on, quietly serving the expand + bridge route would
     produce a run whose numbers describe the wrong schedule.
+
+    ``cb_moe_persistent_b_prepare`` is the per-device attestation: loading the
+    module proves the symbols exist, and this proves THIS device can serve
+    them, opting every compiled configuration in to its dynamic shared-memory
+    budget.  Doing it at load rather than lazily on first launch is what keeps
+    ``cudaFuncSetAttribute`` — which is not stream-ordered work — out of a
+    first forward and out of a CUDA-graph capture.
     """
-    from .cuda_ext import (NativeKernelUnavailableError,
+    from .cuda_ext import (_MOE_PERSISTENT_B_SYMBOLS,
+                           get_moe_persistent_b_ext,
                            moe_persistent_b_buildable,
                            require_moe_persistent_b_ext)
 
-    ext = require_moe_persistent_b_ext(operation)
-    capability = None
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            capability = torch.cuda.get_device_capability(device)
-    except Exception:  # noqa: BLE001 — reported below as "unavailable"
-        capability = None
-    from .cuda_ext import _MOE_PERSISTENT_B_SYMBOLS
-
-    # The loader already enforces this strictly, so the re-check can never be
-    # the difference — but it is spelled against the SAME tuple rather than a
-    # local subset, so the two lists cannot drift into meaning nothing.
-    missing = [name for name in _MOE_PERSISTENT_B_SYMBOLS
-               if not hasattr(ext, name)]
-    if missing:
-        raise NativeKernelUnavailableError(
-            f"{operation} requested the persistent-B grouped MoE lane "
-            f"({_FLAG}=1), but the loaded extension does not carry it "
-            f"(missing {missing}; device capability {capability}). The lane "
-            f"is compiled only for compute capability 12.0/12.1"
-            + ("" if capability is None or
-               moe_persistent_b_buildable(capability)
-               else f", and this device reports "
-                    f"{capability[0]}.{capability[1]}")
-            + f". Unset {_FLAG} to use the default expand + grouped-bridge "
-            f"route; Gridbook does not substitute a different kernel behind "
-            f"an explicit lane selection.")
-
-    # DEVICE ATTESTATION, on the model of ``require_fp4_v2_expander``.  Loading
-    # the module proves the symbols exist; this proves THIS device can serve
-    # them, and opts every compiled configuration in to the 99 KiB dynamic
-    # shared-memory budget.  Doing it here rather than lazily on first launch
-    # is what keeps ``cudaFuncSetAttribute`` — which is not stream-ordered
-    # work — out of a first forward and out of a CUDA-graph capture.
-    try:
-        if device is None:
-            ext.cb_moe_persistent_b_prepare()
-        else:
-            import torch
-
-            with torch.cuda.device(device):
-                ext.cb_moe_persistent_b_prepare()
-    except Exception as exc:  # noqa: BLE001 — normalize the load-time gate
-        raise NativeKernelUnavailableError(
-            f"{operation} requested the persistent-B grouped MoE lane "
-            f"({_FLAG}=1), but load-time device attestation failed "
-            f"({type(exc).__name__}: {exc}). The schedule needs CUDA compute "
-            "capability 12.0 or 12.1 with at least 99 KiB of opt-in shared "
-            "memory. Gridbook does not defer this failure to first prefill or "
-            "serve a different schedule instead.") from exc
-    return ext
+    # Keep the module-level fail-closed diagnostic for "no module at all": it
+    # names the nvcc hint, which a lane-level message would not.
+    require_moe_persistent_b_ext(operation)
+    return lane_select.require_lane(
+        operation, flag=_FLAG,
+        lane="the persistent-B grouped MoE lane",
+        source="persistent-B extension (cb_moe_persistent_b.cu)",
+        alternative="the default expand + grouped-bridge route",
+        get_ext=get_moe_persistent_b_ext,
+        symbols=_MOE_PERSISTENT_B_SYMBOLS,
+        buildable=moe_persistent_b_buildable,
+        device=device,
+        prepare="cb_moe_persistent_b_prepare")
 
 
 def supports(*, is_fp4: bool, is_v2: bool, n_sub: int, k_bits: int,

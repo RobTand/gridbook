@@ -32,10 +32,23 @@ evidence for that claim, in three layers of decreasing strength:
    reference, capped at 2e-3 and required to be no worse than a BF16
    ``F.linear`` computing the same product.
 
-The packed bytes come from the REAL prismaquant encoder (``scale_coding=
-"two_tier"``), never fabricated: only the encoder guarantees every
-``(super, sub)`` scale pair is legal/E4M3-exact, and a fabricated illegal pair
-would make this file's "bit-exact" claim vacuous.
+WHERE THE PACKED BYTES COME FROM. Every gate above compares two decoders over
+the SAME bytes, so what a fixture owes them is LEGALITY: each ``(super, sub)``
+scale pair must compose to an exact, in-range E4M3 value, because a pair no
+artifact can hold makes a "bit-exact" claim vacuous. Two fixtures satisfy that,
+and every substantive gate runs on both:
+
+* ``synth`` — ``tests/cb_torch_reference.synth_two_tier_v2_plane``, which
+  derives the legality mask from the spec rule and draws only from it. It is
+  in-repo, so these gates run on ANY CUDA box.
+* ``producer`` — the real prismaquant encoder (``scale_coding="two_tier"``),
+  which gets legality as a side effect of encoding real weights. It SKIPS per
+  test when the separate producer package is absent; it never gates the file.
+
+The oracle is anchored the same way: ``cb_expand_v2`` is itself checked, bit
+for bit, against the pure-Torch decoder in ``tests/cb_torch_reference.py`` (the
+contract ``csrc/cb_gemv_v2.cu``'s expand twin states in its own header), so the
+chain bottoms out in this repository rather than in another CUDA kernel.
 """
 from __future__ import annotations
 
@@ -45,8 +58,11 @@ torch = pytest.importorskip("torch")
 import torch.nn.functional as F  # noqa: E402
 
 codec = pytest.importorskip("gridbook.codec")
-pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
 
+from cb_torch_reference import (reconstruct_cb_weight,  # noqa: E402
+                                synth_product_codebook,
+                                synth_two_tier_v2_plane,
+                                two_tier_v2_type_size)
 from gridbook.expand import expand_fp4_v2_to_weight  # noqa: E402
 from gridbook.ops import cb_bf16_grouped_mm  # noqa: E402
 
@@ -77,26 +93,71 @@ RUNGS = tuple(range(12, 25))
 # global) plus the one that exactly fills the largest compiled stage — the
 # smem-tightest cells of the shipped residency ladder.
 TIGHT_RUNGS = (22, 23, 24)
+# Both fixtures, for the gates where the bytes' provenance is a real claim.
+SOURCES = ("synth", "producer")
 
 
-def _prep(k, N, K, seed=0):
-    """One dense fp4-v2 layer's tensors, straight from the REAL encoder."""
-    cb = pq._resolve_codebook(k, "fp4", "product", None, torch.device(DEV))
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    w = (torch.randn(1, N, K, generator=g) * 0.02).to(DEV)
-    fields = pq.nvfp4_cb_fields(w, k, grid="fp4", mode="product", codebook=cb,
-                                scale_coding="two_tier", encode_tier="fast")
-    raw = pq.nvfp4_cb_assemble_bytes(fields, k, grid="fp4", mode="product")
-    ts = pq.nvfp4_cb_type_size(k, "fp4", "two_tier")            # 4k + 9
-    n_sb = K // codec.SUPERBLOCK
-    packed = raw.reshape(N, n_sb * ts).contiguous().to(DEV)
-    subs = list(cb) if isinstance(cb, (tuple, list)) else [cb]
+def _producer():
+    """The encoder fixture, or a SKIP — never a module-level gate.
+
+    ``prismaquant`` is the separate producer package and is not part of the
+    Gridbook distribution, so requiring it at import time made the only
+    kernel-correctness tests for this lane unrunnable in CI and on any GPU box
+    without the monorepo checkout.
+    """
+    return pytest.importorskip(
+        "prismaquant.nvfp4_cb_formats",
+        reason="monorepo-only (prismaquant); the in-repo `synth` fixture "
+               "covers the same gates")
+
+
+def _prep(k, N, K, seed=0, source="synth", super_span=3):
+    """One dense fp4-v2 layer's tensors, from either fixture.
+
+    ``super_span`` narrows the super-exponent draw of the synthesized plane;
+    see ``cb_torch_reference.two_tier_full_legal_supers``. Pass ``None`` in a
+    BIT-EXACTNESS gate (widest coverage of the compose gather) and leave the
+    default in a gate that measures a whole-matrix relative L2.
+    """
+    if source == "producer":
+        pq = _producer()
+        cb = pq._resolve_codebook(k, "fp4", "product", None,
+                                  torch.device(DEV))
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        w = (torch.randn(1, N, K, generator=g) * 0.02).to(DEV)
+        fields = pq.nvfp4_cb_fields(w, k, grid="fp4", mode="product",
+                                    codebook=cb, scale_coding="two_tier",
+                                    encode_tier="fast")
+        raw = pq.nvfp4_cb_assemble_bytes(fields, k, grid="fp4",
+                                         mode="product")
+        ts = pq.nvfp4_cb_type_size(k, "fp4", "two_tier")        # 4k + 9
+        assert ts == two_tier_v2_type_size(k), (
+            "the in-repo layout constant disagrees with the producer's")
+        packed = raw.reshape(N, (K // codec.SUPERBLOCK) * ts).contiguous()
+        packed = packed.to(DEV)
+        subs = list(cb) if isinstance(cb, (tuple, list)) else [cb]
+    elif source == "synth":
+        ts = two_tier_v2_type_size(k)
+        packed = synth_two_tier_v2_plane(
+            N, K, k, sub_table=codec.TWO_TIER_SUB_TABLE, seed=seed,
+            device=DEV, super_span=super_span)
+        subs = synth_product_codebook(k, seed=seed, device=DEV)
+    else:
+        raise ValueError(f"unknown fixture source {source!r}")
     return dict(
         qwp=codec.pad_qweight(packed),
         cb_flat=codec.build_flat_codebook(subs),
         compose=codec.build_compose_table(codec.TWO_TIER_SUB_TABLE).to(DEV),
         row_off=torch.zeros(N, dtype=torch.int32, device=DEV),
-        N=N, K=K, k=k, ts=ts)
+        N=N, K=K, k=k, ts=ts, source=source)
+
+
+def _torch_reference_weight(p):
+    """The pure-Torch decode of the same bytes — no CUDA kernel involved."""
+    return reconstruct_cb_weight(
+        p["qwp"], p["cb_flat"], p["row_off"],
+        torch.zeros(1, device=DEV), p["compose"], N=p["N"], K=p["K"],
+        k_bits=p["k"], n_sub=2, type_size=p["ts"], is_fp4=True, is_v2=True)
 
 
 def _expanded(p):
@@ -127,8 +188,9 @@ def _rel_l2(y, reference):
 # ---------------------------------------------------------------------------
 # 1. DIRECT decode read-out — the primary contract-preservation gate.
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("source", SOURCES)
 @pytest.mark.parametrize("k", RUNGS)
-def test_prologue_decode_is_bit_exact_vs_cb_expand_v2(k):
+def test_prologue_decode_is_bit_exact_vs_cb_expand_v2(k, source):
     """Every decoded weight of a whole [N,K] tile equals cb_expand_v2's byte.
 
     M = 128 = TileM, so each call reads back 128 consecutive K columns; four
@@ -136,7 +198,7 @@ def test_prologue_decode_is_bit_exact_vs_cb_expand_v2(k):
     superblocks, both product sub-tables, and all sixteen scale groups.
     """
     N, K, M = 64, 512, 128
-    p = _prep(k, N, K, seed=k)
+    p = _prep(k, N, K, seed=k, source=source, super_span=None)
     W = _expanded(p)
     assert W.shape == (N, K) and W.dtype is torch.bfloat16
     for k0 in range(0, K, M):
@@ -144,12 +206,34 @@ def test_prologue_decode_is_bit_exact_vs_cb_expand_v2(k):
         got = y.t().contiguous()                       # [N, M] = W[:, k0:k0+M]
         want = W[:, k0:k0 + M].contiguous()
         assert torch.equal(got.view(torch.uint16), want.view(torch.uint16)), (
-            f"k={k}: in-prologue decode differs from cb_expand_v2 in the "
-            f"K window [{k0}, {k0 + M})")
+            f"k={k} ({source}): in-prologue decode differs from cb_expand_v2 "
+            f"in the K window [{k0}, {k0 + M})")
 
 
+@pytest.mark.parametrize("source", SOURCES)
+@pytest.mark.parametrize("k", RUNGS)
+def test_the_expand_oracle_equals_the_in_repo_torch_decode(k, source):
+    """...and the oracle those gates lean on is itself anchored, in-repo.
+
+    ``csrc/cb_gemv_v2.cu``'s expand twin states the contract in its own header:
+    it writes ``w = bf16_rn(f32(cb) * f32(scale))`` and "must equal the CPU
+    codec ... and expand.expand_fp4_v2_to_weight bit-for-bit".
+    ``cb_torch_reference.reconstruct_cb_weight`` is exactly that arithmetic in
+    Torch — an fp32 product of the BF16 codebook entry and the composed fp32
+    scale, rounded once to BF16 — and it imports no Gridbook kernel. Pinning
+    the two here means the whole chain above (fused prologue -> cb_expand_v2)
+    bottoms out in this repository, not in a second CUDA kernel.
+    """
+    p = _prep(k, 64, 512, seed=k, source=source, super_span=None)
+    assert torch.equal(_expanded(p).view(torch.uint16),
+                       _torch_reference_weight(p).view(torch.uint16)), (
+        f"k={k} ({source}): cb_expand_v2 disagrees with the pure-Torch decode "
+        f"of the same bytes")
+
+
+@pytest.mark.parametrize("source", SOURCES)
 @pytest.mark.parametrize("k", TIGHT_RUNGS)
-def test_decode_bit_exact_with_the_codebook_forced_to_global(k):
+def test_decode_bit_exact_with_the_codebook_forced_to_global(k, source):
     """The smem residency choice may not change a single decoded bit.
 
     ``force_lut_bytes=0`` compiles out the codebook stage entirely, so both
@@ -157,7 +241,7 @@ def test_decode_bit_exact_with_the_codebook_forced_to_global(k):
     what proves the pointer-select in the mainloop is the only difference.
     """
     N, K, M = 64, 512, 128
-    p = _prep(k, N, K, seed=100 + k)
+    p = _prep(k, N, K, seed=100 + k, source=source, super_span=None)
     W = _expanded(p)
     for k0 in range(0, K, M):
         a = _one_hot(M, K, k0)
@@ -168,7 +252,8 @@ def test_decode_bit_exact_with_the_codebook_forced_to_global(k):
         assert torch.equal(auto.view(torch.uint16), glob.view(torch.uint16))
 
 
-def test_decode_bit_exact_across_superblocks_and_an_n_residue():
+@pytest.mark.parametrize("source", SOURCES)
+def test_decode_bit_exact_across_superblocks_and_an_n_residue(source):
     """A shape that is not a whole number of N tiles, over 3 superblocks.
 
     N = 136 leaves an 8-row residue in the last 64-wide tile (the predicated
@@ -176,7 +261,7 @@ def test_decode_bit_exact_across_superblocks_and_an_n_residue():
     which is where an off-by-one in the superblock/quarter split would show.
     """
     k, N, K, M = 16, 136, 768, 128
-    p = _prep(k, N, K, seed=7)
+    p = _prep(k, N, K, seed=7, source=source, super_span=None)
     W = _expanded(p)
     for k0 in range(0, K, M):
         y = _fused(p, _one_hot(M, K, k0))
@@ -229,30 +314,33 @@ def test_the_decode_write_view_addresses_exactly_what_the_mma_reads(mode,
 # ---------------------------------------------------------------------------
 # 2. Whole-tile GEMM equality against the passthrough oracle.
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("source", SOURCES)
 @pytest.mark.parametrize("k", (12, 16, 20, 24))
 @pytest.mark.parametrize("M", (9, 32, 64, 128))
-def test_fused_equals_the_passthrough_oracle_bit_for_bit(k, M):
+def test_fused_equals_the_passthrough_oracle_bit_for_bit(k, M, source):
     """Same tile, same TiledMma, same epilogue -> same reduction order.
 
     So any difference is the decode, and there is none.
     """
     N, K = 128, 512
-    p = _prep(k, N, K, seed=k + M)
+    p = _prep(k, N, K, seed=k + M, source=source, super_span=None)
     W = _expanded(p)
     g = torch.Generator(device=DEV).manual_seed(M)
     a = (torch.randn(M, K, generator=g, device=DEV) * 0.1).to(torch.bfloat16)
     y_ref = ext.sm120_fp4v2_bf16_mm_fork(a, W)
     y_f = _fused(p, a)
     assert torch.equal(y_ref.view(torch.uint16), y_f.view(torch.uint16)), (
-        f"k={k} M={M}: the fused lane and the passthrough oracle on the "
-        f"cb_expand_v2 tile are not bit-identical")
+        f"k={k} M={M} ({source}): the fused lane and the passthrough oracle "
+        f"on the cb_expand_v2 tile are not bit-identical")
 
 
 # ---------------------------------------------------------------------------
 # 3. End-to-end numerics vs the SHIPPING expand + bridge route.
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("source", SOURCES)
 @pytest.mark.parametrize("M", (9, 16, 32, 64, 128))
-def test_end_to_end_matches_the_bridge_within_the_reduction_order_band(M):
+def test_end_to_end_matches_the_bridge_within_the_reduction_order_band(
+        M, source):
     """The lane's fp32-accumulate error may not exceed a BF16 F.linear's.
 
     Same discipline as the sm12x BF16 grouped lane's gate: relative L2 against
@@ -260,9 +348,14 @@ def test_end_to_end_matches_the_bridge_within_the_reduction_order_band(M):
     relative comparison to ``F.linear`` on the SAME operands. The fused lane,
     the shipping bridge and F.linear compute the same product in three
     different fp32 orders; none may be meaningfully worse than the others.
+
+    This one keeps the DEFAULT narrow super-exponent draw on the synth arm:
+    the measurement is a whole-matrix relative L2, and the full legal run
+    would spread output row magnitudes by up to 2**12 and let the loud rows
+    set the number.
     """
     k, N, K = 16, 512, 1024
-    p = _prep(k, N, K, seed=3)
+    p = _prep(k, N, K, seed=3, source=source)
     W = _expanded(p)
     g = torch.Generator(device=DEV).manual_seed(M)
     a = (torch.randn(M, K, generator=g, device=DEV) * 0.1).to(torch.bfloat16)
@@ -278,13 +371,14 @@ def test_end_to_end_matches_the_bridge_within_the_reduction_order_band(M):
     linear_rel = _rel_l2(bf16_linear, fp32)
     bridge_rel = _rel_l2(bridge, fp32)
     assert fused_rel <= 2e-3, (
-        f"M={M}: fused relative L2 {fused_rel:.6e} exceeds the BF16 output "
-        f"rounding backstop")
+        f"M={M} ({source}): fused relative L2 {fused_rel:.6e} exceeds the "
+        f"BF16 output rounding backstop")
     assert fused_rel <= torch.maximum(1.25 * linear_rel, linear_rel + 2e-5), (
-        f"M={M}: fused {fused_rel:.6e} vs BF16 F.linear {linear_rel:.6e}: the "
-        f"reduction-order difference is larger than the bf16 rounding floor")
+        f"M={M} ({source}): fused {fused_rel:.6e} vs BF16 F.linear "
+        f"{linear_rel:.6e}: the reduction-order difference is larger than the "
+        f"bf16 rounding floor")
     assert fused_rel <= torch.maximum(1.25 * bridge_rel, bridge_rel + 2e-5), (
-        f"M={M}: fused {fused_rel:.6e} vs the shipping bridge "
+        f"M={M} ({source}): fused {fused_rel:.6e} vs the shipping bridge "
         f"{bridge_rel:.6e}")
 
 

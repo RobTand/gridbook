@@ -39,15 +39,6 @@ K02_NOT_ATTESTED = "not_attested"
 K02_MALFORMED = "malformed_stage_attestation"
 K02_CONTRACT_ABSENT = "contract_absent"
 K02_ARTIFACT_UNREADABLE = "artifact_unreadable"
-K02_VERDICTS = (
-    K02_ATTESTED,
-    K02_MISSING_STAGES,
-    K02_DIGEST_MISMATCH,
-    K02_NOT_ATTESTED,
-    K02_MALFORMED,
-    K02_CONTRACT_ABSENT,
-    K02_ARTIFACT_UNREADABLE,
-)
 EVIDENCE_STAGE_ATTESTED = "stage_attested_fused_moe_evidence_eligible"
 EVIDENCE_FALLBACK_TELEMETRY = "fallback_telemetry_not_evidence"
 EVIDENCE_DENSE_SCOPE = "dense_scope_stage_attestation_not_applicable"

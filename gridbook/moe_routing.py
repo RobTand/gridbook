@@ -257,8 +257,9 @@ GROUPED_TILE_N = {"fp8": 64, "fp4": 128}
 # the threshold by passing its own ``min_rows_per_expert=`` to
 # :func:`cb_grouped_tile_m`, or skips the selector outright by handing
 # ``moe.PrismaQuantCBMoEMethod._apply_prefill_grouped_fused_v2`` an explicit
-# ``tile_m=`` (there ``None`` is what means "select") — the same keyword an
-# operator override would use.
+# ``tile_m=`` (there ``None`` is what means "select").  That keyword is a
+# caller-side argument, not an operator-facing knob: there is no env or config
+# TileM override today, and if one is ever added it lands on that argument.
 GROUPED_WIDE_TILE_MIN_ROWS_PER_EXPERT = 512
 
 # (tile_m, k_bits) the extension compiles at ZERO shared-memory margin.

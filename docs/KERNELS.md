@@ -308,8 +308,12 @@ table.
 
 Build cost: instantiating the six rungs × (dense unscaled, dense scaled, grouped
 128) plus grouped 256 × {k28, k32} is **20 kernel instantiations, ~76 s cold-cache
-JIT** in the GB10 container. The K1.2 work changed no instantiation, so the build
-time is unchanged.
+JIT** in the GB10 container. The K1.2 work changed no instantiation, but it is
+not free: measured both ways on the same box, the cold build went **71.4 s at
+the merge base to 76.0 s / 75.7 s, i.e. +4.6 s (~6%)**. That delta is
+compile-time *evaluation* — the rung-law predicates and the twelve-cell
+`static_assert` table above — not code generation. The measurement and its
+method are in [CONTAINER](CONTAINER.md).
 
 #### Measured status
 
@@ -848,7 +852,9 @@ data-dependent control flow. The kernels follow these rules:
    independently. There is no environment switch back to the retired branch.
 5. **Use full-decode graphs without compilation over the plugin.** The validated
    shape is `mode=0`, `cudagraph_mode=FULL_DECODE_ONLY`, capture sizes
-   `[1,2,4,8]`, and `PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE` unset. On a close-rate
+   `[1,2,4,8]`. No Gridbook op carries `torch.Tag.cudagraph_unsafe`, so nothing
+   partitions the captured region — the two whole-dispatch ops are the only
+   graph nodes and are capture-safe by construction. On a close-rate
    0.6B canary, changed inputs at capture sizes 1 and 4 matched eager text,
    tokens, and per-token logprobs exactly; 32+256 latency improved 20.1% and was
    5.9% behind native. This is directional A8-vs-W4A4 execution-contract

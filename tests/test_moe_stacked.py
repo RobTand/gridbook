@@ -1,4 +1,5 @@
-"""CB MoE — stacked-expert layout contract (LAYOUT.md §3, moe_cb_design.md §4).
+"""CB MoE — stacked-expert layout contract (docs/SPEC.md §4, "Stacked packed
+experts": expert ``e`` is ``cb_qweight[e]``, laid out exactly as the 2-D case).
 
 CPU-only (no triton, no vLLM) — validates that each expert's slice of a stacked
 pack is exactly the dense §1 superblock layout, so the MoE method's per-expert
