@@ -630,6 +630,17 @@ The routed path still pays one host read of the per-expert block offsets
 (the decoded weight transient is chunked over experts), which is also where
 the packing order gets its histogram for free.
 
+Both are **wired through the routed dispatch**, not merely available: stage
+one of `moe._apply_prefill_native_bf16_sm120` calls the gather entry point
+with the routing's own `dest` vector as `row_src` (real rows name their
+token, padding rows name the throwaway row `T`, and the kernel reads zeros for
+any id outside `[0, T)`), so the `[Mp, K]` copy is not built at all. Stage two
+deliberately stays in padded mode — its A operand *is* the padded intermediate,
+so there is no compact form to gather from. The packed expert order is applied
+only when one expert chunk covers every expert; a narrower chunk indexes blocks
+as `block_offsets[c0]..block_offsets[c1]` and therefore assumes expert-major
+contiguity, which a permutation would break.
+
 **Measured against its target: met on every cell at both token counts.** The
 P1 target was "≥ segmented-BF16 parity warm". With the gather mode and the
 packed order (GB10, whole operator, warm medians): **1.032–1.051× segmented
@@ -869,7 +880,7 @@ too.
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
 | MoE grouped decode GEMV, smem-resident dictionary | **Opt-in** (`PRISMAQUANT_CB_GEMV=v2`), never a default. Wins 1.13–1.58× on k13/k16/k20 in a 16-cell GB10 sweep; loses on k24 at K≥2048 (occupancy wall), where a compiled predicate routes the cell back to the shipped kernel. Reassociation-class output difference vs the default schedule (9/204 synthetic cells, worst `max_rel` 5.88e-03) — **not** bit-exact. Live GB10 validation on Jason Wong's 117B Laguna release dispatched all 94 expert stacks to v2 with no fallback and measured 24.993 vs 23.585 tok/s (+5.97%); long-prefill, concurrency, and soak requests completed without Gridbook errors |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
-| FP8-CB fused decode-in-prologue prefill | **Bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128**; native transient expansion + CUTLASS serves ineligible and large-M shapes |
+| FP8-CB fused decode-in-prologue prefill | **Bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128**; native transient expansion + CUTLASS serves ineligible and large-M shapes. **Rung surface: `k ∈ {28,32,36,40,44,48}` — the multiples of 4 in the product range, which is the complete set the packed-B TMA box (`type_size = 4k` must be 16-byte aligned) and the mainloop's uniform `CbSubW = k/4` sub-table width admit.** The other 15 integer rungs are served (decode GEMV + expand/CUTLASS bridge), just not by this lane; the compiled set is reported by `cb_fused_kbits()` and dispatch derives eligibility from it rather than from a literal ladder |
 | FP4-CB v2 fused mid-M prefill (dense) | **Opt-in** (`PRISMAQUANT_CB_FP4_FUSED_MIDM`), contract-preserving. The in-prologue decode is proven **bit-identical to `cb_expand_v2` for the whole decoded tile at all 13 K12–K24 rungs** (one-hot read-out, no tolerance), so only the FP32 reduction order moves. Measured 1.06–4.37× the shipping expand + bridge route at M ∈ {9,16,32,64,128} on 27B/DSV4-class shapes, every cell bit-equal to the same-config oracle — a wider band than the fp8 twin because the fp4 quality expand writes BF16 (4× the fp8 expand's transient bytes). Served NATIVE-PARITY protocol **not run**; an unexplained M ≤ 12 latency cliff is open. Ineligible shapes (M ≤ 8, M > 128, multi-dictionary fused modules, uncompiled rungs) fall through to today's exact path unchanged |
 | NVFP4-CB fused native-FP4 prefill (dense and MoE) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, MoE routed-quality, and p95 served gates remain open |
 | MoE persistent-B decode-in-mainloop prefill (FP4-CB v2) | **Opt-in** (`PRISMAQUANT_CB_MOE_PERSISTENT_B=1`), ROADMAP K1.1. Decodes each expert weight tile once and streams that expert's exact routed segment through it, eliminating the `[E,N,K]` BF16 transient and all work for unrouted experts. Weight decode bit-identical to `cb_expand_v2` (`torch.equal`); reduction-order-class output difference vs the bridge, gated at parity with per-segment `F.linear`. Whole-routed-operator microbenchmark wins; served protocol **not run** |
