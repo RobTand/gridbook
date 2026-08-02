@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Compile every JIT extension for the live device's compute capability instead
+  of inheriting `TORCH_CUDA_ARCH_LIST`. The stock vLLM base image's list omits
+  `12.1`, so outside Gridbook's own container a GB10 ran the production decode
+  GEMV from PTX JIT or against a mismatched SASS target. A build host with no
+  visible GPU now reports each module unavailable with an actionable reason;
+  compile-only environments pin the capability for the duration of the build,
+  as the image's prewarm step already did for the CUTLASS modules.
+- Reject non-Blackwell devices in the fused NVFP4-CB loader before any CUTLASS
+  include discovery or build work, as the fused FP8-CB loader already did. A
+  non-Blackwell GPU no longer spends minutes inside nvcc during a first request.
+- Hash `cb_fused_gemm.cu`'s three `cutlass_fork` headers into the fused FP8-CB
+  module identity, which now keys both the extension name and the build
+  directory (`fused/<digest>`), so editing one of those headers can no longer
+  serve the previously cached kernel. Because a module that loads is therefore
+  built from current sources, the fused FP8-CB contract now requires the
+  grouped-MoE bindings alongside the dense entry point.
+- Honour `PRISMAQUANT_CUTLASS_INCLUDE` in every CUTLASS loader; grouped-BF16
+  and fused FP8-CB previously could not build without vLLM's bundled copy. A
+  set-but-wrong value fails with the missing header named rather than silently
+  compiling against a different CUTLASS.
+- Build the main decode extension in `<cache>/main`, like every sibling module.
+  An existing cache rebuilds it once.
+- Retire the FP8-CB routed-MoE per-expert fused host loop. The single grouped
+  launch supersedes it, and its only remaining reason to exist — an extension
+  build carrying the dense fused binding without the grouped one — is now
+  impossible. Constraint misses fall back directly to the exact native BF16
+  expansion plus the owned CUTLASS grouped bridge.
+
 ## 0.5.0 — 2026-08-01
 
 - Remove Gridbook's Triton dependency and every Gridbook-defined Triton
