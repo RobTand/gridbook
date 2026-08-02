@@ -31,8 +31,16 @@
   resolved at model load and failing the load — including the
   `..._CFG` tile override, validated against what the build compiled — rather
   than silently serving the other route. With the flag unset the dispatch is
-  byte-for-byte what it was. `scripts/bench_moe_persistent_b.py` reproduces the
-  whole-routed-operator table; proposal data only, served protocol not run.
+  byte-for-byte what it was.
+  Measured on nine **whole-routed-operator** cells (routing + QDQ + both
+  projection stages + activation + combine, per the NATIVE-PARITY grouped-MoE
+  rule): **1.05–3.32× over the default bridge and 1.02–2.97× over the pingpong
+  bridge, winning every cell**, with the deleted expansion measuring
+  **21.7–46.5%** of the default operator and *not* shrinking with expert count
+  — at `E=128` it is 38–47% at every token count, because the expansion pays
+  for every expert whether the router used it or not.
+  `scripts/bench_moe_persistent_b.py` reproduces the table; proposal data only,
+  served protocol not run.
 - Record two measured-negative results from that kernel's tile sweep rather
   than only its winners: the `128×128` and `256×64` tiles both fall to one CTA
   per SM and never won a sweep cell — `256×64` halves the decode repetition at
