@@ -541,8 +541,12 @@ def _identity_fixture(tmp_path):
     src = tmp_path / "csrc"
     header = src / "cutlass_fork" / "sm120_cb_fused_fp4_mma.hpp"
     header.parent.mkdir(parents=True)
+    # Every declared build input must exist — the list grew when the shared
+    # grouping glue was extracted, and reading it here keeps the fixture from
+    # silently drifting behind the loader.
+    for name in cuda_ext._FUSED_FP4_BUILD_INPUTS:
+        (src / name).write_text("header-v1")
     (src / "cb_fused_fp4_gemm.cu").write_text("source-v1")
-    header.write_text("header-v1")
 
     cutlass = tmp_path / "cutlass" / "include"
     (cutlass / "cutlass").mkdir(parents=True)

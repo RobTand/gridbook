@@ -61,6 +61,13 @@
 #include "cutlass_fork/sm120_cb_fused_mma.hpp"
 #include "cutlass_fork/sm120_expert_row_broadcast.hpp"
 
+// The EVT trees, the smem gate, the tile-feasibility filter and the grouped
+// host validation are shared with cb_fused_fp4_gemm.cu and the sm12x BF16
+// bridge (2026-08-01 audit §4 dedupe #1/#2). Every type this file takes from
+// there is proven identical to its former verbatim spelling by the
+// static_asserts below — the generated kernels are unchanged.
+#include "cb_grouped_common.hpp"
+
 namespace {
 
 using namespace cute;
@@ -111,23 +118,13 @@ struct Cfg {
 //   Sm90EVT<Compute<multiplies, bf16>, RowBroadcast(b_scales),
 //           Sm90EVT<Compute<multiplies, f32>, ColBroadcast(a_scales),
 //                   Sm90AccFetch>>
+//
+// The tree itself now lives in cb_grouped_common.hpp (it was verbatim in three
+// files); binding it to THIS file's element types reproduces the same types.
 // ---------------------------------------------------------------------------
 template <class TileShape>
-struct ScaledFusion {
-  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
-      0, TileShape, float, float, Stride<_1, _0, _0>>;
-  using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
-      0, TileShape, float, float, Stride<_0, _1, _0>>;
-  using AccFetch = cutlass::epilogue::fusion::Sm90AccFetch;
-  using MulA = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies, ElementAcc, ElementAcc,
-      cutlass::FloatRoundStyle::round_to_nearest>;
-  using MulB = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies, ElementD, ElementAcc,
-      cutlass::FloatRoundStyle::round_to_nearest>;
-  using EVTA = cutlass::epilogue::fusion::Sm90EVT<MulA, ScaleA, AccFetch>;
-  using type = cutlass::epilogue::fusion::Sm90EVT<MulB, ScaleB, EVTA>;
-};
+using ScaledFusion = gridbook::grouped::ScaledFusion<TileShape, ElementAcc,
+                                                     ElementD>;
 
 template <class TileShape>
 struct CfgScaled {
@@ -152,17 +149,12 @@ struct CfgScaled {
       cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
 };
 
-// Hard smem gate. The sm90 cooperative kernel layer does NOT static_assert
-// its own SharedStorageSize against the arch capacity (only the sm120
-// asymmetric-DMA kernel does), so an over-budget config would compile and then
-// fail at launch. Every instantiated fused config passes through this.
+// Hard smem gate (shared): the sm90 cooperative kernel layer does NOT
+// static_assert its own SharedStorageSize against the arch capacity (only the
+// sm120 asymmetric-DMA kernel does), so an over-budget config would compile and
+// then fail at launch. Every instantiated fused config passes through this.
 template <class GemmKernel>
-struct AssertSmemFits {
-  static_assert((int)GemmKernel::SharedStorageSize <=
-                    cutlass::arch::sm120_smem_capacity_bytes,
-                "fused CB kernel exceeds the sm_120 shared-memory capacity");
-  static constexpr bool value = true;
-};
+using AssertSmemFits = gridbook::grouped::AssertSmemFits<GemmKernel>;
 
 template <class T>
 struct SwapToCb;
@@ -236,6 +228,46 @@ using Tile128 = Shape<_128, _128, _128>;
 using TileF = Shape<_128, _64, _128>;
 using Fork128 = typename SwapToCb<typename Cfg<Tile128>::BuilderMainloop>::type;
 using ForkF = typename SwapToCb<typename Cfg<TileF>::BuilderMainloop>::type;
+
+// BIT-IDENTITY PROOF for the §4-dedupe extraction: the EVT trees taken from
+// cb_grouped_common.hpp are the SAME TYPES this file spelled verbatim before
+// it. Type identity is what decides the generated kernel here (the fusion type
+// selects the epilogue collective, its smem layout and its rounding order), so
+// this is the same class of proof as the MoeTile<128> == TileF assert below.
+static_assert(
+    cute::is_same_v<
+        typename ScaledFusion<TileF>::type,
+        cutlass::epilogue::fusion::Sm90EVT<
+            cutlass::epilogue::fusion::Sm90Compute<
+                cutlass::multiplies, ElementD, ElementAcc,
+                cutlass::FloatRoundStyle::round_to_nearest>,
+            cutlass::epilogue::fusion::Sm90RowBroadcast<
+                0, TileF, float, float, Stride<_0, _1, _0>>,
+            cutlass::epilogue::fusion::Sm90EVT<
+                cutlass::epilogue::fusion::Sm90Compute<
+                    cutlass::multiplies, ElementAcc, ElementAcc,
+                    cutlass::FloatRoundStyle::round_to_nearest>,
+                cutlass::epilogue::fusion::Sm90ColBroadcast<
+                    0, TileF, float, float, Stride<_1, _0, _0>>,
+                cutlass::epilogue::fusion::Sm90AccFetch>>>,
+    "shared ScaledFusion must reproduce the pre-extraction EVT node tree");
+static_assert(
+    cute::is_same_v<
+        typename MoeScaledFusion<TileF>::type,
+        cutlass::epilogue::fusion::Sm90EVT<
+            cutlass::epilogue::fusion::Sm90Compute<
+                cutlass::multiplies, ElementD, ElementAcc,
+                cutlass::FloatRoundStyle::round_to_nearest>,
+            cutlass::epilogue::fusion::Sm120CbExpertRowBroadcast<
+                0, TileF, float, float, Stride<_0, _1, _0>>,
+            cutlass::epilogue::fusion::Sm90EVT<
+                cutlass::epilogue::fusion::Sm90Compute<
+                    cutlass::multiplies, ElementAcc, ElementAcc,
+                    cutlass::FloatRoundStyle::round_to_nearest>,
+                cutlass::epilogue::fusion::Sm90ColBroadcast<
+                    0, TileF, float, float, Stride<_1, _0, _0>>,
+                cutlass::epilogue::fusion::Sm90AccFetch>>>,
+    "shared MoeScaledFusion must reproduce the pre-extraction EVT node tree");
 
 torch::Tensor sm120_fp8_mm_fork(torch::Tensor a, torch::Tensor b) {
   return run_dense<Tile128, Fork128>(a, b);
@@ -420,21 +452,8 @@ torch::Tensor cb_fused_prefill_mm_scaled(torch::Tensor a, torch::Tensor packed,
 // bf16_rn(b_scale * (a_scale * acc)) -- is identical to ScaledFusion.
 // ---------------------------------------------------------------------------
 template <class TileShape>
-struct MoeScaledFusion {
-  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
-      0, TileShape, float, float, Stride<_1, _0, _0>>;
-  using ScaleB = cutlass::epilogue::fusion::Sm120CbExpertRowBroadcast<
-      0, TileShape, float, float, Stride<_0, _1, _0>>;
-  using AccFetch = cutlass::epilogue::fusion::Sm90AccFetch;
-  using MulA = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies, ElementAcc, ElementAcc,
-      cutlass::FloatRoundStyle::round_to_nearest>;
-  using MulB = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies, ElementD, ElementAcc,
-      cutlass::FloatRoundStyle::round_to_nearest>;
-  using EVTA = cutlass::epilogue::fusion::Sm90EVT<MulA, ScaleA, AccFetch>;
-  using type = cutlass::epilogue::fusion::Sm90EVT<MulB, ScaleB, EVTA>;
-};
+using MoeScaledFusion = gridbook::grouped::MoeScaledFusion<TileShape,
+                                                           ElementAcc, ElementD>;
 
 template <class TileShape>
 struct CfgMoeScaled {
@@ -574,11 +593,9 @@ std::vector<int64_t> cb_fused_moe_tile_sizes() { return {128, 256}; }
 // Per-rung candidate list — python should enumerate THIS, never the union,
 // so it can never select an uncompiled (TileM, k_bits) pair.
 std::vector<int64_t> cb_fused_moe_tile_sizes_for_kbits(int64_t k_bits) {
-  std::vector<int64_t> out;
-  for (int64_t tm : cb_fused_moe_tile_sizes()) {
-    if (moe_tile_supported(tm, k_bits)) out.push_back(tm);
-  }
-  return out;
+  return gridbook::grouped::tile_sizes_where(
+      cb_fused_moe_tile_sizes(),
+      [k_bits](int64_t tm) { return moe_tile_supported(tm, k_bits); });
 }
 
 torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
@@ -602,18 +619,15 @@ torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
               "grouped tile_m=", tile_m, " is not compiled for k_bits=", k_bits,
               " (smem-infeasible on sm_120: limit 101376 B). Query "
               "cb_fused_moe_tile_sizes_for_kbits(k_bits) for the legal set.");
-  TORCH_CHECK(a.size(0) % tile_m == 0,
-              "a.size(0) (Mp=", a.size(0),
-              ") must be a multiple of the grouped tile_m (", tile_m,
-              "); pad each expert's row segment");
+  // Padding granularity, stacked-expert contiguity and the per-tile expert id
+  // vector are properties of the SHARED grouping construction, so those three
+  // checks come from cb_grouped_common.hpp (same conditions, one wording).
+  gridbook::grouped::check_padded_rows(a.size(0), tile_m);
 
-  TORCH_CHECK(packed.is_cuda() && packed.scalar_type() == torch::kUInt8 &&
-                  packed.dim() == 3 && packed.size(1) == N,
+  TORCH_CHECK(packed.scalar_type() == torch::kUInt8,
               "packed must be uint8 [E,N,row_bytes] on cuda");
+  gridbook::grouped::check_stacked_experts(packed, N, "packed");
   const int64_t row_bytes = packed.size(2);
-  TORCH_CHECK(packed.stride(2) == 1 && packed.stride(1) == row_bytes &&
-                  packed.stride(0) == N * row_bytes,
-              "packed must be fully contiguous [E,N,row_bytes]");
   TORCH_CHECK(row_bytes % 16 == 0,
               "packed row stride must be a 16-byte multiple (UNPADDED rows)");
   TORCH_CHECK(row_bytes >= (K / 256) * 4 * k_bits,
@@ -626,11 +640,8 @@ torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
                   b_scales.dim() == 2 && b_scales.size(0) == packed.size(0) &&
                   b_scales.size(1) == N && b_scales.is_contiguous(),
               "b_scales must be contiguous fp32 [E,N]");
-  TORCH_CHECK(expert_ids.is_cuda() && expert_ids.scalar_type() == torch::kInt32 &&
-                  expert_ids.is_contiguous() &&
-                  expert_ids.numel() == a.size(0) / tile_m,
-              "expert_ids must be contiguous int32 cuda [Mp/tile_m] (expected ",
-              a.size(0) / tile_m, ", got ", expert_ids.numel(), ")");
+  gridbook::grouped::check_expert_ids(a, expert_ids, a.size(0), tile_m,
+                                      packed.size(0));
 
 #define PQ_MOE_CALL(TM, KB) \
   return run_moe_grouped<TM, KB>(a, packed, lut, a_scales, b_scales, expert_ids, N, K)
