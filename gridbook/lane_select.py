@@ -174,8 +174,7 @@ def require_lane(operation: str, *, flag: str, lane: str, source: str,
     if capability is not None and not buildable(capability):
         raise NativeKernelUnavailableError(
             f"{operation} requested {lane} ({flag}=1), and the loaded "
-            f"{source} "
-            f"carries it, but THIS device reports compute capability "
+            f"{source} carries it, but THIS device reports compute capability "
             f"{capability[0]}.{capability[1]}, which the lane is not compiled "
             f"for. On a mixed-capability host the module is built for one "
             f"device and would abort at launch on another. Unset {flag} to "
@@ -211,8 +210,8 @@ def require_lane(operation: str, *, flag: str, lane: str, source: str,
                 f"{operation} requested {lane} ({flag}=1), but load-time "
                 f"device attestation failed ({type(exc).__name__}: {exc}). "
                 f"The schedule needs CUDA compute capability 12.0 or 12.1 "
-                f"with "
-                f"enough opt-in shared memory for its largest compiled tile; "
+                f"with enough opt-in shared memory for its largest compiled "
+                f"tile; "
                 f"the kernel's own check reports the exact bound. Gridbook "
                 f"does not defer this failure to first prefill or serve "
                 f"{alternative} instead.") from exc
