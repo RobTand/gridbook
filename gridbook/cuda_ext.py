@@ -655,6 +655,8 @@ _BF16_GROUPED_SYMBOLS = (
 _BF16_GROUPED_SM120_SYMBOLS = (
     "cb_bf16_grouped_mm_sm120",
     "cb_bf16_grouped_mm_sm120_out",
+    "cb_bf16_grouped_mm_sm120_gather",
+    "cb_bf16_grouped_mm_sm120_gather_out",
     "cb_bf16_grouped_sm120_tile_m",
     "cb_bf16_grouped_sm120_tile_sizes",
     "cb_bf16_grouped_sm120_config",

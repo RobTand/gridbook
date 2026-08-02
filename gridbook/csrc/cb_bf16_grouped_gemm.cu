@@ -421,9 +421,17 @@ using GroupedCfg = Cfg<GroupedTile>;
 static_assert(gridbook::grouped::AssertSmemFits<
                   typename GroupedCfg::GemmKernel>::value);
 
-void run_sm120_grouped(torch::Tensor output, torch::Tensor a,
-                       torch::Tensor weights, torch::Tensor expert_ids,
-                       int64_t tile_m) {
+// Shared launch core for the two A-source modes of the ONE compiled
+// collective. `row_src_ptr == nullptr` is the row-padded TMA-A mode: `a` is
+// the materialized [Mp, K] padded activation. Otherwise `a` is a COMPACT
+// [S, K] activation and padded row m reads source row row_src[m] inside the
+// mainloop (ids outside [0, S) are zero rows) — the padded copy never
+// exists. Both modes load byte-identical smem tiles, so their outputs are
+// bit-identical (gated in tests/test_bf16_grouped_cutlass.py).
+void run_sm120_launch(torch::Tensor output, torch::Tensor a,
+                      torch::Tensor weights, torch::Tensor expert_ids,
+                      int64_t tile_m, int64_t mp,
+                      int const* row_src_ptr, int64_t source_rows) {
   using Gemm = typename GroupedCfg::Gemm;
   using GemmKernel = typename GroupedCfg::GemmKernel;
 
@@ -432,28 +440,27 @@ void run_sm120_grouped(torch::Tensor output, torch::Tensor a,
   TORCH_CHECK(a.scalar_type() == torch::kBFloat16 &&
                   weights.scalar_type() == torch::kBFloat16,
               "a and weights must be BF16");
-  TORCH_CHECK(a.dim() == 2, "expected a padded activation [Mp,K]");
   TORCH_CHECK(tile_m == kSm120TileM,
               "the sm120 grouped BF16 lane compiles tile_m=", kSm120TileM,
               " only (got ", tile_m,
               "); query cb_bf16_grouped_sm120_tile_sizes()");
 
-  const int64_t mp = a.size(0);
   const int64_t k = a.size(1);
   const int64_t e = weights.size(0);
   const int64_t n = weights.size(1);
   gridbook::grouped::check_stacked_experts(weights, weights.size(1),
                                            "weights");
   TORCH_CHECK(weights.size(2) == k,
-              "shape mismatch: a [Mp,K] and weights [E,N,K]");
+              "shape mismatch: a [.,K] and weights [E,N,K]");
   TORCH_CHECK(mp <= std::numeric_limits<int>::max() &&
                   n <= std::numeric_limits<int>::max() &&
                   k <= std::numeric_limits<int>::max() &&
-                  e <= std::numeric_limits<int>::max(),
+                  e <= std::numeric_limits<int>::max() &&
+                  source_rows <= std::numeric_limits<int>::max(),
               "grouped GEMM dimensions exceed int32");
   TORCH_CHECK(k % kAlignment == 0 && n % kAlignment == 0,
               "K and N must be multiples of 8 BF16 elements");
-  TORCH_CHECK(a.is_contiguous(), "a must be contiguous [Mp,K]");
+  TORCH_CHECK(a.is_contiguous(), "a must be contiguous");
   gridbook::grouped::check_padded_rows(mp, tile_m);
   gridbook::grouped::check_expert_ids(a, expert_ids, mp, tile_m, e);
   gridbook::grouped::check_same_cuda_device(a, weights, "weights");
@@ -475,6 +482,9 @@ void run_sm120_grouped(torch::Tensor output, torch::Tensor a,
   using StrideC = typename GemmKernel::StrideC;
   using StrideD = typename GemmKernel::StrideD;
   const int mpi = int(mp), ni = int(n), ki = int(k), ei = int(e);
+  // The problem's M is the PADDED row count in both modes; in gather mode
+  // the A TMA descriptor this stride shapes is built but never issued (the
+  // mainloop reads A by row index instead).
   StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {mpi, ki, 1});
   // B's batch mode is the EXPERT mode: per-expert stride N*K, which is exactly
   // a contiguous [E,N,K] stack. The problem's own L stays 1.
@@ -486,7 +496,8 @@ void run_sm120_grouped(torch::Tensor output, torch::Tensor a,
       {mpi, ni, ki, 1},
       {reinterpret_cast<const Element*>(a.data_ptr()), sa,
        reinterpret_cast<const Element*>(weights.data_ptr()), sb,
-       expert_ids.data_ptr<int>(), ei},
+       expert_ids.data_ptr<int>(), ei,
+       row_src_ptr, int(source_rows)},
       {{1.0f, 0.0f}, nullptr, StrideC{},
        reinterpret_cast<Element*>(output.data_ptr()), sd},
       cutlass::KernelHardwareInfo{},
@@ -513,6 +524,26 @@ void run_sm120_grouped(torch::Tensor output, torch::Tensor a,
               cutlass::cutlassGetStatusString(status));
 }
 
+void run_sm120_grouped(torch::Tensor output, torch::Tensor a,
+                       torch::Tensor weights, torch::Tensor expert_ids,
+                       int64_t tile_m) {
+  TORCH_CHECK(a.dim() == 2, "expected a padded activation [Mp,K]");
+  run_sm120_launch(output, a, weights, expert_ids, tile_m,
+                   /*mp=*/a.size(0), /*row_src_ptr=*/nullptr,
+                   /*source_rows=*/0);
+}
+
+void run_sm120_grouped_gather(torch::Tensor output, torch::Tensor a,
+                              torch::Tensor row_src, torch::Tensor weights,
+                              torch::Tensor expert_ids, int64_t tile_m) {
+  TORCH_CHECK(a.dim() == 2, "expected a compact activation [S,K]");
+  TORCH_CHECK(tile_m > 0, "grouped tile_m must be positive, got ", tile_m);
+  const int64_t mp = row_src.numel();
+  gridbook::grouped::check_row_src(a, row_src, mp, tile_m);
+  run_sm120_launch(output, a, weights, expert_ids, tile_m, mp,
+                   row_src.data_ptr<int>(), /*source_rows=*/a.size(0));
+}
+
 torch::Tensor cb_bf16_grouped_mm_sm120(torch::Tensor a, torch::Tensor weights,
                                        torch::Tensor expert_ids,
                                        int64_t tile_m) {
@@ -529,6 +560,27 @@ void cb_bf16_grouped_mm_sm120_out(torch::Tensor output, torch::Tensor a,
   run_sm120_grouped(output, a, weights, expert_ids, tile_m);
 }
 
+torch::Tensor cb_bf16_grouped_mm_sm120_gather(torch::Tensor a,
+                                              torch::Tensor row_src,
+                                              torch::Tensor weights,
+                                              torch::Tensor expert_ids,
+                                              int64_t tile_m) {
+  TORCH_CHECK(a.dim() == 2 && weights.dim() == 3,
+              "expected a [S,K] and weights [E,N,K]");
+  auto output = torch::empty({row_src.numel(), weights.size(1)}, a.options());
+  run_sm120_grouped_gather(output, a, row_src, weights, expert_ids, tile_m);
+  return output;
+}
+
+void cb_bf16_grouped_mm_sm120_gather_out(torch::Tensor output,
+                                         torch::Tensor a,
+                                         torch::Tensor row_src,
+                                         torch::Tensor weights,
+                                         torch::Tensor expert_ids,
+                                         int64_t tile_m) {
+  run_sm120_grouped_gather(output, a, row_src, weights, expert_ids, tile_m);
+}
+
 int64_t cb_bf16_grouped_sm120_tile_m() { return kSm120TileM; }
 
 std::vector<int64_t> cb_bf16_grouped_sm120_tile_sizes() {
@@ -538,7 +590,8 @@ std::vector<int64_t> cb_bf16_grouped_sm120_tile_sizes() {
 // Host-only config attestation: what was actually compiled. Used by the tests
 // and by the KERNELS.md evidence table (no launch, no device needed).
 // [tile_m, tile_n, tile_k, stages, SharedStorageSize, sm120 capacity,
-//  mma_threads, swizzle(small grid), swizzle(large grid), grid threshold].
+//  mma_threads, swizzle(small grid), swizzle(large grid), grid threshold,
+//  gather_mainloop (1 = the in-mainloop A-row gather mode is compiled)].
 std::vector<int64_t> cb_bf16_grouped_sm120_config() {
   return {int64_t(size<0>(GroupedTile{})),
           int64_t(size<1>(GroupedTile{})),
@@ -549,7 +602,8 @@ std::vector<int64_t> cb_bf16_grouped_sm120_config() {
           int64_t(size(typename MmaCfg<GroupedTile>::TiledMma{})),
           int64_t(kSm120SwizzleSmallGrid),
           int64_t(kSm120SwizzleLargeGrid),
-          int64_t(kSm120SwizzleGridThreshold)};
+          int64_t(kSm120SwizzleGridThreshold),
+          int64_t(1)};
 }
 
 }  // namespace sm120_lane
@@ -583,6 +637,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "sm12x-native grouped BF16 GEMM into a caller-owned [Mp,N] output",
         pybind11::arg("output"), pybind11::arg("a"), pybind11::arg("weights"),
         pybind11::arg("expert_ids"),
+        pybind11::arg("tile_m") = sm120_lane::kSm120TileM);
+  m.def("cb_bf16_grouped_mm_sm120_gather",
+        &sm120_lane::cb_bf16_grouped_mm_sm120_gather,
+        "sm12x-native grouped BF16 GEMM, IN-MAINLOOP A-row gather mode: the "
+        "same collective as cb_bf16_grouped_mm_sm120, but padded row m reads "
+        "row row_src[m] of a COMPACT [S,K] activation inside the mainloop "
+        "(ids outside [0,S) are zero rows), so the row-padded activation "
+        "copy is never materialized. row_src is int32 [Mp], Mp a multiple of "
+        "tile_m, one expert id per tile as usual. The smem tiles are byte-"
+        "identical to the padded-copy mode's, so the two modes' outputs are "
+        "bit-identical.",
+        pybind11::arg("a"), pybind11::arg("row_src"), pybind11::arg("weights"),
+        pybind11::arg("expert_ids"),
+        pybind11::arg("tile_m") = sm120_lane::kSm120TileM);
+  m.def("cb_bf16_grouped_mm_sm120_gather_out",
+        &sm120_lane::cb_bf16_grouped_mm_sm120_gather_out,
+        "gather-mode sm12x grouped BF16 GEMM into a caller-owned [Mp,N] "
+        "output",
+        pybind11::arg("output"), pybind11::arg("a"), pybind11::arg("row_src"),
+        pybind11::arg("weights"), pybind11::arg("expert_ids"),
         pybind11::arg("tile_m") = sm120_lane::kSm120TileM);
   m.def("cb_bf16_grouped_sm120_tile_m", &sm120_lane::cb_bf16_grouped_sm120_tile_m,
         "row-padding granularity of the sm12x-native lane");

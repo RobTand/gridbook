@@ -89,6 +89,8 @@ def test_require_lane_accepts_a_complete_module(monkeypatch):
         cb_bf16_grouped_mm_out=lambda *a, **k: None,
         cb_bf16_grouped_mm_sm120=lambda *a, **k: None,
         cb_bf16_grouped_mm_sm120_out=lambda *a, **k: None,
+        cb_bf16_grouped_mm_sm120_gather=lambda *a, **k: None,
+        cb_bf16_grouped_mm_sm120_gather_out=lambda *a, **k: None,
         cb_bf16_grouped_sm120_tile_m=lambda: 128,
     )
     monkeypatch.setattr("gridbook.cuda_ext.get_bf16_grouped_ext",
@@ -97,8 +99,25 @@ def test_require_lane_accepts_a_complete_module(monkeypatch):
     assert lane.tile_m(stub) == 128
 
 
+def test_require_lane_fails_closed_without_the_gather_mode(monkeypatch):
+    """A module carrying only the padded-copy entry points is incomplete:
+    serving a partial lane would silently reintroduce the padded copy."""
+    stub = types.SimpleNamespace(
+        cb_bf16_grouped_mm=lambda *a, **k: None,
+        cb_bf16_grouped_mm_out=lambda *a, **k: None,
+        cb_bf16_grouped_mm_sm120=lambda *a, **k: None,
+        cb_bf16_grouped_mm_sm120_out=lambda *a, **k: None,
+        cb_bf16_grouped_sm120_tile_m=lambda: 64,
+    )
+    monkeypatch.setattr("gridbook.cuda_ext.get_bf16_grouped_ext",
+                        lambda: stub)
+    with pytest.raises(NativeKernelUnavailableError,
+                       match="cb_bf16_grouped_mm_sm120_gather"):
+        lane.require_lane("routed quality prefill")
+
+
 def test_dense_helper_pads_to_one_tile_and_slices_back(monkeypatch):
-    """M=100 becomes one 128-row tile; the padding never reaches the caller."""
+    """Without the gather mode (an old stub), M=100 becomes one padded tile."""
     seen = {}
 
     def fake_op(a, weights, expert_ids, tile_m):
@@ -138,3 +157,73 @@ def test_dense_helper_leaves_an_exact_multiple_alone(monkeypatch):
     y = lane.dense_mm(ext, torch.randn(256, 64, dtype=torch.bfloat16),
                       torch.randn(8, 64, dtype=torch.bfloat16))
     assert y.shape == (256, 8)
+
+
+def test_dense_helper_prefers_the_gather_mode_and_copies_nothing(monkeypatch):
+    """With the gather entry point present, no padded copy is built at all:
+    the compact activation goes straight in with row_src = arange(Mp), whose
+    ids past M read zeros inside the kernel."""
+    seen = {}
+
+    def fake_gather(a, row_src, weights, expert_ids, tile_m):
+        seen["a"] = a
+        seen["row_src"] = row_src
+        seen["expert_ids"] = expert_ids
+        seen["tile_m"] = tile_m
+        return torch.zeros(row_src.shape[0], weights.shape[1],
+                           dtype=torch.bfloat16)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the padded-copy op must not be called")
+
+    monkeypatch.setattr("gridbook.ops.cb_bf16_grouped_mm_sm120_gather",
+                        fake_gather)
+    monkeypatch.setattr("gridbook.ops.cb_bf16_grouped_mm_sm120", forbidden)
+    ext = types.SimpleNamespace(
+        cb_bf16_grouped_sm120_tile_m=lambda: 128,
+        cb_bf16_grouped_mm_sm120_gather=lambda *a, **k: None,
+    )
+    a = torch.randn(100, 64, dtype=torch.bfloat16)
+    y = lane.dense_mm(ext, a, torch.randn(32, 64, dtype=torch.bfloat16))
+
+    assert y.shape == (100, 32)
+    assert seen["a"] is not None and seen["a"].shape == (100, 64)
+    assert seen["row_src"].dtype is torch.int32
+    assert seen["row_src"].tolist() == list(range(128))
+    assert seen["expert_ids"].tolist() == [0]
+    assert seen["tile_m"] == 128
+
+
+# ---------------------------------------------------------------------------
+# The swizzle-group-aligned expert ORDER (tile-order policy).
+# ---------------------------------------------------------------------------
+
+
+def test_pack_expert_blocks_fills_groups_exactly_when_possible():
+    """{3,3,2}-block experts tile a group of 8 with no straddle at all."""
+    counts = [129, 130, 65, 129, 130, 66, 129, 129]  # blocks: 3,3,2,3,3,2,3,3
+    order, touched, minimum = lane.pack_expert_blocks(counts, 64, 8)
+    assert sorted(order) == list(range(8))
+    assert touched == minimum, "an exactly packable histogram must align"
+
+
+def test_pack_expert_blocks_is_deterministic_and_skips_empty_experts():
+    counts = [0, 100, 0, 500, 64, 0, 1, 320]
+    first = lane.pack_expert_blocks(counts, 64, 8)
+    second = lane.pack_expert_blocks(counts, 64, 8)
+    assert first == second
+    order = first[0]
+    assert sorted(order) == [1, 3, 4, 6, 7]
+    assert 0 not in order and 2 not in order and 5 not in order
+
+
+def test_pack_expert_blocks_handles_experts_larger_than_a_group():
+    counts = [1200, 30, 30]  # 19 blocks + 1 + 1
+    order, touched, minimum = lane.pack_expert_blocks(counts, 64, 8)
+    assert sorted(order) == [0, 1, 2]
+    assert minimum <= touched <= minimum + 2
+
+
+def test_pack_expert_blocks_group_one_never_straddles():
+    order, touched, minimum = lane.pack_expert_blocks([70, 3, 900], 64, 1)
+    assert touched == minimum

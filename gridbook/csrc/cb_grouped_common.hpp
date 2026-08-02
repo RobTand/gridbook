@@ -181,6 +181,23 @@ inline void check_expert_ids(torch::Tensor const& anchor,
   TORCH_CHECK(experts > 0, "the stacked expert dimension must be positive");
 }
 
+// Row-source index vector for an IN-MAINLOOP A-row gather: one int32 per
+// padded row, contiguous, on the anchor's device. Ids outside
+// [0, source_rows) are the padding rows (they load zeros); like expert_ids,
+// the CONTENT is the caller's contract — validating values would cost a
+// device sync in the hot path.
+inline void check_row_src(torch::Tensor const& anchor,
+                          torch::Tensor const& row_src,
+                          int64_t mp, int64_t tile_m) {
+  TORCH_CHECK(row_src.is_cuda() && row_src.scalar_type() == torch::kInt32 &&
+                  row_src.is_contiguous() && row_src.dim() == 1 &&
+                  row_src.numel() == mp,
+              "row_src must be a contiguous int32 cuda [Mp] vector (expected ",
+              mp, ", got ", row_src.numel(), ")");
+  check_same_cuda_device(anchor, row_src, "row_src");
+  check_padded_rows(mp, tile_m);
+}
+
 // A stacked [E, N, W] weight buffer must be FULLY contiguous: the grouped
 // mainloop turns the expert index into a single batch stride (N*W), which is
 // only the expert's slice if no dimension is strided or permuted.

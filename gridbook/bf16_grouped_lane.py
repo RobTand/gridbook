@@ -79,6 +79,8 @@ def require_lane(operation: str = "this operation", *, device=None):
         capability = None
     missing = [name for name in ("cb_bf16_grouped_mm_sm120",
                                  "cb_bf16_grouped_mm_sm120_out",
+                                 "cb_bf16_grouped_mm_sm120_gather",
+                                 "cb_bf16_grouped_mm_sm120_gather_out",
                                  "cb_bf16_grouped_sm120_tile_m")
                if not hasattr(ext, name)]
     if missing:
@@ -103,25 +105,97 @@ def tile_m(ext) -> int:
 
 
 def dense_mm(ext, a, weight):
-    """Dense ``E=1`` GEMM through the padded lane.
+    """Dense ``E=1`` GEMM through the sm12x lane.
 
-    ``a`` is ``[M, K]`` BF16 and ``weight`` is ``[N, K]`` BF16. M is padded up
-    to one tile with zero rows (an activation-side transient of the same class
-    the promoted fused routed path already allocates — no second weight copy,
-    no new packer), every tile carries expert id 0, and the padded rows are
-    sliced off. Returns ``[M, N]``.
+    ``a`` is ``[M, K]`` BF16 and ``weight`` is ``[N, K]`` BF16; returns
+    ``[M, N]``. When the extension carries the in-mainloop A-row gather mode
+    (every cc 12.x build since it was added), no padded copy exists at all:
+    the kernel reads rows ``0..M-1`` directly and the rounded-up remainder of
+    the last tile reads zeros (``row_src`` ids ``>= M``). Older stubs without
+    the gather entry point fall back to materializing the zero-padded copy —
+    the two are bit-identical (the kernel-level gate asserts it).
     """
     import torch
-
-    from .ops import cb_bf16_grouped_mm_sm120
 
     granularity = tile_m(ext)
     m = int(a.shape[0])
     blocks = (m + granularity - 1) // granularity
     padded = blocks * granularity
+    expert_ids = torch.zeros(blocks, dtype=torch.int32, device=a.device)
+    if hasattr(ext, "cb_bf16_grouped_mm_sm120_gather"):
+        from .ops import cb_bf16_grouped_mm_sm120_gather
+
+        row_src = torch.arange(padded, dtype=torch.int32, device=a.device)
+        y = cb_bf16_grouped_mm_sm120_gather(a.contiguous(), row_src,
+                                            weight.unsqueeze(0), expert_ids,
+                                            granularity)
+        return y[:m]
+
+    from .ops import cb_bf16_grouped_mm_sm120
+
     if padded != m:
         a = torch.cat([a, a.new_zeros((padded - m, a.shape[1]))])
-    expert_ids = torch.zeros(blocks, dtype=torch.int32, device=a.device)
     y = cb_bf16_grouped_mm_sm120(a.contiguous(), weight.unsqueeze(0),
                                  expert_ids, granularity)
     return y[:m]
+
+
+def swizzle_group(ext) -> int:
+    """The large-grid tile-scheduler swizzle the compiled lane uses.
+
+    This is the group size the packed tile ORDER below aligns expert
+    boundaries to; below the kernel's grid threshold the scheduler runs
+    swizzle 1 and the order is measured neutral, so one order serves both
+    regimes.
+    """
+    return int(ext.cb_bf16_grouped_sm120_config()[8])
+
+
+def pack_expert_blocks(counts, tile_m, group):
+    """Deterministic expert ORDER aligning expert boundaries to swizzle groups.
+
+    The tile scheduler processes M-tiles in groups of ``group`` (its
+    large-grid swizzle): all tiles of a group sweep the N dimension together,
+    so a B (expert weight) slice is fetched from DRAM once per GROUP its
+    tiles touch, not once per tile. With the natural expert-major order an
+    expert's tiles regularly straddle a group boundary and its B slice is
+    fetched twice. This packs experts into groups first-fit by padded block
+    count (largest fitting expert first, smallest spills when none fits), so
+    group boundaries coincide with expert boundaries wherever the block
+    histogram allows.
+
+    Pure host math on the routing histogram; the order permutes WHOLE expert
+    segments only, never rows within an expert, so each padded row's GEMM
+    result is unchanged — tile order is scheduler order, which the kernel
+    already treats as bit-neutral (same guarantee as the swizzle itself).
+
+    Returns ``(order, groups_touched, groups_minimum)`` — the last two are
+    dispatch telemetry: how many swizzle groups the packed order's expert
+    tile-ranges touch, against the unpackable minimum ``sum(ceil(b/group))``.
+    """
+    blocks = [(int(e), (int(r) + tile_m - 1) // tile_m)
+              for e, r in enumerate(counts) if int(r) > 0]
+    blocks.sort(key=lambda t: (-t[1], t[0]))
+    remaining = list(blocks)
+    order, cap = [], 0
+    while remaining:
+        if cap == 0:
+            cap = group
+        pick = None
+        for i, (_, b) in enumerate(remaining):
+            if b <= cap:
+                pick = i
+                break
+        if pick is None:
+            pick = len(remaining) - 1  # smallest remaining; spills the group
+        expert, b = remaining.pop(pick)
+        order.append(expert)
+        cap = (cap - b) % group
+    by_expert = dict(blocks)
+    pos, touched, minimum = 0, 0, 0
+    for expert in order:
+        b = by_expert[expert]
+        touched += (pos + b - 1) // group - pos // group + 1
+        minimum += (b + group - 1) // group
+        pos += b
+    return order, touched, minimum
