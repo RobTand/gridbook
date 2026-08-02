@@ -209,6 +209,51 @@ def _cb_bf16_grouped_mm_sm120_out_fake(out, a, weights, expert_ids, tile_m):
     return None
 
 
+@torch.library.custom_op("prismaquant::cb_moe_persistent_b_prefill",
+                         mutates_args=("out",), tags=_PQ_UNSAFE)
+def cb_moe_persistent_b_prefill(out: torch.Tensor, a: torch.Tensor,
+                                qw: torch.Tensor, lut: torch.Tensor,
+                                compose: torch.Tensor,
+                                expert_ends: torch.Tensor, k_bits: int,
+                                type_size: int, cfg: int) -> None:
+    """Persistent-B grouped MoE decode-in-mainloop, into a caller-owned [P,N].
+
+    ONE launch per projection stage over the exact routed segments. The packed
+    FP4-CB-v2 expert bytes are decoded inside the mainloop, so no expanded
+    ``[E,N,K]`` BF16 transient is allocated or written.
+    """
+    from .cuda_ext import require_moe_persistent_b_ext
+    require_moe_persistent_b_ext(
+        "persistent-B grouped MoE prefill").cb_moe_persistent_b_prefill(
+            out, a, qw, lut, compose, expert_ends, k_bits, type_size, cfg)
+
+
+@cb_moe_persistent_b_prefill.register_fake
+def _cb_moe_persistent_b_prefill_fake(out, a, qw, lut, compose, expert_ends,
+                                      k_bits, type_size, cfg):
+    return None
+
+
+@torch.library.custom_op("prismaquant::cb_moe_persistent_b_decode",
+                         mutates_args=(), tags=_PQ_UNSAFE)
+def cb_moe_persistent_b_decode(qw_flat: torch.Tensor, lut: torch.Tensor,
+                               compose: torch.Tensor, row0: int, nrows: int,
+                               K: int, k_bits: int,
+                               type_size: int) -> torch.Tensor:
+    """The persistent-B mainloop's decode stage, standalone (bit-exactness
+    oracle; not a serving path)."""
+    from .cuda_ext import require_moe_persistent_b_ext
+    return require_moe_persistent_b_ext(
+        "persistent-B MoE decode probe").cb_moe_persistent_b_decode(
+            qw_flat, lut, compose, row0, nrows, K, k_bits, type_size)
+
+
+@cb_moe_persistent_b_decode.register_fake
+def _cb_moe_persistent_b_decode_fake(qw_flat, lut, compose, row0, nrows, K,
+                                     k_bits, type_size):
+    return qw_flat.new_empty((nrows, K), dtype=torch.bfloat16)
+
+
 # NOTE (2026-08-01): `prismaquant::cb_expand_fp8_into` (the out-variant of
 # cb_expand_fp8) and its `cb_expand_fp8_into_available` probe were registered
 # here with zero serving call sites — residue of the L2-pinned per-expert

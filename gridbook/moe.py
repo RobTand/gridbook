@@ -45,6 +45,10 @@ from .moe_gemv_select import cb_gemv_choice
 from .bf16_grouped_lane import (require_lane as bf16_sm120_require_lane,
                                 requested as bf16_sm120_requested,
                                 tile_m as bf16_sm120_tile_m)
+from .moe_persistent_b_lane import (require_lane as persistent_b_require_lane,
+                                    requested as persistent_b_requested,
+                                    resolve_cfg as persistent_b_resolve_cfg,
+                                    supports as persistent_b_supports)
 from .moe_routing import (
     cb_cached_row_offsets,
     cb_grouped_block_offsets,
@@ -465,6 +469,38 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if bf16_sm120_requested():
             layer._cb_bf16_sm120 = bf16_sm120_require_lane(
                 f"{self.prefix} routed quality prefill", device=dev)
+        # OPT-IN persistent-B grouped MoE decode-in-mainloop (ROADMAP K1.1).
+        # Resolved HERE for the same reason: an explicit lane selection this
+        # build/device/artifact cannot serve must fail the model LOAD, because
+        # silently serving expand+bridge instead would answer a different
+        # question than the operator asked. FP4-CB v2 only — an FP8-CB layer
+        # in a mixed serve keeps its own route rather than failing the load.
+        layer._cb_moe_persistent_b = None
+        if persistent_b_requested() and self.is_fp4:
+            reason = persistent_b_supports(
+                is_fp4=self.is_fp4, is_v2=self.is_v2, n_sub=self.n_sub,
+                k_bits=self.k, type_size=self.type_size,
+                hidden=layer._cb_hidden, inter=layer._cb_inter)
+            if reason is not None:
+                raise NativeKernelUnavailableError(
+                    f"{self.prefix}: requested the persistent-B grouped MoE "
+                    f"lane (PRISMAQUANT_CB_MOE_PERSISTENT_B=1), but this "
+                    f"layer cannot use it ({reason}); Gridbook does not "
+                    "substitute a different schedule behind an explicit lane "
+                    "selection")
+            layer._cb_moe_persistent_b = persistent_b_require_lane(
+                f"{self.prefix} routed quality prefill", device=dev)
+            # The tile override is resolved HERE too, against what this build
+            # actually compiled: a bad index must fail the load, not the first
+            # request that happens to carry routed rows.
+            layer._cb_moe_persistent_b_cfg = persistent_b_resolve_cfg(
+                layer._cb_moe_persistent_b)
+            print(f"[prismaquant-cb] moe_prefill {self.prefix} -> "
+                  f"persistent-B decode-in-mainloop (k={self.k} "
+                  f"type_size={self.type_size} hidden={layer._cb_hidden} "
+                  f"inter={layer._cb_inter} "
+                  f"cfg={layer._cb_moe_persistent_b_cfg}); no expanded "
+                  f"[E,N,K] transient", flush=True)
         if not self._cuda_moe_ok(layer):
             raise NativeKernelUnavailableError(
                 f"{self.prefix}: routed decode layout has no native grouped "
@@ -887,11 +923,21 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         instead — same operands, same single bf16 round, different FP32
         reduction order and a padded row layout. See
         ``_apply_prefill_native_bf16_sm120``.
+
+        With the OPT-IN ``PRISMAQUANT_CB_MOE_PERSISTENT_B`` lane resolved at
+        model load, the expansion disappears entirely and each stage is ONE
+        decode-in-mainloop launch over these same exact segments. It takes
+        precedence over the sm12x bridge lane, because it replaces the pair of
+        operations the bridge lane is one half of. See
+        ``_apply_prefill_native_bf16_persistent_b``.
         """
         from . import ops as pq_ops
 
         if x.dtype is not torch.bfloat16:
             raise TypeError("native CB MoE prefill requires BF16 activations")
+        if getattr(layer, "_cb_moe_persistent_b", None) is not None:
+            return self._apply_prefill_native_bf16_persistent_b(
+                layer, x, topk_weights, topk_ids, act)
         if getattr(layer, "_cb_bf16_sm120", None) is not None:
             return self._apply_prefill_native_bf16_sm120(
                 layer, x, topk_weights, topk_ids, act)
@@ -947,6 +993,100 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             .to(pair_output.dtype)
         pair_output.mul_(pair_weight[:, None])
         output = torch.zeros((T, hidden), dtype=x.dtype, device=x.device)
+        output.index_add_(0, rows, pair_output.to(output.dtype))
+        return output
+
+    def _apply_prefill_native_bf16_persistent_b(self, layer, x, topk_weights,
+                                                topk_ids, act):
+        """The OPT-IN persistent-B decode-in-mainloop form of the quality path.
+
+        WHAT IT REMOVES. ``_apply_prefill_native_bf16`` expands each expert
+        chunk's packed CB rows to BF16 in HBM and runs a grouped CUTLASS GEMM
+        over that transient. ``cb_moe_persistent_b_prefill`` decodes those rows
+        INSIDE the mainloop, so the ``[E, N, K]`` tile never exists: no BF16
+        write, no BF16 read back, and — because the grid only visits experts
+        with routed rows — no work at all for an unrouted expert, where the
+        expansion paid full price for every one of them. That expansion is the
+        ~35%-of-layer-time MoE expand tax the 2026-08-01 performance audit
+        measures at Laguna scale (§2 cause b).
+
+        It also removes the expert-chunk LOOP. The bridge chunks the expert
+        dimension to bound the transient (``_native_bf16_chunk``, a ~1 GiB
+        budget); with no transient there is nothing to bound, so each stage is
+        exactly ONE launch regardless of E.
+
+        ROUTING. Identical to the default lane above, helper for helper: the
+        same stable ``argsort`` over the routed pairs, the same
+        ``expert_ends = cumsum(bincount(...))`` exact segments, the same
+        ``index_select`` gather and ``index_add_`` combine. Nothing new was
+        invented, and unlike the padded tile-indexed lanes there are no
+        padding rows and NO host read of device data anywhere on this path —
+        the kernel's launch geometry is a function of ``(E, N)`` alone.
+
+        EMPTY AND SKEWED ROUTING. An expert with no routed rows is two int32
+        loads and a CTA return. A heavily-skewed expert is walked by its
+        owning CTAs in M-tiles inside the kernel, so skew costs a longer CTA,
+        never a serialized grid or a host-visible branch.
+
+        NUMERICS. Same activations (the exact group-16 RTN QDQ, on the module
+        input and on the intermediate), weights decoded bit-identically to
+        ``cb_expand_fp4_v2`` (proven by ``torch.equal`` in the suite, not
+        asserted), FP32 accumulate, ONE bf16 round. Only the GEMM's FP32
+        reduction order and the cross-expert combine reassociate —
+        REASSOCIATION-CLASS, the suite's established contract.
+        """
+        from . import ops as pq_ops
+
+        ext = layer._cb_moe_persistent_b
+        E = int(layer._cb_E)
+        T = int(x.shape[0])
+        top_k = int(topk_ids.shape[-1])
+        hidden = int(layer._cb_hidden)
+        inter = int(layer._cb_inter)
+        dev = x.device
+        # Fixed at model load (process_weights_after_loading); a plain
+        # attribute read, so the hot path performs no environment lookup and
+        # both stages of one forward cannot disagree.
+        cfg = getattr(layer, "_cb_moe_persistent_b_cfg", 0)
+
+        pair_expert = topk_ids.reshape(-1).to(torch.int64)
+        order = torch.argsort(pair_expert, stable=True)
+        pair_token = torch.arange(
+            T, dtype=torch.int64, device=dev).repeat_interleave(top_k)
+        rows = pair_token.index_select(0, order)
+        counts = torch.bincount(pair_expert, minlength=E)
+        expert_ends = torch.cumsum(counts, 0, dtype=torch.int32).contiguous()
+
+        xq = pq_ops.fp4_act_qdq(x)
+        x_sorted = xq.index_select(0, rows).contiguous()
+        del xq
+        pair_count = int(x_sorted.shape[0])
+
+        gate_up = torch.empty((pair_count, 2 * inter), dtype=torch.bfloat16,
+                              device=dev)
+        pq_ops.cb_moe_persistent_b_prefill(
+            gate_up, x_sorted, layer.w13_cb_qweight.data, layer._cb_flat,
+            layer._cb_compose, expert_ends, self.k, self.type_size, cfg)
+        del x_sorted
+
+        activated = torch.empty((pair_count, inter), dtype=torch.bfloat16,
+                                device=dev)
+        native_moe_activation(act, activated, gate_up)
+        del gate_up
+        aq = pq_ops.fp4_act_qdq(activated)
+        del activated
+
+        pair_output = torch.empty((pair_count, hidden), dtype=torch.bfloat16,
+                                  device=dev)
+        pq_ops.cb_moe_persistent_b_prefill(
+            pair_output, aq, layer.w2_cb_qweight.data, layer._cb_flat,
+            layer._cb_compose, expert_ends, self.k, self.type_size, cfg)
+        del aq
+
+        pair_weight = topk_weights.reshape(-1).index_select(0, order) \
+            .to(pair_output.dtype)
+        pair_output.mul_(pair_weight[:, None])
+        output = torch.zeros((T, hidden), dtype=x.dtype, device=dev)
         output.index_add_(0, rows, pair_output.to(output.dtype))
         return output
 
