@@ -2,7 +2,14 @@
 # things a GPU-less machine can prove, and says where it stops.
 #
 # What it gates:
-#   * the sdist and the wheel actually contain gridbook/csrc/*.cu | *.hpp
+#   * the sdist contains every gridbook/csrc/*.cu | *.hpp in the checkout, and
+#     the wheel contains every one of them EXCEPT the declared sdist-only set
+#     (standalone developer binaries under csrc/tools/, and the pristine
+#     cutlass_fork/*_orig.hpp diff baselines). check_dist.py gates that split in
+#     both directions -- missing from the wheel is a broken install, present in
+#     the wheel is dead weight in every user's site-packages -- and
+#     tests/test_release_metadata.py re-checks it from inside the wheel that
+#     cpu-tests actually installs
 #   * a NON-EDITABLE install of the wheel resolves those sources from
 #     site-packages (the historical bug was repo-root `os.pardir` arithmetic,
 #     which resolved to <site-packages>/csrc; old releases then selected a

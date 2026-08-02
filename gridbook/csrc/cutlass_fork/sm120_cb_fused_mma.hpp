@@ -146,7 +146,7 @@ struct CollectiveMma<
   // off that cliff -- decode-ALU 0.091 ms at k44 vs 0.779 ms at k48).
   //
   // Feasibility (GemmKernel::SharedStorageSize vs sm_120's 101,376 B ceiling,
-  // TileN=64/TileK=128/Stages=2; measured by csrc/smem_probe_tilem.cu):
+  // TileN=64/TileK=128/Stages=2; measured by csrc/tools/smem_probe_tilem.cu):
   //   TileM=128 base:  k28 66,560 k32 68,608 k36 70,656 k40 72,704 k44 74,752 k48 76,800
   //   TileM=256 base:  k28 99,328 k32 101,376  (the rest are not compiled)
   // The pre-R6 base is exactly TileM*TileK*Stages + TileN*CbTypeSize*Stages +

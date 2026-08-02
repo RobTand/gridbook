@@ -1,5 +1,11 @@
 // HOST-ONLY smem budget probe for the grouped (MoE) fused CB GEMM.
 //
+// A standalone main() developer tool, NOT a serving source: nothing loads it,
+// and everything under csrc/tools/ is kept in the repo and the sdist but
+// excluded from the wheel (see pyproject.toml / MANIFEST.in). Its OUTPUT is
+// what ships -- the smem table baked into cb_fused_gemm.cu -- so re-run it
+// whenever a tile shape, stage count, or the collective's storage changes.
+//
 // Compiles the SAME collective/epilogue types cb_fused_gemm.cu instantiates,
 // for TileM x k_bits, and printf()s the SharedStorage byte sizes. There is NO
 // kernel launch and NO CUDA runtime call, so this binary runs on a GPU-less
@@ -12,11 +18,12 @@
 //                      + sizeof(Mainloop::TensorStorage)
 //                      + pipeline/scheduler storage
 //
-// build:
+// build (from the repo root; -I must name the csrc directory itself, since the
+// cutlass_fork/ includes below are relative to it):
 //   nvcc -std=c++17 -arch=sm_120a -O3 --expt-relaxed-constexpr \
-//     -I$CUTLASS/include -I$CUTLASS/tools/util/include -Icsrc \
+//     -I$CUTLASS/include -I$CUTLASS/tools/util/include -Igridbook/csrc \
 //     -I$TORCH/include -I$TORCH/include/torch/csrc/api/include \
-//     -I/usr/include/python3.12 smem_probe_tilem.cu -o probe
+//     -I/usr/include/python3.12 gridbook/csrc/tools/smem_probe_tilem.cu -o probe
 #include <cstdio>
 
 #include "cutlass/cutlass.h"

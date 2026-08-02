@@ -1,8 +1,10 @@
 // ============================================================================
 // Persistent-N FP8_CB prefill, TENSOR-CORE phase-2 (§4b v1, self-contained).
 //
-// Schedule identical to the §4a reference (cb_persistent_prefill.cu, parity-
-// green): each CTA grid-strides over N-tiles; per N-tile, phase 1 decodes the
+// Schedule identical to the §4a f32-FMA reference (cb_persistent_prefill.cu,
+// parity-green; deleted 2026-08-01 as fully superseded by this file -- see
+// docs/audits/ultraplan_perf_2026-08-01.md §4):
+// each CTA grid-strides over N-tiles; per N-tile, phase 1 decodes the
 // packed CB rows for [TILE_N, K] ONCE into resident smem (e4m3 bytes,
 // bit-exact to cb_expand_fp8 — same window extraction, same LUT); phase 2
 // streams the whole M dimension through the resident tile. INV-1: decoded

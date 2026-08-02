@@ -15,6 +15,23 @@ recursive-include tests *.py
 include scripts/prepare_lfm_fused_validation.py
 include scripts/validate_fused_nvfp4_ab.py
 
+# Developer tools that live inside the package directory but are NOT package
+# data: standalone main() binaries (gridbook/csrc/tools/) that nothing loads at
+# runtime. The pyproject package-data globs are single-level and therefore skip
+# them, which is what keeps them out of the wheel; this rule puts them back in
+# the SDIST, where the full auditable source tree belongs. Their output ships
+# (the smem table baked into cb_fused_gemm.cu), the binaries do not.
+recursive-include gridbook/csrc/tools *.cu
+
+# Same deal for the pristine CUTLASS baselines the forks are diffed against
+# (~67 KB). Nothing #includes them; they exist so a reviewer can see exactly
+# what the fork changed. Auditability wants them in the source distribution,
+# and nothing wants them in every user's site-packages. Here they must be named
+# explicitly, because the package-data glob csrc/cutlass_fork/*.hpp DOES match
+# them and pyproject's exclude-package-data is what takes them back out of the
+# wheel.
+include gridbook/csrc/cutlass_fork/*_orig.hpp
+
 # ...but `graft docs` is indiscriminate, and two things under docs/ are internal
 # working material, not documentation for someone who ran `pip install gridbook`.
 # A published sdist is permanent (a PyPI file cannot be re-uploaded), so these

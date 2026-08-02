@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Delete the unreachable native sources identified by the dead-code ledger in
+  `docs/audits/ultraplan_perf_2026-08-01.md` §4: `csrc/sm120_fp8_gemm.cu` (the
+  spent CUTLASS baseline-parity gate, whose binding validated per-token/
+  per-channel scales it then ignored), `csrc/cutlass_fork/sm120_cb_persistent_mma.hpp`
+  (an unbuilt draft of the abandoned persistent-N endgame), and
+  `csrc/cb_persistent_prefill.cu` with its test (the f32 twin of the retained
+  research kernel `cb_persistent_tc.cu`). The measured verdicts these kernels
+  produced stay recorded in ROADMAP and KERNELS.
+- Remove the `prismaquant::cb_expand_fp8_into` custom op and the
+  `l2_pin_region` / `l2_reset_window` / `l2_unpin` / `l2_persisting_max_bytes` /
+  `l2_max_window_bytes` extension bindings — registered surface with zero
+  serving call sites, left behind when the L2-pinned per-expert scratch
+  pipeline was removed from production dispatch. The allocating
+  `prismaquant::cb_expand_fp8` prefill expander is unaffected.
+- Shrink the wheel: standalone developer binaries move to
+  `gridbook/csrc/tools/` and, with the pristine `cutlass_fork/*_orig.hpp` diff
+  baselines, are now sdist-only. The repository and the source distribution
+  keep them for auditability; `check_dist.py` and `tests/test_release_metadata.py`
+  gate the split in both directions.
+- Delete the `PRISMAQUANT_CB_EXPAND` row from the environment-switch table. The
+  variable has had no reader since the Triton removal; documented switches that
+  do nothing are worse than undocumented ones.
+
 ## 0.5.1 — 2026-08-01
 
 - Documentation-only release. Add the ultraplan performance audit
