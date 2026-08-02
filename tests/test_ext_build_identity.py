@@ -356,7 +356,10 @@ def test_cutlass_include_override_reaches_every_cutlass_loader(
     _patch_capability(monkeypatch, (12, 1))
 
     for loader, symbols in (
-        (cuda_ext.get_bf16_grouped_ext, cuda_ext._BF16_GROUPED_SYMBOLS),
+        # cc 12.1 also compiles the sm12x-native lane, whose bindings the
+        # loader requires strictly.
+        (cuda_ext.get_bf16_grouped_ext,
+         cuda_ext._BF16_GROUPED_SYMBOLS + cuda_ext._BF16_GROUPED_SM120_SYMBOLS),
         (cuda_ext.get_fused_ext, cuda_ext._FUSED_SYMBOLS),
         (cuda_ext.get_fused_fp4_ext,
          cuda_ext._FUSED_FP4_SYMBOL_FAMILIES[0][1]),

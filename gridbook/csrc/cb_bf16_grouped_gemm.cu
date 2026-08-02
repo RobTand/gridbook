@@ -4,6 +4,30 @@
 // of Gridbook's group-16 QDQ.  This kernel therefore changes only the GEMM
 // launch topology: one device-scheduled CUTLASS group instead of one GEMM per
 // expert.  Accumulation is FP32 and the epilogue rounds once to BF16.
+//
+// TWO LANES LIVE HERE (2026-08-01 performance audit, §3 P1):
+//
+//  1. `cb_bf16_grouped_mm[_out]` — the ORIGINAL device-scheduled CUTLASS 2.x
+//     `DefaultGemmGrouped` on an `arch::Sm80` schedule (Ampere `m16n8k16`, no
+//     TMA, no warp specialization). It consumes EXACT per-expert segments via
+//     cumulative `expert_ends`, needs no padding, and runs on every device from
+//     cc 8.0 up. It is compiled on every device and stays the DEFAULT.
+//
+//  2. `cb_bf16_grouped_mm_sm120[_out]` — the sm12x-NATIVE lane: a CUTLASS 3.x
+//     collective with a TMA warp-specialized mainloop, stages carved out of the
+//     sm120 smem budget, and the row-padded TILE-INDEXED grouping Gridbook's
+//     two fused kernels already use (see cb_grouped_common.hpp). Compiled only
+//     when the loader defines `PRISMAQUANT_CB_BF16_SM120` (cc 12.x), and
+//     dispatched only behind `PRISMAQUANT_CB_BF16_SM120=1` — OPT-IN, per
+//     docs/NATIVE-PARITY.md.
+//
+// NUMERICS, both lanes: FP32 accumulate, alpha=1/beta=0, ONE round to BF16 in
+// the epilogue. There are no scales in this bridge and none are added. What
+// differs between the lanes is the REDUCTION ORDER of the FP32 accumulation
+// (different tile shape, different K-iteration, different warp partitioning) —
+// that difference, and nothing else, is the requalification surface for the
+// new lane. It is the same class of change the promoted FP8 mid-M fused kernel
+// cleared: bit-level unit gates first, then the NATIVE-PARITY served protocol.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -11,11 +35,22 @@
 #include <c10/cuda/CUDAException.h>
 
 #include <limits>
+#include <vector>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
+
+#if defined(PRISMAQUANT_CB_BF16_SM120)
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/util/packed_stride.hpp"
+
+#include "cutlass_fork/sm120_bf16_expert_mma.hpp"
+#include "cb_grouped_common.hpp"
+#endif
 
 namespace {
 
@@ -209,6 +244,267 @@ void cb_bf16_grouped_mm_out(torch::Tensor output,
   check_and_run_grouped_mm(output, a, weights, expert_ends, expert_start);
 }
 
+// ===========================================================================
+// LANE 2 — sm12x-native CUTLASS 3.x collective, row-padded tile-indexed
+// grouping.  Compiled only for cc 12.x (loader-defined macro).
+// ===========================================================================
+#if defined(PRISMAQUANT_CB_BF16_SM120)
+
+// ---------------------------------------------------------------------------
+// WHY THE COLLECTIVE IS HAND-BUILT.
+//
+// Upstream CUTLASS 4.3.4's sm120 dense CollectiveBuilder refuses 16-bit input:
+// `sm120_mma_builder.inl` carries
+//   static_assert(is_sm10x_f8f6f4_element<ElementA>() && ...,
+//                 "SM120 TmaWarpSpecialized builder currently only supports
+//                  F8F6F4 MMA.")
+// and its `rr_op_selector_sm120` unconditionally returns the 8-bit
+// `SM120_16x8x32_TN` atom. The MAINLOOP, however, is type-generic — it
+// branches on `IsF8F6F4` for its smem allocation type and its fp4 shifts are
+// no-ops for every other atom — so what is missing is only the builder's
+// operand selection. We therefore assemble the same four choices the builder
+// makes for f8f6f4, in their 16-bit forms, and hand them to the (forked)
+// mainloop:
+//
+//   MMA atom      SM80_16x8x16_F32BF16BF16F32_TN — the bf16 tensor-core
+//                 instruction on sm_120; rmem-sourced, which is exactly what
+//                 this mainloop requires (it static_asserts no GMMA
+//                 descriptor iterators).
+//   Atom layout   4x2x1 warps = 256 threads, the builder's cooperative shape.
+//   Permutation   Tile<_128,_32,_16>: M repeats the 4-warp row twice to cover
+//                 TileM=128, and N is widened to 32 (2 n-atoms) so ONE
+//                 ldmatrix.x4 fills a thread's B fragment — the same reason
+//                 upstream widens PermTileN to 32 for 8-bit.
+//   Smem atom     rs_smem_selector<K-major> — CUTLASS's own selector for a
+//                 swizzled K-major tile that TMA writes and LDSM reads (the
+//                 sm90 "RS" mainloop uses it for precisely this pairing).
+//
+// Everything downstream (TMA descriptors, pipeline, tile scheduler, epilogue)
+// is stock CUTLASS. The stage count comes from the same
+// StageCountAutoCarveout helper the builder uses, against the sm120 smem
+// budget with the epilogue's storage carved out.
+// ---------------------------------------------------------------------------
+namespace sm120_lane {
+
+// NOTE: `using namespace cute;` stays INSIDE this named namespace. cute opens
+// its own anonymous namespace (cute/atom/mma_traits_sm70.hpp), so a
+// file-scope using-directive would make this TU's anonymous namespace name
+// ambiguous with cute's — and nvcc's generated device-stub, which references
+// the SM80 lane's __global__ through _NV_ANON_NAMESPACE, then fails to
+// compile. Confining it keeps both lanes in one translation unit.
+using namespace cute;
+
+namespace cutlass_detail = cutlass::gemm::collective::detail;
+
+using ElementAcc = float;
+using ClusterShape = Shape<_1, _1, _1>;
+
+// The bf16 tensor-core atom, 8 warps cooperative, N widened for ldmatrix.x4.
+template <class TileShape>
+struct MmaCfg {
+  using TiledMma = decltype(cute::make_tiled_mma(
+      cute::MMA_Atom<cute::SM80_16x8x16_F32BF16BF16F32_TN>{},
+      cute::Layout<cute::Shape<_4, _2, _1>>{},
+      cute::Tile<decltype(cute::min(size<0>(TileShape{}), _128{})),
+                 _32, _16>{}));
+  using SmemLayoutAtomA = decltype(cutlass_detail::rs_smem_selector<
+      cute::GMMA::Major::K, Element,
+      decltype(cute::get<0>(TileShape{})),
+      decltype(cute::get<2>(TileShape{}))>());
+  using SmemLayoutAtomB = decltype(cutlass_detail::rs_smem_selector<
+      cute::GMMA::Major::K, Element,
+      decltype(cute::get<1>(TileShape{})),
+      decltype(cute::get<2>(TileShape{}))>());
+  using SmemCopyAtom = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
+};
+
+template <class TileShape>
+struct Cfg {
+  // Plain alpha=1/beta=0 epilogue: this bridge has no scales, and adding any
+  // would change the served numerics rather than only the reduction order.
+  using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
+      TileShape, ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAcc, ElementAcc,
+      void, LayoutC, kAlignment,
+      Element, LayoutC, kAlignment,
+      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+  // Stage count: (sm120 capacity - epilogue storage) / per-stage bytes, the
+  // builder's own arithmetic. A/B smem is the only per-stage tensor storage —
+  // no packed stream, no decoded buffer, so BF16 gets more stages than the
+  // fused lanes at the same tile.
+  static constexpr int kStages =
+      cutlass_detail::sm100_compute_stage_count_or_override<
+          cutlass_detail::sm120_smem_capacity_bytes,
+          Element, Element, TileShape,
+          typename cutlass::PipelineTmaUmmaAsync<1>::SharedStorage>(
+              cutlass::gemm::collective::StageCountAutoCarveout<
+                  static_cast<int>(sizeof(
+                      typename Epilogue::SharedStorage))>{});
+  static_assert(kStages >= 2,
+                "the sm120 BF16 collective needs at least two mainloop stages");
+
+  using DispatchPolicy =
+      cutlass::gemm::MainloopSm120CbBf16ExpertTmaWarpSpecialized<
+          kStages, /*SchedulerPipelineStageCount=*/2, ClusterShape,
+          cutlass::gemm::KernelTmaWarpSpecializedCooperativeSm120<2>>;
+
+  using Mainloop = cutlass::gemm::collective::CollectiveMma<
+      DispatchPolicy, TileShape,
+      Element, cutlass::gemm::TagToStrideA_t<LayoutA>,
+      Element, cutlass::gemm::TagToStrideB_t<LayoutB>,
+      typename MmaCfg<TileShape>::TiledMma,
+      cute::SM90_TMA_LOAD, typename MmaCfg<TileShape>::SmemLayoutAtomA,
+      typename MmaCfg<TileShape>::SmemCopyAtom, cute::identity,
+      cute::SM90_TMA_LOAD, typename MmaCfg<TileShape>::SmemLayoutAtomB,
+      typename MmaCfg<TileShape>::SmemCopyAtom, cute::identity>;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>, Mainloop, Epilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+// TileM is the row-padding granularity python must respect. ONE rung is
+// compiled, deliberately: unlike the fused lanes — where a larger TileM
+// amortizes a per-tile B DECODE and the ladder is a real tradeoff — B here is
+// plain BF16 read through TMA, so a larger TileM buys no arithmetic and costs
+// strictly more padded rows on short experts. TileN=128/TileK=64 keeps the
+// 128-byte swizzle atom (K=64 bf16 = 128 B) and leaves room for several
+// stages.
+using GroupedTile = Shape<_128, _128, _64>;
+constexpr int64_t kSm120TileM = size<0>(GroupedTile{});
+
+using GroupedCfg = Cfg<GroupedTile>;
+static_assert(gridbook::grouped::AssertSmemFits<
+                  typename GroupedCfg::GemmKernel>::value);
+
+void run_sm120_grouped(torch::Tensor output, torch::Tensor a,
+                       torch::Tensor weights, torch::Tensor expert_ids,
+                       int64_t tile_m) {
+  using Gemm = typename GroupedCfg::Gemm;
+  using GemmKernel = typename GroupedCfg::GemmKernel;
+
+  TORCH_CHECK(a.is_cuda() && weights.is_cuda() && expert_ids.is_cuda(),
+              "a, weights and expert_ids must be CUDA tensors");
+  TORCH_CHECK(a.scalar_type() == torch::kBFloat16 &&
+                  weights.scalar_type() == torch::kBFloat16,
+              "a and weights must be BF16");
+  TORCH_CHECK(a.dim() == 2, "expected a padded activation [Mp,K]");
+  TORCH_CHECK(tile_m == kSm120TileM,
+              "the sm120 grouped BF16 lane compiles tile_m=", kSm120TileM,
+              " only (got ", tile_m,
+              "); query cb_bf16_grouped_sm120_tile_sizes()");
+
+  const int64_t mp = a.size(0);
+  const int64_t k = a.size(1);
+  const int64_t e = weights.size(0);
+  const int64_t n = weights.size(1);
+  gridbook::grouped::check_stacked_experts(weights, weights.size(1),
+                                           "weights");
+  TORCH_CHECK(weights.size(2) == k,
+              "shape mismatch: a [Mp,K] and weights [E,N,K]");
+  TORCH_CHECK(mp <= std::numeric_limits<int>::max() &&
+                  n <= std::numeric_limits<int>::max() &&
+                  k <= std::numeric_limits<int>::max() &&
+                  e <= std::numeric_limits<int>::max(),
+              "grouped GEMM dimensions exceed int32");
+  TORCH_CHECK(k % kAlignment == 0 && n % kAlignment == 0,
+              "K and N must be multiples of 8 BF16 elements");
+  TORCH_CHECK(a.is_contiguous(), "a must be contiguous [Mp,K]");
+  gridbook::grouped::check_padded_rows(mp, tile_m);
+  gridbook::grouped::check_expert_ids(a, expert_ids, mp, tile_m, e);
+  gridbook::grouped::check_same_cuda_device(a, weights, "weights");
+  TORCH_CHECK(output.is_cuda() && output.device() == a.device() &&
+                  output.scalar_type() == torch::kBFloat16 &&
+                  output.dim() == 2 && output.size(0) == mp &&
+                  output.size(1) == n && output.is_contiguous(),
+              "output must be a contiguous CUDA BF16 [Mp,N] tensor on a's "
+              "device");
+  if (mp == 0) {
+    return;
+  }
+
+  const c10::cuda::OptionalCUDAGuard guard(a.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  using StrideA = typename GemmKernel::StrideA;
+  using StrideB = typename GemmKernel::StrideB;
+  using StrideC = typename GemmKernel::StrideC;
+  using StrideD = typename GemmKernel::StrideD;
+  const int mpi = int(mp), ni = int(n), ki = int(k), ei = int(e);
+  StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {mpi, ki, 1});
+  // B's batch mode is the EXPERT mode: per-expert stride N*K, which is exactly
+  // a contiguous [E,N,K] stack. The problem's own L stays 1.
+  StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {ni, ki, ei});
+  StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {mpi, ni, 1});
+
+  typename Gemm::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {mpi, ni, ki, 1},
+      {reinterpret_cast<const Element*>(a.data_ptr()), sa,
+       reinterpret_cast<const Element*>(weights.data_ptr()), sb,
+       expert_ids.data_ptr<int>(), ei},
+      {{1.0f, 0.0f}, nullptr, StrideC{},
+       reinterpret_cast<Element*>(output.data_ptr()), sd}};
+
+  Gemm gemm;
+  size_t ws = Gemm::get_workspace_size(args);
+  auto workspace = torch::empty({int64_t(ws)},
+                                a.options().dtype(torch::kUInt8));
+  auto status = gemm.can_implement(args);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "sm120 grouped BF16 can_implement failed: ",
+              cutlass::cutlassGetStatusString(status));
+  status = gemm.initialize(args, workspace.data_ptr(), stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "sm120 grouped BF16 initialize failed: ",
+              cutlass::cutlassGetStatusString(status));
+  status = gemm.run(stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "sm120 grouped BF16 run failed: ",
+              cutlass::cutlassGetStatusString(status));
+}
+
+torch::Tensor cb_bf16_grouped_mm_sm120(torch::Tensor a, torch::Tensor weights,
+                                       torch::Tensor expert_ids,
+                                       int64_t tile_m) {
+  TORCH_CHECK(a.dim() == 2 && weights.dim() == 3,
+              "expected a [Mp,K] and weights [E,N,K]");
+  auto output = torch::empty({a.size(0), weights.size(1)}, a.options());
+  run_sm120_grouped(output, a, weights, expert_ids, tile_m);
+  return output;
+}
+
+void cb_bf16_grouped_mm_sm120_out(torch::Tensor output, torch::Tensor a,
+                                  torch::Tensor weights,
+                                  torch::Tensor expert_ids, int64_t tile_m) {
+  run_sm120_grouped(output, a, weights, expert_ids, tile_m);
+}
+
+int64_t cb_bf16_grouped_sm120_tile_m() { return kSm120TileM; }
+
+std::vector<int64_t> cb_bf16_grouped_sm120_tile_sizes() {
+  return {kSm120TileM};
+}
+
+// Host-only config attestation: what was actually compiled. Used by the tests
+// and by the KERNELS.md evidence table (no launch, no device needed).
+// [tile_m, tile_n, tile_k, stages, SharedStorageSize, sm120 capacity].
+std::vector<int64_t> cb_bf16_grouped_sm120_config() {
+  return {int64_t(size<0>(GroupedTile{})),
+          int64_t(size<1>(GroupedTile{})),
+          int64_t(size<2>(GroupedTile{})),
+          int64_t(GroupedCfg::kStages),
+          int64_t(GroupedCfg::GemmKernel::SharedStorageSize),
+          int64_t(cutlass::arch::sm120_smem_capacity_bytes)};
+}
+
+}  // namespace sm120_lane
+
+#endif  // PRISMAQUANT_CB_BF16_SM120
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -221,4 +517,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("output"), pybind11::arg("a"),
         pybind11::arg("weights"), pybind11::arg("expert_ends"),
         pybind11::arg("expert_start") = 0);
+#if defined(PRISMAQUANT_CB_BF16_SM120)
+  m.def("cb_bf16_grouped_mm_sm120", &sm120_lane::cb_bf16_grouped_mm_sm120,
+        "sm12x-native CUTLASS BF16 grouped GEMM (TMA warp-specialized): ONE "
+        "launch over row-padded A [Mp,K] where each tile_m block multiplies "
+        "expert_ids[tile]'s slice of the stacked weights [E,N,K]. Mp must be a "
+        "multiple of tile_m (= cb_bf16_grouped_sm120_tile_m()). fp32 "
+        "accumulate, alpha=1/beta=0, one bf16 round — same numerics class as "
+        "the SM80 lane, different FP32 reduction order.",
+        pybind11::arg("a"), pybind11::arg("weights"),
+        pybind11::arg("expert_ids"),
+        pybind11::arg("tile_m") = sm120_lane::kSm120TileM);
+  m.def("cb_bf16_grouped_mm_sm120_out", &sm120_lane::cb_bf16_grouped_mm_sm120_out,
+        "sm12x-native grouped BF16 GEMM into a caller-owned [Mp,N] output",
+        pybind11::arg("output"), pybind11::arg("a"), pybind11::arg("weights"),
+        pybind11::arg("expert_ids"),
+        pybind11::arg("tile_m") = sm120_lane::kSm120TileM);
+  m.def("cb_bf16_grouped_sm120_tile_m", &sm120_lane::cb_bf16_grouped_sm120_tile_m,
+        "row-padding granularity of the sm12x-native lane");
+  m.def("cb_bf16_grouped_sm120_tile_sizes", &sm120_lane::cb_bf16_grouped_sm120_tile_sizes,
+        "every TileM compiled for the sm12x-native lane (enumerate THIS)");
+  m.def("cb_bf16_grouped_sm120_config", &sm120_lane::cb_bf16_grouped_sm120_config,
+        "[tile_m, tile_n, tile_k, stages, SharedStorageSize, sm120 capacity]");
+#endif
 }
