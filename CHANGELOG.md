@@ -22,7 +22,13 @@
   telemetered as groups-touched vs minimum) removes the straddle excess,
   measured 14–17% GEMM time at ``T=512`` and neutral at ``T=128``. The dense
   ``E=1`` helper now uses the gather mode too (``row_src = arange``; no
-  padded copy, no concat). BENCH_NUMBERS_SENTENCE Bit gates extended to
+  padded copy, no concat). Measured on the GB10 (whole operator, warm
+  medians, seed-731 DSV4/Laguna cells): **1.03–1.05× segmented BF16
+  matmuls at ``T=128`` and 1.10–1.15× at ``T=512``** — the padded-copy
+  construction's measured 0.83–0.92× ``T=512`` deficit is closed — while
+  beating the SM80 bridge by 1.13–1.37× everywhere; a ``TileM`` ladder was
+  evaluated against the sweep record instead and is measured-dead for these
+  cells (every 128-row tile ≤ 0.97× segmented). Bit gates extended to
   every new boundary (gather==padded bitwise on every routing shape incl.
   K-residue, OOB ids read zeros, packed order is a pure block permutation);
   flag semantics, the SM80 lane, and flag-off dispatch are byte-for-byte

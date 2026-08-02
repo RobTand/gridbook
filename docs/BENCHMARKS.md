@@ -201,17 +201,93 @@ of four shapes; at 80 M-tiles swizzle 8 was worth 1.36× on `w13`
 optimises the worst cell. Swizzle is a tile-ORDER argument and cannot move a
 bit of output.
 
-**Status.** The lane stays **opt-in**. It now strictly dominates the SM80
-bridge it would replace on every cell at `T ≤ 512` except one (`w13` at
-`T=512`, 0.938×), meets the segmented-parity target at `T=128`, and misses it
-at `T=512`. The two remaining structural costs are named and measured: the
-ragged padding tax above, and the padded activation gather (0.02–0.35 ms per
-launch here) that the exact-segment lane does not pay. Closing them needs a
-change of construction, not of schedule — a TileM ladder selected by measured
-rows-per-expert (which the fused lanes already have, and which the `tile_m`
-binding and dispatch helper already parameterise), or an A-side row-gather
-inside the mainloop. The served [NATIVE-PARITY](NATIVE-PARITY.md) protocol has
-not been run.
+**Status (superseded 2026-08-02).** This table describes the lane's original
+PADDED-COPY mode with the natural expert order; those numbers still hold for
+that mode and the analysis above (the padding tax, the sweep, the swizzle
+policy) remains the measured record. The two structural costs it names —
+the ragged padding tax and the padded activation gather — are closed by the
+construction changes in the next section: an in-mainloop A-row gather and a
+swizzle-group-aligned expert order. A `TileM` ladder was considered and is
+measured-dead for these cells: every 128-row tile in the sweep above
+(cooperative AND pingpong, all four swizzles, three raster orders) landed at
+≤ 0.97× segmented, because the swizzle already recovers same-expert B reuse
+in L2 while the 1.5× padding of a 128 rounding granularity is real work. The
+served [NATIVE-PARITY](NATIVE-PARITY.md) protocol has not been run.
+
+## 2026-08-02 sm12x grouped-BF16 lane: in-mainloop A-row gather + swizzle-aligned tile order (PROPOSAL DATA)
+
+Same instrument, cells, seed and warm discipline as the table above
+(`scripts/bench_bf16_grouped_sm120.py`, seed-731 router, `E=32`, `top_k=8`,
+warm = median of 30 CUDA-event samples after 10 warmups, GB10 `sm_121`,
+Torch 2.11.0+cu130, `gridbook:test`, GPU held exclusively under the bench
+lock), so the rows are directly comparable. Two construction changes to the
+SAME compiled collective — the kernel schedule, tile (pingpong 64×128×64),
+stages (3) and shared memory (83,968 B) are unchanged:
+
+1. **In-mainloop A-row gather** (`cb_bf16_grouped_mm_sm120_gather[_out]`).
+   The producer warp reads each padded row through `row_src[m]` from the
+   COMPACT activation with predicated, zero-filling 16-byte `cp.async` (ids
+   outside `[0, S)` are the padding rows), instead of TMA-reading a
+   materialized row-padded copy. The padded activation copy — an HBM write
+   plus a padded re-read too large for L2 — no longer exists, and the compact
+   source IS L2-resident at these sizes. Producer accounting follows
+   upstream's own `sm120_mma_tma_blockwise_scaling.hpp` idiom (33 producer
+   events; B-only transaction bytes). The smem stage bytes are identical to
+   the padded-copy mode's, so the two modes are **bit-identical**
+   (`tests/test_bf16_grouped_cutlass.py` asserts `torch.equal` on every
+   routing shape, including K-residue).
+2. **Swizzle-group-aligned expert order**
+   (`bf16_grouped_lane.pack_expert_blocks`). The tile scheduler sweeps N with
+   groups of 8 M-tiles (the measured large-grid swizzle), so an expert whose
+   tiles straddle a group boundary has its whole B slice fetched from DRAM
+   once per group touched. Packing experts into groups — deterministic
+   first-fit-decreasing on the routing histogram, pure host math, telemetered
+   as groups-touched vs minimum — aligns the boundaries: at `T=512` the
+   seed-731 routing straddles 39 groups against a 32-group minimum, and
+   packing reaches exactly 32/32 (the `grp` column). Tile order is scheduler
+   order; the bit gate asserts a packed order is a pure block permutation.
+
+`sm12x gather` below is the whole operator — ONE launch, no gather kernel, no
+copy (the `row_src`/`expert_ids` layout vectors are routing products of the
+same excluded class as every arm's routing). `sm12x padded` is the previous
+mode re-measured in the same session, with its padded copy inside the timed
+region as before.
+
+| T | shape | P | Mp | sm12x gather | sm12x padded | SM80 | segmented | gather / SM80 | gather / segmented |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | `w13` K=4096 N=4096 | 1,024 | 2,048 | 5.591 ms | 5.496 ms | 6.670 ms | 5.865 ms | **1.193×** | **1.049×** |
+| 128 | `w2` K=2048 N=4096 | 1,024 | 2,048 | 2.492 ms | 2.520 ms | 2.993 ms | 2.571 ms | **1.201×** | **1.032×** |
+| 128 | Laguna s1 K=3072 N=2048 | 1,024 | 2,048 | 1.847 ms | 1.948 ms | 2.254 ms | 1.906 ms | **1.221×** | **1.032×** |
+| 128 | Laguna s2 K=1024 N=3072 | 1,024 | 2,048 | 1.002 ms | 0.984 ms | 1.135 ms | 1.053 ms | **1.133×** | **1.051×** |
+| 512 | `w13` K=4096 N=4096 | 4,096 | 5,120 | 6.870 ms | 8.057 ms | 8.089 ms | 7.606 ms | **1.177×** | **1.107×** |
+| 512 | `w2` K=2048 N=4096 | 4,096 | 5,120 | 2.662 ms | 3.321 ms | 3.458 ms | 3.035 ms | **1.299×** | **1.140×** |
+| 512 | Laguna s1 K=3072 N=2048 | 4,096 | 5,120 | 2.040 ms | 2.735 ms | 2.795 ms | 2.247 ms | **1.370×** | **1.102×** |
+| 512 | Laguna s2 K=1024 N=3072 | 4,096 | 5,120 | 1.050 ms | 1.303 ms | 1.330 ms | 1.209 ms | **1.267×** | **1.151×** |
+
+**Isolated effect of the tile order alone** (GEMM-only, padded-copy mode,
+same iso protocol as the packed-vs-ragged table above, `T=512`): natural vs
+packed order — `w13` 8.071 → 6.824 ms, `w2` 3.209 → 2.709 ms, s1
+2.504 → 2.081 ms, s2 1.234 → 1.063 ms (13.9–16.9%), while at `T=128`
+(32 tiles, swizzle 1) the order is neutral to <0.3%. The group-straddle
+excess (39/32 ≈ 1.22× B-slice fetches) was the single largest remaining tax
+at `T=512`; the gather then removes the padded copy and turns the A stream
+into L2-resident compact reads (`s1` gather 2.040 ms vs 2.081 ms for the
+packed GEMM alone — the gather mode is faster than the padded GEMM even
+before counting the copy it deletes).
+
+**Where this lands against the P1 target** ("≥ segmented-BF16 parity warm"):
+**met on every cell at both token counts** — 1.032–1.051× segmented at
+`T=128` and 1.102–1.151× at `T=512`, while beating the SM80 bridge it
+replaces by 1.133–1.221× (`T=128`) and 1.177–1.370× (`T=512`). The
+`T=512` cells that missed at 0.83–0.92× under the padded-copy construction
+now clear parity by 10–15%.
+
+**Status.** The lane stays **opt-in** (`PRISMAQUANT_CB_BF16_SM120`); these
+are whole-operator microbenchmarks and PROPOSAL DATA — the served
+[NATIVE-PARITY](NATIVE-PARITY.md) protocol has not been run. The gather mode
+and the tile-order policy change no output bit relative to the padded mode
+(gated `torch.equal`), so the lane's requalification surface is unchanged:
+FP32 reduction order vs the SM80 lane, exactly as before.
 
 ## What is being compared, and how
 
