@@ -384,11 +384,28 @@ def test_fp4_symbol_families_exist_in_packaged_source():
         assert not (set(required) - exported)
 
 
-def test_main_optional_bindings_stay_optional():
-    for name in ("cb_expand_fp8_into", "l2_pin_region", "l2_reset_window",
-                 "l2_unpin", "l2_persisting_max_bytes",
-                 "l2_max_window_bytes"):
-        assert name not in cuda_ext._EXT_SYMBOLS
+def test_retired_l2_pipeline_surface_stays_deleted():
+    """The L2-pinned scratch pipeline's binding residue must not come back.
+
+    ``cb_expand_fp8_into`` and the ``l2_*`` access-policy-window helpers were
+    the last surviving pieces of a pipeline that wedged live serving three
+    times and was removed from production dispatch and its selector surface.
+    They outlived it as *exported symbols with zero call sites*, which is worse
+    than dead code: every reader after the removal has to prove to themselves
+    that nothing dispatches to them. Deleted per
+    ``docs/audits/ultraplan_perf_2026-08-01.md`` §4 -- kernel, binding, custom
+    op, and probe together -- and their absence is now the contract, in all
+    three places the surface was visible.
+    """
+    retired = ("cb_expand_fp8_into", "l2_pin_region", "l2_reset_window",
+               "l2_unpin", "l2_persisting_max_bytes", "l2_max_window_bytes")
+    assert not (set(retired) & _exports("cb_gemv.cu"))
+    assert not (set(retired) & set(cuda_ext._EXT_SYMBOLS))
+    ops = pytest.importorskip("gridbook.ops", reason="torch unavailable")
+    assert not [name for name in retired if hasattr(ops, name)]
+    assert not hasattr(ops, "cb_expand_fp8_into_available")
+    # The allocating expander it was a variant OF is live and required.
+    assert "cb_expand_fp8" in cuda_ext._EXT_SYMBOLS
 
 
 def test_main_contract_rejects_pre_fp4_qdq_revision(monkeypatch, capsys,
