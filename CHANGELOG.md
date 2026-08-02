@@ -63,6 +63,76 @@
   expand's transient bytes. Proposal data only, served NATIVE-PARITY protocol
   not run, and an unexplained M ≤ 12 latency cliff is recorded as open;
   `scripts/bench_fp4v2_fused_midm.py` reproduces the table.
+- Add a **persistent-B grouped MoE decode-in-mainloop kernel**
+  (`csrc/cb_moe_persistent_b.cu`, ROADMAP K1.1 / audit §3 P2b), the FP4-CB
+  answer to the ~35%-of-layer-time MoE expand tax. A CTA owns one
+  `(expert, N-tile)`, decodes that weight tile from packed CB bytes into
+  shared memory **once**, and streams the expert's routed rows through it with
+  the M-loop inside the kernel — so the `[E,N,K]` BF16 transient is never
+  written or read back and unrouted experts cost two int32 loads. It consumes
+  the **exact** `expert_ends` segments the default quality path already builds
+  (no padded rows, no host read anywhere on the path), and its launch geometry
+  is `E × ceil(N/TN)`, a function of the layer shape alone, so the call is
+  CUDA-graph capturable as it stands. The mainloop is hand-assembled from
+  `mma.sync.m16n8k16` / `ldmatrix` / `cp.async` rather than a CUTLASS
+  collective, because no CUTLASS grouping construction on this architecture
+  permits an in-kernel M-loop over one expert's segment. This is **not** a
+  revival of the retired dense persistent-N schedule: it is MoE-only with no
+  dense entry point in the translation unit, it uses tensor cores, and its win
+  comes from amortizing a decode that kernel never had. Dense large-M stays
+  behind K1.3.
+  The weight decode is **bit-identical to `cb_expand_v2`** — a tested fact, not
+  an asserted one: `cb_moe_persistent_b_decode` exposes the mainloop's own
+  decode stage and the suite compares it to the expander with `torch.equal`
+  across the k=12–24 rungs, on full and windowed row ranges. Activations are
+  the same exact group-16 RTN QDQ payload and the epilogue rounds once to
+  bf16, so only the FP32 reduction order changes (reassociation-class, gated
+  at parity with per-segment `F.linear`). **Opt-in** behind
+  `PRISMAQUANT_CB_MOE_PERSISTENT_B=1`, FP4-CB-v2 layers on cc 12.0/12.1,
+  resolved at model load and failing the load — including the
+  `..._CFG` tile override, validated against what the build compiled — rather
+  than silently serving the other route. With the flag unset the dispatch is
+  byte-for-byte what it was.
+  Measured on nine **whole-routed-operator** cells (routing + QDQ + both
+  projection stages + activation + combine, per the NATIVE-PARITY grouped-MoE
+  rule): **1.05–3.36× over the default bridge and 1.04–3.02× over the pingpong
+  bridge, winning every cell**, with the deleted expansion measuring
+  **20.9–46.7%** of the default operator and *not* shrinking with expert count
+  — at `E=128` it is 38–47% at every token count, because the expansion pays
+  for every expert whether the router used it or not.
+  `scripts/bench_moe_persistent_b.py` reproduces the table; proposal data only,
+  served protocol not run.
+- Harden that kernel against three defects a dedicated graph/stream audit
+  found, two of which no test in the suite could have caught. (1) A **WAR race
+  on the A double buffer**: the `cp.async` prefetch for stage `st+1` targets
+  the same buffer `mma(st-1)` is reading and sat above the barrier that
+  separates them, so a lagging warp could have its A fragment overwritten
+  mid-MMA. Latent — not reproducible in ~1.15e9 stage×warp opportunities under
+  SM contention — but reproducible at 400 cycles of injected warp skew, where
+  relative error went from 1.6e-3 to 0.3-0.6. The prefetch now issues below the
+  barrier. (2) `expert_ends` is DEVICE data whose **values** the host cannot
+  check, and the kernel used them unclamped for both the row predicate and the
+  store predicate; a hand-built out-of-range entry through the public binding
+  produced an illegal access. The segment is now clamped to `[0, P]` with one
+  register `min`. (3) The routing counted with `torch.bincount`, whose CUDA
+  implementation host-syncs (it sizes its output from `self.max().item()`), so
+  the lane's "no host read on this path" claim was false and the operator could
+  not be captured end to end. It counts with `scatter_add_` now — identical
+  integers, pure device work — and a test captures the whole routed operator
+  and a negative control proves the avoided call really does break capture.
+  Also added: alignment `TORCH_CHECK`s for the operands whose instruction
+  selection assumes them, an `NATOM % 2` static assert, and a device gate that
+  states the schedule's real shared-memory need instead of the whole budget.
+- Record two measured-negative results from that kernel's tile sweep rather
+  than only its winners: the `128×128` and `256×64` tiles both fall to one CTA
+  per SM and never won a sweep cell — `256×64` halves the decode repetition at
+  large rows-per-expert, exactly the regime it should own, and still lost — and
+  a resident codebook in shared memory (`cb_gemv_v2.cu`'s DS=2 idea) cost 1.9×
+  by tripping over the ~1 KiB the hardware reserves per CTA while buying ~1%
+  where it fit. `csrc/tools/persistent_b_probe.cu` reproduces the budget table
+  and the binding now `TORCH_CHECK`s the two-CTAs-per-SM floor that both
+  results are about.
+
 - Add an **sm12x-native CUTLASS 3.x lane** to the quality-preserving BF16
   grouped bridge (`csrc/cb_bf16_grouped_gemm.cu`, audit §3 P1): TMA
   warp-specialized mainloop, stages carved out of the sm120 shared-memory

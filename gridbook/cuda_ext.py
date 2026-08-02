@@ -1408,4 +1408,165 @@ def _load_fused_fp4v2_ext_locked():
     finally:
         _fused_fp4v2_tried = True
     return _fused_fp4v2
-# =========================== END P2a BLOCK =================================
+# =========================== END P2a BLOCK ========================================
+# BEGIN ADDITIVE BLOCK — persistent-B grouped MoE loader (ROADMAP K1.1, audit
+# §3 P2b).  Self-contained: it adds module-level globals, constants and three
+# functions, and modifies nothing above.
+# ===========================================================================
+_moe_persistent_b = None
+_moe_persistent_b_tried = False
+_moe_persistent_b_lock = threading.Lock()
+
+# The one packaged translation unit.  The kernel is hand-assembled from PTX
+# `mma.sync`/`ldmatrix`/`cp.async` rather than a CUTLASS collective, so unlike
+# the grouped-BF16 and fused modules it includes no `cutlass_fork` header and
+# no CUTLASS at all — there is nothing else to hash, and no CUTLASS include
+# path to discover.  Should it ever grow a Gridbook header, adding the name
+# here is the whole change (tests/test_moe_persistent_b_lane.py asserts the
+# declared inputs cover every Gridbook include the source actually has).
+_MOE_PERSISTENT_B_BUILD_INPUTS = ("cb_moe_persistent_b.cu",)
+# Starts at 1: this module's identity payload is new.
+_MOE_PERSISTENT_B_ABI_SCHEMA = 1
+
+# Strict symbol contract.  The digest keys both the module name and the build
+# directory, so a module that loads at all was built from exactly this source;
+# a missing binding is a broken build, not an older one.
+_MOE_PERSISTENT_B_SYMBOLS = (
+    "cb_moe_persistent_b_prefill",
+    "cb_moe_persistent_b_decode",
+    "cb_moe_persistent_b_prepare",
+    "cb_moe_persistent_b_configs",
+    "cb_moe_persistent_b_tile_k",
+    "cb_moe_persistent_b_is_moe_only",
+)
+# The capabilities whose tensor-core/`cp.async` schedule this kernel targets.
+# Same set the fused modules and the sm12x BF16 lane gate on.
+_MOE_PERSISTENT_B_CAPABILITIES = ((12, 0), (12, 1))
+
+
+def moe_persistent_b_buildable(capability) -> bool:
+    """Whether the persistent-B grouped MoE kernel compiles for ``capability``."""
+    return tuple(capability) in _MOE_PERSISTENT_B_CAPABILITIES
+
+
+def get_moe_persistent_b_ext():
+    """Load Gridbook's persistent-B grouped MoE decode-in-mainloop kernel.
+
+    Capability probes may inspect the ``None`` result; production calls use
+    :func:`require_moe_persistent_b_ext` and fail closed.
+    """
+    if _moe_persistent_b_tried:
+        return _moe_persistent_b
+    with _moe_persistent_b_lock:
+        if _moe_persistent_b_tried:
+            return _moe_persistent_b
+        return _load_moe_persistent_b_ext_locked()
+
+
+def require_moe_persistent_b_ext(operation: str = "this operation"):
+    """Return the persistent-B grouped MoE extension or fail closed."""
+    ext = get_moe_persistent_b_ext()
+    if ext is None:
+        raise NativeKernelUnavailableError(
+            f"{operation} requires Gridbook's persistent-B grouped MoE "
+            "extension (cb_moe_persistent_b.cu), but it is unavailable. It is "
+            "compiled only for compute capability 12.0/12.1. Gridbook does "
+            "not fall back to Triton, torch._grouped_mm, F.linear, or cuBLAS. "
+            f"To enable the native path: {_NVCC_HINT}.")
+    return ext
+
+
+def _moe_persistent_b_build_identity(torch, cpp_extension, *, src_dir: str,
+                                     capability: tuple[int, int]):
+    """``(digest, payload)`` for the persistent-B module's binary ABI.
+
+    Shares the engine every other digest-keyed module uses.  ``cutlass_include``
+    / ``util_include`` are passed as the source directory: the helper only
+    hashes three CUTLASS sentinel files if they exist there, and for a module
+    that includes no CUTLASS they legitimately do not, so all three record
+    ``None`` — a stable, honest "this build has no CUTLASS input" fact rather
+    than a fabricated one.
+    """
+    return _fused_build_identity(
+        torch, cpp_extension, src_dir=src_dir,
+        cutlass_include=src_dir, util_include=src_dir,
+        capability=capability,
+        build_inputs=_MOE_PERSISTENT_B_BUILD_INPUTS,
+        bindings=(("persistent-B grouped MoE", _MOE_PERSISTENT_B_SYMBOLS),),
+        abi_schema=_MOE_PERSISTENT_B_ABI_SCHEMA,
+        accelerated=True)
+
+
+def _load_moe_persistent_b_ext_locked():
+    """Build and publish the kernel with ``_moe_persistent_b_lock`` held."""
+    global _moe_persistent_b, _moe_persistent_b_tried
+    build_dir = "<unresolved>"
+    try:
+        import torch  # noqa: F401  (must import before cpp_extension)
+        from torch.utils import cpp_extension
+
+        cc = _target_capability(
+            "the persistent-B grouped MoE extension (cb_moe_persistent_b.cu)")
+        # ARCH PRECHECK FIRST, before any include discovery or build work: the
+        # schedule targets the sm_12x tensor-core/`cp.async` pairing and there
+        # is no portable lane in this translation unit, so a non-Blackwell
+        # device must be rejected in one `if` rather than minutes deep in nvcc.
+        if not moe_persistent_b_buildable(cc):
+            raise RuntimeError(
+                f"the persistent-B grouped MoE kernel is compiled only for "
+                f"compute capability 12.0/12.1, got {cc[0]}.{cc[1]}")
+        src_dir = _require_csrc(*_MOE_PERSISTENT_B_BUILD_INPUTS)
+        identity, _identity_payload = _moe_persistent_b_build_identity(
+            torch, cpp_extension, src_dir=src_dir, capability=cc)
+        module_name = f"pq_cb_moe_persistent_b_{identity}"
+        build_root = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
+        build_dir = os.path.join(build_root, "moe_persistent_b", identity)
+        os.makedirs(build_dir, exist_ok=True)
+        # The `a`-suffixed target is REQUIRED, for the same measured reason the
+        # grouped-BF16 sm12x lane records: on this toolchain the sm12x
+        # arch-conditional feature macros gate tensor-core code paths, and a
+        # plain `sm_121` build can load and then abort at launch. This kernel's
+        # `mma.sync.m16n8k16` is architecture-generic, but the module is
+        # cc-12.x-only anyway, so there is no portability cost to pinning the
+        # accelerated target and it removes a whole class of launch failure.
+        flags = ["-O3", "--expt-relaxed-constexpr",
+                 _gencode_flag(cc, accelerated=True)]
+        mod = cpp_extension.load(
+            name=module_name,
+            sources=[os.path.join(src_dir, "cb_moe_persistent_b.cu")],
+            extra_include_paths=[src_dir],
+            extra_cuda_cflags=flags,
+            build_directory=build_dir,
+            verbose=False)
+        mod = _require_symbols(
+            mod, _MOE_PERSISTENT_B_SYMBOLS, build_dir=build_dir,
+            source="cb_moe_persistent_b.cu")
+        _moe_persistent_b = _require_fused_identity(
+            mod, expected_name=module_name, identity=identity,
+            abi_schema=_MOE_PERSISTENT_B_ABI_SCHEMA,
+            build_dir=build_dir, source="cb_moe_persistent_b.cu")
+    except StaleExtensionError as exc:
+        print("[prismaquant-cb] ERROR: incompatible persistent-B grouped MoE "
+              f"extension — {exc} The FP4-CB MoE quality prefill stays on the "
+              "expand + grouped-bridge route.", file=sys.stderr, flush=True)
+        _moe_persistent_b = None
+    except IncompleteInstallError as exc:
+        print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
+              "The FP4-CB MoE quality prefill stays on the expand + "
+              "grouped-bridge route.", file=sys.stderr, flush=True)
+        _moe_persistent_b = None
+    except Exception as exc:  # noqa: BLE001 — capability probe is fail-soft
+        print("[prismaquant-cb] WARNING: persistent-B grouped MoE extension "
+              f"unavailable ({type(exc).__name__}: {exc}); the FP4-CB MoE "
+              "quality prefill stays on the expand + grouped-bridge route "
+              "(this is expected off cc 12.0/12.1 and without nvcc). To "
+              f"enable the native path: {_NVCC_HINT}.",
+              file=sys.stderr, flush=True)
+        _moe_persistent_b = None
+    finally:
+        _moe_persistent_b_tried = True
+    return _moe_persistent_b
+# ===========================================================================
+# END ADDITIVE BLOCK — persistent-B grouped MoE loader
+# ===========================================================================

@@ -139,6 +139,17 @@ resident weight copy, decoder, or matmul merely to create another route.
   avoid an expanded `[E,N,K]` HBM tile, handle empty/uneven routing, and remain
   stream- and graph-safe. This is a new MoE schedule, not a revival of the
   measured-negative dense persistent-N kernel.
+  **Kernel IMPLEMENTED behind `PRISMAQUANT_CB_MOE_PERSISTENT_B=1`**
+  (`csrc/cb_moe_persistent_b.cu`, FP4-CB v2, cc 12.0/12.1): a CTA owns one
+  (expert, N-tile), decodes that tile from packed CB bytes into shared memory
+  once and streams the expert's exact routed segment through it, with the
+  M-loop inside the kernel. No `[E,N,K]` transient, no padded rows, no host
+  read; launch geometry is a function of `(E, N)` alone. Decode bit-identical
+  to `cb_expand_v2` by test; only the FP32 reduction order changes. The
+  whole-routed-operator microbenchmark is proposal data only —
+  **what remains open on this item is the served
+  [NATIVE-PARITY](docs/NATIVE-PARITY.md) gate, not the kernel.** See
+  [KERNELS](docs/KERNELS.md#persistent-b-decode-in-mainloop-opt-in-prismaquant_cb_moe_persistent_b).
 - [ ] **K1.2 — Cover the complete FP8-CB mid-M production rung surface.** The
   fused kernel currently instantiates only K28/32/36/40/44/48 while production
   permits every K28 through K48. Either instantiate and test every product rung

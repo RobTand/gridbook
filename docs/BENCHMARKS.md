@@ -347,6 +347,86 @@ the bridge column is flat across the same sweep — so this is a property of the
 fused kernel, not of the harness. It costs the lane roughly half its win at
 M ≤ 12 and it should be profiled (ncu) before any promotion argument is made.
 
+## 2026-08-02 persistent-B grouped-MoE decode-in-mainloop microbenchmark (PROPOSAL DATA)
+
+The two sections above time a **GEMM**. This one times the **whole routed
+operator**, which is what [NATIVE-PARITY](NATIVE-PARITY.md) requires of a
+grouped-MoE change: routing, activation QDQ, the gather, both projection
+stages, the gated activation between them, the router-weight multiply and the
+combine — everything from `(x, topk_ids, topk_weights)` to a combined
+`[T, hidden]`. It is still a microbenchmark, so it still only **proposes**;
+only the served protocol promotes, and the lane ships opt-in.
+
+Execution identity: one GB10 (`sm_121`), Torch `2.11.0+cu130`, CUDA 13.0,
+`gridbook:test`. FP4-CB two-tier v2, `k=16`, `type_size=73`; softmax-top-`k`
+router over seed-731 `randn` logits, `top_k=8`; warm = median of 30 CUDA-event
+samples after 10 warmups, taken with the shared GB10 held exclusively.
+Reproduce with `python3 scripts/bench_moe_persistent_b.py`. Shapes are whole
+MoE layers — `w13` is `[E, 2*inter, hidden]` and `w2` is `[E, hidden, inter]`,
+so both stages run at their real shapes rather than one shape twice.
+
+The three arms are the three routes a `T > 16` FP4-CB MoE prefill can take:
+
+- **pb** — the persistent-B decode-in-mainloop lane
+  (`PRISMAQUANT_CB_MOE_PERSISTENT_B=1`), exact `expert_ends` segments;
+- **sm80** — the DEFAULT shipping path: `cb_expand_fp4_v2` per expert chunk
+  into a BF16 `[Ec,N,K]` transient, then the SM80-schedule grouped bridge;
+- **sm120** — the OPT-IN pingpong bridge lane, i.e. the same expansion feeding
+  the freshly improved sm12x collective, **including** its padded gather and
+  its one host read, because those are what that lane requires.
+
+Every arm's expert-chunk loop is the serving one (`_native_bf16_chunk`'s 1 GiB
+budget), which is why `E=128` shows `chunks=2`. **`expand%` is the share of the
+DEFAULT operator spent inside the transient expansion the new lane deletes** —
+the tax this kernel exists to remove. Ratios above 1 mean persistent-B is
+faster.
+
+| shape | E | T | P | pb warm | sm80 warm | sm120 warm | expand | expand% | sm80/pb | sm120/pb |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| DSV4 `h=4096 i=2048` | 32 | 128 | 1,024 | 5.768 ms | 19.354 ms | 17.027 ms | 8.663 ms | 44.8% | **3.355×** | **2.952×** |
+| DSV4 `h=4096 i=2048` | 32 | 512 | 4,096 | 10.181 ms | 21.921 ms | 22.550 ms | 8.666 ms | 39.5% | **2.153×** | **2.215×** |
+| DSV4 `h=4096 i=2048` | 32 | 2,048 | 16,384 | 28.672 ms | 41.506 ms | 36.125 ms | 8.671 ms | 20.9% | **1.448×** | **1.260×** |
+| Laguna `h=3072 i=1024` | 32 | 128 | 1,024 | 2.485 ms | 7.074 ms | 6.723 ms | 3.177 ms | 44.9% | **2.847×** | **2.705×** |
+| Laguna `h=3072 i=1024` | 32 | 512 | 4,096 | 4.360 ms | 7.948 ms | 8.316 ms | 3.182 ms | 40.0% | **1.823×** | **1.907×** |
+| Laguna `h=3072 i=1024` | 32 | 2,048 | 16,384 | 12.669 ms | 13.315 ms | 13.145 ms | 3.177 ms | 23.9% | **1.051×** | **1.038×** |
+| Laguna `h=3072 i=1024` | 128 | 128 | 1,024 | 8.755 ms | 27.207 ms | 26.396 ms | 12.662 ms | 46.5% | **3.108×** | **3.015×** |
+| Laguna `h=3072 i=1024` | 128 | 512 | 4,096 | 9.386 ms | 27.167 ms | 26.281 ms | 12.681 ms | 46.7% | **2.894×** | **2.800×** |
+| Laguna `h=3072 i=1024` | 128 | 2,048 | 16,384 | 16.687 ms | 32.952 ms | 31.390 ms | 12.659 ms | 38.4% | **1.975×** | **1.881×** |
+
+**The expand tax is real and it is the whole story at low `T`.** It measures
+**20.9–46.7%** of the default operator, bracketing the ~35% the 2026-08-01
+audit quotes, and — the part that matters for production — it does **not**
+shrink with the expert count. At `E=128` it is 38–47% at every token count,
+because the expansion pays for all 128 experts whether or not the router used
+them, while the GEMM only pays for the routed rows. That is the asymmetry the
+new schedule removes: its grid visits `(expert, N-tile)` pairs and an unrouted
+expert costs two int32 loads and a CTA return.
+
+**The lane wins every cell measured**, 1.05–3.36× over the default bridge and
+1.04–3.02× over the pingpong bridge, and the two baselines are close enough to
+each other that the win is against the *route*, not against a weak GEMM.
+
+**Where the win narrows, and why.** The ratio falls with mean routed rows per
+expert (`P/E`): the kernel decodes each weight tile once per `TM`-row M-tile,
+so at `P/E = 512` (`E=32`, `T=2048`) it decodes four times where the expansion
+decodes once, and the two costs nearly cancel (1.05×). The production-shaped
+`E=128` row keeps `P/E = 128` even at `T=2048` and holds **1.98×**. The kernel
+answers this with a shape-driven tile choice (cfg 4 below ~64 mean rows, cfg 1
+above, selected from `P` and `E` alone so it stays capture-safe), and a
+kernel-level sweep of the alternatives is recorded in
+[KERNELS](KERNELS.md#persistent-b-decode-in-mainloop-opt-in-prismaquant_cb_moe_persistent_b):
+a `256×64` tile halves the decode repetition in exactly this regime and still
+lost, because it falls to one CTA per SM. Raising `TM` past 128 without losing
+occupancy is the identified next step, and it is a change of *tile*, not of
+schedule.
+
+**Numerics were checked, not assumed.** The benchmark verifies all three arms
+agree to a relative L2 of ≤ 4e-3 outside the timed region before reporting any
+row; the observed worst case was 1.5e-3 and five of nine rows came out
+bit-identical between pb and sm80. The weight decode itself is bit-exact
+against `cb_expand_v2` under `torch.equal` in the test suite. The served
+[NATIVE-PARITY](NATIVE-PARITY.md) protocol has **not** been run.
+
 ## What is being compared, and how
 
 - **Matched-rate baseline.** Quality rows compare the same model family against a
