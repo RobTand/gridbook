@@ -501,3 +501,101 @@ def test_rowwise_phase_override_cannot_change_weight_compose_bytes(
     assert activation_contract.rowwise_range_multiplier() == 256.0
     assert codec.FP8_ELEMENT_MAX == 448.0
     assert torch.equal(codec.build_compose_u8(), expected)
+
+
+def _rowwise_dense_method():
+    """A dense FP4 method whose rowwise fused mode is ATTESTED, as at load."""
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.k = 16
+    method.n_sub = 2
+    method.type_size = 73
+    method.is_v2 = True
+    method.is_fp4 = True
+    method.prefix = "model.layers.0.mlp.gate_up_proj"
+    method._sub_table = [1.0] * 16
+    method._fused_fp4_ok = (
+        lambda layer, K, *, rowwise=False, static_lsq=False: True
+    )
+    return method
+
+
+@pytest.mark.parametrize("mode,dtype", [
+    ("rowwise", torch.float32),
+    ("static_lsq", torch.float32),
+    ("rowwise", torch.float64),
+])
+def test_dense_fused_fp4_raises_instead_of_serving_a_different_contract(
+    monkeypatch, mode, dtype,
+):
+    """A call-time miss must fail, exactly as the MoE twin already does.
+
+    The mode is attested at model load, so ``_try_fused_fp4`` returning None
+    means the lane declined THIS call — here through the rowwise/static-LSQ
+    quantizers' half-precision guard. Falling through would have served the
+    exact BF16 quality route, whose activation bucket is the fp32-emulated
+    group QDQ rather than the format's native ue4m3 scale factors: a different
+    served activation contract than the operator selected, chosen silently.
+    """
+    from gridbook.cuda_ext import NativeKernelUnavailableError
+
+    method = _rowwise_dense_method()
+    layer = types.SimpleNamespace(
+        _cb_N=8, _cb_K=256, _cb_fused_fp4_mode=mode,
+        _cb_fp4_input_global_scale=torch.tensor([3.0]),
+        _cb_fp4_input_global_scale_f32=3.0,
+        _cb_fp4_lut=torch.ones(1),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(8),
+        _cb_qw_padded=torch.ones(8, 73, dtype=torch.uint8),
+    )
+    from gridbook import cuda_ext
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext",
+                        lambda: types.SimpleNamespace())
+    # Anything downstream of the raise would be a fall-through, so make the
+    # exact BF16 route loudly unreachable rather than merely unlikely.
+    monkeypatch.setattr(
+        method, "_require_fp4_v2_product",
+        lambda *_a: pytest.fail(
+            "fell through to the emulated-QDQ quality route"))
+
+    x = torch.zeros(32, 256, dtype=dtype)
+    with pytest.raises(NativeKernelUnavailableError) as exc_info:
+        method._apply_inline(layer, x)
+    message = str(exc_info.value)
+    assert "became unavailable after model load" in message
+    assert repr(mode) in message
+    assert str(dtype) in message
+
+
+def test_dense_fused_fp4_still_serves_the_contract_it_attested(monkeypatch):
+    """The negative control: half-precision activations take the lane."""
+    method = _rowwise_dense_method()
+    layer = types.SimpleNamespace(
+        _cb_N=8, _cb_K=256, _cb_fused_fp4_mode="rowwise",
+        _cb_fp4_lut=torch.ones(1),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(8),
+        _cb_qw_padded=torch.ones(8, 73, dtype=torch.uint8),
+    )
+    from gridbook import cuda_ext
+
+    class Ext:
+        @staticmethod
+        def cb_nvfp4_quantize_rows(x, multiplier):
+            return (x[:, :128].to(torch.uint8),
+                    torch.zeros(x.shape[0] * 16, dtype=torch.uint8),
+                    torch.ones(x.shape[0], dtype=torch.float32))
+
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(aq, *args, **kwargs):
+            return torch.zeros(aq.shape[0], 8, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: Ext())
+    monkeypatch.setattr(
+        method, "_require_fp4_v2_product",
+        lambda *_a: pytest.fail("the attested lane must serve this call"))
+
+    y = method._apply_inline(
+        layer, torch.zeros(32, 256, dtype=torch.bfloat16))
+    assert y.shape == (32, 8)

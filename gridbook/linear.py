@@ -955,6 +955,22 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                     layer, x, N, K, M, **mode_kwargs)
                 if y is not None:
                     return y
+                # SAME rule as the MoE twin (moe.py::_apply_inline). The mode
+                # was ATTESTED at model load, so a None here means the lane
+                # declined this concrete CALL — in practice the rowwise /
+                # static-LSQ activation quantizers' half-precision guard
+                # (``_try_fused_fp4``'s dtype checks). Falling through would
+                # serve the exact BF16 quality route, whose activation bucket
+                # is the fp32-emulated group QDQ rather than the format's
+                # native ue4m3 scale factors: a DIFFERENT served activation
+                # contract than the one the operator explicitly selected, and
+                # silently so. Gridbook does not substitute an activation
+                # contract, so this is an error, exactly as it is for MoE.
+                from .cuda_ext import NativeKernelUnavailableError
+                raise NativeKernelUnavailableError(
+                    f"{self.prefix}: requested native fused dense FP4 mode "
+                    f"{fused_mode!r} became unavailable after model load "
+                    f"(activation dtype {x.dtype}, M={M}, N={N}, K={K})")
 
             self._require_fp4_v2_product("dense execution")
             xq = fp4_act_qdq_or_codec(x)
