@@ -14,6 +14,19 @@ from typing import Any, Mapping
 RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v1"
 _RESOURCE_NAME = "runtime_contract.json"
 
+#: The vLLM package roots a ``top_level_loader_modules`` entry may name. The
+#: historical root is ``vllm.model_executor.models``; vLLM 0.24 additionally
+#: ships per-architecture packages under ``vllm.models`` whose entrypoint class
+#: lives in a platform submodule (``vllm.models.deepseek_v4.nvidia.model``
+#: defines ``DeepseekV4ForCausalLM``; ``vllm/models/deepseek_v4/__init__.py``
+#: only re-exports it). ``plugin.py`` matches on the module that DEFINES a class
+#: (``__module__`` guard), so the contract has to be able to name that
+#: submodule. The list stays an explicit two-entry allow-list rather than a
+#: bare ``vllm.`` prefix: every entry here becomes a dynamic import into the
+#: serving process, which is exactly what ``tests/test_no_triton_runtime.py``
+#: pins against a reviewed allow-list.
+_LOADER_MODULE_ROOTS = ("vllm.model_executor.models.", "vllm.models.")
+
 
 class RuntimeContractError(ValueError):
     """The packaged runtime contract is malformed or internally inconsistent."""
@@ -250,9 +263,9 @@ def validate_runtime_contract(contract: Any) -> None:
     )
     for index, module in enumerate(modules):
         path = f"contract.producer_profiles.top_level_loader_modules[{index}]"
-        if not module.startswith("vllm.model_executor.models."):
+        if not module.startswith(_LOADER_MODULE_ROOTS):
             _fail(path,
-                  "must be a vllm.model_executor.models module")
+                  "must be a vllm.model_executor.models or vllm.models module")
     if not supported_profile_ids:
         _fail("contract.producer_profiles.supported_ids",
               "must declare at least one producer profile")

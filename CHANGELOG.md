@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+- **D0.1 — register `deepseek_v4` and pin the DeepSeek-V4 serving contract.**
+  Established against vLLM **0.24.0** and the released
+  `deepseek-ai/DeepSeek-V4-Flash-0731` config (43 layers, all MoE, 256 routed +
+  1 shared expert, top-6, MLA), by reading the class and instantiating it, not
+  from the family resemblance to DeepSeek-V2/V3 — which turned out to mislead on
+  every point that mattered. Four findings changed the wiring. (1) The class is
+  not under `vllm/model_executor/models/` at all: vLLM 0.24 ships DSV4 as a
+  per-platform package and `DeepseekV4ForCausalLM` is *defined* in
+  `vllm/models/deepseek_v4/nvidia/model.py`, while the package `__init__` only
+  re-exports it. `plugin.py` matches on the defining module, so the contract
+  validator now takes a second root — `vllm.models.` — beside
+  `vllm.model_executor.models.`, kept as a two-entry allow-list because each
+  entry is a dynamic import into the serving process. (2) Its module attributes
+  are `attn`/`ffn`, not `self_attn`/`mlp`, and the routed stack nests one level
+  deeper again (`…ffn.experts.routed_experts.w13_*` under a FusedMoE prefix of
+  `…ffn.experts`); the existing stem-plus-leaf `.experts.` anchor already spans
+  both, so **no new per-model loader module was written** — the generic
+  top-level wrap covers DSV4 as-is. (3) The checkpoint carries no `model.`
+  component (keys start at `layers.N.`) and the class re-attaches it inside its
+  own `hf_to_vllm_mapper`, i.e. after serving prefixes have been handed out;
+  the loader already applied the model's mapper, and `_canonical_prefix` gained
+  the matching source-namespace vintage so config-side target resolution
+  crosses the same gap. (4) The class publishes **no**
+  `packed_modules_mapping`, yet merges `attn.wq_a`+`attn.wkv` into
+  `fused_wqa_wkv` and the shared expert's Mixtral-convention `w1`+`w3` into
+  `gate_up_proj` — the merge lives only in `stacked_params_mapping`. Both fused
+  fallback tables now carry those spellings, and `shard_target_keys` learned
+  that one fused leaf can have more than one shard spelling (`gate_up_proj` is
+  `gate_proj`/`up_proj` on Llama-class models and `w1`/`w3` here), trying each
+  in order and taking the first with hits whole. Without that, a declared CB
+  shard resolved to nothing and the layer fell silently through to BF16 or
+  stock dispatch — the exact failure class this repo fails closed on.
+  TP stays rejected above one, and D0.1 establishes that DSV4 needs no
+  narrowly scoped TP implementation: it fits one GB10 at the planned 92 GB and
+  every TP guard in the class is satisfied at `tp_size == 1`.
+- **MTP and DSpark are passthrough, and the contract says so rather than
+  implying support.** The artifact preserves `mtp.*` — 4,705 tensors across the
+  three DSpark stages — verbatim, and
+  `DeepseekV4ForCausalLM.load_weights` builds
+  `AutoWeightsLoader(self, skip_substrs=["mtp."])`, so at plain serving time
+  every one of them is dropped before any parameter lookup. The drafter
+  `DeepSeekV4MTPModel` is reachable only under `--speculative-config` and
+  consumes the payload in its source format, so no CB stacks are written for it
+  and no loader module is registered for it; if one ever appears,
+  `cb_fill_guard` fails the load and names the path to add. `dspark` occurs
+  nowhere in the vLLM package, so none of the four `dspark_*` config keys is
+  read at serving time. Hyper-connections (`hc_*`), the hash-routing
+  `tid2eid` tables, `compressor.ape`, `attn_sink` and the router gate ride as
+  unquantized parameters vLLM never routes through `get_quant_method`.
+  `attn.wo_a` is documented as must-not-quantize for a subtler reason: it is
+  created and post-processed through the quant-method contract but its forward
+  **bypasses `apply()`**, reading `.weight`/`.weight_scale_inv` directly, so a
+  CB layout there would serve wrong results silently instead of failing.
+  D0.2 needed nothing new — the all-CB assignment delegates nothing, and the
+  shipped `delegated_preflight` already refuses an unaudited or
+  activation-scale-dropping backend for any stock region that might appear.
+
 - Stop the CPU suite needing NumPy. `test_validate_fused_nvfp4_ab.py`'s K0.2
   fixture writer built its artifact with `safetensors.torch.save_file`, whose
   **write** path imports NumPy — which Gridbook deliberately does not depend on
