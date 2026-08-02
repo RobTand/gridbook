@@ -82,15 +82,30 @@ _FUSED_FALLBACK = {
     "fused_wqa_wkv": ["wq_a", "wkv"],
 }
 
-# A fused leaf can carry MORE THAN ONE valid shard spelling across
-# architectures. DeepSeek-V4's shared expert fuses the Mixtral-convention
-# `w1`/`w3` into the SAME `gate_up_proj` leaf that Llama-class models fuse
-# `gate_proj`/`up_proj` into, so one dict value cannot express both. Resolution
-# tries the primary spelling first and then each alternate, and the first
-# spelling with any hit wins WHOLE (never mixed) — the same rule
-# `shard_target_keys` already applies across namespace vintages.
-_FUSED_ALTERNATE_SHARDS = {
+# A served leaf can correspond to MORE THAN ONE checkpoint spelling across
+# architectures, in two ways this table covers together:
+#
+#   * a different FUSION — DeepSeek-V4's shared expert fuses the
+#     Mixtral-convention `w1`/`w3` into the same `gate_up_proj` leaf that
+#     Llama-class models fuse `gate_proj`/`up_proj` into, so one
+#     `_FUSED_FALLBACK` value cannot express both;
+#   * a plain 1:1 RENAME — the same shared expert's un-fused down projection is
+#     `w2` in the checkpoint and `down_proj` in the module tree. That is not a
+#     fusion at all, so it never reached the fused table, and before this it
+#     resolved to nothing: the exact-key lookup missed and `down_proj` had no
+#     declared shard spelling, so a declared CB target fell silently through to
+#     BF16/stock dispatch. A one-element spelling expresses it exactly.
+#
+# Resolution tries the primary spelling first, then each alternate, and the
+# first spelling with any hit wins WHOLE (never mixed) — the same rule
+# `shard_target_keys` already applies across namespace vintages. An alternate is
+# only ever consulted after the primary misses, so an architecture using the
+# canonical spelling is unaffected.
+_ALTERNATE_SHARD_SPELLINGS = {
     "gate_up_proj": (["w1", "w3"],),
+    "gate_proj": (["w1"],),
+    "up_proj": (["w3"],),
+    "down_proj": (["w2"],),
 }
 
 
@@ -738,11 +753,15 @@ class PrismaQuantConfig(QuantizationConfig):
             leaf = base.split(".")[-1]
             primary = pmm.get(leaf) or _FUSED_FALLBACK.get(leaf)
             spellings = [primary] if primary is not None else []
-            spellings.extend(_FUSED_ALTERNATE_SHARDS.get(leaf, ()))
+            spellings.extend(_ALTERNATE_SHARD_SPELLINGS.get(leaf, ()))
+            if primary is None and unfused_fallback:
+                # ``_shard_roles``' "a plain Linear is its own single role"
+                # rung. It stays LAST so an alternate spelling that actually
+                # matches wins, and it is still withheld from a leaf with a
+                # declared fusion, exactly as before.
+                spellings.append([leaf])
             if not spellings:
-                if not unfused_fallback:
-                    continue
-                spellings = [[leaf]]
+                continue
             stem = base[: -len(leaf)]
             for shard_leaves in spellings:
                 hits = [stem + sl for sl in shard_leaves

@@ -317,7 +317,9 @@ def test_cb_shared_expert_shard_on_a_plain_bf16_target_fails_closed():
         (P + ".gate_up_proj.weight", 0)
     assert resolve_shared_cb_target(P + ".w3.cb_qweight", params, rev) == \
         (P + ".gate_up_proj.weight", 1)
-    assert resolve_shared_cb_target(P + ".w2.cb_qweight", params, rev) is None
+    # `w2` is a plain rename of `down_proj`, not a shard: index 0, direct.
+    assert resolve_shared_cb_target(P + ".w2.cb_qweight", params, rev) == \
+        (P + ".down_proj.weight", 0)
 
 
 # --------------------------------------------------------------------------
@@ -442,13 +444,26 @@ def test_dsv4_neighbouring_layer_does_not_borrow_a_scheme(dsv4_config):
         f"model.layers.{LAYER + 1}.ffn.experts") is None
 
 
-def test_dsv4_rejects_tensor_parallel_above_one(dsv4_config):
-    """D0.1 keeps TP=1: the model fits one GB10 at the planned 92 GB, and no
-    CB weight has TP handling."""
+def test_dsv4_rejects_tensor_parallel_above_one(dsv4_config, monkeypatch):
+    """D0.1 keeps TP=1: the model fits one GB10 at the planned 92 GB, and no CB
+    weight has TP handling.
+
+    The gate reads the LIVE worker's world size, not an argument string, so the
+    probe is what has to report >1 — an uninitialised model-parallel group
+    (every CPU-side config test) correctly defers rather than guessing."""
+    import gridbook.config as gbconfig
+
     c = dsv4_config()
     c._tp_world_size = 4
+    monkeypatch.setattr(gbconfig, "_initialized_tensor_parallel_world_size",
+                        lambda: 4)
     with pytest.raises(ValueError, match="tensor-parallel size 1 only"):
         c._require_supported_tensor_parallel()
+    # A live TP=1 worker is accepted and latched.
+    monkeypatch.setattr(gbconfig, "_initialized_tensor_parallel_world_size",
+                        lambda: 1)
+    c._require_supported_tensor_parallel()
+    assert c._tp_world_size == 1
 
 
 def test_dsv4_delegated_preflight_still_guards_a_stock_region():

@@ -204,12 +204,17 @@ _FUSED_FALLBACK = {
     "fused_wqa_wkv": ["wq_a", "wkv"],
 }
 
-# Extra shard spellings for an ALREADY-listed fused leaf, merged into the
-# reverse map (which is keyed by shard leaf, so these never collide with the
-# primary spelling above).
+# Extra checkpoint spellings, merged into the reverse map (which is keyed by
+# SHARD leaf, so these never collide with the primary spellings above). `w1`/`w3`
+# are DeepSeek-V4's shared-expert shards of the merged `gate_up_proj`; `w2` is
+# not a shard at all but the plain rename of that expert's `down_proj`, entered
+# at index 0 exactly as a direct (unfused) Linear would be. Without it an
+# orphaned CB `w2` would defer and surface as the arch loader's bare KeyError
+# instead of this module's "needs a native CB Linear" diagnosis.
 _FUSED_SHARD_ALIASES = {
     "w1": ("gate_up_proj", 0),
     "w3": ("gate_up_proj", 1),
+    "w2": ("down_proj", 0),
 }
 
 
