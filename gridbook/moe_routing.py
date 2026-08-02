@@ -96,6 +96,26 @@ def cb_cached_row_offsets(layer, rows: int, device) -> torch.Tensor:
     return cache.setdefault(key, value)
 
 
+def cb_grouped_block_offsets(topk_ids: torch.Tensor, E: int, tile_m: int):
+    """``[E+1]`` cumulative TileM-block offsets of the padded row layout.
+
+    ``block_offsets[e]`` is the first padded M-tile owned by expert ``e`` in
+    the layout :func:`cb_grouped_pad_routing` builds, so a contiguous expert
+    chunk ``[c0, c1)`` owns tiles ``[block_offsets[c0], block_offsets[c1])``
+    and rows ``[block_offsets[c0]*tile_m, block_offsets[c1]*tile_m)``.
+    ``block_offsets[E]`` is the real block total (what ``n_blocks`` reports).
+
+    Callers that CHUNK the expert dimension — the BF16 bridge bounds its
+    decoded weight transient that way — need these boundaries on the HOST to
+    slice each launch, which costs one device read. Kept out of
+    :func:`cb_grouped_pad_routing` so the fused paths, which launch the whole
+    collective at once, keep their single optional sync.
+    """
+    counts = torch.bincount(topk_ids.reshape(-1).to(torch.long), minlength=E)
+    blocks_e = (counts + (tile_m - 1)) // tile_m
+    return torch.cat([blocks_e.new_zeros(1), torch.cumsum(blocks_e, 0)])
+
+
 def cb_grouped_pad_routing(topk_ids: torch.Tensor, E: int, tile_m: int):
     """Build the block-aligned padded row layout the grouped CUTLASS kernel
     consumes: every expert's rows start on a TileM boundary, so an M-tile

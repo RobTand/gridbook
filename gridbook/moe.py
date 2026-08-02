@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import NamedTuple
 
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -41,8 +42,12 @@ from .cb_fill_guard import (
     mark_unfilled,
 )
 from .moe_gemv_select import cb_gemv_choice
+from .bf16_grouped_lane import (require_lane as bf16_sm120_require_lane,
+                                requested as bf16_sm120_requested,
+                                tile_m as bf16_sm120_tile_m)
 from .moe_routing import (
     cb_cached_row_offsets,
+    cb_grouped_block_offsets,
     cb_grouped_pad_routing,
 )
 from .native_cutlass import (native_fp4_quant, native_fp8_quant,
@@ -61,6 +66,77 @@ from .ops import fp4_act_qdq_or_codec
 
 def _row_bytes(in_features: int, type_size: int) -> int:
     return (in_features // codec.SUPERBLOCK) * type_size
+
+
+class _PaddedRoute(NamedTuple):
+    """The row-padded, tile-indexed routing layout, built once per prefill.
+
+    Every Gridbook grouped CUTLASS lane on sm12x consumes this shape (see
+    ``csrc/cb_grouped_common.hpp``): each expert's rows start on a TileM
+    boundary so an M-tile belongs to exactly one expert.
+
+    * ``expert_ids`` ``[B]`` int32 — the expert owning each padded M-tile.
+    * ``row_src`` ``[B*tile_m]`` int64 — index into the STABLE-argsorted pair
+      array each padded row gathers from.
+    * ``is_pad`` ``[B*tile_m]`` bool.
+    * ``dest`` ``[B*tile_m]`` int64 — the token each padded row belongs to,
+      with padding rows pointing at the THROWAWAY row ``T``: one vector does
+      both the activation gather (from a ``[T+1, K]`` zero-extended tensor) and
+      the output scatter (into a ``[T+1, N]`` accumulator that is sliced off).
+    * ``pw_sorted`` ``[P]`` fp32 — router weights in sorted-pair order.
+    * ``block_offsets`` — per-expert cumulative block offsets on the HOST, or
+      ``None`` when the caller did not ask for them.
+    """
+
+    expert_ids: "torch.Tensor"
+    row_src: "torch.Tensor"
+    is_pad: "torch.Tensor"
+    dest: "torch.Tensor"
+    pw_sorted: "torch.Tensor"
+    block_offsets: "list[int] | None"
+
+
+def _padded_route(topk_ids, topk_weights, E: int, tile_m: int, *,
+                  trim: bool, block_offsets: bool = False) -> _PaddedRoute:
+    """Build the padded routing layout shared by every grouped CUTLASS lane.
+
+    Extracted from the promoted FP8/FP4 fused routed paths, which had it
+    verbatim, when the sm12x-native BF16 bridge became its third consumer.
+    Stable ``argsort`` keeps each expert's rows token-major, so a padded
+    segment's GEMM sees the same row order the per-expert reference does and
+    only the combine reassociates.
+
+    ``trim`` slices the static capacity down to the real block count, which
+    costs ONE device read (the host must know how many tiles to launch);
+    ``block_offsets`` returns the per-expert boundaries from the SAME read,
+    for callers that additionally chunk the expert dimension.
+    """
+    T = int(topk_ids.shape[0])
+    top_k = int(topk_ids.shape[-1])
+    dev = topk_ids.device
+    pair_expert = topk_ids.reshape(-1).to(torch.long)
+    pair_token = torch.arange(T, device=dev, dtype=torch.long) \
+        .repeat_interleave(top_k)
+    order = torch.argsort(pair_expert, stable=True)             # STABLE
+    ptok_sorted = pair_token[order]
+    pw_sorted = topk_weights.reshape(-1)[order].to(torch.float32)
+
+    expert_ids, row_src, is_pad, n_blocks = cb_grouped_pad_routing(
+        topk_ids, E, tile_m)
+    offsets = None
+    if block_offsets:
+        offsets = cb_grouped_block_offsets(topk_ids, E, tile_m).tolist()
+    if trim:
+        # One host read of the real block total; ``block_offsets`` already
+        # carries it, so asking for both costs a single sync, not two.
+        nb = int(offsets[E]) if offsets is not None else int(n_blocks.item())
+        expert_ids = expert_ids[:nb].contiguous()
+        row_src = row_src[:nb * tile_m]
+        is_pad = is_pad[:nb * tile_m]
+
+    rows = ptok_sorted.index_select(0, row_src)
+    dest = torch.where(is_pad, torch.full_like(rows, T), rows)
+    return _PaddedRoute(expert_ids, row_src, is_pad, dest, pw_sorted, offsets)
 
 
 _FUSED_FP4_MOE_STATE: list[str] = []
@@ -381,6 +457,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 f"{self.prefix} routed FP8 quality prefill")
         require_bf16_grouped_ext(
             f"{self.prefix} routed quality prefill")
+        # OPT-IN sm12x-native bridge lane, resolved HERE (never at first
+        # forward) and failing the model load if the operator asked for a lane
+        # this build/device cannot serve — serving the SM80 schedule instead
+        # would silently answer a different question than the one asked.
+        layer._cb_bf16_sm120 = None
+        if bf16_sm120_requested():
+            layer._cb_bf16_sm120 = bf16_sm120_require_lane(
+                f"{self.prefix} routed quality prefill", device=dev)
         if not self._cuda_moe_ok(layer):
             raise NativeKernelUnavailableError(
                 f"{self.prefix}: routed decode layout has no native grouped "
@@ -674,26 +758,15 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         w13 = layer.w13_cb_qweight.data
         w2 = layer.w2_cb_qweight.data
 
-        # Stable expert grouping plus tile padding remains entirely on device;
-        # padding rows gather the appended zero row and scatter into throwaway
-        # destination T.
-        pair_expert = topk_ids.reshape(-1).to(torch.long)
-        pair_token = torch.arange(T, device=dev, dtype=torch.long) \
-            .repeat_interleave(top_k)
-        order = torch.argsort(pair_expert, stable=True)
-        ptok_sorted = pair_token[order]
-        pw_sorted = topk_weights.reshape(-1)[order].to(torch.float32)
-
-        expert_ids, row_src, is_pad, n_blocks = cb_grouped_pad_routing(
-            topk_ids, E, tile_m)
-        if os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1":
-            nb = int(n_blocks.item())
-            expert_ids = expert_ids[:nb].contiguous()
-            row_src = row_src[:nb * tile_m]
-            is_pad = is_pad[:nb * tile_m]
-
-        rows = ptok_sorted.index_select(0, row_src)
-        dest = torch.where(is_pad, torch.full_like(rows, T), rows)
+        # Stable expert grouping plus tile padding remains entirely on device
+        # (bar the optional trim read); padding rows gather the appended zero
+        # row and scatter into throwaway destination T. The layout itself is
+        # the shared one — see ``_padded_route``.
+        route = _padded_route(
+            topk_ids, topk_weights, E, tile_m,
+            trim=os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1")
+        expert_ids, row_src, dest = route.expert_ids, route.row_src, route.dest
+        pw_sorted = route.pw_sorted
         x1 = torch.cat([x, x.new_zeros((1, Kh))])
         a_pad = x1.index_select(0, dest).contiguous()
         padded_rows = a_pad.shape[0]
@@ -808,11 +881,20 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         and FC2. Matrix multiplication is one device-scheduled CUTLASS grouped
         launch per expert chunk. Routing stays device-resident and zero-token
         experts remain zero-M CUTLASS problems (no host compaction or sync).
+
+        With the OPT-IN ``PRISMAQUANT_CB_BF16_SM120`` lane resolved at model
+        load, the two grouped launches go to the sm12x-native collective
+        instead — same operands, same single bf16 round, different FP32
+        reduction order and a padded row layout. See
+        ``_apply_prefill_native_bf16_sm120``.
         """
         from . import ops as pq_ops
 
         if x.dtype is not torch.bfloat16:
             raise TypeError("native CB MoE prefill requires BF16 activations")
+        if getattr(layer, "_cb_bf16_sm120", None) is not None:
+            return self._apply_prefill_native_bf16_sm120(
+                layer, x, topk_weights, topk_ids, act)
         E = int(layer._cb_E)
         T = int(x.shape[0])
         top_k = int(topk_ids.shape[-1])
@@ -868,6 +950,101 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         output.index_add_(0, rows, pair_output.to(output.dtype))
         return output
 
+    def _apply_prefill_native_bf16_sm120(self, layer, x, topk_weights,
+                                         topk_ids, act):
+        """The OPT-IN sm12x-native form of the BF16 quality bridge.
+
+        SAME numerical contract as the default lane above: the activations are
+        the exact native QDQ, the weights are the bit-exact CB -> BF16
+        expansion, accumulation is FP32 and the epilogue rounds ONCE to bf16.
+        What changes is the GEMM schedule (a CUTLASS 3.x TMA warp-specialized
+        sm120 collective instead of the SM80 device-scheduled grouped kernel)
+        and therefore the FP32 REDUCTION ORDER — reassociation-class, the same
+        requalification surface the promoted FP8 mid-M fused kernel cleared.
+
+        WHAT THE LANE COSTS. The sm12x collective has no ptr-array grouping, so
+        rows must be PADDED to whole TileM blocks per expert (the construction
+        in ``csrc/cb_grouped_common.hpp``). This path therefore pays a padded
+        activation gather that the exact-segment lane does not — an
+        activation-side transient of exactly the class the promoted FP8 routed
+        fused path already allocates, never a second weight copy. It also pays
+        ONE host read of the per-expert block offsets, because the decoded
+        weight transient is CHUNKED over experts and each chunk launches over
+        its own contiguous block range. Both costs belong to the lane and are
+        inside the microbenchmark's whole-operator timing.
+
+        PADDING IS INERT BY CONSTRUCTION: padding rows gather an appended zero
+        activation row and scatter into a THROWAWAY row ``T`` that is sliced
+        off, so their GEMM output never reaches a token even if it were
+        non-finite.
+        """
+        from . import ops as pq_ops
+
+        ext = layer._cb_bf16_sm120
+        tile_m = bf16_sm120_tile_m(ext)
+        E = int(layer._cb_E)
+        T = int(x.shape[0])
+        hidden = int(layer._cb_hidden)
+        inter = int(layer._cb_inter)
+        dev = x.device
+
+        route = _padded_route(topk_ids, topk_weights, E, tile_m,
+                              trim=True, block_offsets=True)
+        expert_ids, dest = route.expert_ids, route.dest
+        block_off = route.block_offsets
+        n_rows = int(expert_ids.numel()) * tile_m
+
+        xq = (pq_ops.fp4_act_qdq(x) if self.is_fp4
+              else pq_ops.fp8_act_qdq(x))
+        xq = torch.cat([xq, xq.new_zeros((1, hidden))])
+        a_pad = xq.index_select(0, dest).contiguous()
+        del xq
+        chunk = self._native_bf16_chunk(layer)
+
+        gate_up = torch.empty((n_rows, 2 * inter), dtype=torch.bfloat16,
+                              device=dev)
+        for c0 in range(0, E, chunk):
+            c1 = min(E, c0 + chunk)
+            b0, b1 = int(block_off[c0]), int(block_off[c1])
+            if b1 == b0:                      # no routed rows in this chunk
+                continue
+            weight = self._expand_native_bf16_slice(layer, "w13", c0, c1)
+            pq_ops.cb_bf16_grouped_mm_sm120_out(
+                gate_up[b0 * tile_m:b1 * tile_m],
+                a_pad[b0 * tile_m:b1 * tile_m], weight,
+                (expert_ids[b0:b1] - c0).contiguous(), tile_m)
+            del weight
+        del a_pad
+
+        activated = torch.empty((n_rows, inter), dtype=torch.bfloat16,
+                                device=dev)
+        native_moe_activation(act, activated, gate_up)
+        del gate_up
+        # Per-row QDQ, so quantizing the padded tensor is bit-identical to
+        # quantizing before the gather for every REAL row; padding rows are
+        # all-zero and their result is discarded.
+        aq = (pq_ops.fp4_act_qdq(activated) if self.is_fp4
+              else pq_ops.fp8_act_qdq(activated))
+        del activated
+
+        y = torch.empty((n_rows, hidden), dtype=torch.bfloat16, device=dev)
+        for c0 in range(0, E, chunk):
+            c1 = min(E, c0 + chunk)
+            b0, b1 = int(block_off[c0]), int(block_off[c1])
+            if b1 == b0:
+                continue
+            weight = self._expand_native_bf16_slice(layer, "w2", c0, c1)
+            pq_ops.cb_bf16_grouped_mm_sm120_out(
+                y[b0 * tile_m:b1 * tile_m], aq[b0 * tile_m:b1 * tile_m],
+                weight, (expert_ids[b0:b1] - c0).contiguous(), tile_m)
+            del weight
+        del aq
+
+        pw_pad = route.pw_sorted.index_select(0, route.row_src)
+        y = y * pw_pad[:, None].to(y.dtype)
+        out = torch.zeros((T + 1, hidden), dtype=x.dtype, device=dev)
+        out.index_add_(0, dest, y.to(out.dtype))
+        return out[:T]
 
     # -- prefill: grouped FUSED (decode-in-prologue, one launch/stage) ------
     def _gf2_ok(self, layer) -> bool:
@@ -1078,25 +1255,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             return None
 
         # ---- routing (device-side; static shapes) --------------------------
-        pair_expert = topk_ids.reshape(-1).to(torch.long)          # [P]
-        pair_token = torch.arange(T, device=dev, dtype=torch.long) \
-            .repeat_interleave(top_k)                              # [P]
-        order = torch.argsort(pair_expert, stable=True)            # STABLE
-        ptok_sorted = pair_token[order]
-        pw_sorted = topk_weights.reshape(-1)[order].to(torch.float32)
-
-        expert_ids, row_src, is_pad, n_blocks = cb_grouped_pad_routing(
-            topk_ids, E, tile_m)
-
-        if os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1":
-            # Kept intentionally: a host-read-free replacement must either
-            # launch the full static-capacity tail (a performance change) or
-            # teach the grouped kernel to consume n_blocks on device. A tensor
-            # slice bound still performs this same host conversion implicitly.
-            nb = int(n_blocks.item())                # THE one sync (optional)
-            expert_ids = expert_ids[:nb].contiguous()
-            row_src = row_src[:nb * tile_m]
-            is_pad = is_pad[:nb * tile_m]
+        # The padded layout is the shared one (``_padded_route``); the TRIM
+        # read is kept intentionally: a host-read-free replacement must either
+        # launch the full static-capacity tail (a performance change) or teach
+        # the grouped kernel to consume n_blocks on device. A tensor slice
+        # bound still performs this same host conversion implicitly.
+        route = _padded_route(
+            topk_ids, topk_weights, E, tile_m,
+            trim=os.environ.get("PRISMAQUANT_CB_GROUPED_TRIM", "1") == "1")
+        expert_ids, row_src, dest = route.expert_ids, route.row_src, route.dest
+        pw_sorted = route.pw_sorted
 
         # ---- input activation QDQ, ONCE over all token rows ----------------
         a1, a1s = native_fp8_quant(x)
@@ -1106,8 +1274,6 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # to their token, padding rows to the appended zero row / throwaway
         # output row T. Gathering the zeros (rather than masking an fp8 tensor
         # after the fact) keeps every op on this path a plain index_select.
-        rows = ptok_sorted.index_select(0, row_src)                 # [Mp]
-        dest = torch.where(is_pad, torch.full_like(rows, T), rows)
         a1x = torch.cat([a1, a1.new_zeros((1, Kh))])
         # Padding scale 1.0 (see docstring): the row is zero either way, but a
         # zero scale would make the intermediate QDQ's per-row amax degenerate.

@@ -166,6 +166,49 @@ def _cb_bf16_grouped_mm_out_fake(out, a, weights, expert_ends,
     return None
 
 
+@torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_sm120",
+                         mutates_args=(), tags=_PQ_UNSAFE)
+def cb_bf16_grouped_mm_sm120(a: torch.Tensor, weights: torch.Tensor,
+                             expert_ids: torch.Tensor,
+                             tile_m: int) -> torch.Tensor:
+    """sm12x-native CUTLASS grouped BF16 GEMM (OPT-IN lane).
+
+    ``a`` is the ROW-PADDED activation ``[Mp, K]`` whose every ``tile_m``-row
+    block belongs to one expert, ``weights`` is the contiguous stack
+    ``[E, N, K]``, and ``expert_ids[m_tile]`` names each block's expert (``-1``
+    for a padding block). Same numerics class as the default SM80 lane — fp32
+    accumulate, one bf16 round — with a different FP32 reduction order.
+    """
+    from .cuda_ext import require_bf16_grouped_ext
+    return require_bf16_grouped_ext(
+        "sm12x-native CUTLASS grouped BF16 GEMM").cb_bf16_grouped_mm_sm120(
+            a, weights, expert_ids, tile_m)
+
+
+@cb_bf16_grouped_mm_sm120.register_fake
+def _cb_bf16_grouped_mm_sm120_fake(a, weights, expert_ids, tile_m):
+    return torch.empty((a.shape[0], weights.shape[1]), dtype=torch.bfloat16,
+                       device=a.device)
+
+
+@torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_sm120_out",
+                         mutates_args=("out",), tags=_PQ_UNSAFE)
+def cb_bf16_grouped_mm_sm120_out(out: torch.Tensor, a: torch.Tensor,
+                                 weights: torch.Tensor,
+                                 expert_ids: torch.Tensor,
+                                 tile_m: int) -> None:
+    """Write the sm12x-native grouped BF16 result into a caller-owned tensor."""
+    from .cuda_ext import require_bf16_grouped_ext
+    require_bf16_grouped_ext(
+        "sm12x-native CUTLASS grouped BF16 GEMM").cb_bf16_grouped_mm_sm120_out(
+            out, a, weights, expert_ids, tile_m)
+
+
+@cb_bf16_grouped_mm_sm120_out.register_fake
+def _cb_bf16_grouped_mm_sm120_out_fake(out, a, weights, expert_ids, tile_m):
+    return None
+
+
 # NOTE (2026-08-01): `prismaquant::cb_expand_fp8_into` (the out-variant of
 # cb_expand_fp8) and its `cb_expand_fp8_into_available` probe were registered
 # here with zero serving call sites — residue of the L2-pinned per-expert
