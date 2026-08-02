@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Stop the CPU suite needing NumPy. `test_validate_fused_nvfp4_ab.py`'s K0.2
+  fixture writer built its artifact with `safetensors.torch.save_file`, whose
+  **write** path imports NumPy — which Gridbook deliberately does not depend on
+  (`gridbook/cb_digest.py`), so it is absent from the one environment that
+  matters here: the wheel's own closure, which is what `cpu-tests` and
+  `release.yml`'s `verify` install the suite into from outside the checkout.
+  The fixture therefore passed on every developer host and failed all four CI
+  legs on master — `ModuleNotFoundError: No module named 'numpy'` from
+  `safetensors/torch.py`, 4 failed / 49 passed. It now serializes its two F32
+  scalars directly, exactly as `test_codebook_digest.py` has always done for
+  its F16 sidecar and for the same written reason, and a scan asserts no test
+  or script reaches for `save_file` again. Nothing in the wheel changes: the
+  read path, which is all Gridbook ever uses, was never NumPy-bound.
 - Make the no-Triton ratchet independent of the directory the suite is staged
   in. `release.yml`'s `verify installed wheel` job copies `tests` to
   `$RUNNER_TEMP/gbtests` — so the checkout cannot shadow the installed wheel —
