@@ -59,15 +59,49 @@ def _isolate_process_stable_moe_selectors():
 # exactly the loop path's per-expert row selection, in the loop's order.        #
 # --------------------------------------------------------------------------- #
 DEV = "cuda"
-# GB10/CUDA 13.0, grouped-fused vs the native BF16 bridge: 1.906–2.039e-2 over
-# the four fixed routing cases (measured 2026-08-01, torch 2.11+cu130). Moving
-# the oracle off the retired per-expert round did not move this bound: that
-# round measured 1.906–2.040e-2 against the same bridge, and the two rounds
-# differed from each other by only 2.9–3.9e-4.
-# Keep a narrow 2.1e-2 reassociation envelope: the fused path and native BF16
-# bridge quantize the same values, but accumulate them in different tensor-core
-# types/orders. This is a regression bound, not a claim of bit equivalence.
+# GB10/CUDA 13.0, torch 2.11+cu130. TWO comparison classes live in this file
+# and they do NOT share an envelope.
+#
+# _REL — SAME-REPRESENTATION. Both sides are BF16-operand lanes over identical
+# expanded weights and identical QDQ'd activations (the sm12x bridge lane vs
+# the default sm80 one). Only the FP32 reduction order differs, so this really
+# is reassociation, and 2.1e-2 is loose for it. Unchanged.
+#
+# _REL_FUSED — CROSS-REPRESENTATION, and NOT reassociation. The grouped fused
+# lane hands the tensor cores FP8 operands with FP32 EVT scales; the bridge
+# hands them BF16 operands it obtained by rounding ``code * scale`` to BF16.
+# The two lanes therefore do not multiply the same numbers (measured
+# 2026-08-02, uniform/M=33/k28):
+#   * their per-token E4M3 activation quantizers — vLLM's
+#     ``dynamic_per_token_scaled_fp8_quant`` for the fused lane, Gridbook's
+#     ``fp8_act_qdq`` for the bridge — put 0.82% of elements on DIFFERENT
+#     codes. Both derive scale = amax/448 (agreeing to 1.2e-7); they break
+#     bin-boundary ties differently, and each flip is a full FP8 ULP;
+#   * the bridge's BF16 dequant of ``code * scale`` costs another 1.5e-3;
+#   * and the pipeline then RE-quantizes the intermediate to E4M3, whose 3-bit
+#     mantissa turns that ~2.3e-3 input perturbation into a few percent of
+#     flipped intermediate codes, each again worth a full ULP.
+# So this disagreement is AMPLIFICATION-dominated: it moves with routing luck
+# and does not shrink as either kernel improves.
+#
+# 2.1e-2 was fitted to FOUR hand-picked routing cases (1.906–2.039e-2, measured
+# 2026-08-01) — a four-sample fit to a distribution that reaches further. Over
+# 224 configurations (both compiled rungs x 7 build seeds x 8 routing shapes x
+# 2 routing seeds, measured 2026-08-02) the disagreement runs 1.566e-2 to
+# 2.316e-2, with 23/224 above 2.1e-2 — and the DEFAULT k=44 rung breaches it
+# more often (13/112) than k28 does (10/112) and owns the maximum. Every new
+# quality case added to this file therefore had a ~1-in-10 chance of failing on
+# arrival; ``test_ragged_routing_at_tile_256[uniform-33]`` (2.174e-2) drew one.
+# 2.5e-2 clears the measured maximum by 8%.
+#
+# Loosening it costs nothing that was being gated, because the number it
+# loosens was never the sharp claim: a fused-vs-bridge tolerance cannot say
+# WHICH lane moved. That claim is pinned separately and far more tightly by
+# ``test_fused_lane_is_no_less_exact_than_the_bridge`` (both lanes against the
+# exact FP32 computation) and, on the tile dimension, at bit equality by
+# ``test_both_compiled_tiles_are_bit_identical``.
 _REL = 2.1e-2
+_REL_FUSED = 2.5e-2
 
 
 def _require_stack():
@@ -314,7 +348,7 @@ def test_grouped_fused_matches_native_quality_bridge(distribution, topk):
     assert candidate is not None
     rel = _report(
         f"grouped-vs-native[{distribution},topk={topk}]", reference, candidate)
-    assert rel <= _REL
+    assert rel <= _REL_FUSED
 
 
 @pytest.mark.parametrize("tokens", [17, 33, 129])
@@ -333,7 +367,7 @@ def test_grouped_fused_partial_tiles_match_native_quality_bridge(tokens):
         layer, x, weights, ids, act)
     assert candidate is not None
     assert _report(
-        f"grouped-vs-native[M={tokens}]", reference, candidate) <= _REL
+        f"grouped-vs-native[M={tokens}]", reference, candidate) <= _REL_FUSED
 
 
 def test_padding_trim_is_bit_identical(monkeypatch):
@@ -434,7 +468,8 @@ def test_quality_at_every_compiled_tile(k):
             layer, x, weights, ids, act, tile_m=tile_m)
         assert candidate is not None
         assert _report(
-            f"grouped[tile={tile_m}]-vs-native", reference, candidate) <= _REL
+            f"grouped[tile={tile_m}]-vs-native",
+            reference, candidate) <= _REL_FUSED
 
 
 @pytest.mark.parametrize(
@@ -462,7 +497,132 @@ def test_ragged_routing_at_tile_256(distribution, tokens):
     assert candidate is not None
     assert _report(
         f"grouped[tile=256,{distribution},M={tokens}]-vs-native",
-        reference, candidate) <= _REL
+        reference, candidate) <= _REL_FUSED
+
+
+# ---------------------------------------------------------------------------
+# The claim `_REL_FUSED` is too loose to make: WHICH lane is wrong?
+# ---------------------------------------------------------------------------
+def _fp8_qdq_f32(a):
+    """Per-token E4M3 quantize-dequantize as MATH, in FP32.
+
+    Deliberately neither lane's kernel: privileging one lane's quantizer here
+    would hand that lane a head start on the very comparison below.
+    """
+    amax = a.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    scale = amax / 448.0
+    code = (a.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return code.float() * scale
+
+
+def _exact_weight_f32(method, layer, which, experts):
+    """The dequantized weight as ``fp8 grid value * fp32 per-row scale``.
+
+    This is exactly the product the FUSED lane forms (FP8 operand, FP32 EVT
+    scale) and that the BRIDGE additionally rounds to BF16 before its GEMM —
+    so it is the unrounded value both approximate, not either one's operand.
+    Mirrors ``PrismaQuantCBMoEMethod._expand_native_bf16_slice`` up to that
+    final ``.to(torch.bfloat16)``.
+    """
+    from gridbook import ops as pq_ops
+    from gridbook.moe_routing import cb_cached_row_offsets
+
+    packed = getattr(layer, f"{which}_cb_qweight")[:experts].contiguous()
+    out_f = int(packed.shape[1])
+    in_f = int(layer._cb_hidden if which == "w13" else layer._cb_inter)
+    rows = experts * out_f
+    raw = codec.pad_qweight(packed.reshape(rows, -1))
+    row0 = cb_cached_row_offsets(layer, rows, packed.device)
+    value = pq_ops.cb_expand_fp8(
+        raw, method._stock_cb_flat_fp8(layer), row0, rows, in_f,
+        method.k, method.n_sub, method.type_size)
+    scale = getattr(layer, f"{which}_weight_scale")[:experts] \
+        .reshape(rows).to(torch.float32)
+    return (value.float() * scale[:, None]).view(experts, out_f, in_f)
+
+
+def _exact_fp32_moe(method, layer, dims, x, topk_weights, topk_ids):
+    """The routed collective in FP32, carrying ONLY the two mandated E4M3
+    activation quantizations — the computation both lanes approximate.
+
+    One (token, expert) pair at a time, so no cross-pair accumulation order is
+    baked in either. Small-M only: it is a Python loop over routed pairs.
+    """
+    experts, hidden = dims["E"], dims["hidden"]
+    inter = dims["inter"]
+    tokens, topk = topk_ids.shape
+    w13 = _exact_weight_f32(method, layer, "w13", experts)
+    w2 = _exact_weight_f32(method, layer, "w2", experts)
+    xq = _fp8_qdq_f32(x)
+
+    pair_expert = topk_ids.reshape(-1).to(torch.long)
+    pair_token = torch.arange(
+        tokens, device=topk_ids.device).repeat_interleave(topk)
+    pair_weight = topk_weights.reshape(-1).float()
+
+    out = torch.zeros((tokens, hidden), dtype=torch.float32, device=x.device)
+    for p in range(int(pair_expert.numel())):
+        e, t = int(pair_expert[p]), int(pair_token[p])
+        gate_up = xq[t] @ w13[e].t()
+        activated = torch.nn.functional.silu(gate_up[:inter]) \
+            * gate_up[inter:]
+        out[t] += pair_weight[p] * (_fp8_qdq_f32(activated) @ w2[e].t())
+    return out
+
+
+@pytest.mark.parametrize(
+    "distribution,tokens", [("one_expert", 40), ("subset", 17),
+                            ("uniform", 33)])
+def test_fused_lane_is_no_less_exact_than_the_bridge(distribution, tokens):
+    """Measure BOTH lanes against the exact FP32 computation.
+
+    A fused-vs-bridge tolerance cannot say which lane moved, which is why
+    ``_REL_FUSED`` had to be widened to cover routing luck rather than tuned to
+    catch a defect. This is the gate that catches the defect: a real numerics
+    fault in the fused lane — a mis-indexed padded row, a wrong per-tile expert
+    id, a dropped or mis-broadcast EVT scale — drives the fused lane AWAY from
+    exact while the bridge stays put, and that is a signed, per-lane signal a
+    symmetric disagreement bound cannot produce.
+
+    Same configuration as ``test_ragged_routing_at_tile_256`` above, and the
+    same TileM=256, so the cell that test failed on is the cell this one
+    attests. Measured 2026-08-02 over these three cases plus three more: the
+    bridge sits 1.899–2.082e-2 from exact and the fused lane 1.853–2.025e-2,
+    ratio 0.89–1.05x. The two lanes are equally accurate, and the ~2e-2 they
+    disagree by is the norm of two independent error vectors of that size —
+    not a defect in either. 1.25x leaves 19% headroom over the measured worst.
+    """
+    method, layer, dims = _build(seed=6, k=28)
+    _require_grouped_fused(method, layer)
+    if 256 not in method._gf2_tile_sizes(layer):
+        pytest.skip("tile_m=256 not compiled")
+    act = _silu_act()
+    topk = 1 if distribution == "one_expert" else 2
+    ids, weights = _routing(
+        tokens, dims["E"], topk, distribution, seed=1)
+    torch.manual_seed(8)
+    x = torch.randn(
+        tokens, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+
+    exact = _exact_fp32_moe(method, layer, dims, x, weights, ids)
+    bridge = method._apply_prefill_native_bf16(layer, x, weights, ids, act)
+    fused = method._apply_prefill_grouped_fused_v2(
+        layer, x, weights, ids, act, tile_m=256)
+    assert fused is not None
+
+    tag = f"[{distribution},M={tokens}]"
+    err_bridge = _report(f"bridge-vs-exact{tag}", exact, bridge)
+    err_fused = _report(f"fused[tile=256]-vs-exact{tag}", exact, fused)
+
+    # Each lane is independently a quality-green approximation...
+    assert err_bridge <= _REL_FUSED
+    assert err_fused <= _REL_FUSED
+    # ...and the fused lane is not the one carrying the error.
+    assert err_fused <= 1.25 * err_bridge, (
+        f"the fused lane is {err_fused / err_bridge:.3f}x farther from the "
+        f"exact FP32 computation than the bridge is; measured range is "
+        f"0.89-1.05x, so this is a fused-lane numerics regression, not the "
+        f"reassociation the disagreement bound tolerates")
 
 
 # ---------------------------------------------------------------------------
@@ -784,7 +944,18 @@ def _pair_order(y, ids, experts, tile_m):
 
 @pytest.mark.parametrize("distribution,tokens,topk",
                          [("uniform", 300, 2), ("subset", 257, 4),
-                          ("one_expert", 400, 1)])
+                          ("one_expert", 400, 1),
+                          # The RAGGED arm: at M=33/topk=2 an expert holds ~8
+                          # rows, so a TileM=256 block is ~97% padding where a
+                          # TileM=128 block is ~94%. This is the regime
+                          # test_ragged_routing_at_tile_256 was added for, and
+                          # the regime its tolerance gate is least able to
+                          # speak about — a padded-row indexing fault that
+                          # perturbs a handful of the 66 live rows moves a
+                          # Frobenius ratio by less than routing luck does, but
+                          # breaks equality here outright.
+                          ("uniform", 33, 2), ("subset", 17, 2),
+                          ("one_expert", 40, 1)])
 def test_both_compiled_tiles_are_bit_identical(distribution, tokens, topk):
     """The selector must be a PURE PERFORMANCE choice.
 
