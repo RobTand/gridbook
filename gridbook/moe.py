@@ -199,10 +199,14 @@ def _padded_route(topk_ids, topk_weights, E: int, tile_m: int, *,
         # Per-expert PADDED ROW counts, straight from the host read above —
         # pack_expert_blocks re-derives block counts as ceil(rows/tile_m), and
         # blocks*tile_m rows round-trips to exactly those blocks.
-        order, _touched, _minimum = pack_expert_blocks(
+        # NOT `order` — that name already holds the stable-argsort permutation
+        # this function built above, and `ptok_sorted`/`pw_sorted` are taken
+        # from it. Rebinding it here would work today only because those two
+        # reads happen earlier, which is one line-move from a silent bug.
+        expert_order, _touched, _minimum = pack_expert_blocks(
             [(int(offsets[e + 1]) - int(offsets[e])) * tile_m
              for e in range(E)], tile_m, pack_group)
-        if order:
+        if expert_order:
             # Build the BLOCK permutation on device from the host segment
             # ranges. Concatenating whole [start, stop) block ranges is what
             # makes this a segment permutation rather than a row shuffle.
@@ -210,7 +214,7 @@ def _padded_route(topk_ids, topk_weights, E: int, tile_m: int, *,
             block_perm = torch.cat([
                 torch.arange(int(offsets[e]), int(offsets[e + 1]),
                              device=dev_, dtype=torch.long)
-                for e in order]) if len(order) > 1 else None
+                for e in expert_order]) if len(expert_order) > 1 else None
             if block_perm is not None and block_perm.numel():
                 expert_ids = expert_ids.index_select(0, block_perm).contiguous()
                 # Rows follow their block: [b*tile_m, (b+1)*tile_m) moves whole.
