@@ -12,16 +12,26 @@ expander module, the required grouped-BF16 quality bridge, and the optional
 FP8 fused specialization on Blackwell. Experimental fused FP4 remains an
 explicit, default-off build option.
 
-**Fused FP8 module build cost (measured, GB10 / cc 12.1, cold cache):**
+**Fused FP8 module build cost (measured, GB10 / cc 12.1, cold cache, 2026-08-02).**
 `get_fused_ext()` compiles 20 kernel instantiations — six `k_bits` rungs ×
 {dense unscaled, dense scaled, grouped TileM=128}, plus grouped TileM=256 at
-k28/k32 — in **~76 s**. The K1.2 rung-surface work (2026-08-02) changed *no*
-instantiation, because the six compiled rungs were already the complete set the
-packed-B TMA box and the uniform sub-table width admit (see
-[KERNELS](KERNELS.md#rung-coverage-what-this-lane-can-and-cannot-serve-k12)), so
-the build-time delta against the previous release is **zero within measurement
-noise**. Every rung that *could* be added would need a different TMA schedule,
-not another template instantiation.
+k28/k32. Measured by clearing `$PRISMAQUANT_CB_EXT_DIR/fused` and timing the
+loader:
+
+| source | cold build |
+|---|---|
+| pre-K1.2 (merge base) | 71.4 s |
+| K1.2 | 76.0 s, 75.7 s |
+
+**+4.6 s (~6%).** The K1.2 work changed *no* kernel instantiation — the six
+compiled rungs were already the complete set the packed-B TMA box and the
+uniform sub-table width admit (see
+[KERNELS](KERNELS.md#rung-coverage-what-this-lane-can-and-cannot-serve-k12)) —
+so the delta is compile-time *evaluation*, not code generation: the rung-law
+predicates, the smem closed form, and the twelve-cell `static_assert` table that
+pins it to the probe. Every rung that could be *added* would need a different
+TMA schedule and a ragged-width decode, i.e. a new kernel rather than another
+template instantiation, so this is not a preview of a larger future cost.
 
 ---
 

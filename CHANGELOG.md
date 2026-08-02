@@ -23,8 +23,11 @@
   that *do* serve it. Per-rung bit-exact gates are now parametrized from the
   module's own reported surface rather than a hand-written four-of-six list.
   The published smem table was **regenerated** — it quoted the pre-R6 base and
-  was stale by up to 16,384 B. No instantiation changed, so the cold-cache JIT
-  build is unchanged at ~76 s (GB10 container, 20 kernel instantiations).
+  was stale by up to 16,384 B. No kernel instantiation changed; the cold-cache
+  JIT build moves 71.4 s -> 76.0/75.7 s (GB10 container, 20 instantiations),
+  i.e. +4.6 s of compile-time *evaluation* — the law predicates and the
+  twelve-cell `static_assert` table pinning the smem closed form to the probe —
+  not of code generation.
 - **K0.4 — graph-safe grouped TileM selector and full dispatch telemetry.**
   `moe_routing.cb_grouped_tile_m` replaces a choice that was worse than manual:
   the FP8 grouped path resolved `tile_m=None` to the kernel's compiled default,

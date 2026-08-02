@@ -1,8 +1,9 @@
-"""CPU contract gates for the OPT-IN sm12x-native BF16 grouped lane.
+"""Contract and wiring gates for the OPT-IN sm12x-native BF16 grouped lane.
 
-The lane itself is a GPU kernel (``tests/test_bf16_grouped_cutlass.py`` gates
-its numerics). What is testable without a device is the part that decides
-WHETHER it runs, and that part carries the whole opt-in promise:
+The selector, attestation and tile-order cases below are CPU-only. The lane
+itself is a GPU kernel (``tests/test_bf16_grouped_cutlass.py`` gates its
+numerics); what is testable without a device is the part that decides WHETHER
+it runs, and that part carries the whole opt-in promise:
 
 * with ``PRISMAQUANT_CB_BF16_SM120`` unset, nothing about the dispatch changes
   and nothing probes or builds;
@@ -11,9 +12,22 @@ WHETHER it runs, and that part carries the whole opt-in promise:
   which would answer a different question than the operator asked;
 * the selector is process-stable and rejects typos, so an intended A/B can
   never become an unlabelled baseline run.
+
+The last section gates the WIRING: ``gridbook/moe.py``'s routed prefill through
+its own dispatch with the flag on and off, so the two claims the lane makes at
+the operator level are asserted where an operator actually meets them — that
+stage one carries NO padded activation copy any more (the in-mainloop A-row
+gather reads the compact tensor and is bit-identical to the copy it replaced),
+and that the swizzle-group packed expert ORDER is bit-neutral and applied only
+where the expert-chunk loop's expert-major assumption still holds. Those cases
+need CUDA, the grouped-BF16 extension and the sm12x lane; each skips on its own
+rather than skipping the file, exactly as sections A-C stay live on a CI host
+with no GPU.
 """
 from __future__ import annotations
 
+import importlib.util
+import inspect
 import types
 
 import pytest

@@ -90,10 +90,14 @@ def _moe_shape(layer, topk_ids) -> str:
     sync and is legal to call on the hot path and under capture. ``P`` is
     included because it is what the tile selector actually reasons about.
     """
-    T = int(topk_ids.shape[0])
-    top_k = int(topk_ids.shape[-1])
-    return (f"T{T}:P{T * top_k}:E{int(layer._cb_E)}"
-            f":H{int(layer._cb_hidden)}:I{int(layer._cb_inter)}:topk{top_k}")
+    try:
+        T = int(topk_ids.shape[0])
+        top_k = int(topk_ids.shape[-1])
+        return (f"T{T}:P{T * top_k}:E{int(layer._cb_E)}"
+                f":H{int(layer._cb_hidden)}:I{int(layer._cb_inter)}"
+                f":topk{top_k}")
+    except Exception:  # noqa: BLE001 — telemetry never breaks a request
+        return ""
 
 
 def _row_bytes(in_features: int, type_size: int) -> int:
@@ -185,6 +189,13 @@ def _padded_route(topk_ids, topk_weights, E: int, tile_m: int, *,
         is_pad = is_pad[:nb * tile_m]
 
     if pack_group and pack_group > 1 and offsets is not None:
+        # NOTE the returned ``block_offsets`` stay in EXPERT-ID order and are
+        # therefore only meaningful at 0 and E once this runs — which is
+        # exactly the caller contract above. They are deliberately not
+        # "repaired" into packed order: ``block_offsets[e]`` is indexed by
+        # expert id, and in packed order an id no longer names a contiguous
+        # block range, so any rewrite would be a differently-wrong answer
+        # rather than a right one.
         # Per-expert PADDED ROW counts, straight from the host read above —
         # pack_expert_blocks re-derives block counts as ceil(rows/tile_m), and
         # blocks*tile_m rows round-trips to exactly those blocks.
