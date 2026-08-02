@@ -662,3 +662,182 @@ def test_unsupported_activation_fails_before_external_dispatch(monkeypatch):
                        match="no direct native Gridbook operator"):
         native_cutlass.require_native_moe_activation(
             "swiglustep", "test routed activation")
+
+
+# --- Routed FP4 lane PRECEDENCE (fused NVFP4 > persistent-B > sm12x) -------
+
+
+def _reset_lane_latches():
+    from gridbook import bf16_grouped_lane, moe_persistent_b_lane
+
+    moe_persistent_b_lane._reset_for_tests()
+    bf16_grouped_lane._reset_for_tests()
+    moe._FUSED_FP4_MOE_STATE.clear()
+
+
+@pytest.fixture
+def lane_latches():
+    _reset_lane_latches()
+    yield
+    _reset_lane_latches()
+
+
+def _loadable_layer():
+    layer = _layer(experts=1, hidden=256, inter=256)
+    layer.w13_input_global_scale = torch.nn.Parameter(torch.tensor([2.5]))
+    layer.w2_input_global_scale = torch.nn.Parameter(torch.tensor([1.25]))
+    layer.w13_cb_qweight = torch.nn.Parameter(
+        torch.empty(1, 512, 73, dtype=torch.uint8), requires_grad=False)
+    layer.w2_cb_qweight = torch.nn.Parameter(
+        torch.empty(1, 256, 73, dtype=torch.uint8), requires_grad=False)
+    return layer
+
+
+def _stub_load(monkeypatch, method):
+    """Neutralize every native attestation so the LOAD's own logic is visible."""
+    from gridbook import cuda_ext, ops
+
+    class QuantConfig:
+        @staticmethod
+        def get_codebooks():
+            return {"cb": torch.zeros(1)}
+
+        @staticmethod
+        def moe_activation_stage_targets(prefix):
+            del prefix
+            return {"w13": ["gate_up"], "w2": ["down"]}
+
+        @staticmethod
+        def activation_scales_for_targets(targets):
+            return [2.5 if targets == ["gate_up"] else 1.25]
+
+    method.scheme["codebook_ref"] = "cb"
+    method.quant_config = QuantConfig()
+    method._cuda_moe_ok = lambda _layer: True
+    monkeypatch.setattr(moe, "assert_cb_experts_filled", lambda *_a: None)
+    monkeypatch.setattr(moe.codec, "build_flat_codebook",
+                        lambda *_a: torch.zeros(1))
+    monkeypatch.setattr(moe.codec, "build_compose_table",
+                        lambda *_a: torch.zeros(1))
+    monkeypatch.setattr(moe, "cb_gemv_choice", lambda *_a: (True, "test"))
+    monkeypatch.setattr(moe, "require_native_moe_activation",
+                        lambda *_a: "silu")
+    monkeypatch.setattr(cuda_ext, "require_ext", lambda *_a: None)
+    monkeypatch.setattr(cuda_ext, "require_ext_v2", lambda *_a: None)
+    monkeypatch.setattr(cuda_ext, "require_fp4_v2_expander",
+                        lambda *_a, **_k: None)
+    monkeypatch.setattr(cuda_ext, "require_bf16_grouped_ext", lambda *_a: None)
+    monkeypatch.setattr(ops, "register_cb_layer", lambda *_a: 7)
+    # The persistent-B lane is ATTESTED even when it will be overridden, so a
+    # broken explicit selection still fails the load. Stand in for the module.
+    ext = types.SimpleNamespace(cb_moe_persistent_b_configs=lambda: [[64, 64]])
+    monkeypatch.setattr(moe, "persistent_b_require_lane",
+                        lambda *_a, **_k: ext)
+    return ext
+
+
+def test_load_print_names_the_route_that_will_actually_serve(
+    monkeypatch, capsys, lane_latches,
+):
+    """Both flags set: the log must name the fused mode, not persistent-B.
+
+    Until 2026-08-02 this printed "-> persistent-B decode-in-mainloop" and
+    then served the fused NVFP4 MoE kernel for every request. A dispatch log
+    that names the wrong kernel is worse than none: it is the artifact an A/B
+    is read from.
+    """
+    monkeypatch.setenv("PRISMAQUANT_CB_MOE_PERSISTENT_B", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", "rowwise")
+    method = _method(k=16)
+    ext = _stub_load(monkeypatch, method)
+    layer = _loadable_layer()
+    method._gf4_ok = lambda *_a, **_k: True
+
+    method.process_weights_after_loading(layer)
+
+    out = capsys.readouterr().out
+    assert "-> fused NVFP4 MoE 'rowwise'" in out
+    assert "PRECEDENCE" in out
+    assert "PRISMAQUANT_CB_MOE_PERSISTENT_B" in out
+    assert "will NOT serve this layer" in out
+    assert "-> persistent-B decode-in-mainloop" not in out
+    # Attested regardless, so an unserveable explicit selection still fails
+    # the LOAD rather than being silently ignored.
+    assert layer._cb_moe_persistent_b is ext
+    assert layer._cb_fused_fp4_moe_mode == "rowwise"
+
+
+def test_load_print_is_unchanged_when_persistent_b_is_the_only_flag(
+    monkeypatch, capsys, lane_latches,
+):
+    monkeypatch.setenv("PRISMAQUANT_CB_MOE_PERSISTENT_B", "1")
+    monkeypatch.delenv("PRISMAQUANT_CB_FUSED_FP4_MOE", raising=False)
+    method = _method(k=16)
+    _stub_load(monkeypatch, method)
+    layer = _loadable_layer()
+
+    method.process_weights_after_loading(layer)
+
+    out = capsys.readouterr().out
+    assert "-> persistent-B decode-in-mainloop" in out
+    assert "no expanded [E,N,K] transient" in out
+    assert "PRECEDENCE" not in out
+
+
+def test_dispatch_matches_the_precedence_the_load_announced(monkeypatch):
+    """The coded order IS fused > persistent-B; pin it as deliberate."""
+    Method = moe.PrismaQuantCBMoEMethod
+    taken = []
+    monkeypatch.setattr(
+        Method, "_apply_prefill_grouped_fused_fp4",
+        lambda self, *a, **k: taken.append("fused-fp4") or "fused")
+    monkeypatch.setattr(
+        Method, "_apply_prefill_native_bf16",
+        lambda self, *a, **k: taken.append("bridge-family") or "bridge")
+
+    method = _method(k=16)
+    method._cuda_moe_ok = lambda _layer: True
+    layer = types.SimpleNamespace(
+        _cb_fused_fp4_moe_mode="rowwise",
+        _cb_moe_persistent_b=object(),
+        _cb_bf16_sm120=object(),
+        _cb_native_activation="silu",
+        # `_apply_inline`'s getattr default is evaluated eagerly, so the
+        # module attribute must exist even when the cached value is present.
+        activation=types.SimpleNamespace(value="silu"))
+    x = torch.zeros(64, 256, dtype=torch.bfloat16)
+    ids = torch.zeros(64, 2, dtype=torch.int32)
+
+    assert method._apply_inline(layer, x, torch.ones(64, 2), ids) == "fused"
+    assert taken == ["fused-fp4"]
+
+
+def test_persistent_b_serves_once_the_contract_flag_is_absent(monkeypatch):
+    """The negative control for the row above: no fused mode, lane serves."""
+    Method = moe.PrismaQuantCBMoEMethod
+    taken = []
+    monkeypatch.setattr(
+        Method, "_apply_prefill_grouped_fused_fp4",
+        lambda self, *a, **k: taken.append("fused-fp4") or "fused")
+    monkeypatch.setattr(
+        Method, "_apply_prefill_native_bf16_persistent_b",
+        lambda self, *a, **k: taken.append("persistent-b") or "pb")
+    monkeypatch.setattr(
+        Method, "_apply_prefill_native_bf16_sm120",
+        lambda self, *a, **k: taken.append("sm120") or "sm120")
+
+    method = _method(k=16)
+    method._cuda_moe_ok = lambda _layer: True
+    layer = types.SimpleNamespace(
+        _cb_fused_fp4_moe_mode="",
+        _cb_moe_persistent_b=object(),
+        _cb_bf16_sm120=object(),
+        _cb_native_activation="silu",
+        # `_apply_inline`'s getattr default is evaluated eagerly, so the
+        # module attribute must exist even when the cached value is present.
+        activation=types.SimpleNamespace(value="silu"))
+    x = torch.zeros(64, 256, dtype=torch.bfloat16)
+    ids = torch.zeros(64, 2, dtype=torch.int32)
+
+    assert method._apply_inline(layer, x, torch.ones(64, 2), ids) == "pb"
+    assert taken == ["persistent-b"]

@@ -582,12 +582,38 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # request that happens to carry routed rows.
             layer._cb_moe_persistent_b_cfg = persistent_b_resolve_cfg(
                 layer._cb_moe_persistent_b)
-            print(f"[prismaquant-cb] moe_prefill {self.prefix} -> "
-                  f"persistent-B decode-in-mainloop (k={self.k} "
-                  f"type_size={self.type_size} hidden={layer._cb_hidden} "
-                  f"inter={layer._cb_inter} "
-                  f"cfg={layer._cb_moe_persistent_b_cfg}); no expanded "
-                  f"[E,N,K] transient", flush=True)
+            # PRECEDENCE, announced rather than discovered. An explicit fused
+            # NVFP4 MoE mode CHANGES THE SERVED ACTIVATION CONTRACT; this lane
+            # only changes the GEMM schedule behind the contract the artifact
+            # already declares. The contract-changing selection therefore wins
+            # — that is what ``_apply_inline`` implements, and it is the
+            # deliberate rule, not an accident of ordering.
+            #
+            # Until 2026-08-02 this print announced persistent-B
+            # unconditionally, so a run with BOTH flags set logged one route at
+            # model load and served the other for every request. A dispatch log
+            # that names the wrong kernel is worse than no log: it is the
+            # artifact an A/B is read from. The lane stays resolved and
+            # attested either way, so an unserveable explicit selection still
+            # fails the LOAD rather than being quietly ignored.
+            overriding_mode = _requested_fused_fp4_moe_mode()
+            if overriding_mode:
+                print(f"[prismaquant-cb] moe_prefill {self.prefix} -> fused "
+                      f"NVFP4 MoE {overriding_mode!r} (k={self.k} "
+                      f"type_size={self.type_size} hidden={layer._cb_hidden} "
+                      f"inter={layer._cb_inter}); PRECEDENCE: "
+                      f"PRISMAQUANT_CB_FUSED_FP4_MOE changes the served "
+                      f"activation contract and outranks "
+                      f"PRISMAQUANT_CB_MOE_PERSISTENT_B, which is attested "
+                      f"(cfg={layer._cb_moe_persistent_b_cfg}) but will NOT "
+                      f"serve this layer", flush=True)
+            else:
+                print(f"[prismaquant-cb] moe_prefill {self.prefix} -> "
+                      f"persistent-B decode-in-mainloop (k={self.k} "
+                      f"type_size={self.type_size} hidden={layer._cb_hidden} "
+                      f"inter={layer._cb_inter} "
+                      f"cfg={layer._cb_moe_persistent_b_cfg}); no expanded "
+                      f"[E,N,K] transient", flush=True)
         if not self._cuda_moe_ok(layer):
             raise NativeKernelUnavailableError(
                 f"{self.prefix}: routed decode layout has no native grouped "
@@ -677,6 +703,24 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 layer, x, topk_weights, topk_ids, act)
 
         if self.is_fp4:
+            # ROUTED FP4 PRECEDENCE (deliberate, and announced at model load —
+            # see process_weights_after_loading):
+            #
+            #   PRISMAQUANT_CB_FUSED_FP4_MOE
+            #     > PRISMAQUANT_CB_MOE_PERSISTENT_B
+            #       > PRISMAQUANT_CB_BF16_SM120
+            #         > the default expand + grouped-bridge route
+            #
+            # The rule is what each flag CHANGES, not the order they were
+            # added. The fused NVFP4 mode changes the served ACTIVATION
+            # CONTRACT, so it outranks everything below it, which only move the
+            # GEMM schedule behind the contract the artifact already declares.
+            # Persistent-B in turn outranks the sm12x bridge lane because it
+            # replaces the pair of operations that lane is one half of (see
+            # ``_apply_prefill_native_bf16``, which implements the lower two).
+            # Every one of them is still resolved and attested at load, so an
+            # unserveable explicit selection fails the LOAD even when a
+            # higher-precedence flag will be the one that serves.
             mode = getattr(layer, "_cb_fused_fp4_moe_mode", None)
             if mode is None:
                 # Production fixes this at model load. This branch supports
@@ -1017,6 +1061,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         precedence over the sm12x bridge lane, because it replaces the pair of
         operations the bridge lane is one half of. See
         ``_apply_prefill_native_bf16_persistent_b``.
+
+        Neither reaches this method at all when ``PRISMAQUANT_CB_FUSED_FP4_MOE``
+        names a mode: that selection changes the served ACTIVATION CONTRACT and
+        outranks both, so ``_apply_inline`` routes past this whole family. The
+        full ordering and the reason for it are stated there.
         """
         from . import ops as pq_ops
 
