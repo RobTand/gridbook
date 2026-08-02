@@ -252,14 +252,27 @@ def _arms(shape, tokens, args, tile_m, cfg, weights):
                                       compose, 0, rows, in_f, k, ts)
         return weight.view(n_e, out_f, in_f)
 
-    def exact_route():
-        """The exact-segment routing both non-padded lanes share."""
+    def exact_route(capture_safe_counts):
+        """The exact-segment routing both non-padded lanes build.
+
+        ``capture_safe_counts`` mirrors the difference between the two lanes
+        rather than papering over it: the persistent-B path counts with
+        ``scatter_add_`` (pure device work), the default path calls
+        ``torch.bincount``, whose CUDA implementation host-syncs. Both produce
+        the identical integer counts; timing the one each lane actually runs is
+        what keeps this a comparison of the shipped routes.
+        """
         pair_expert = topk_ids.reshape(-1).to(torch.int64)
         order = torch.argsort(pair_expert, stable=True)
         pair_token = torch.arange(tokens, dtype=torch.int64,
                                   device=dev).repeat_interleave(top_k)
         rows = pair_token.index_select(0, order)
-        counts = torch.bincount(pair_expert, minlength=E)
+        if capture_safe_counts:
+            counts = torch.zeros(E, dtype=torch.int64,
+                                 device=dev).scatter_add_(
+                0, pair_expert, torch.ones_like(pair_expert))
+        else:
+            counts = torch.bincount(pair_expert, minlength=E)
         ends = torch.cumsum(counts, 0, dtype=torch.int32).contiguous()
         return order, rows, ends
 
@@ -272,7 +285,7 @@ def _arms(shape, tokens, args, tile_m, cfg, weights):
         return output
 
     def run_persistent_b():
-        order, rows, ends = exact_route()
+        order, rows, ends = exact_route(True)
         xq = ops.fp4_act_qdq(x)
         x_sorted = xq.index_select(0, rows).contiguous()
         del xq
@@ -296,7 +309,7 @@ def _arms(shape, tokens, args, tile_m, cfg, weights):
         return combine(pair_output, order, rows)
 
     def run_expand_sm80():
-        order, rows, ends = exact_route()
+        order, rows, ends = exact_route(False)
         xq = ops.fp4_act_qdq(x)
         x_sorted = xq.index_select(0, rows).contiguous()
         del xq

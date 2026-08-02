@@ -1015,13 +1015,21 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         budget); with no transient there is nothing to bound, so each stage is
         exactly ONE launch regardless of E.
 
-        ROUTING. Identical to the default lane above, helper for helper: the
-        same stable ``argsort`` over the routed pairs, the same
-        ``expert_ends = cumsum(bincount(...))`` exact segments, the same
-        ``index_select`` gather and ``index_add_`` combine. Nothing new was
-        invented, and unlike the padded tile-indexed lanes there are no
-        padding rows and NO host read of device data anywhere on this path —
-        the kernel's launch geometry is a function of ``(E, N)`` alone.
+        ROUTING. The same construction as the default lane above, helper for
+        helper: stable ``argsort`` over the routed pairs, cumulative per-expert
+        counts, ``index_select`` gather, ``index_add_`` combine. Nothing new
+        was invented. Two differences, both in this lane's favour:
+
+        * there are no padding rows, because the kernel's tile does not have to
+          belong to one expert the way a CUTLASS grouped tile does;
+        * the path performs NO host read of device data — no ``.item()``, no
+          ``.tolist()``, no implicit sync — where the padded tile-indexed lanes
+          each spend one host read per layer on the real block total. The
+          per-expert counts use ``scatter_add_`` rather than ``bincount``
+          precisely because ATen's CUDA ``bincount`` host-syncs (see the call
+          site). Combined with a launch geometry that is a function of
+          ``(E, N)`` alone, that makes the whole method capturable, which the
+          suite gates directly.
 
         EMPTY AND SKEWED ROUTING. An expert with no routed rows is two int32
         loads and a CTA return. A heavily-skewed expert is walked by its
@@ -1054,7 +1062,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         pair_token = torch.arange(
             T, dtype=torch.int64, device=dev).repeat_interleave(top_k)
         rows = pair_token.index_select(0, order)
-        counts = torch.bincount(pair_expert, minlength=E)
+        # scatter_add_, NOT bincount. ATen's CUDA bincount sizes its output
+        # from `self.min().item()` / `self.max().item()`, so it host-syncs and
+        # cannot be captured ("Cannot copy between CPU and CUDA tensors during
+        # CUDA graph capture", measured on torch 2.11.0+cu130). This form is
+        # pure device work at a static shape and produces the identical integer
+        # counts, which is what lets this lane's claim below be literally true.
+        counts = torch.zeros(E, dtype=torch.int64, device=dev).scatter_add_(
+            0, pair_expert, torch.ones_like(pair_expert))
         expert_ends = torch.cumsum(counts, 0, dtype=torch.int32).contiguous()
 
         xq = pq_ops.fp4_act_qdq(x)

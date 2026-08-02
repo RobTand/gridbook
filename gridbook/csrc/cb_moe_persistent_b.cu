@@ -192,6 +192,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -393,7 +394,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
     const float* __restrict__ compose,       // [256*16] two-tier compose
     const int32_t* __restrict__ expert_ends, // [E] cumulative routed rows
     uint16_t* __restrict__ y,                // [P, N] bf16
-    const int64_t N, const int64_t K,
+    const int64_t P, const int64_t N, const int64_t K,
     const CbFp4V2Fmt fmt,
     const int ts_pad,
     const int n_tiles,
@@ -407,6 +408,10 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
   static_assert(WM * WN == WARPS, "warp grid must cover the CTA");
   static_assert(TM % (16 * WM) == 0, "TM must tile the warp rows");
   static_assert(MATOM * NATOM * 4 <= 128, "accumulator register budget");
+  // The MMA block issues N-atoms in PAIRS (one `ldmatrix.x4` feeds two), so an
+  // odd NATOM would silently drop the last 8 output columns instead of failing
+  // to compile.
+  static_assert(NATOM % 2 == 0, "N-atoms are consumed in ldmatrix.x4 pairs");
 
   extern __shared__ __align__(16) uint8_t smem_raw[];
   uint16_t* sA = reinterpret_cast<uint16_t*>(smem_raw);
@@ -430,8 +435,20 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
     const int n0 = (int)(wu % n_tiles) * TN;
 
     // Exact routed segment for this expert.  An empty expert stops here.
-    const int m_lo = (e == 0) ? 0 : expert_ends[e - 1];
-    const int m_hi = expert_ends[e];
+    //
+    // CLAMPED TO [0, P] because `expert_ends` is DEVICE data: the host can
+    // check its dtype, length and device, but not its VALUES, and these bounds
+    // drive both the A-row predicate and the epilogue's store predicate. An
+    // out-of-range or non-monotone entry would otherwise read and write past
+    // `a` and `y` -- a fault at best, and at worst two CTAs writing the same
+    // rows. Serving builds this as a cumsum of a bincount so it always ends at
+    // exactly P, but the binding is public and the clamp is one register `min`
+    // on a value already loaded once per work unit.
+    const int Pi = (int)P;
+    const int raw_lo = (e == 0) ? 0 : expert_ends[e - 1];
+    const int raw_hi = expert_ends[e];
+    const int m_lo = raw_lo < 0 ? 0 : (raw_lo > Pi ? Pi : raw_lo);
+    const int m_hi = raw_hi < m_lo ? m_lo : (raw_hi > Pi ? Pi : raw_hi);
     if (m_hi <= m_lo) {
       continue;
     }
@@ -729,10 +746,21 @@ void pb_prepare_device(int device) {
               "cb_moe_persistent_b supports only native compute capability "
               "12.0/12.1, but cuda:", device, " reports ", prop.major, ".",
               prop.minor);
-  TORCH_CHECK(prop.sharedMemPerBlockOptin >= kSm120SmemCapacity,
-              "cb_moe_persistent_b requires ", kSm120SmemCapacity,
-              " B opt-in shared memory, but cuda:", device, " advertises ",
-              prop.sharedMemPerBlockOptin, " B");
+  // The REAL requirement is the largest compiled tile at the widest rung, not
+  // the whole 99 KiB budget: gating on the budget would reject a device this
+  // schedule can serve. (Every cc-12.x part advertises the full 101,376 B, so
+  // this has never fired -- which is exactly why it should state the true
+  // bound rather than a convenient one.)
+  int64_t need = 0;
+  for (int i = 0; i < kNumCfgs; ++i) {
+    const int64_t s = cfg_smem_bytes(kCfgs[i], 4 * 24 + 9);
+    if (s > need) need = s;
+  }
+  TORCH_CHECK(prop.sharedMemPerBlockOptin >= need,
+              "cb_moe_persistent_b needs ", need,
+              " B of opt-in shared memory for its largest compiled tile, but "
+              "cuda:", device, " advertises ", prop.sharedMemPerBlockOptin,
+              " B");
   TORCH_CHECK(prop.sharedMemPerMultiprocessor >= kSmemPerSm,
               "cb_moe_persistent_b sizes its tiles against ", kSmemPerSm,
               " B of shared memory per SM, but cuda:", device, " advertises ",
@@ -761,12 +789,12 @@ void cb_moe_persistent_b_prepare() {
 template <int TM, int TN, int WARPS>
 void launch_cfg(const uint16_t* a, const uint8_t* qw, const uint16_t* lut,
                 const float* compose, const int32_t* expert_ends, uint16_t* y,
-                int64_t N, int64_t K, CbFp4V2Fmt fmt, int ts_pad, int n_tiles,
-                int64_t total_wu, int64_t smem, unsigned grid,
+                int64_t P, int64_t N, int64_t K, CbFp4V2Fmt fmt, int ts_pad,
+                int n_tiles, int64_t total_wu, int64_t smem, unsigned grid,
                 cudaStream_t stream) {
   auto kern = cb_moe_persistent_b_kernel<TM, TN, WARPS>;
   kern<<<grid, WARPS * 32, (size_t)smem, stream>>>(
-      a, qw, lut, compose, expert_ends, y, N, K, fmt, ts_pad, n_tiles,
+      a, qw, lut, compose, expert_ends, y, P, N, K, fmt, ts_pad, n_tiles,
       total_wu);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -867,6 +895,22 @@ void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
               "cb_moe_persistent_b: cfg must be 0 (auto) or 1..", kNumCfgs,
               ", got ", cfg_index);
 
+  // Alignment the instruction selection depends on, and that contiguity does
+  // NOT imply: `cp.async ..., 16` needs a 16-byte-aligned global source, the
+  // epilogue stores two BF16 as one `uint32_t`, and the decode gathers eight
+  // BF16 as one `uint2`. Fresh allocations satisfy all three; an odd-offset
+  // view through this public binding would not.
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0,
+              "cb_moe_persistent_b: `a` must be 16-byte aligned (the mainloop "
+              "stages it with 16-byte cp.async); pass a fresh contiguous "
+              "tensor rather than an offset view");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 4 == 0,
+              "cb_moe_persistent_b: `out` must be 4-byte aligned (the epilogue "
+              "stores two BF16 columns per instruction)");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(lut.data_ptr()) % 8 == 0,
+              "cb_moe_persistent_b: the flat codebook must be 8-byte aligned "
+              "(each decode gathers four BF16 per sub-table in one load)");
+
   if (P == 0) {
     return;
   }
@@ -898,18 +942,34 @@ void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
     // narrowest tile is kept and the masking carries it, rather than failing a
     // shape the kernel computes correctly.
     if (kCfgs[idx].tn > N) {
+      // Rank: prefer a tile that fits N; among those prefer the TM the
+      // rows-per-expert rule already chose (dropping it would discard the
+      // whole point of the selection at exactly the narrow shapes); then the
+      // widest TN.  If nothing fits, take the narrowest TN and let the column
+      // masking carry it.
+      const int want_tm = kCfgs[idx].tm;
       int next = -1;
       for (int i = 0; i < kNumCfgs; ++i) {
-        const bool fits = kCfgs[i].tn <= N;
-        const bool best_fits = next >= 0 && kCfgs[next].tn <= N;
         if (next < 0) {
           next = i;
-        } else if (fits && !best_fits) {
-          next = i;                       // any fitting tile beats a wide one
-        } else if (fits && best_fits && kCfgs[i].tn > kCfgs[next].tn) {
-          next = i;                       // widest that fits
-        } else if (!fits && !best_fits && kCfgs[i].tn < kCfgs[next].tn) {
-          next = i;                       // else the narrowest overall
+          continue;
+        }
+        const bool fits = kCfgs[i].tn <= N;
+        const bool best_fits = kCfgs[next].tn <= N;
+        if (fits != best_fits) {
+          if (fits) next = i;
+          continue;
+        }
+        if (!fits) {
+          if (kCfgs[i].tn < kCfgs[next].tn) next = i;
+          continue;
+        }
+        const bool same_tm = kCfgs[i].tm == want_tm;
+        const bool best_same_tm = kCfgs[next].tm == want_tm;
+        if (same_tm != best_same_tm) {
+          if (same_tm) next = i;
+        } else if (kCfgs[i].tn > kCfgs[next].tn) {
+          next = i;
         }
       }
       idx = next;
@@ -946,7 +1006,7 @@ void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
   uint16_t* yp = reinterpret_cast<uint16_t*>(out.data_ptr());
 
 #define GB_LAUNCH(TM_, TN_, W_)                                              \
-  launch_cfg<TM_, TN_, W_>(ap, qp, lp, cp, ep, yp, N, K, fmt, ts_pad,        \
+  launch_cfg<TM_, TN_, W_>(ap, qp, lp, cp, ep, yp, P, N, K, fmt, ts_pad,     \
                            n_tiles, total_wu, smem, grid, stream)
   switch (idx) {
     case 0: GB_LAUNCH(128, 64, 8); break;

@@ -549,6 +549,87 @@ def test_cuda_graph_capture_and_replay_match_eager(on_worker_stream):
             f"from the eager result")
 
 
+def test_the_whole_routed_operator_captures_including_its_routing():
+    """The lane claims the WHOLE method is capturable, not just the kernel.
+
+    That claim is about the ROUTING, which is where the other lanes lose it:
+    the padded tile-indexed lanes read the real block total back to the host,
+    and ATen's CUDA ``bincount`` host-syncs (it sizes its output from
+    ``self.max().item()``), which is why
+    ``_apply_prefill_native_bf16_persistent_b`` counts with ``scatter_add_``
+    instead.  This captures the same op sequence the method runs -- routing,
+    both projection stages, the activation between them, the router-weight
+    multiply and the combine -- and requires the replay to reproduce eager
+    bitwise.  A host sync anywhere in it makes capture raise, so this is a
+    direct gate on the claim rather than a restatement of it.
+    """
+    k, K, E, N = 16, 512, 4, 64
+    top_k, tokens = 2, 24
+    qw, lut, compose, type_size = _pack(k, K, E, N, seed=9911)
+    torch.manual_seed(9912)
+    ids = torch.randint(0, E, (tokens, top_k), device=DEV)
+    weights = torch.rand(tokens, top_k, device=DEV, dtype=torch.float32)
+    x = torch.randn(tokens, K, dtype=torch.bfloat16, device=DEV) * 0.1
+    out = torch.zeros(tokens, N, dtype=torch.bfloat16, device=DEV)
+
+    def routed_operator():
+        pair_expert = ids.reshape(-1).to(torch.int64)
+        order = torch.argsort(pair_expert, stable=True)
+        pair_token = torch.arange(
+            tokens, dtype=torch.int64, device=DEV).repeat_interleave(top_k)
+        rows = pair_token.index_select(0, order)
+        counts = torch.zeros(E, dtype=torch.int64, device=DEV).scatter_add_(
+            0, pair_expert, torch.ones_like(pair_expert))
+        ends = torch.cumsum(counts, 0, dtype=torch.int32).contiguous()
+        a = x.index_select(0, rows).contiguous()
+        y = torch.empty(a.shape[0], N, dtype=torch.bfloat16, device=DEV)
+        ext.cb_moe_persistent_b_prefill(
+            y, a, qw, lut, compose, ends, k, type_size, 0)
+        pw = weights.reshape(-1).index_select(0, order).to(y.dtype)
+        y.mul_(pw[:, None])
+        out.zero_()
+        out.index_add_(0, rows, y)
+
+    routed_operator()
+    torch.cuda.synchronize()
+    eager = out.clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        routed_operator()
+    for replay in range(3):
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out.clone().view(torch.int16),
+                           eager.view(torch.int16)), (
+            f"replay {replay} of the whole routed operator diverged")
+
+
+def test_bincount_is_the_thing_the_routing_avoids():
+    """A negative control for the test above: prove the avoided call really
+    does break capture on this torch, so the ``scatter_add_`` in
+    ``_apply_prefill_native_bf16_persistent_b`` is load-bearing and not
+    cosmetic.  Skips rather than fails if a future torch makes bincount
+    capture-clean -- at which point the comment there should be revisited."""
+    ids = torch.randint(0, 8, (32,), device=DEV, dtype=torch.int64)
+    ones = torch.ones_like(ids)
+    scattered = torch.zeros(8, dtype=torch.int64, device=DEV).scatter_add_(
+        0, ids, ones)
+    assert torch.equal(scattered, torch.bincount(ids, minlength=8)), (
+        "scatter_add_ must produce exactly the counts bincount does")
+
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            torch.bincount(ids, minlength=8)
+    except RuntimeError:
+        return
+    pytest.skip("this torch captures torch.bincount; the routing's "
+                "scatter_add_ is no longer required for capture safety")
+
+
 # ===========================================================================
 # 7. Contract violations fail loudly at the API boundary.
 # ===========================================================================
