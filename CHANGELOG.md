@@ -2,6 +2,340 @@
 
 ## Unreleased
 
+## 0.6.0 — 2026-08-02
+
+- **K1.2 — the FP8-CB fused mid-M rung surface, and why it is already
+  complete.** The lane instantiated `k ∈ {28,32,36,40,44,48}` while production
+  permits every integer K28–K48, which read like five missing instantiations on
+  the published 27B artifact's 8-rung K36–K47 ladder. It is not: the compiled
+  set is exactly what a **format + TMA law** admits. `type_size = 4k` is the
+  packed-B TMA box's contiguous extent and must be a 16-byte multiple
+  (`k % 4 == 0`); and the fused mainloop decodes with a *single* width
+  `CbSubW = k/4`, while the format splits `k` over `n_sub = 4` **raggedly**
+  (`csrc/cb_gemv.cu` `SubSplit`), so at k37 the true widths are `(10,9,9,9)` and
+  a uniform decode would be *wrong*, not merely unaligned. ROADMAP K1.2's second
+  arm is therefore the live one, and is implemented: the compiled set is
+  queryable (`cb_fused_kbits()`), `linear.py` and `moe.py` stop carrying
+  duplicate literal ladders and gate on the derived law
+  (`codec.FP8_FUSED_KBITS`) before confirming against the module, every switch
+  and report in the kernel is generated from one rung list, the rung check and
+  `moe_tile_supported` became laws (the smem predicate is a closed form
+  `static_assert`ed cell-by-cell against the probe's twelve measured numbers),
+  and an off-law rung is refused with a message naming the law and the routes
+  that *do* serve it. Per-rung bit-exact gates are now parametrized from the
+  module's own reported surface rather than a hand-written four-of-six list.
+  The published smem table was **regenerated** — it quoted the pre-R6 base and
+  was stale by up to 16,384 B. No kernel instantiation changed; the cold-cache
+  JIT build moves 71.4 s -> 76.0/75.7 s (GB10 container, 20 instantiations),
+  i.e. +4.6 s of compile-time *evaluation* — the law predicates and the
+  twelve-cell `static_assert` table pinning the smem closed form to the probe —
+  not of code generation.
+- **K0.4 — graph-safe grouped TileM selector and full dispatch telemetry.**
+  `moe_routing.cb_grouped_tile_m` replaces a choice that was worse than manual:
+  the FP8 grouped path resolved `tile_m=None` to the kernel's compiled default,
+  so serving could never reach TileM=256 at all, and the FP4 path read its tile
+  off the *suffix* of an activation-policy env string. The selector is
+  CUDA-graph-safe **by construction** — every input is a host-known integer
+  (`topk_ids.shape`, layer constants, the build's own compiled tile list, the
+  cached non-synchronizing SM count), so there is no device read to sync on,
+  which matters because `tile_m` fixes both the kernel symbol and every routing
+  tensor's shape. The rule is `ρ = P/E > 512` plus the dense selector's
+  `ceil(2·SM/3)` occupancy floor, derived from the exact
+  `pad₂₅₆ − pad₁₂₈` padding lemma and a decode:MMA ratio that is `1:t`
+  independent of N and K (so both projection stages give one condition); the
+  threshold is calibrated by inverting the dense TileM A/B and remains proposal
+  data for the grouped lanes. Telemetry now emits K0.4's full list — requested
+  activation policy, actual kernel symbol, TileM, problem shape, activation
+  contract, fallback state and the **exact** fallback reason — for dense *and*
+  MoE calls, extending the 0.4.2 dense mechanism (plain scalars on the layer,
+  tensor-free, sync-free, last-write-wins) rather than adding a parallel one,
+  with two-phase writes and selector provenance so a tile choice is auditable
+  offline. The FP8 grouped gate recorded a bare bool before this; it now names
+  the failing clause. Both tiles are gated **bit-identical** pre-combine in
+  stable-argsorted pair order — the selector is a pure performance choice.
+- **Fixed a CUDA-graph capture defect in the padded grouped routing.**
+  `cb_grouped_pad_routing` documented "NO HOST READS" while calling
+  `torch.bincount`, which sizes its CUDA output from `.max().item()` and
+  therefore host-syncs — the exact trap the persistent-B lane hit and gated with
+  a negative control. Every padded grouped lane was uncapturable as a result.
+  Counts now come from the `scatter_add_` form that lane already proved
+  (identical integers, static shape, pure device work).
+- **Fixed a packaging bug that broke JIT builds from an installed wheel.**
+  `csrc/*.hpp` was matched by no `package-data` glob (`csrc/*.h` does not match
+  `.hpp`, and `csrc/cutlass_fork/*.hpp` is a different directory), so
+  `cb_grouped_common.hpp` shipped in **neither** the wheel nor the sdist. It is
+  a declared build input of all four fused/grouped loaders, so an installed
+  wheel could not build any of them (`_require_csrc` raises
+  `IncompleteInstallError`). Added the glob and reconciled all three mirrors of
+  the runtime-required floor (`check_dist.py`, `check_installed.py`,
+  `test_release_metadata.py`), which had also fallen a wave behind on the
+  fp4v2, persistent-B and shared-header sources.
+- **`PRISMAQUANT_PRELOAD_FUSED=1` now warms every native extension family**
+  (decode GEMV, GEMV-v2, grouped BF16, both fused FP8/NVFP4 modules, fused
+  FP4-v2, persistent-B MoE) instead of only the two fused ones, so a
+  residency-matched A/B cannot be confounded by a module one arm never loaded
+  — the audit's §3 P4 "preload must be a full warm-up" item, and the practical
+  half of the documented ±17% measurement-arithmetic caveat. Each family is
+  attempted independently and fail-soft; strict mode still reports every failure
+  after every attempt. `preload_fused_extensions` remains as a delegating alias
+  because it is the published name.
+- The sm12x grouped-BF16 lane's in-mainloop A-row gather and swizzle-group
+  expert packing are now **wired through `moe.py`**, not just available: stage
+  one of the routed bridge takes the gather entry point (its `[Mp, K]` padded
+  activation copy no longer exists — `dest` *is* the row-source vector), and
+  `_padded_route` applies `pack_expert_blocks` using the per-expert block counts
+  from the block-offset host read already taken, gated on `chunk >= E` because
+  narrower expert chunks index blocks by expert-major contiguity. Stage two
+  stays in padded mode by construction: its input is the padded intermediate.
+
+- Close the sm12x grouped-BF16 lane's ragged-padding tax with two
+  construction changes to the SAME compiled collective (schedule, tile,
+  stages and smem untouched; audit §3 P1 follow-through):
+  **an in-mainloop A-row gather** — the mainloop fork gains a fourth marked
+  addition: the producer warp reads each padded row through ``row_src[m]``
+  from the COMPACT activation with predicated zero-filling 16-byte
+  ``cp.async`` (upstream's own `sm120_mma_tma_blockwise_scaling.hpp`
+  producer idiom: 33 producer events, B-only transaction bytes), so the
+  row-padded activation copy — an HBM write plus a padded re-read too large
+  for L2 — no longer exists (`cb_bf16_grouped_mm_sm120_gather[_out]`; the
+  padded-copy entry points are unchanged and the two modes are gated
+  BIT-IDENTICAL, `torch.equal`, because they load byte-identical smem
+  tiles); and **a swizzle-group-aligned expert order**
+  (`bf16_grouped_lane.pack_expert_blocks`) — the persistent scheduler sweeps
+  N in groups of 8 M-tiles, so an expert straddling a group boundary has its
+  whole B slice fetched from DRAM once per group touched; packing experts
+  into groups (deterministic first-fit-decreasing on the routing histogram,
+  telemetered as groups-touched vs minimum) removes the straddle excess,
+  measured 14–17% GEMM time at ``T=512`` and neutral at ``T=128``. The dense
+  ``E=1`` helper now uses the gather mode too (``row_src = arange``; no
+  padded copy, no concat). Measured on the GB10 (whole operator, warm
+  medians, seed-731 DSV4/Laguna cells): **1.03–1.05× segmented BF16
+  matmuls at ``T=128`` and 1.10–1.15× at ``T=512``** — the padded-copy
+  construction's measured 0.83–0.92× ``T=512`` deficit is closed — while
+  beating the SM80 bridge by 1.13–1.37× everywhere; a ``TileM`` ladder was
+  evaluated against the sweep record instead and is measured-dead for these
+  cells (every 128-row tile ≤ 0.97× segmented). Bit gates extended to
+  every new boundary (gather==padded bitwise on every routing shape incl.
+  K-residue, OOB ids read zeros, packed order is a pure block permutation);
+  flag semantics, the SM80 lane, and flag-off dispatch are byte-for-byte
+  unchanged. Proposal data; the served NATIVE-PARITY protocol has not run.
+- Add the **FP4-CB v2 fused mid-M lane** (`csrc/cb_fused_fp4v2_gemm.cu` +
+  `csrc/cutlass_fork/sm120_cb_fp4v2_bf16_mma.hpp`, audit §3 P2a), closing the
+  audit's structural cause (c): FP8-CB owned M = 9–128 with a fused
+  decode-in-prologue kernel while FP4 had **no mid-M lane at all**. The new
+  lane decodes packed CB rows to BF16 inside the CUTLASS producer/consumer
+  stage, so the `[N,K]` BF16 transient never reaches HBM. It is
+  **contract-preserving**: the decoded values are proven bit-identical to
+  `cb_expand_v2` — the whole decoded tile, at all 13 K12–K24 rungs, via a
+  one-hot read-out that turns the GEMM into a direct dump of the decoded
+  weights (no tolerance anywhere) — and the activations are the same BF16
+  group-16 QDQ output the bridge already consumes, so only the FP32 GEMM
+  reduction order moves. Separate module from the native-NVFP4 fused lane,
+  whose payload and served numerics are different; nothing there is touched.
+  fp4-v2's odd `type_size = 4k+9` makes TMA structurally unusable for B, so the
+  producer publishes a per-stage descriptor under the mbarrier and the
+  consumers gather packed bytes from gmem with aligned-u32 windows — which also
+  makes `k_bits` a runtime parameter, so four compiled kernels serve the whole
+  rung ladder (they differ only in the codebook smem-stage size). Shipped tile
+  `128×64×64`/2 stages, measured against the 101,376-byte budget by the new
+  host-only `csrc/tools/smem_probe_fp4v2_bf16.cu`; the zero-margin 48 KiB stage
+  is deliberately not compiled. **Opt-in** behind
+  `PRISMAQUANT_CB_FP4_FUSED_MIDM=1`, resolved at model load and failing closed;
+  with the flag unset the dispatch is byte-for-byte what it was. `M ≤ 128` is a
+  HARD gate the kernel enforces itself. Measured 1.06–4.37× the shipping expand
+  + bridge route at M ∈ {9,16,32,64,128} on 27B/DSV4-class shapes, every cell
+  bit-equal to a same-config passthrough oracle — a wider band than the fp8
+  twin's 1.04–1.45× because the fp4 quality expand writes BF16, 4× the fp8
+  expand's transient bytes. Proposal data only, served NATIVE-PARITY protocol
+  not run, and an unexplained M ≤ 12 latency cliff is recorded as open;
+  `scripts/bench_fp4v2_fused_midm.py` reproduces the table.
+- Add a **persistent-B grouped MoE decode-in-mainloop kernel**
+  (`csrc/cb_moe_persistent_b.cu`, ROADMAP K1.1 / audit §3 P2b), the FP4-CB
+  answer to the ~35%-of-layer-time MoE expand tax. A CTA owns one
+  `(expert, N-tile)`, decodes that weight tile from packed CB bytes into
+  shared memory **once**, and streams the expert's routed rows through it with
+  the M-loop inside the kernel — so the `[E,N,K]` BF16 transient is never
+  written or read back and unrouted experts cost two int32 loads. It consumes
+  the **exact** `expert_ends` segments the default quality path already builds
+  (no padded rows, no host read anywhere on the path), and its launch geometry
+  is `E × ceil(N/TN)`, a function of the layer shape alone, so the call is
+  CUDA-graph capturable as it stands. The mainloop is hand-assembled from
+  `mma.sync.m16n8k16` / `ldmatrix` / `cp.async` rather than a CUTLASS
+  collective, because no CUTLASS grouping construction on this architecture
+  permits an in-kernel M-loop over one expert's segment. This is **not** a
+  revival of the retired dense persistent-N schedule: it is MoE-only with no
+  dense entry point in the translation unit, it uses tensor cores, and its win
+  comes from amortizing a decode that kernel never had. Dense large-M stays
+  behind K1.3.
+  The weight decode is **bit-identical to `cb_expand_v2`** — a tested fact, not
+  an asserted one: `cb_moe_persistent_b_decode` exposes the mainloop's own
+  decode stage and the suite compares it to the expander with `torch.equal`
+  across the k=12–24 rungs, on full and windowed row ranges. Activations are
+  the same exact group-16 RTN QDQ payload and the epilogue rounds once to
+  bf16, so only the FP32 reduction order changes (reassociation-class, gated
+  at parity with per-segment `F.linear`). **Opt-in** behind
+  `PRISMAQUANT_CB_MOE_PERSISTENT_B=1`, FP4-CB-v2 layers on cc 12.0/12.1,
+  resolved at model load and failing the load — including the
+  `..._CFG` tile override, validated against what the build compiled — rather
+  than silently serving the other route. With the flag unset the dispatch is
+  byte-for-byte what it was.
+  Measured on nine **whole-routed-operator** cells (routing + QDQ + both
+  projection stages + activation + combine, per the NATIVE-PARITY grouped-MoE
+  rule): **1.05–3.36× over the default bridge and 1.04–3.02× over the pingpong
+  bridge, winning every cell**, with the deleted expansion measuring
+  **20.9–46.7%** of the default operator and *not* shrinking with expert count
+  — at `E=128` it is 38–47% at every token count, because the expansion pays
+  for every expert whether the router used it or not.
+  `scripts/bench_moe_persistent_b.py` reproduces the table; proposal data only,
+  served protocol not run.
+- Harden that kernel against three defects a dedicated graph/stream audit
+  found, two of which no test in the suite could have caught. (1) A **WAR race
+  on the A double buffer**: the `cp.async` prefetch for stage `st+1` targets
+  the same buffer `mma(st-1)` is reading and sat above the barrier that
+  separates them, so a lagging warp could have its A fragment overwritten
+  mid-MMA. Latent — not reproducible in ~1.15e9 stage×warp opportunities under
+  SM contention — but reproducible at 400 cycles of injected warp skew, where
+  relative error went from 1.6e-3 to 0.3-0.6. The prefetch now issues below the
+  barrier. (2) `expert_ends` is DEVICE data whose **values** the host cannot
+  check, and the kernel used them unclamped for both the row predicate and the
+  store predicate; a hand-built out-of-range entry through the public binding
+  produced an illegal access. The segment is now clamped to `[0, P]` with one
+  register `min`. (3) The routing counted with `torch.bincount`, whose CUDA
+  implementation host-syncs (it sizes its output from `self.max().item()`), so
+  the lane's "no host read on this path" claim was false and the operator could
+  not be captured end to end. It counts with `scatter_add_` now — identical
+  integers, pure device work — and a test captures the whole routed operator
+  and a negative control proves the avoided call really does break capture.
+  Also added: alignment `TORCH_CHECK`s for the operands whose instruction
+  selection assumes them, an `NATOM % 2` static assert, and a device gate that
+  states the schedule's real shared-memory need instead of the whole budget.
+- Record two measured-negative results from that kernel's tile sweep rather
+  than only its winners: the `128×128` and `256×64` tiles both fall to one CTA
+  per SM and never won a sweep cell — `256×64` halves the decode repetition at
+  large rows-per-expert, exactly the regime it should own, and still lost — and
+  a resident codebook in shared memory (`cb_gemv_v2.cu`'s DS=2 idea) cost 1.9×
+  by tripping over the ~1 KiB the hardware reserves per CTA while buying ~1%
+  where it fit. `csrc/tools/persistent_b_probe.cu` reproduces the budget table
+  and the binding now `TORCH_CHECK`s the two-CTAs-per-SM floor that both
+  results are about.
+
+- Add an **sm12x-native CUTLASS 3.x lane** to the quality-preserving BF16
+  grouped bridge (`csrc/cb_bf16_grouped_gemm.cu`, audit §3 P1): TMA
+  warp-specialized mainloop, stages carved out of the sm120 shared-memory
+  budget, and the row-padded tile-indexed grouping the two fused kernels
+  already use — now extracted into `csrc/cb_grouped_common.hpp` and consumed by
+  all three, with static_asserts proving the shared EVT/gate types are the ones
+  each file spelled verbatim before. Upstream has no sm120 grouped collective
+  and its sm120 builder refuses 16-bit input, so the collective is assembled
+  from the 16-bit forms of the builder's own choices and the expert
+  `l`-coordinate selection lives in a thin mainloop fork
+  (`csrc/cutlass_fork/sm120_bf16_expert_mma.hpp`). The DEFAULT SM80-schedule
+  lane is unchanged on every device. The new lane is **opt-in** behind
+  `PRISMAQUANT_CB_BF16_SM120=1`, resolved at model load and failing closed:
+  it is bit-gated against the torch reference (both lanes and a per-segment
+  `F.linear` share one relative-L2 band), but it changes the FP32 reduction
+  order. Measured on the GB10 with the compiled rung (pingpong 64×128×64, 3
+  stages): 1.18–1.27× the bridge it would replace and 1.02–1.05× segmented
+  BF16 matmuls at T=128, 0.83–0.92× segmented at T=512. The residual is the
+  tile-indexed construction's ragged row padding, not the schedule — with the
+  padding removed the same kernel runs 1.08–1.13× segmented — so the next step
+  is a TileM ladder or an in-mainloop A gather, not more tuning. Proposal data
+  only, served protocol not run; `scripts/bench_bf16_grouped_sm120.py`
+  reproduces the tables.
+- Key the grouped-BF16 module's JIT identity like the two fused modules: its
+  packaged sources, Gridbook headers, compiled-in lane macro, target and
+  toolchain ABI decide the module name and the `bf16_grouped/<digest>` build
+  directory. One rebuild per user, once.
+
+- Delete the unreachable native sources identified by the dead-code ledger in
+  `docs/audits/ultraplan_perf_2026-08-01.md` §4: `csrc/sm120_fp8_gemm.cu` (the
+  spent CUTLASS baseline-parity gate, whose binding validated per-token/
+  per-channel scales it then ignored), `csrc/cutlass_fork/sm120_cb_persistent_mma.hpp`
+  (an unbuilt draft of the abandoned persistent-N endgame), and
+  `csrc/cb_persistent_prefill.cu` with its test (the f32 twin of the retained
+  research kernel `cb_persistent_tc.cu`). The measured verdicts these kernels
+  produced stay recorded in ROADMAP and KERNELS.
+- Remove the `prismaquant::cb_expand_fp8_into` custom op and the
+  `l2_pin_region` / `l2_reset_window` / `l2_unpin` / `l2_persisting_max_bytes` /
+  `l2_max_window_bytes` extension bindings — registered surface with zero
+  serving call sites, left behind when the L2-pinned per-expert scratch
+  pipeline was removed from production dispatch. The allocating
+  `prismaquant::cb_expand_fp8` prefill expander is unaffected.
+- Shrink the wheel: standalone developer binaries move to
+  `gridbook/csrc/tools/` and, with the pristine `cutlass_fork/*_orig.hpp` diff
+  baselines, are now sdist-only. The repository and the source distribution
+  keep them for auditability; `check_dist.py` and `tests/test_release_metadata.py`
+  gate the split in both directions.
+- Delete the `PRISMAQUANT_CB_EXPAND` row from the environment-switch table. The
+  variable has had no reader since the Triton removal; documented switches that
+  do nothing are worse than undocumented ones.
+- Fail closed at model load when a delegated `compressed-tensors` group
+  resolves to a backend that is Triton-backed, discards the declared activation
+  scales (Marlin's NVFP4 W4A4 → W4A16 conversion), or is unaudited for an NVFP4
+  W4A4 declaration. The error names the resolved backend class, the group, and
+  the violated contract; there is no environment-variable bypass. Weight-only
+  declarations are unaffected, including the published 27B's stock NVFP4 W4A16
+  vision tower, which vLLM legitimately serves on Marlin.
+- Extend the no-Triton ratchet to `scripts/` and `tests/`, pin
+  `runtime_contract.json`'s dynamically imported model-module list to a
+  reviewed allow-list, and add a GPU-lane assertion that executing a
+  Gridbook-owned op imports no Triton module vLLM had not already loaded.
+- Correct the staged HF card blocks and the README's no-Triton sentence: the
+  cards no longer describe a Triton decode fallback or quote its retired
+  warning string, the Hy3 card documents `TRITON_ATTN` as the attention backend
+  measured at publication rather than a recommendation, and the README carries
+  the operator-lane scope qualifier the other docs already use.
+- Compile every JIT extension for the live device's compute capability instead
+  of inheriting `TORCH_CUDA_ARCH_LIST`. The stock vLLM base image's list omits
+  `12.1`, so outside Gridbook's own container a GB10 ran the production decode
+  GEMV from PTX JIT or against a mismatched SASS target. A build host with no
+  visible GPU now reports each module unavailable with an actionable reason;
+  compile-only environments pin the capability for the duration of the build,
+  as the image's prewarm step already did for the CUTLASS modules.
+- Reject non-Blackwell devices in the fused NVFP4-CB loader before any CUTLASS
+  include discovery or build work, as the fused FP8-CB loader already did. A
+  non-Blackwell GPU no longer spends minutes inside nvcc during a first request.
+- Hash `cb_fused_gemm.cu`'s three `cutlass_fork` headers into the fused FP8-CB
+  module identity, which now keys both the extension name and the build
+  directory (`fused/<digest>`), so editing one of those headers can no longer
+  serve the previously cached kernel. Because a module that loads is therefore
+  built from current sources, the fused FP8-CB contract now requires the
+  grouped-MoE bindings alongside the dense entry point.
+- Honour `PRISMAQUANT_CUTLASS_INCLUDE` in every CUTLASS loader; grouped-BF16
+  and fused FP8-CB previously could not build without vLLM's bundled copy. A
+  set-but-wrong value fails with the missing header named rather than silently
+  compiling against a different CUTLASS.
+- Build the main decode extension in `<cache>/main`, like every sibling module.
+  An existing cache rebuilds it once.
+- Retire the FP8-CB routed-MoE per-expert fused host loop. The single grouped
+  launch supersedes it, and its only remaining reason to exist — an extension
+  build carrying the dense fused binding without the grouped one — is now
+  impossible. Constraint misses fall back directly to the exact native BF16
+  expansion plus the owned CUTLASS grouped bridge.
+- ROADMAP K0.2 (consumer half): recognise and verify PrismaQuant's routed-MoE
+  stage attestation. `gridbook/nvfp4_activation_contract.py` accepts both the
+  v1 record and the new stage-attested
+  `prismaquant.nvfp4_w4a4_activation.v2` record, whose whole-model
+  `target_names`/`target_count`/`target_values_sha256` fields are bit-identical
+  to v1 (the digest framing constant stays pinned at the v1 literal). A v1
+  record carrying a stage section, or a v2 record without one, fails closed.
+  The new reader validates every packed FusedMoE module's `w13`/`w2` pair,
+  their physical targets, policy coherence, stage-legal calibration sources,
+  and both the per-stage and section digests.
+- The fused-NVFP4 validation harness emits a machine-readable K0.2 readiness
+  verdict (`attested_and_verified`, `missing_stages`, `digest_mismatch`,
+  `not_attested`, `contract_absent`, `artifact_unreadable`) computed from the
+  artifact alone — no GPU, no vLLM, no model load — naming the failing module
+  and stage. Both `scripts/validate_fused_nvfp4_ab.py` and
+  `scripts/validate_fused_nvfp4_three_arm.py` consume it as a core integrity
+  gate and promotion-contract precondition: a routed-MoE A/B against an
+  unattested artifact is now reported as `fallback_telemetry_not_evidence`
+  rather than publishing a zero-difference fallback comparison. Dense runs are
+  unaffected — a dense-only artifact carries no stage section and stays valid.
+- Serving dispatch is unchanged: `moe.py`, `linear.py`, and `config.py` were
+  not touched, and `validate_payload` still verifies exactly what it always
+  verified.
+
 ## 0.5.1 — 2026-08-01
 
 - Documentation-only release. Add the ultraplan performance audit

@@ -12,6 +12,27 @@ expander module, the required grouped-BF16 quality bridge, and the optional
 FP8 fused specialization on Blackwell. Experimental fused FP4 remains an
 explicit, default-off build option.
 
+**Fused FP8 module build cost (measured, GB10 / cc 12.1, cold cache, 2026-08-02).**
+`get_fused_ext()` compiles 20 kernel instantiations — six `k_bits` rungs ×
+{dense unscaled, dense scaled, grouped TileM=128}, plus grouped TileM=256 at
+k28/k32. Measured by clearing `$PRISMAQUANT_CB_EXT_DIR/fused` and timing the
+loader:
+
+| source | cold build |
+|---|---|
+| pre-K1.2 (merge base) | 71.4 s |
+| K1.2 | 76.0 s, 75.7 s |
+
+**+4.6 s (~6%).** The K1.2 work changed *no* kernel instantiation — the six
+compiled rungs were already the complete set the packed-B TMA box and the
+uniform sub-table width admit (see
+[KERNELS](KERNELS.md#rung-coverage-what-this-lane-can-and-cannot-serve-k12)) —
+so the delta is compile-time *evaluation*, not code generation: the rung-law
+predicates, the smem closed form, and the twelve-cell `static_assert` table that
+pins it to the probe. Every rung that could be *added* would need a different
+TMA schedule and a ragged-width decode, i.e. a new kernel rather than another
+template instantiation, so this is not a preview of a larger future cost.
+
 ---
 
 ## Quick start
@@ -164,15 +185,18 @@ docker build \
 
 The upstream vLLM image ships
 `TORCH_CUDA_ARCH_LIST="8.0 8.7 8.9 9.0 10.0 11.0 12.0"`. **`12.1` is absent.**
-gridbook's kernels are JIT-compiled by torch, which inherits that list, so on the
-GB10 / DGX Spark reference target (`sm_121`) the stock list would never emit
-matching SASS. The Dockerfile therefore sets the list explicitly, defaulting to
-`12.1a`.
+That list used to decide gridbook's targets too, which made the reference target
+(GB10 / DGX Spark, `sm_121`) run from PTX JIT or mismatched SASS outside this
+image. Since 2026-08-01 **gridbook derives its own `-gencode` from the live
+device** and no longer reads the list at all; `GRIDBOOK_CUDA_ARCH` now decides
+what the image PREWARMS (the build host has no GPU, so the prewarm pins that
+capability while it compiles) and what every OTHER torch JIT path in the
+container inherits.
 
 The consequence is that **the image's prebuilt kernel cache is
-architecture-locked**. torch only reuses a cached build when the arch flags
-match, and the value is baked into the image's environment so build time and run
-time agree. To target other hardware, rebuild:
+architecture-locked** — it holds binaries for the prewarmed capability, and a
+container run on different hardware simply rebuilds for what it finds. To
+prewarm for other hardware, rebuild:
 
 ```bash
 docker build --build-arg GRIDBOOK_CUDA_ARCH=9.0 -t gridbook:h100 .   # H100, FP8-only
@@ -188,9 +212,14 @@ v2 exact expander, whose **device prepare** accepts only cc 12.0/12.1. The image
 can compile that module without a GPU for any requested arch, but an FP4 model
 load on H100/Ada/A100 fails its device attestation; those images are FP8-only.
 
-You can also override the arch at *run* time (`-e TORCH_CUDA_ARCH_LIST=9.0`),
-which invalidates the baked cache and triggers a one-time rebuild inside the
-container. Rebuilding the image is the better path.
+**`TORCH_CUDA_ARCH_LIST` no longer changes Gridbook's targets at run time.**
+Since 2026-08-01 every Gridbook module derives its `-gencode` from the LIVE
+device instead of inheriting that list (the stock list omits `12.1`, which is
+the reference target — see the audit's §3 P0.1). Setting it at run time
+therefore steers torch's *other* JIT paths, not Gridbook's: to target other
+hardware, run on that hardware, or rebuild the image so the prewarm compiles for
+it. A build host with no visible GPU pins the capability for the duration of the
+build (the Dockerfile's `load_for_build`).
 
 **It is a process-wide torch setting, not a gridbook one.** gridbook JIT-compiles
 inside the vLLM process, so there is no way to scope this variable to the plugin.
@@ -198,11 +227,11 @@ Baking it narrows the arch list for *every* torch JIT path in the container —
 vLLM's own `cpp_extension` / inductor compiles included — from the base image's
 `8.0 8.7 8.9 9.0 10.0 11.0 12.0` down to this one value (confirmed with
 `docker inspect`: the image exports `TORCH_CUDA_ARCH_LIST=12.1a`). That is the
-intended trade: the stock list omits `12.1` entirely, so it is *wrong* for
-gridbook on the reference target, and compiling all eight arches would add
-minutes to every build. If something else in your container needs the wider
-list, restore it at run time with `-e TORCH_CUDA_ARCH_LIST="8.0 8.7 8.9 9.0 10.0
-11.0 12.0 12.1a"` and accept a one-time gridbook kernel rebuild.
+intended trade: compiling all eight arches would add minutes to every build. If
+something else in your container needs the wider list, restore it at run time
+with `-e TORCH_CUDA_ARCH_LIST="8.0 8.7 8.9 9.0 10.0 11.0 12.0 12.1a"` — that is
+now free for gridbook, whose targets come from the device rather than from this
+variable.
 
 ### Build-time gates
 
@@ -468,7 +497,7 @@ The message names the exception; the usual causes are:
 |---|---|
 | `PermissionError: ... '/opt/gridbook/ext-cache/lock'` | The kernel cache is not writable by your UID — you mounted your own directory over it, or you are on an image predating this fix. |
 | `FileNotFoundError: No usable temporary directory` | `--read-only` without `--tmpfs /tmp`. |
-| a long `nvcc` error / a recompile every start | `TORCH_CUDA_ARCH_LIST` differs from build time, or a bind mount shadowed the prewarmed cache. |
+| a long `nvcc` error / a recompile every start | A bind mount shadowed the prewarmed cache, or the live device differs from the one the image prewarmed for (Gridbook compiles for the live device, not for `TORCH_CUDA_ARCH_LIST`). |
 
 **`KeyError: 'getpwuid(): uid not found: 1000'` at startup**
 You are on a base image or an older gridbook image without the `LOGNAME` fix,
@@ -476,9 +505,13 @@ running `--user` with a UID that has no `/etc/passwd` entry. Workaround without
 rebuilding: add `-e LOGNAME=anything` to the `docker run`.
 
 **Kernels rebuild on every container start**
-The cache directory is not persisting, or the arch list changed. Use a *named*
-volume for `/opt/gridbook/ext-cache`, and do not override
-`TORCH_CUDA_ARCH_LIST` at run time.
+The cache directory is not persisting, or this image predates a change to a
+module's build inputs. Use a *named* volume for `/opt/gridbook/ext-cache`. The
+identity-keyed modules (`fused/<digest>`, `fused_fp4/<digest>`,
+`bf16_grouped/<digest>`) rebuild ONCE after any change to their packaged
+sources, headers, compiled-in lane macros, target or toolchain ABI — that is the
+mechanism refusing to serve a stale kernel, not a cache miss. Overriding
+`TORCH_CUDA_ARCH_LIST` no longer affects Gridbook's targets (see above).
 
 **`unknown quantization method` at model load**
 vLLM did not load the plugin. vLLM's loader logs plugin failures and continues,

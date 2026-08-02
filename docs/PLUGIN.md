@@ -235,17 +235,21 @@ experimental native-FP4 prefill, **off by default**:
   decoder, or matmul. Kernel parity and raw speed do not promote either flag;
   see the [dated served-evidence decision](audits/fused_nvfp4_enablement_2026-07-31.md).
 
-**`gridbook/csrc/cb_persistent_prefill.cu`** and
 **`gridbook/csrc/cb_persistent_tc.cu`**
 (research source only, **not serving-reachable**) — the persistent-N schedule:
 decode each B N-tile **once** into smem and stream M through it (no `[N,K]` in
-HBM, INV-1). The first is an f32-FMA schedule/correctness reference; the second
-is the tensor-core build. **Verdict: measured negative for dense prefill** —
-parity-green but 2–5.7× slower than expand-then-GEMM at 27B shapes, because the
-CUDA expander had already cut the dense expand tax to ~10%. The serving
-selector, custom op, and JIT loader were deleted; the `.cu` files remain only
-for direct research tests. The MoE analog of the idea is tracked in the
-canonical [`kernel TODO`](../ROADMAP.md#kernel-todo-canonical).
+HBM, INV-1), with phase 2 on the fp8 tensor cores. **Verdict: measured negative
+for dense prefill** — parity-green but 2–5.7× slower than expand-then-GEMM at
+27B shapes, because the CUDA expander had already cut the dense expand tax to
+~10%. The serving selector, custom op, and JIT loader were deleted; this one
+`.cu` remains for direct research tests behind
+`GRIDBOOK_RESEARCH_PERSISTENT_TC=1` (`tests/test_persistent_tc.py` compiles it
+itself). Its f32-FMA twin `cb_persistent_prefill.cu` — the schedule's
+correctness reference, superseded verbatim by the tensor-core build — was
+deleted on 2026-08-01 per
+[`audits/ultraplan_perf_2026-08-01.md`](audits/ultraplan_perf_2026-08-01.md) §4.
+The MoE analog of the idea is tracked in the canonical
+[`kernel TODO`](../ROADMAP.md#kernel-todo-canonical).
 
 ## Environment switches
 
@@ -259,22 +263,40 @@ tooling and model cards — see the README's naming section.)
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PRISMAQUANT_CB_EXT_DIR` | `~/.cache/prismaquant-cb-ext` | Where the JIT extensions are built and cached. Point it at a persistent, writable directory in containers to avoid a ~30 s rebuild per start. |
+| `PRISMAQUANT_CB_EXT_DIR` | `~/.cache/prismaquant-cb-ext` | Root of the JIT build cache. Point it at a persistent, writable directory in containers to avoid a ~30 s rebuild per start. Every module owns a SUBDIRECTORY of it — `main`, `v2`, and the identity-keyed `bf16_grouped/<digest>`, `fused/<digest>`, `fused_fp4/<digest>` — so no two ninja workspaces share artefacts and a changed source, header, lane macro, target or toolchain ABI lands in a new directory instead of serving a stale kernel. Upgrading Gridbook therefore costs ONE rebuild per affected module; the old directories are inert and can be deleted. |
 | `PRISMAQUANT_CB_GEMV` | `inherited` | Which grouped FP4-CB **decode GEMV** serves a layer: `inherited` \| `auto` \| `v2`. All FP4-v2 quality paths build/load `cb_gemv_v2.cu` and run its cc 12.0/12.1 device prepare because that module also owns the required exact expander. Unset/`inherited` keeps the shipped decode schedule; `auto` or `v2` may additionally use the module's smem-resident decode GEMV where its occupancy predicate says it wins. That alternate decode is **not** bit-exact against `inherited` (reassociation class). FP8-only serves do not need the v2 module. An unknown spelling raises; changing it mid-process raises. |
 | `PRISMAQUANT_CB_FUSED_FP4` | off | Dense fp4-CB native-FP4 prefill opt-in. `1`/`midm` use a fully attested artifact scalar for all prefill shapes / `16 < M <= 128`. `static_lsq`/`static_lsq_midm` keep that exact `G` and the native E2M1/SFA payload, but fit the existing per-row EVT residual by least squares; they add no model metadata, weight copy, decoder, or GEMM. `rowwise`/`rowwise_midm` instead derive an independent full-range scalar per runtime row and are the only fused choices accepted for legacy artifacts. All dense modes use one occupancy selector: TileM256 is chosen only for `M >= 256` and `ceil(M/256) * ceil(N/128) >= ceil(2*SM_count/3)`; otherwise TileM128 runs. The `*_midm` modes therefore always remain TileM128. All values are experimental and default-off; unknown spellings and mid-process changes fail. The K24 short exact gate passed, but long-context evidence is mixed and no >=4B/MoE served validation exists; see the [dated audit](audits/fused_nvfp4_enablement_2026-07-31.md). |
 | `PRISMAQUANT_CB_FUSED_FP4_MOE` | off | Grouped-MoE fp4-CB native-FP4 prefill opt-in. Static `1`/`128` and `256` select TileM 128 and 256 and require both attested stage scalars. `static_lsq`/`static_lsq128` and `static_lsq256` select those same tiles while reusing the shared fixed-`G` LSQ quantizer. `rowwise`/`rowwise128` and `rowwise256` use independent runtime row scales and may serve legacy artifacts. An ineligible attempt records its cached reason and returns to the exact native BF16 quality bridge; unknown spellings and mid-process changes fail. Keep this off pending the dated audit's routed-quality, workload, and routing-policy gates. |
+| `PRISMAQUANT_CB_BF16_SM120` | off | `1` routes the quality-preserving BF16 grouped bridge (every default NVFP4-CB prefill — dense `E=1` and routed MoE — plus the FP8-CB fallback) to the **sm12x-native** CUTLASS 3.x collective instead of the default SM80-schedule `DefaultGemmGrouped`. Compiled only for cc 12.0/12.1; resolved at model load and **fails the load** if unavailable rather than silently serving the other lane. Same operands, same single bf16 round, different FP32 reduction order — bit-gated against the torch reference, served protocol NOT run. The lane's collective has two A-source modes (bit-identical to each other, gated `torch.equal`): the row-padded copy, and an **in-mainloop A-row gather** that never materializes the padded activation; with the gather mode and the swizzle-group-aligned expert order, measured (GB10, pingpong 64×128×64): 1.13–1.37× the default bridge, and vs segmented BF16 matmuls **1.03–1.05× at T=128 and 1.10–1.15× at T=512** (the padded-copy mode's 0.83–0.92× T=512 deficit is closed at the construction level). The routed path still pays one host read of the per-expert block offsets per layer. Unknown spellings and mid-process changes raise. See [KERNELS](KERNELS.md#sm12x-native-grouped-bf16-opt-in-prismaquant_cb_bf16_sm120) and the [benchmark table](BENCHMARKS.md#2026-08-02-sm12x-grouped-bf16-lane-in-mainloop-a-row-gather--swizzle-aligned-tile-order-proposal-data). |
+| `PRISMAQUANT_CB_FP4_FUSED_MIDM` | off | `1` routes **dense FP4-CB v2 quality prefill at 9 ≤ M ≤ 128** to the fused decode-in-prologue lane (`csrc/cb_fused_fp4v2_gemm.cu`) instead of `expand_fp4_v2_to_weight` + the owned CUTLASS bridge. CONTRACT-PRESERVING: the decoded weights are bit-identical to `cb_expand_v2` and the activation is the same group-16 QDQ output, so only the FP32 GEMM reduction order changes. Compiled only for cc 12.0/12.1; resolved at model load and **fails the load** if unavailable rather than silently serving the bridge. `M ≤ 128` is a HARD gate enforced by the kernel itself (decode-in-prologue re-decodes B per M-tile); ineligible shapes — M ≤ 8, M > 128, an uncompiled rung, `K % 256 ≠ 0`, `N % 8 ≠ 0`, or a fused module whose roles use different interned codebooks — fall through to today's exact path unchanged. Measured 1.06–4.37× the bridge at M ∈ {9,16,32,64,128}, bit-checked against a same-config oracle; served protocol NOT run. Unknown spellings and mid-process changes raise. See [KERNELS](KERNELS.md#fp4-cb-v2-fused-mid-m-opt-in-prismaquant_cb_fp4_fused_midm) and the [benchmark table](BENCHMARKS.md#2026-08-02-fp4-cb-v2-fused-mid-m-lane-microbenchmark-proposal-data). |
+| `PRISMAQUANT_CB_BF16_SM120` | off | `1` routes the quality-preserving BF16 grouped bridge (every default NVFP4-CB prefill — dense `E=1` and routed MoE — plus the FP8-CB fallback) to the **sm12x-native** CUTLASS 3.x collective instead of the default SM80-schedule `DefaultGemmGrouped`. Compiled only for cc 12.0/12.1; resolved at model load and **fails the load** if unavailable rather than silently serving the other lane. Same operands, same single bf16 round, different FP32 reduction order — bit-gated against the torch reference, served protocol NOT run. Measured (GB10, pingpong 64×128×64): 1.18–1.27× the default bridge and 1.02–1.05× segmented BF16 matmuls at T=128, but 0.83–0.92× segmented at T=512 where the tile-indexed construction's ragged row padding binds; it also adds a padded activation gather and one host read per layer. Unknown spellings and mid-process changes raise. See [KERNELS](KERNELS.md#sm12x-native-grouped-bf16-opt-in-prismaquant_cb_bf16_sm120) and the [benchmark table](BENCHMARKS.md#2026-08-01-sm12x-native-grouped-bf16-lane-microbenchmark-proposal-data). |
+| `PRISMAQUANT_CB_MOE_PERSISTENT_B` | off | `1` routes the **FP4-CB MoE quality prefill** above the `M<=16` GEMV band to the persistent-B decode-in-mainloop kernel (`csrc/cb_moe_persistent_b.cu`, ROADMAP K1.1) instead of expand + grouped bridge. A CTA owns one (expert, N-tile), decodes that weight tile from packed CB bytes into shared memory ONCE, and streams the expert's routed rows through it, so the `[E,N,K]` BF16 transient never exists and unrouted experts cost nothing. Consumes the exact `expert_ends` segments the default path already builds — no padded rows, and no host read anywhere on the path. Compiled only for cc 12.0/12.1 and only for FP4-CB two-tier v2 (`n_sub=2`, `type_size=4k+9`, superblock-aligned dimensions); resolved at model load and **fails the load** if the flag is on where the lane cannot serve. Same activation payload and one bf16 round; the weight decode is bit-identical to `cb_expand_v2` (tested with `torch.equal`), so only the FP32 reduction order changes. It takes precedence over `PRISMAQUANT_CB_BF16_SM120` for these layers, because it replaces the pair of operations that lane is one half of. Unknown spellings and mid-process changes raise. See [KERNELS](KERNELS.md#persistent-b-decode-in-mainloop-opt-in-prismaquant_cb_moe_persistent_b) and the [benchmark table](BENCHMARKS.md#2026-08-02-persistent-b-grouped-moe-decode-in-mainloop-microbenchmark-proposal-data). |
+| `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG` | `0` | Tile override for the lane above; `0` lets the kernel choose from the SHAPES (mean routed rows per expert), which is the production setting. A non-zero value is a 1-based index into `cb_moe_persistent_b_configs()` and is **validated at model load against what this build compiled**, so a stale or mistyped index fails the load instead of aborting the first request that carries routed rows. Measurement knob only. |
 | `PRISMAQUANT_CB_FUSED_MIDM` | `1` | Resolved during model load. `0` skips the CUTLASS mid-M FP8 fused specialization and its JIT build; the exact native expansion/CUTLASS route remains. Any other supported setting is loaded/probed before the model becomes serve-ready. Changing the value later raises. |
 | `PRISMAQUANT_CB_DECODE_CONTRACT` | `v1` | `v2` selects the scale-epilogue-hoist decode contract. Measured **null** on the served 27B; kept for reproducibility. |
-| `PRISMAQUANT_CB_EXPAND` | native CUDA (fp8-CB) / raw view (fp4-CB) | `pad` restores the historical padded-copy input on the fp4-CB branch for a native-vs-native bisection. No value selects Triton. |
 | `PRISMAQUANT_DEBUG_PREFIXES` | off | `1` prints, per Linear, whether it resolved to a CB scheme or to a config-declared non-CB group — the first tool to reach for when memory use is higher than expected. |
-| `PRISMAQUANT_PRELOAD_FUSED` | off | `1` independently attempts to build/preload both fused extensions (FP8-CB and NVFP4-CB) at registration so both arms of a served A/B can carry identical extension residency. Registration treats this as a capability probe; a serving caller still requires its selected native operation and fails closed (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |
+| `PRISMAQUANT_PRELOAD_FUSED` | off | `1` independently attempts to build/preload **every** native extension family at registration — decode GEMV, GEMV-v2, grouped BF16, both fused FP8-CB/NVFP4-CB modules, fused FP4-v2 and persistent-B MoE — so both arms of a served A/B can carry identical extension residency. (Before 2026-08-02 it warmed only the two fused modules, which left the other five free to differ between arms; the name is kept because it is the published one.) Each family is attempted independently and fail-soft: one that will not build on this box leaves the others warmed. Registration treats this as a capability probe; a serving caller still requires its selected native operation and fails closed (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |
 
-The retired values `PRISMAQUANT_CB_DECODE=triton`,
-`PRISMAQUANT_CB_EXPAND=triton`, and the former
-`PRISMAQUANT_CB_PREFILL={auto,stock,loop,batched,...}` family are not serving
-modes. The former dispatch-mode environment variable is also removed; opaque
-whole-call dispatch is unconditional. Remove these settings from old scripts
-and model-card commands.
+**Variables that no longer select anything.** `PRISMAQUANT_CB_DECODE` and
+`PRISMAQUANT_CB_EXPAND` (whose `=triton` values are the ones you will find in
+old scripts and model cards), the former
+`PRISMAQUANT_CB_PREFILL={auto,stock,loop,batched,...}` family, and the former
+dispatch-mode variable are **not retired *values* of live variables — no
+dispatch reads any of them at all**, so setting one has no effect whatsoever,
+not even a warning. Opaque whole-call dispatch is unconditional. Delete these
+settings from old scripts and model-card commands rather than carrying them
+forward as inert text.
+
+The two `=triton` names have no reader whatsoever;
+`PRISMAQUANT_CB_EXPAND`'s last one went with the Triton removal, and its
+documentation row outlived it by a release until
+[`audits/ultraplan_perf_2026-08-01.md`](audits/ultraplan_perf_2026-08-01.md)
+§4 removed it. `PRISMAQUANT_CB_PREFILL` is still *named* in one place —
+`scripts/validate_fused_nvfp4_ab.py` and the fused-NVFP4 validation harness
+strip it from the environment and record that they did, so an inherited value
+from an old shell cannot be mistaken for a measurement condition. That is a
+sanitizer, not a selector. The regeneration command below is what keeps this
+section honest: a documented variable the grep does not find is a ghost.
 
 ### The rest of them
 
@@ -324,5 +346,6 @@ exported** 0.6B tensors and (a) matches `nvfp4_cb_reconstruct @ x` to ≤1e-2 re
 `tests/test_cuda_gemv.py` gates the `cb_gemv.cu` kernels (dense + grouped-MoE fp8
 and fp4-v2, QDQ bit-exactness, the expander) against independent PyTorch/FP64
 references. The grouped-BF16 bridge is gated against segmented BF16 matmul
-references, while `tests/test_fused_prefill.py` and
-`tests/test_persistent_prefill.py` gate the specialized prefill kernels.
+references, while `tests/test_fused_prefill.py` gates the specialized prefill
+kernels and `tests/test_persistent_tc.py` gates the research-only persistent-N
+source behind its opt-in.

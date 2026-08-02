@@ -185,8 +185,9 @@ Nothing is compiled at `pip install` time. The extensions are built lazily by
 | `pq_cb_fused` (FP8-CB mid-M fused CUTLASS prefill) | `gridbook/csrc/cb_fused_gemm.cu` + `csrc/cutlass_fork/*.hpp` | **at weight load** when `PRISMAQUANT_CB_FUSED_MIDM` is enabled; availability and mode are fixed before serving, and later environment mutation raises | **Optional specialization.** An unavailable specialization stays on the exact native FP8 expansion/CUTLASS route; it is never first-built inside an eligible forward. |
 | `pq_cb_fused_fp4_<identity>` (native-NVFP4 fused CUTLASS prefill) | `gridbook/csrc/cb_fused_fp4_gemm.cu` + `csrc/cutlass_fork/*.hpp` | only when the explicit fused-FP4 experiment is preloaded or selected | **Optional, experimental, and default-off.** An unavailable specialization stays on the exact native FP4-v2 expansion/grouped-BF16 route. |
 
-The retained persistent-N `.cu` files are research sources, not a sixth serving
-extension: their selector, custom op, and package loader are deleted.
+The one retained persistent-N `.cu` file (`cb_persistent_tc.cu`) is a research
+source, not a sixth serving extension: its selector, custom op, and package
+loader are deleted, and its test compiles it directly behind an opt-in.
 
 **Where "~30 s" comes from.** Cold `get_ext()` in the reference container
 (`vllm-node:latest`, compile-only, **no** `--gpus`, `PRISMAQUANT_CB_EXT_DIR`
@@ -233,6 +234,24 @@ or point the variable somewhere persistent:
 ```
 
 The directory must be writable by the serving process. It is never `/tmp`.
+
+**Every module owns a subdirectory** of that root, so no two ninja workspaces
+share artefacts:
+
+```
+main                    # cb_gemv.cu           (decode GEMV / QDQ / expanders)
+v2                      # cb_gemv_v2.cu        (FP4-v2 GEMV + exact expander)
+bf16_grouped/<digest>   # cb_bf16_grouped_gemm.cu  (quality prefill bridge)
+fused/<digest>          # cb_fused_gemm.cu     (FP8-CB fused prefill)
+fused_fp4/<digest>      # cb_fused_fp4_gemm.cu (NVFP4-CB fused prefill)
+```
+
+The three CUTLASS modules key their directory (and their module name) by a
+digest of their packaged sources, Gridbook headers, compiled-in lane macros,
+target capability and toolchain ABI. That is what makes an edited header
+impossible to serve from a stale cached kernel — and it means **upgrading
+Gridbook costs one rebuild per affected module**, landing in a new digest
+directory. The old directories are inert; delete them to reclaim the space.
 
 ---
 

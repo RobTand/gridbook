@@ -57,6 +57,12 @@
 
 #include "cutlass_fork/sm120_cb_fused_fp4_mma.hpp"
 
+// Shared glue for the row-padded tile-indexed grouped construction (EVT tree,
+// smem gate, host validation) — see cb_grouped_common.hpp. The types this file
+// takes from there are proven identical to its former verbatim spellings by
+// the static_asserts below, so the generated kernels are unchanged.
+#include "cb_grouped_common.hpp"
+
 namespace {
 
 using namespace cute;
@@ -78,24 +84,34 @@ using TileShapeFp4M256 = Shape<_256, _128, _128>;
 
 using Sm1xxCfg = cutlass::detail::Sm1xxBlockScaledConfig<16>;
 
-// Same EVT node tree as cb_fused_gemm.cu's ScaledFusion (fp32 multiply chain,
-// one round to bf16): D = bf16_rn(b_scale[n] * (a_scale[m] * acc)).
+// The EVT node tree (fp32 multiply chain, one round to bf16):
+// D = bf16_rn(b_scale[n] * (a_scale[m] * acc)). It was verbatim in three files
+// and now lives once in cb_grouped_common.hpp; binding it to THIS file's
+// element types reproduces the same types (proven immediately below).
 template <class TileShape>
-struct ScaledFusion {
-  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
-      0, TileShape, float, float, Stride<_1, _0, _0>>;
-  using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
-      0, TileShape, float, float, Stride<_0, _1, _0>>;
-  using AccFetch = cutlass::epilogue::fusion::Sm90AccFetch;
-  using MulA = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies, ElementAcc, ElementAcc,
-      cutlass::FloatRoundStyle::round_to_nearest>;
-  using MulB = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies, ElementD, ElementAcc,
-      cutlass::FloatRoundStyle::round_to_nearest>;
-  using EVTA = cutlass::epilogue::fusion::Sm90EVT<MulA, ScaleA, AccFetch>;
-  using type = cutlass::epilogue::fusion::Sm90EVT<MulB, ScaleB, EVTA>;
-};
+using ScaledFusion = gridbook::grouped::ScaledFusion<TileShape, ElementAcc,
+                                                     ElementD>;
+
+// BIT-IDENTITY PROOF for the §4-dedupe extraction: the shared tree is the SAME
+// TYPE this file spelled before it, so the epilogue collective, its smem
+// layout and its rounding order are unchanged.
+static_assert(
+    cute::is_same_v<
+        typename ScaledFusion<TileShapeFp4>::type,
+        cutlass::epilogue::fusion::Sm90EVT<
+            cutlass::epilogue::fusion::Sm90Compute<
+                cutlass::multiplies, ElementD, ElementAcc,
+                cutlass::FloatRoundStyle::round_to_nearest>,
+            cutlass::epilogue::fusion::Sm90RowBroadcast<
+                0, TileShapeFp4, float, float, Stride<_0, _1, _0>>,
+            cutlass::epilogue::fusion::Sm90EVT<
+                cutlass::epilogue::fusion::Sm90Compute<
+                    cutlass::multiplies, ElementAcc, ElementAcc,
+                    cutlass::FloatRoundStyle::round_to_nearest>,
+                cutlass::epilogue::fusion::Sm90ColBroadcast<
+                    0, TileShapeFp4, float, float, Stride<_1, _0, _0>>,
+                cutlass::epilogue::fusion::Sm90AccFetch>>>,
+    "shared ScaledFusion must reproduce the pre-extraction EVT node tree");
 
 template <class TileShape>
 struct CfgFp4 {
@@ -120,23 +136,12 @@ struct CfgFp4 {
       cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
 };
 
-// Hard smem gate (see cb_fused_gemm.cu — the sm90 cooperative kernel layer
-// does not static_assert its own SharedStorageSize).
+// Hard smem gate (shared — the sm90 cooperative kernel layer does not
+// static_assert its own SharedStorageSize).
 template <class GemmKernel>
-struct AssertSmemFits {
-  static_assert((int)GemmKernel::SharedStorageSize <=
-                    cutlass::arch::sm120_smem_capacity_bytes,
-                "fused CB fp4 kernel exceeds the sm_120 shared-memory capacity");
-  static constexpr bool value = true;
-};
+using AssertSmemFits = gridbook::grouped::AssertSmemFits<GemmKernel>;
 
-void check_same_cuda_device(torch::Tensor const& anchor,
-                            torch::Tensor const& tensor,
-                            char const* name) {
-  TORCH_CHECK(tensor.device() == anchor.device(), name,
-              " must be on the same CUDA device as a (", anchor.device(),
-              "), got ", tensor.device());
-}
+using gridbook::grouped::check_same_cuda_device;
 
 void check_dense_packed_row_storage(torch::Tensor const& packed,
                                     int64_t rows,
@@ -1054,19 +1059,18 @@ torch::Tensor cb_fused_fp4_moe_grouped(
               "type_size inconsistent with k_bits/scale coding");
   const int Mp = (int)a.size(0);
   TORCH_CHECK(tile_m == 128 || tile_m == 256, "tile_m must be 128 or 256");
-  TORCH_CHECK(Mp % tile_m == 0, "Mp (", Mp, ") must be a multiple of tile_m (",
-              tile_m, "); pad each expert's row segment");
+  // Padding granularity, stacked-expert contiguity and the per-tile expert id
+  // vector belong to the SHARED grouping construction (cb_grouped_common.hpp).
+  gridbook::grouped::check_padded_rows(Mp, tile_m);
   const int64_t n_sb = K / 256;
   const int64_t sfa_need = ((Mp + 127) / 128) * 128 * (K / 16);
   TORCH_CHECK(sfa.is_cuda() && sfa.scalar_type() == torch::kUInt8 &&
               sfa.numel() == sfa_need && sfa.is_contiguous(),
               "sfa must be contiguous uint8 swizzled ue4m3 storage, numel ",
               sfa_need);
-  TORCH_CHECK(packed.is_cuda() && packed.scalar_type() == torch::kUInt8 &&
-              packed.dim() == 3 && packed.size(0) > 0 && packed.size(1) == N &&
-              packed.stride(2) == 1 && packed.stride(1) == packed.size(2) &&
-              packed.stride(0) == N * packed.size(2),
+  TORCH_CHECK(packed.scalar_type() == torch::kUInt8,
               "packed must be fully contiguous uint8 [E, N, row_bytes]");
+  gridbook::grouped::check_stacked_experts(packed, N, "packed");
   TORCH_CHECK(packed.size(2) == n_sb * type_size,
               "row_bytes must equal n_sb*type_size for stacked experts");
   // No tail-slack requirement (gmem gathers stay in-superblock; see the
@@ -1089,18 +1093,15 @@ torch::Tensor cb_fused_fp4_moe_grouped(
               a_scales.numel() == Mp && a_scales.is_contiguous());
   TORCH_CHECK(b_scales.is_cuda() && b_scales.scalar_type() == torch::kFloat32 &&
               b_scales.numel() == N && b_scales.is_contiguous());
-  TORCH_CHECK(expert_ids.is_cuda() &&
-              expert_ids.scalar_type() == torch::kInt32 &&
-              expert_ids.is_contiguous() &&
-              expert_ids.numel() == Mp / tile_m,
-              "expert_ids must be contiguous int32 [Mp/tile_m]");
+  gridbook::grouped::check_expert_ids(a, expert_ids, Mp, tile_m,
+                                      packed.size(0));
   check_same_cuda_device(a, sfa, "sfa");
   check_same_cuda_device(a, packed, "packed");
   check_same_cuda_device(a, lut, "lut");
   check_same_cuda_device(a, compose, "compose");
   check_same_cuda_device(a, a_scales, "a_scales");
   check_same_cuda_device(a, b_scales, "b_scales");
-  check_same_cuda_device(a, expert_ids, "expert_ids");
+  // (expert_ids' device is attested inside check_expert_ids above.)
   if (tile_m == 256) {
     return run_fp4_fused_m256(
         a, sfa, packed, lut, compose, a_scales, b_scales,

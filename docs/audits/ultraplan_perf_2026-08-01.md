@@ -226,6 +226,10 @@ changes served numerics — so it moves strictly through the existing chain:
   (`PRISMAQUANT_PRELOAD_FUSED=1`, matched arms); note `preload_fused_extensions`
   does **not** warm `get_ext`/`get_ext_v2`/`get_bf16_grouped_ext` today —
   extend it so "preload" is a full warm-up before any A/B.
+  **DONE 2026-08-02:** the warm-up now covers all seven loader families
+  (adding the two lanes that landed after this audit was written, fp4v2 and
+  persistent-B), each attempted independently and fail-soft, strict mode
+  preserved.
 - **`cb_gemv_v2` qualification on `sm_120` (K1.4)** — measured +5.97% live on
   Laguna decode; it is sm121-attested only. Same-session quality, soak, long
   prefill per roadmap.
@@ -236,6 +240,21 @@ changes served numerics — so it moves strictly through the existing chain:
   Instantiate the missing rungs (smem table already parameterizes KBits) or
   encode the concrete route in the candidate identity so the allocator can't
   price an unbacked fast path.
+  **RESOLVED 2026-08-02 — second arm, and the first arm's premise was wrong.**
+  "The smem table already parameterizes KBits" is true but not the binding
+  constraint. Two independent laws restrict this lane to `k % 4 == 0`:
+  `type_size = 4k` is the packed-B TMA box's contiguous extent and must be a
+  16-byte multiple; and the fused mainloop decodes with a *single* width
+  `CbSubW = k/4`, while the format splits `k` over `n_sub = 4` **raggedly**
+  (`csrc/cb_gemv.cu` `SubSplit`), so a uniform decode at k37 would be wrong
+  rather than merely unaligned. The six compiled rungs were therefore already
+  maximal, and this audit's own arithmetic corroborates it: the three of the
+  27B ladder's eight rungs that *do* hit the lane are exactly the multiples of
+  4 in [36, 47]. The second arm shipped instead — a queryable compiled set
+  (`cb_fused_kbits()`), law-based validation, macro-generated dispatch, and
+  Python gating on the law then confirming against the module. See
+  [KERNELS](../KERNELS.md#rung-coverage-what-this-lane-can-and-cannot-serve-k12)
+  and ROADMAP K1.2.
 - **FP4 decode ALU (structural cause d)**: no schedule work without a fresh ncu
   capture — the graveyard (decode-contract v2 null, fp4 double-buffer loss, w2
   rowpack negative) says speculative decode-GEMV retunes don't pay here. The
@@ -280,7 +299,10 @@ and CI scripts.
    the pair P4's v2 qualification should eventually collapse to one default.
 
 **Dispatch-surface gaps (not dead code, but unbacked surface):** K1.2 rung
-coverage (§3 P4); the doc-only ghost env vars; the `sm_120`-untested `v2`
+coverage (§3 P4 — **closed 2026-08-02**: the surface is unbacked for
+`k % 4 != 0` and provably must be, so it is now *declared* rather than
+implied — `cb_fused_kbits()` reports the compiled set and dispatch derives
+eligibility from it instead of from duplicated literals); the doc-only ghost env vars; the `sm_120`-untested `v2`
 device attestation narrowing the FP4 floor to cc 12.0/12.1 even on the
 `inherited` GEMV path (acceptable today — Blackwell is the target — but it is
 the single coupling that makes FP4-CB's hardware floor *narrower* than FP8-CB's,

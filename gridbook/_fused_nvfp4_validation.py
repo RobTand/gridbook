@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import gc
 import importlib.metadata
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -23,6 +24,34 @@ from typing import Any, Mapping, Sequence
 
 MEASURED_PHASE_ORDER = ("timing", "quality")
 
+# --- ROADMAP K0.2 readiness verdict ---------------------------------------
+# A fused-MoE A/B is only evidence if the artifact's producer attested a
+# stage-specific ``input_global_scale`` for BOTH routed stages.  Against an
+# unattested artifact every fused attempt correctly fails closed to the
+# baseline loop, so identical outputs and ~1.00x timing are *fallback
+# telemetry, not evidence* (docs/audits/fused_nvfp4_enablement_2026-07-31.md).
+# These verdicts let the A/B entry points say that in the report instead of
+# silently publishing a zero-difference comparison.
+K02_ATTESTED = "attested_and_verified"
+K02_MISSING_STAGES = "missing_stages"
+K02_DIGEST_MISMATCH = "digest_mismatch"
+K02_NOT_ATTESTED = "not_attested"
+K02_MALFORMED = "malformed_stage_attestation"
+K02_CONTRACT_ABSENT = "contract_absent"
+K02_ARTIFACT_UNREADABLE = "artifact_unreadable"
+K02_VERDICTS = (
+    K02_ATTESTED,
+    K02_MISSING_STAGES,
+    K02_DIGEST_MISMATCH,
+    K02_NOT_ATTESTED,
+    K02_MALFORMED,
+    K02_CONTRACT_ABSENT,
+    K02_ARTIFACT_UNREADABLE,
+)
+EVIDENCE_STAGE_ATTESTED = "stage_attested_fused_moe_evidence_eligible"
+EVIDENCE_FALLBACK_TELEMETRY = "fallback_telemetry_not_evidence"
+EVIDENCE_DENSE_SCOPE = "dense_scope_stage_attestation_not_applicable"
+
 
 def measurement_phase_order(timing_repeats: int) -> tuple[str, ...]:
     """Keep allocation-heavy full-vocabulary scoring outside timing setup."""
@@ -30,6 +59,135 @@ def measurement_phase_order(timing_repeats: int) -> tuple[str, ...]:
     if timing_repeats < 0:
         raise ValueError("timing_repeats must be nonnegative")
     return MEASURED_PHASE_ORDER if timing_repeats else ("quality",)
+
+
+def read_artifact_activation_contract(
+    model_dir: Path,
+) -> tuple[dict[str, Any] | None, dict[str, float]]:
+    """Read one local artifact's activation contract and serialized scalars.
+
+    Deliberately independent of the serving config reader: this runs before
+    (and without) an engine, so a K0.2 verdict costs no GPU and no vLLM.
+    """
+
+    from safetensors import safe_open
+
+    from gridbook import nvfp4_activation_contract as contract
+
+    root = Path(model_dir)
+    raw: Any = None
+    quant_config_path = root / "quant_config.json"
+    if quant_config_path.is_file():
+        raw = json.loads(quant_config_path.read_text(encoding="utf-8"))
+    else:
+        config_path = root / "config.json"
+        if config_path.is_file():
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(config, Mapping):
+                raw = config.get("quantization_config")
+    if not isinstance(raw, Mapping):
+        raise RuntimeError(
+            f"artifact {root} declares no readable quantization config"
+        )
+    record = contract.parse_contract(raw)
+    scales: dict[str, float] = {}
+    suffix = "." + contract.TENSOR_SUFFIX
+    shards = sorted(root.glob("*.safetensors"))
+    if not shards:
+        raise RuntimeError(f"artifact {root} has no safetensors shard")
+    for shard in shards:
+        with safe_open(str(shard), framework="pt", device="cpu") as reader:
+            for name in reader.keys():
+                if not name.endswith(suffix):
+                    continue
+                target = name[: -len(suffix)]
+                if target in scales:
+                    raise RuntimeError(
+                        f"artifact {root} serializes {name} more than once"
+                    )
+                scales[target] = contract.scale_f32(
+                    reader.get_tensor(name), target=target
+                )
+    return (dict(record) if record is not None else None), scales
+
+
+def k02_readiness_verdict(
+    model_dir: Any, *, mode: str
+) -> dict[str, Any]:
+    """Return the machine-readable K0.2 stage-attestation verdict.
+
+    ``pass`` is the precondition the A/B entry points consume: for a routed-MoE
+    run it is True only when every packed FusedMoE module attests both stages
+    AND every stage digest matches the artifact's serialized scalar.  Dense
+    runs are out of scope by construction — a dense-only artifact carries no
+    stage section and remains valid.
+    """
+
+    from gridbook import nvfp4_activation_contract as contract
+
+    routed = mode != "dense"
+    path = Path(model_dir).expanduser() if model_dir is not None else None
+    result: dict[str, Any] = {
+        "schema": contract.CONTRACT_SCHEMA_V2,
+        "roadmap_item": "K0.2",
+        "execution_mode": mode,
+        "routed_moe_scope": routed,
+        "artifact": str(path) if path is not None else None,
+        "contract_schema": None,
+        "modules": [],
+        "failing_module": None,
+        "failing_stage": None,
+    }
+    if path is None or not path.is_dir():
+        result.update({
+            "verdict": K02_ARTIFACT_UNREADABLE,
+            "detail": (
+                "a K0.2 verdict requires a local artifact directory; a Hub "
+                "candidate cannot be stage-verified before download"
+            ),
+        })
+    else:
+        try:
+            record, scales = read_artifact_activation_contract(path)
+        except Exception as exc:  # unreadable/malformed artifact
+            record = None
+            scales = {}
+            result.update({
+                "verdict": K02_ARTIFACT_UNREADABLE,
+                "detail": f"{type(exc).__name__}: {exc}",
+            })
+        else:
+            result["contract_schema"] = (
+                record.get("schema") if record is not None else None
+            )
+            if record is None:
+                result.update({
+                    "verdict": K02_CONTRACT_ABSENT,
+                    "detail": (
+                        "the artifact declares no "
+                        f"execution_contracts.{contract.CONTRACT_KEY} record, "
+                        "so it carries no lawful static activation scale for "
+                        "either routed stage"
+                    ),
+                })
+            else:
+                verified = contract.verify_routed_moe_stages(record, scales)
+                result.update({
+                    "verdict": verified["verdict"],
+                    "detail": verified["detail"],
+                    "modules": verified["modules"],
+                    "failing_module": verified["failing_module"],
+                    "failing_stage": verified["failing_stage"],
+                })
+    attested = result["verdict"] == K02_ATTESTED
+    result["pass"] = bool(attested) if routed else True
+    result["evidence_class"] = (
+        EVIDENCE_DENSE_SCOPE if not routed
+        else EVIDENCE_STAGE_ATTESTED if attested
+        else EVIDENCE_FALLBACK_TELEMETRY
+    )
+    result["fused_moe_ab_is_evidence"] = bool(attested) if routed else None
+    return result
 
 
 def quiesce_before_timing(torch: Any) -> int:

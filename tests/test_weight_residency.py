@@ -853,6 +853,14 @@ def test_same_ref_fused_roles_enter_native_fused_kernel(monkeypatch, M):
     calls = []
 
     class _FusedExt:
+        # A faithful stand-in must answer the RUNG query (K1.2): dispatch now
+        # asks the module which rungs it compiled instead of carrying a
+        # literal ladder, and `cb_fused_kbits` is in the fused module's STRICT
+        # symbol contract — a real module that loads always has it.
+        @staticmethod
+        def cb_fused_kbits():
+            return list(codec.FP8_FUSED_KBITS)
+
         @staticmethod
         def cb_fused_prefill_mm_scaled(xq, qw, cb, sa, ws, n, k, k_bits):
             calls.append((qw, cb, n, k, k_bits))

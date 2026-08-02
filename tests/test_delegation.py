@@ -11,6 +11,7 @@ import pytest
 
 pytest.importorskip("vllm")
 from gridbook.config import PrismaQuantConfig  # noqa: E402
+from gridbook.delegated_preflight import DelegatedBackendError  # noqa: E402
 
 
 def _mixed_config():
@@ -83,6 +84,87 @@ def test_uniform_cb_has_no_ct():
     c = PrismaQuantConfig.from_config(cfg)
     c._ensure_resolved()
     assert c.ct_config is None
+
+
+# --- D0.2: the delegated backend a mixed artifact actually resolves to -------
+#
+# The policy itself is unit-tested vLLM-free in ``test_delegated_preflight.py``.
+# What is pinned HERE is the wiring: that ``PrismaQuantConfig`` reads the right
+# declared group for a serving prefix using compressed-tensors' own matcher,
+# and that its delegation choke point runs the policy on whatever vLLM handed
+# back. Stub backend identities stand in for the vLLM ladder so the check does
+# not need a GPU, a real FusedMoE, or a particular vLLM build.
+
+
+def _stub_backend(qualname, module):
+    """A class whose IDENTITY (module + qualname) is what the policy reads."""
+    cls = type("StubBackend", (), {})
+    cls.__name__ = qualname
+    cls.__qualname__ = qualname
+    cls.__module__ = module
+    return cls
+
+
+_EMULATION_EXPERTS = _stub_backend(
+    "Nvfp4QuantizationEmulationTritonExperts",
+    "vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe")
+_MARLIN_EXPERTS = _stub_backend(
+    "MarlinExperts", "vllm.model_executor.layers.fused_moe.experts.marlin_moe")
+_CUTLASS_EXPERTS = _stub_backend(
+    "CutlassExpertsFp4",
+    "vllm.model_executor.layers.fused_moe.experts.cutlass_moe")
+
+
+class _StubMethod:
+    """The post-``__init__`` shape of ``CompressedTensorsW4A4Nvfp4MoEMethod``."""
+
+    def __init__(self, experts_cls):
+        self.experts_cls = experts_cls
+
+
+def _delegating_config(method):
+    c = PrismaQuantConfig.from_config(_mixed_config())
+    c._ensure_resolved()
+    c.ct_config.get_quant_method = lambda layer, prefix: method
+    return c
+
+
+class _Layer:
+    pass
+
+
+def test_stock_group_resolves_for_a_delegated_prefix():
+    c = PrismaQuantConfig.from_config(_mixed_config())
+    c._ensure_resolved()
+    name, group = c._stock_group_for_prefix(
+        _Layer(), "model.layers.0.mlp.gate_proj")
+    assert name == "group_nvfp4"
+    assert group["input_activations"]["num_bits"] == 4      # declared W4A4
+    # A CB target is never a delegated group.
+    assert c._stock_group_for_prefix(
+        _Layer(), "model.layers.0.mlp.down_proj")[0] is None
+
+
+def test_delegated_emulation_backend_is_rejected_at_load():
+    c = _delegating_config(_StubMethod(_EMULATION_EXPERTS))
+    with pytest.raises(DelegatedBackendError) as excinfo:
+        c._delegate(_Layer(), "model.layers.0.mlp.gate_proj")
+    message = str(excinfo.value)
+    assert "Nvfp4QuantizationEmulationTritonExperts" in message
+    assert "Triton-backed" in message
+    assert "group_nvfp4" in message and "W4A4" in message
+
+
+def test_delegated_marlin_backend_is_rejected_at_load():
+    c = _delegating_config(_StubMethod(_MARLIN_EXPERTS))
+    with pytest.raises(DelegatedBackendError, match="activation scales"):
+        c._delegate(_Layer(), "model.layers.0.mlp.gate_proj")
+
+
+def test_delegated_native_backend_is_accepted_at_load():
+    method = _StubMethod(_CUTLASS_EXPERTS)
+    c = _delegating_config(method)
+    assert c._delegate(_Layer(), "model.layers.0.mlp.gate_proj") is method
 
 
 def _shared_mlp_config():

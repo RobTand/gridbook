@@ -66,6 +66,13 @@ def _patch_load(monkeypatch, result=None, *, error=None):
     return calls
 
 
+def _prepare_main_loader(monkeypatch):
+    """The generic modules now compile for the live device (audit P0.1)."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 1))
+
+
 def _prepare_cutlass(monkeypatch, tmp_path):
     cutlass = tmp_path / "cutlass" / "include"
     cutlass.mkdir(parents=True)
@@ -116,6 +123,8 @@ def test_cold_load_is_published_once_to_concurrent_callers(
         _prepare_fp4_loader(monkeypatch, tmp_path)
     elif prepare == "fused":
         _prepare_fused_loader(monkeypatch, tmp_path)
+    else:
+        _prepare_main_loader(monkeypatch)
 
     declared = getattr(cuda_ext, symbols)
     if symbols == "_FUSED_FP4_SYMBOL_FAMILIES":
@@ -176,6 +185,7 @@ def test_cold_load_is_published_once_to_concurrent_callers(
 def test_concurrent_failed_load_is_memoized_once(monkeypatch, capsys,
                                                    tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _prepare_main_loader(monkeypatch)
     started = threading.Event()
     release = threading.Event()
     calls = []
@@ -384,11 +394,28 @@ def test_fp4_symbol_families_exist_in_packaged_source():
         assert not (set(required) - exported)
 
 
-def test_main_optional_bindings_stay_optional():
-    for name in ("cb_expand_fp8_into", "l2_pin_region", "l2_reset_window",
-                 "l2_unpin", "l2_persisting_max_bytes",
-                 "l2_max_window_bytes"):
-        assert name not in cuda_ext._EXT_SYMBOLS
+def test_retired_l2_pipeline_surface_stays_deleted():
+    """The L2-pinned scratch pipeline's binding residue must not come back.
+
+    ``cb_expand_fp8_into`` and the ``l2_*`` access-policy-window helpers were
+    the last surviving pieces of a pipeline that wedged live serving three
+    times and was removed from production dispatch and its selector surface.
+    They outlived it as *exported symbols with zero call sites*, which is worse
+    than dead code: every reader after the removal has to prove to themselves
+    that nothing dispatches to them. Deleted per
+    ``docs/audits/ultraplan_perf_2026-08-01.md`` §4 -- kernel, binding, custom
+    op, and probe together -- and their absence is now the contract, in all
+    three places the surface was visible.
+    """
+    retired = ("cb_expand_fp8_into", "l2_pin_region", "l2_reset_window",
+               "l2_unpin", "l2_persisting_max_bytes", "l2_max_window_bytes")
+    assert not (set(retired) & _exports("cb_gemv.cu"))
+    assert not (set(retired) & set(cuda_ext._EXT_SYMBOLS))
+    ops = pytest.importorskip("gridbook.ops", reason="torch unavailable")
+    assert not [name for name in retired if hasattr(ops, name)]
+    assert not hasattr(ops, "cb_expand_fp8_into_available")
+    # The allocating expander it was a variant OF is live and required.
+    assert "cb_expand_fp8" in cuda_ext._EXT_SYMBOLS
 
 
 def test_main_contract_rejects_pre_fp4_qdq_revision(monkeypatch, capsys,
@@ -399,6 +426,7 @@ def test_main_contract_rejects_pre_fp4_qdq_revision(monkeypatch, capsys,
     instead of being accepted and silently dropping the single-launch QDQ.
     """
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _prepare_main_loader(monkeypatch)
     old_symbols = tuple(name for name in cuda_ext._EXT_SYMBOLS
                         if name != "fp4_act_qdq")
     stale = _stub("main", old_symbols,
@@ -411,11 +439,12 @@ def test_main_contract_rejects_pre_fp4_qdq_revision(monkeypatch, capsys,
     assert "fp4_act_qdq" in error
 
 
-def test_fp8_grouped_bindings_stay_optional_after_dense_prerequisite():
+def test_fp8_grouped_bindings_are_required_with_the_dense_entry_point():
+    """The identity-keyed cache makes a dense-only fused build impossible."""
     for name in ("cb_fused_moe_grouped", "cb_fused_moe_tile_m",
                  "cb_fused_moe_tile_sizes",
                  "cb_fused_moe_tile_sizes_for_kbits"):
-        assert name not in cuda_ext._FUSED_SYMBOLS
+        assert name in cuda_ext._FUSED_SYMBOLS
 
 
 # ---------------------------------------------------------------------------
@@ -425,15 +454,17 @@ def test_fp8_grouped_bindings_stay_optional_after_dense_prerequisite():
 
 def test_get_ext_accepts_complete_module(monkeypatch, tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _prepare_main_loader(monkeypatch)
     good = _stub("main", cuda_ext._EXT_SYMBOLS,
                  path=tmp_path / "prismaquant_cb_ext.so")
     calls = _patch_load(monkeypatch, good)
     assert cuda_ext.get_ext() is good
-    assert calls[0][1]["build_directory"] == str(tmp_path)
+    assert calls[0][1]["build_directory"] == str(tmp_path / "main")
 
 
 def test_get_ext_refuses_incompatible_module(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _prepare_main_loader(monkeypatch)
     stale = _stub("main", cuda_ext._EXT_SYMBOLS[:-1],
                   path=tmp_path / "prismaquant_cb_ext.so")
     _patch_load(monkeypatch, stale)
@@ -446,6 +477,7 @@ def test_get_ext_refuses_incompatible_module(monkeypatch, capsys, tmp_path):
 
 def test_get_ext_is_memoized(monkeypatch, tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _prepare_main_loader(monkeypatch)
     good = _stub("main", cuda_ext._EXT_SYMBOLS)
     calls = _patch_load(monkeypatch, good)
     assert cuda_ext.get_ext() is good
@@ -456,6 +488,7 @@ def test_get_ext_is_memoized(monkeypatch, tmp_path):
 def test_get_ext_reports_build_exception_separately(monkeypatch, capsys,
                                                      tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _prepare_main_loader(monkeypatch)
     _patch_load(monkeypatch, error=PermissionError("cannot create lock"))
     assert cuda_ext.get_ext() is None
     error = capsys.readouterr().err
@@ -508,8 +541,12 @@ def _identity_fixture(tmp_path):
     src = tmp_path / "csrc"
     header = src / "cutlass_fork" / "sm120_cb_fused_fp4_mma.hpp"
     header.parent.mkdir(parents=True)
+    # Every declared build input must exist — the list grew when the shared
+    # grouping glue was extracted, and reading it here keeps the fixture from
+    # silently drifting behind the loader.
+    for name in cuda_ext._FUSED_FP4_BUILD_INPUTS:
+        (src / name).write_text("header-v1")
     (src / "cb_fused_fp4_gemm.cu").write_text("source-v1")
-    header.write_text("header-v1")
 
     cutlass = tmp_path / "cutlass" / "include"
     (cutlass / "cutlass").mkdir(parents=True)
@@ -638,13 +675,16 @@ def test_fused_fp4_reports_build_exception(monkeypatch, capsys, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_fused_fp8_accepts_dense_only_module(monkeypatch, tmp_path):
+def test_fused_fp8_accepts_a_complete_module(monkeypatch, tmp_path):
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
     _prepare_fused_loader(monkeypatch, tmp_path)
-    dense = _stub("fused", cuda_ext._FUSED_SYMBOLS)
-    calls = _patch_load(monkeypatch, dense)
-    assert cuda_ext.get_fused_ext() is dense
-    assert calls[0][1]["build_directory"] == str(tmp_path / "fused")
+    complete = _stub("fused", cuda_ext._FUSED_SYMBOLS)
+    calls = _patch_load(monkeypatch, complete)
+    assert cuda_ext.get_fused_ext() is complete
+    assert re.fullmatch(r"pq_cb_fused_[0-9a-f]{64}", calls[0][1]["name"])
+    identity = calls[0][1]["name"].removeprefix("pq_cb_fused_")
+    assert calls[0][1]["build_directory"] == str(
+        tmp_path / "fused" / identity)
     assert "-gencode=arch=compute_121a,code=sm_121a" in \
         calls[0][1]["extra_cuda_cflags"]
 

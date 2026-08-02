@@ -72,9 +72,11 @@ states which parts were measured and which were inferred.
 | A compiler error from `nvcc` | Toolchain/torch mismatch, or an `nvcc` too old for your GPU's architecture. | `nvcc` 13.0 is the tested toolchain. Match the CUDA major version your torch was built against. |
 | Anything, but only inside a container that used to work | The ephemeral build cache is being rebuilt and failing. | See [persisting the cache](INSTALL.md#persisting-the-jit-build-cache). |
 
-No current environment switch enables Triton. Remove obsolete
-`PRISMAQUANT_CB_DECODE=triton` or `PRISMAQUANT_CB_EXPAND=triton` settings from
-old scripts/model-card commands rather than relying on them for bisection.
+No current environment switch enables Triton. `PRISMAQUANT_CB_DECODE` and
+`PRISMAQUANT_CB_EXPAND` have no reader left in the code at all, so an inherited
+`=triton` setting is inert rather than dangerous — but delete it from old
+scripts/model-card commands anyway, because a variable that looks like a
+bisection lever and silently does nothing is worse than no lever.
 
 ---
 
@@ -524,6 +526,13 @@ elsewhere in the model and perturbs floating-point reduction order. On the 27B
 artifact that produced a **±17%** swing in a measured KL evaluation with
 byte-identical served weights.
 
-Match extension residency across arms, or the comparison is confounded. Details:
+Match extension residency across arms, or the comparison is confounded.
+
+Fix: run **both** arms with `PRISMAQUANT_PRELOAD_FUSED=1`. At plugin registration
+that now builds and loads *every* native extension family — the decode GEMV,
+GEMV-v2, grouped BF16, both fused FP8/NVFP4 modules, fused FP4-v2 and persistent-B
+MoE — rather than only the two fused ones it warmed before, so an arm cannot drift
+by loading a module the other never touched. Individual loaders stay fail-soft: one
+that will not build on this box leaves the others warmed. Details:
 [KERNELS.md](KERNELS.md#a-measurement-side-effect-worth-knowing) and
 [BENCHMARKS.md](BENCHMARKS.md#caveats--read-these).

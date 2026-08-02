@@ -166,41 +166,149 @@ def _cb_bf16_grouped_mm_out_fake(out, a, weights, expert_ends,
     return None
 
 
-@torch.library.custom_op("prismaquant::cb_expand_fp8_into",
-                         mutates_args=("out",), tags=_PQ_UNSAFE)
-def cb_expand_fp8_into(out: torch.Tensor, qw_padded: torch.Tensor,
-                       cb_flat_fp8: torch.Tensor, cb_row_offset: torch.Tensor,
-                       N: int, K: int, k_bits: int, n_sub: int,
-                       type_size: int) -> None:
-    """``cb_expand_fp8`` writing into a CALLER-OWNED buffer.
+@torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_sm120",
+                         mutates_args=(), tags=_PQ_UNSAFE)
+def cb_bf16_grouped_mm_sm120(a: torch.Tensor, weights: torch.Tensor,
+                             expert_ids: torch.Tensor,
+                             tile_m: int) -> torch.Tensor:
+    """sm12x-native CUTLASS grouped BF16 GEMM (OPT-IN lane).
 
-    The allocating form is unusable for the L2 pipeline: the persisting-access
-    window pins a fixed ADDRESS RANGE, so a fresh allocation per expert would
-    land outside the pinned range and the lever would silently do nothing. ``out``
-    may be LARGER than ``N*K`` (it is one half of a rotating arena sized for the
-    largest expert group), and only the first ``N*K`` bytes are written.
-
-    ``mutates_args=("out",)`` is load-bearing: an empty annotation would let
-    compile/capture reorder or elide the write against the GEMM that reads it —
-    a silent wrong answer, not a crash. Missing native code is fatal.
+    ``a`` is the ROW-PADDED activation ``[Mp, K]`` whose every ``tile_m``-row
+    block belongs to one expert, ``weights`` is the contiguous stack
+    ``[E, N, K]``, and ``expert_ids[m_tile]`` names each block's expert (``-1``
+    for a padding block). Same numerics class as the default SM80 lane — fp32
+    accumulate, one bf16 round — with a different FP32 reduction order.
     """
-    from .cuda_ext import require_ext
-    require_ext("FP8-CB in-place transient expansion").cb_expand_fp8_into(
-        out, qw_padded, cb_flat_fp8, cb_row_offset,
-        N, K, k_bits, n_sub, type_size)
+    from .cuda_ext import require_bf16_grouped_ext
+    return require_bf16_grouped_ext(
+        "sm12x-native CUTLASS grouped BF16 GEMM").cb_bf16_grouped_mm_sm120(
+            a, weights, expert_ids, tile_m)
 
 
-@cb_expand_fp8_into.register_fake
-def _cb_expand_fp8_into_fake(out, qw_padded, cb_flat_fp8, cb_row_offset, N, K,
-                             k_bits, n_sub, type_size):
+@cb_bf16_grouped_mm_sm120.register_fake
+def _cb_bf16_grouped_mm_sm120_fake(a, weights, expert_ids, tile_m):
+    return torch.empty((a.shape[0], weights.shape[1]), dtype=torch.bfloat16,
+                       device=a.device)
+
+
+@torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_sm120_out",
+                         mutates_args=("out",), tags=_PQ_UNSAFE)
+def cb_bf16_grouped_mm_sm120_out(out: torch.Tensor, a: torch.Tensor,
+                                 weights: torch.Tensor,
+                                 expert_ids: torch.Tensor,
+                                 tile_m: int) -> None:
+    """Write the sm12x-native grouped BF16 result into a caller-owned tensor."""
+    from .cuda_ext import require_bf16_grouped_ext
+    require_bf16_grouped_ext(
+        "sm12x-native CUTLASS grouped BF16 GEMM").cb_bf16_grouped_mm_sm120_out(
+            out, a, weights, expert_ids, tile_m)
+
+
+@cb_bf16_grouped_mm_sm120_out.register_fake
+def _cb_bf16_grouped_mm_sm120_out_fake(out, a, weights, expert_ids, tile_m):
     return None
 
 
-def cb_expand_fp8_into_available() -> bool:
-    """Report whether this extension build exposes the research utility."""
-    from .cuda_ext import get_ext
-    ext = get_ext()
-    return ext is not None and hasattr(ext, "cb_expand_fp8_into")
+@torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_sm120_gather",
+                         mutates_args=(), tags=_PQ_UNSAFE)
+def cb_bf16_grouped_mm_sm120_gather(a: torch.Tensor, row_src: torch.Tensor,
+                                    weights: torch.Tensor,
+                                    expert_ids: torch.Tensor,
+                                    tile_m: int) -> torch.Tensor:
+    """sm12x grouped BF16 GEMM, in-mainloop A-row gather mode (OPT-IN lane).
+
+    ``a`` is the COMPACT activation ``[S, K]``; ``row_src`` is int32 ``[Mp]``
+    naming the source row of every padded row (ids outside ``[0, S)`` are the
+    padding rows and read zeros), so the row-padded activation copy of the
+    plain mode is never materialized. Bit-identical output to running the
+    padded-copy mode on the materialized gather of the same ``row_src``.
+    """
+    from .cuda_ext import require_bf16_grouped_ext
+    return require_bf16_grouped_ext(
+        "sm12x-native CUTLASS grouped BF16 GEMM"
+    ).cb_bf16_grouped_mm_sm120_gather(a, row_src, weights, expert_ids, tile_m)
+
+
+@cb_bf16_grouped_mm_sm120_gather.register_fake
+def _cb_bf16_grouped_mm_sm120_gather_fake(a, row_src, weights, expert_ids,
+                                          tile_m):
+    return torch.empty((row_src.shape[0], weights.shape[1]),
+                       dtype=torch.bfloat16, device=a.device)
+
+
+@torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_sm120_gather_out",
+                         mutates_args=("out",), tags=_PQ_UNSAFE)
+def cb_bf16_grouped_mm_sm120_gather_out(out: torch.Tensor, a: torch.Tensor,
+                                        row_src: torch.Tensor,
+                                        weights: torch.Tensor,
+                                        expert_ids: torch.Tensor,
+                                        tile_m: int) -> None:
+    """Write the gather-mode sm12x grouped BF16 result into a caller-owned
+    ``[Mp, N]`` tensor."""
+    from .cuda_ext import require_bf16_grouped_ext
+    require_bf16_grouped_ext(
+        "sm12x-native CUTLASS grouped BF16 GEMM"
+    ).cb_bf16_grouped_mm_sm120_gather_out(out, a, row_src, weights,
+                                          expert_ids, tile_m)
+
+
+@cb_bf16_grouped_mm_sm120_gather_out.register_fake
+def _cb_bf16_grouped_mm_sm120_gather_out_fake(out, a, row_src, weights,
+                                              expert_ids, tile_m):
+    return None
+@torch.library.custom_op("prismaquant::cb_moe_persistent_b_prefill",
+                         mutates_args=("out",), tags=_PQ_UNSAFE)
+def cb_moe_persistent_b_prefill(out: torch.Tensor, a: torch.Tensor,
+                                qw: torch.Tensor, lut: torch.Tensor,
+                                compose: torch.Tensor,
+                                expert_ends: torch.Tensor, k_bits: int,
+                                type_size: int, cfg: int) -> None:
+    """Persistent-B grouped MoE decode-in-mainloop, into a caller-owned [P,N].
+
+    ONE launch per projection stage over the exact routed segments. The packed
+    FP4-CB-v2 expert bytes are decoded inside the mainloop, so no expanded
+    ``[E,N,K]`` BF16 transient is allocated or written.
+    """
+    from .cuda_ext import require_moe_persistent_b_ext
+    require_moe_persistent_b_ext(
+        "persistent-B grouped MoE prefill").cb_moe_persistent_b_prefill(
+            out, a, qw, lut, compose, expert_ends, k_bits, type_size, cfg)
+
+
+@cb_moe_persistent_b_prefill.register_fake
+def _cb_moe_persistent_b_prefill_fake(out, a, qw, lut, compose, expert_ends,
+                                      k_bits, type_size, cfg):
+    return None
+
+
+@torch.library.custom_op("prismaquant::cb_moe_persistent_b_decode",
+                         mutates_args=(), tags=_PQ_UNSAFE)
+def cb_moe_persistent_b_decode(qw_flat: torch.Tensor, lut: torch.Tensor,
+                               compose: torch.Tensor, row0: int, nrows: int,
+                               K: int, k_bits: int,
+                               type_size: int) -> torch.Tensor:
+    """The persistent-B mainloop's decode stage, standalone (bit-exactness
+    oracle; not a serving path)."""
+    from .cuda_ext import require_moe_persistent_b_ext
+    return require_moe_persistent_b_ext(
+        "persistent-B MoE decode probe").cb_moe_persistent_b_decode(
+            qw_flat, lut, compose, row0, nrows, K, k_bits, type_size)
+
+
+@cb_moe_persistent_b_decode.register_fake
+def _cb_moe_persistent_b_decode_fake(qw_flat, lut, compose, row0, nrows, K,
+                                     k_bits, type_size):
+    return qw_flat.new_empty((nrows, K), dtype=torch.bfloat16)
+
+
+# NOTE (2026-08-01): `prismaquant::cb_expand_fp8_into` (the out-variant of
+# cb_expand_fp8) and its `cb_expand_fp8_into_available` probe were registered
+# here with zero serving call sites — residue of the L2-pinned per-expert
+# scratch pipeline, which only ever needed an out-variant because a persisting
+# access-policy window pins a fixed ADDRESS RANGE. That pipeline wedged live
+# serving three times and was removed; these were removed with their kernel and
+# binding per docs/audits/ultraplan_perf_2026-08-01.md §4. Prefill expansion is
+# the allocating `cb_expand_fp8` above.
 
 
 @torch.library.custom_op("prismaquant::fp8_act_qdq", mutates_args=(), tags=_PQ_UNSAFE)

@@ -84,11 +84,48 @@ include = ["gridbook*"]
 # including a non-editable wheel. They live under gridbook/csrc (inside the
 # package) precisely so this glob can reach them; package-data also lands in
 # the sdist automatically. Do not move csrc back to the repo root.
+#
+# These globs are single-level ON PURPOSE. `csrc/tools/` holds standalone
+# main() developer binaries (a smem-budget probe and a toolchain probe) that
+# no runtime path loads: they belong in the repo and the sdist, not in every
+# user's site-packages. A `csrc/**/*.cu` recursive glob would silently ship
+# them again -- MANIFEST.in re-adds that directory to the sdist alone, and
+# .github/scripts/check_dist.py asserts the split in both directions.
 [tool.setuptools.package-data]
 gridbook = [
     "runtime_contract.json",
     "csrc/*.cu",
     "csrc/*.cuh",
     "csrc/*.h",
+    # csrc/*.hpp — added 2026-08-02. `cb_grouped_common.hpp` (the shared EVT
+    # trees, smem gate and grouped host validation, extracted by the 2026-08-01
+    # audit §4 dedupe) is the first top-level .hpp under csrc/, and NO glob here
+    # matched it: `.h` does not match `.hpp`, and `cutlass_fork/*.hpp` is a
+    # different directory. It is a declared build input of all four
+    # fused/grouped loaders, so an installed wheel could not JIT-build ANY of
+    # them (`_require_csrc` raises IncompleteInstallError). Single-level like
+    # its siblings, so csrc/tools/ stays wheel-excluded.
+    "csrc/*.hpp",
     "csrc/cutlass_fork/*.hpp",
 ]
+
+# ...and the wheel-side subtraction. `include-package-data` defaults to TRUE
+# under a pyproject.toml config, so every MANIFEST.in rule that names a file
+# INSIDE the package would otherwise put it in the wheel as well as the sdist.
+# These entries are what make "sdist yes, wheel no" hold; they are asserted in
+# both directions by .github/scripts/check_dist.py, which fails if any of them
+# reaches the wheel or goes missing from the sdist.
+#
+# BOTH keys are load-bearing, and the reason is not obvious. `packages.find`
+# defaults to namespaces = true, so setuptools treats `gridbook/csrc/tools`
+# as its own (namespace) package: a MANIFEST.in file under it is attributed to
+# the package `gridbook.csrc.tools`, while the same file reached through the
+# `gridbook` package-data globs is attributed to `gridbook`. An exclusion only
+# filters the attribution it names, so a single key silently half-works.
+[tool.setuptools.exclude-package-data]
+gridbook = [
+    "csrc/tools/*",
+    "csrc/cutlass_fork/*_orig.hpp",
+]
+"gridbook.csrc.tools" = ["*"]
+"gridbook.csrc.cutlass_fork" = ["*_orig.hpp"]

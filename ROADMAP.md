@@ -84,19 +84,64 @@ resident weight copy, decoder, or matmul merely to create another route.
   `input_global_scale` values for both `w13` and `w2`. The existing partial LFM
   artifact has no such payload, so all fused attempts correctly fail closed;
   inventing a runtime scale is not an acceptable workaround.
-- [ ] **K0.3 — Finish shared fused-JIT attestation and fail-fast loading.** The
-  fused-FP4 source/header/ABI identity and strict two-module preload validation
-  shipped in 0.4.2. Extract that facility and apply it to every header-bearing
-  fused extension, including FP8, so packaged sources/headers, target
-  architecture, Python/Torch/CUDA/compiler ABI, and external CUTLASS sentinels
-  key every affected module and cache. Reject non-`sm_120`/`sm_121` targets
-  before either fused build starts, and make required validation fail when the
-  requested call route—not merely its module—does not execute.
-- [ ] **K0.4 — Finish grouped-MoE routing and telemetry.** Replace the manual
-  TileM128/256 choice with a CUDA-graph-safe selector that accounts for routed
-  token counts, padding, both stages' shapes, and occupancy. Emit the requested
-  activation policy, actual kernel symbol, TileM, shape, activation contract,
-  fallback state, and exact fallback reason for dense and MoE calls.
+  *Status: the attestation plumbing has landed on both sides and the remaining
+  gate is the re-export run itself.* PrismaQuant's execution-contract record now
+  carries a per-FusedMoE-module stage section
+  (`prismaquant.nvfp4_w4a4_activation_stages.v1`, record schema bumped to
+  `prismaquant.nvfp4_w4a4_activation.v2`) naming each stage's physical target,
+  policy, calibration source (experts-module input vs routed-intermediate
+  replay), and per-stage value digest; all three exporters build it from one
+  shared builder and fail closed on a half-calibrated module. Gridbook's
+  validation harness verifies that section against the serialized scalars
+  before any engine loads and emits a machine-readable K0.2 verdict
+  (`attested_and_verified` / `missing_stages` / `digest_mismatch` /
+  `not_attested`) that both A/B entry points consume as a precondition: a
+  routed-MoE A/B against an unattested artifact is now reported as
+  `fallback_telemetry_not_evidence` instead of proceeding silently. What remains
+  is the GPU work: pick a manageable representative routed-MoE model, run the
+  activation probe plus routed-intermediate replay, re-export through the CB
+  exporter, and confirm the harness returns `attested_and_verified`. Only then
+  do K0.5/K0.6 have a lawful MoE artifact to measure.
+- [x] **K0.3 — Finish shared fused-JIT attestation and fail-fast loading.
+  IMPLEMENTED (2026-08-02).** The fused-FP4 source/header/ABI identity and
+  strict two-module preload validation shipped in 0.4.2. That facility is now
+  extracted (`cuda_ext._fused_build_identity`) and keys every header-bearing
+  native module — fused FP8 (`fused/<digest>`), the grouped-BF16 bridge
+  (`bf16_grouped/<digest>`), the fused FP4-v2 mid-M lane, and the persistent-B
+  MoE lane — over packaged sources/headers (including the shared
+  `cb_grouped_common.hpp`), target architecture and lane macros, Python/Torch/
+  CUDA/compiler ABI, and the external CUTLASS sentinels. Non-`sm_120`/`sm_121`
+  targets are rejected before either fused build starts (the FP4 loader gained
+  the same precheck the FP8 loader had), and required validation now fails when
+  the requested call route — not merely its module — does not execute: the FP8
+  contract requires the grouped bindings, and each opt-in lane attests every
+  symbol its forward path dereferences at model load, with negative-control
+  tests. Evidence: `tests/test_ext_build_identity.py`,
+  `tests/test_ext_symbols.py`, the per-lane attestation tests.
+- [x] **K0.4 — Finish grouped-MoE routing and telemetry. IMPLEMENTED
+  (2026-08-02).** `moe_routing.cb_grouped_tile_m` replaces the manual choice —
+  which was worse than "manual": the FP8 grouped path resolved `tile_m=None` to
+  the kernel's compiled default, so serving could never reach TileM=256 at all,
+  and the FP4 path read its tile off the *suffix* of an activation-policy env
+  string. The selector accounts for routed token counts (`P = tokens × top_k`,
+  exactly host-known), per-expert padding waste at each tile (through the exact
+  `pad₂₅₆ − pad₁₂₈` lemma), both projection stages' shapes (their decode:MMA
+  ratio is `1:t` independent of N and K, so one condition serves both, and the
+  narrower N bounds the occupancy), and occupancy (the dense selector's
+  `ceil(2·SM/3)` floor). It is CUDA-graph-safe **by construction**: every input
+  is a host-known integer, so there is no device read to sync on — which matters
+  because `tile_m` fixes both the kernel symbol and every routing tensor's
+  shape. Fixing this surfaced and repaired a real capture defect: the padded
+  routing called `torch.bincount`, which host-syncs, while documenting "NO HOST
+  READS". **K0.4's telemetry list is satisfied in full** — requested activation
+  policy, actual kernel symbol, TileM, problem shape, activation contract,
+  fallback state and the exact fallback reason are emitted for dense *and* MoE
+  calls through `nvfp4_activation_contract.emit_route`, which extends the
+  existing 0.4.2 dense mechanism rather than adding a parallel one, plus
+  selector provenance so a tile choice is auditable offline. See
+  [KERNELS](docs/KERNELS.md#grouped-moe-tilem-selection-k04). The calibrated
+  `ρ > 512` threshold remains proposal data for the grouped lanes until a routed
+  sweep pins it.
 - [ ] **K0.5 — Profile and close the fused-NVFP4 raw operator gap.** Split
   activation quantization, packed-B decode, synchronization, MMA, epilogue,
   and launch costs and compare against the matching stock
@@ -121,11 +166,39 @@ resident weight copy, decoder, or matmul merely to create another route.
   avoid an expanded `[E,N,K]` HBM tile, handle empty/uneven routing, and remain
   stream- and graph-safe. This is a new MoE schedule, not a revival of the
   measured-negative dense persistent-N kernel.
-- [ ] **K1.2 — Cover the complete FP8-CB mid-M production rung surface.** The
-  fused kernel currently instantiates only K28/32/36/40/44/48 while production
-  permits every K28 through K48. Either instantiate and test every product rung
-  or encode the concrete route/fallback in the candidate identity and timing
-  surface so the allocator cannot price an unbacked fast path.
+  **Kernel IMPLEMENTED behind `PRISMAQUANT_CB_MOE_PERSISTENT_B=1`**
+  (`csrc/cb_moe_persistent_b.cu`, FP4-CB v2, cc 12.0/12.1): a CTA owns one
+  (expert, N-tile), decodes that tile from packed CB bytes into shared memory
+  once and streams the expert's exact routed segment through it, with the
+  M-loop inside the kernel. No `[E,N,K]` transient, no padded rows, no host
+  read; launch geometry is a function of `(E, N)` alone. Decode bit-identical
+  to `cb_expand_v2` by test; only the FP32 reduction order changes. The
+  whole-routed-operator microbenchmark is proposal data only —
+  **what remains open on this item is the served
+  [NATIVE-PARITY](docs/NATIVE-PARITY.md) gate, not the kernel.** See
+  [KERNELS](docs/KERNELS.md#persistent-b-decode-in-mainloop-opt-in-prismaquant_cb_moe_persistent_b).
+- [x] **K1.2 — Cover the complete FP8-CB mid-M production rung surface.
+  RESOLVED (2026-08-02) — second arm.** Production does permit every K28–K48,
+  but the first arm ("instantiate and test every product rung") is **closed by a
+  format + TMA law**, not by effort: `type_size = 4k` is the packed-B TMA box's
+  contiguous extent and must be a 16-byte multiple (`k % 4 == 0`), and the fused
+  mainloop's single `CbSubW = k/4` sub-table width is the format's real layout
+  only on those same rungs — the format splits `k` over `n_sub = 4` raggedly
+  (`csrc/cb_gemv.cu` `SubSplit`), so a uniform decode at k37 would be *wrong*,
+  not merely unaligned. The six compiled rungs were therefore already the
+  maximum this collective admits, and the published 27B artifact's 8-rung
+  K36–K47 ladder hits exactly the three multiples of 4 it contains.
+  **The second arm is implemented:** the compiled set is queryable
+  (`cb_fused_kbits()`), Python gates on the derived law and confirms against the
+  module instead of carrying duplicated literals, every kernel switch is
+  generated from one rung list, the smem feasibility predicate is a closed form
+  `static_assert`ed against the probe's measured cells, the published smem table
+  was regenerated (it quoted the stale pre-R6 base), an off-law rung is refused
+  with a message naming the law and the routes that *do* serve it, and per-rung
+  bit-exact gates are parametrized from the module's own reported surface. See
+  [KERNELS](docs/KERNELS.md#rung-coverage-what-this-lane-can-and-cannot-serve-k12).
+  Serving all 21 rungs through this lane would need a new packed-B TMA schedule
+  *and* a ragged-width decode — a new kernel, tracked separately if ever wanted.
 - [ ] **K1.3 — Reassess large-M dense FP8-CB from a fresh roofline.** The
   transient path remains about 1.44x native, but the existing persistent-N
   implementation was 2–5.7x slower. Profile current traffic and synchronization
@@ -172,7 +245,15 @@ resident weight copy, decoder, or matmul merely to create another route.
   producer packers/metadata, and a version-attested upstream vLLM backend for
   rank-3 stock NVFP4/FP8 experts. Do not create another packer, loader, or
   native kernel. Fail closed if a selected backend drops activation scales and
-  changes a declared W4A4 unit into W4A16.
+  changes a declared W4A4 unit into W4A16. **The fail-closed clause is
+  SHIPPED and generalized** (`gridbook/delegated_preflight.py`, called from the
+  single delegation choke point in `config.py`): at model load a delegated
+  group whose resolved backend is Triton-backed, is documented to discard
+  declared activation scales, or is simply unaudited for an NVFP4 W4A4
+  declaration, raises with the backend class, the group, and the contract it
+  would violate. No environment variable bypasses it. The rest of D0.2 — the
+  packed-expert loader work itself — remains open and is only needed if the
+  assignment calls for it.
 - [ ] **D0.3 — Close the exact-rate evidence gap.** Rerun exact-byte
   0.6B/4B/27B endpoints and optimized menus over the representative workload
   matrix. At 4.5 bpp compare native NVFP4 with FP8-CB K36 using exact

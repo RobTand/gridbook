@@ -24,8 +24,12 @@ Checks
 2. A hard floor of runtime-required sources is present in both.  (This floor
    cannot be satisfied vacuously -- it is a literal list, not a diff.)
 3. No drift: every ``.cu``/``.cuh``/``.hpp`` that exists under
-   ``<repo>/gridbook/csrc`` in the checkout is present in both artifacts.  This
-   catches a new kernel file that nobody added to the package-data globs.
+   ``<repo>/gridbook/csrc`` in the checkout is present in the sdist, and every
+   one of them *except the declared sdist-only set* is present in the wheel.
+   This catches a new kernel file that nobody added to the package-data globs.
+   The sdist-only set (developer tools, pristine diff baselines) is asserted
+   in both directions -- present in the sdist, ABSENT from the wheel -- so the
+   exclusion cannot silently rot back into every user's site-packages.
 4. No stray top-level ``csrc/`` **in the checkout**.  A tree that holds the
    pre-fix repo-root ``csrc/`` as well as ``gridbook/csrc`` has two copies of
    every kernel, and the root one then rots silently.  This has to be
@@ -48,6 +52,7 @@ Checks
 from __future__ import annotations
 
 import email
+import fnmatch
 import pathlib
 import re
 import sys
@@ -64,9 +69,29 @@ PKG = "gridbook"
 #                            (exact native quality bridge for dense/MoE)
 #   cb_fused_gemm.cu    -> cuda_ext.get_fused_ext()      (fused prefill)
 #   cb_fused_fp4_gemm.cu -> cuda_ext.get_fused_fp4_ext() (fused NVFP4 prefill)
+#   cb_fused_fp4v2_gemm.cu -> cuda_ext.get_fused_fp4v2_ext()
+#                            (contract-preserving fused FP4-v2 quality lane)
+#   cb_moe_persistent_b.cu -> cuda_ext.get_moe_persistent_b_ext()
+#                            (persistent-B grouped MoE decode-in-mainloop)
 # cb_fused_gemm.cu #includes the three cutlass_fork headers listed below.
 # cb_fused_fp4_gemm.cu #includes sm120_cb_fused_fp4_mma.hpp; both are also
 # JIT-identity inputs and therefore belong on this non-vacuous floor.
+# The Gridbook-owned headers are runtime-required for the same reason: every
+# one is a declared ``_*_BUILD_INPUTS`` entry, so it is both #included by a
+# JIT-compiled translation unit and hashed into that module's build identity.
+#   cb_grouped_common.hpp  shared grouping glue (EVT trees, smem gate, host
+#                          validation) -- pulled in by ALL FOUR of
+#                          get_fused_ext / get_fused_fp4_ext /
+#                          get_fused_fp4v2_ext / get_bf16_grouped_ext, so its
+#                          absence breaks every grouped and fused lane at once.
+#   sm120_cb_fp4v2_bf16_mma.hpp  the FP4-v2 CB->BF16 decode-in-prologue
+#                                mainloop fork (get_fused_fp4v2_ext).
+#   sm120_bf16_expert_mma.hpp    the expert-indexed BF16 mainloop fork
+#                                (get_bf16_grouped_ext, get_fused_fp4v2_ext).
+# NOTE: cb_grouped_common.hpp sits at csrc/ top level with a ``.hpp`` suffix,
+# which the pyproject package-data globs (csrc/*.cu, *.cuh, *.h and
+# csrc/cutlass_fork/*.hpp) do not match. Listing it here makes that a named
+# runtime-floor failure rather than a generic drift report.
 # A serving-reachable opt-in specialization still belongs on this floor: check
 # 3 (drift) would also notice it missing, but only while the file exists in the
 # checkout the CI job happens to be run against. Source-only research kernels
@@ -79,9 +104,14 @@ REQUIRED = [
     f"{PKG}/csrc/cb_bf16_grouped_gemm.cu",
     f"{PKG}/csrc/cb_fused_gemm.cu",
     f"{PKG}/csrc/cb_fused_fp4_gemm.cu",
+    f"{PKG}/csrc/cb_fused_fp4v2_gemm.cu",
+    f"{PKG}/csrc/cb_moe_persistent_b.cu",
+    f"{PKG}/csrc/cb_grouped_common.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_mma_tma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_fused_mma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
+    f"{PKG}/csrc/cutlass_fork/sm120_cb_fp4v2_bf16_mma.hpp",
+    f"{PKG}/csrc/cutlass_fork/sm120_bf16_expert_mma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_expert_row_broadcast.hpp",
 ]
 
@@ -97,6 +127,26 @@ FORBIDDEN = [
 ]
 
 NATIVE_SUFFIXES = (".cu", ".cuh", ".hpp", ".h")
+
+# Native sources that ship in the SDIST but must NOT ship in the WHEEL.
+# Kept in the repo and the sdist for auditability and reproducibility; kept out
+# of every user's site-packages because no runtime path loads them.
+#
+#   csrc/tools/     standalone main() developer binaries (smem-budget probe,
+#                   toolchain probe). Their OUTPUT ships -- the smem table
+#                   baked into cb_fused_gemm.cu -- the binaries do not.
+#   *_orig.hpp      pristine CUTLASS copies the forks are diffed against
+#                   (~67 KB). Nothing #includes them; they exist so a reviewer
+#                   can see exactly what each fork changed.
+#
+# See docs/audits/ultraplan_perf_2026-08-01.md §4. The mechanism is the
+# single-level package-data globs in pyproject.toml plus the MANIFEST.in rules
+# that re-add these paths to the sdist; this list is what makes the split a
+# gate rather than an accident of glob syntax.
+SDIST_ONLY_GLOBS = [
+    f"{PKG}/csrc/tools/*",
+    f"{PKG}/csrc/cutlass_fork/*_orig.hpp",
+]
 
 _errors: list[str] = []
 _warnings: list[str] = []
@@ -140,7 +190,13 @@ def wheel_metadata(path: pathlib.Path) -> email.message.Message:
         return email.message_from_bytes(zf.read(name))
 
 
-def check_artifact(label: str, members: list[str], expected: set[str]) -> None:
+def is_sdist_only(path: str) -> bool:
+    """True for a native source that belongs in the sdist but not the wheel."""
+    return any(fnmatch.fnmatch(path, pattern) for pattern in SDIST_ONLY_GLOBS)
+
+
+def check_artifact(label: str, members: list[str], expected: set[str],
+                   excluded: set[str] = frozenset()) -> None:
     present = set(members)
 
     forbidden = [path for path in FORBIDDEN if path in present]
@@ -162,6 +218,20 @@ def check_artifact(label: str, members: list[str], expected: set[str]) -> None:
             f"(package-data globs are out of date): {drift}")
     elif expected:
         ok(f"{label}: no drift vs the checkout ({len(expected)} native files)")
+
+    # The other direction: a source declared sdist-only must not have leaked
+    # into this artifact. Without this, widening a package-data glob (or a
+    # stale build/lib) silently re-ships developer tools and diff baselines.
+    leaked = sorted(path for path in excluded if path in present)
+    if leaked:
+        err(f"{label}: sdist-only native sources packaged into the artifact "
+            f"({leaked}). These are kept in the repo and the sdist for "
+            f"auditability and must stay out of the wheel; check the "
+            f"package-data globs in pyproject.toml (they must not recurse) "
+            f"and remove a stale build/ directory.")
+    elif excluded:
+        ok(f"{label}: none of the {len(excluded)} sdist-only native sources "
+           f"leaked in")
 
     # Check 4b -- see check_checkout_layout() for the one that actually catches
     # a stale repo-root csrc/. This only fires if MANIFEST.in is ever changed to
@@ -311,7 +381,9 @@ def main() -> int:
     wheel, sdist = wheels[0], sdists[0]
     ok(f"artifacts: {wheel.name} + {sdist.name}")
 
-    # Expected native-file set, derived from the checkout so it cannot drift.
+    # Expected native-file set, derived from the checkout so it cannot drift,
+    # then split: the sdist carries the whole tree, the wheel carries the
+    # runtime subset (see SDIST_ONLY_GLOBS).
     csrc = root / PKG / "csrc"
     expected: set[str] = set()
     if csrc.is_dir():
@@ -322,9 +394,15 @@ def main() -> int:
         err(f"{csrc} does not exist. The CUDA sources must live inside the "
             f"package -- a repo-root csrc/ cannot be resolved from "
             f"site-packages under a non-editable install.")
+    sdist_only = {path for path in expected if is_sdist_only(path)}
+    if any(path in REQUIRED for path in sdist_only):
+        err(f"a runtime-required source is declared sdist-only: "
+            f"{sorted(set(REQUIRED) & sdist_only)}. The wheel must carry every "
+            f"source the runtime JIT-compiles.")
 
     check_checkout_layout(root)
-    check_artifact("wheel", wheel_members(wheel), expected)
+    check_artifact("wheel", wheel_members(wheel), expected - sdist_only,
+                   excluded=sdist_only)
     check_artifact("sdist", sdist_members(sdist), expected)
 
     md = wheel_metadata(wheel)

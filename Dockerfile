@@ -273,13 +273,17 @@ PY
 # -----------------------------------------------------------------------------
 # Pre-warm the JIT kernel cache
 # -----------------------------------------------------------------------------
-# Measured: torch.utils.cpp_extension.load() needs nvcc and an explicit
-# TORCH_CUDA_ARCH_LIST, but NOT a GPU — so the kernels compile during
-# `docker build`, which never has a GPU attached (torch.cuda.is_available() is
-# False throughout; it only warns). The main, FP4-v2, and grouped-BF16
-# extensions are the required serving floor and all compile here. Crucially,
-# this build does NOT call cb_gemv_v2_prepare(): that is a device attestation
-# and runs during FP4 model load on the actual serving GPU.
+# Measured: torch.utils.cpp_extension.load() needs nvcc and an explicit target,
+# but NOT a GPU — so the kernels compile during `docker build`, which never has
+# a GPU attached (torch.cuda.is_available() is False throughout; it only warns).
+# Every Gridbook loader now compiles for the live device's capability rather
+# than inheriting TORCH_CUDA_ARCH_LIST (the stock base image's list omits 12.1,
+# which silently cost GB10 users their SASS target), so each prewarm below runs
+# through load_for_build, which pins the capability this image is built for.
+# The main, FP4-v2, and grouped-BF16 extensions are the required serving floor
+# and all compile here. Crucially, this build does NOT call
+# cb_gemv_v2_prepare(): that is a device attestation and runs during FP4 model
+# load on the actual serving GPU.
 #
 # The per-kernel wall-clock numbers this step prints are recorded in
 # docs/CONTAINER.md, "Verified vs untested". They are deliberately NOT restated
@@ -310,7 +314,13 @@ def build_capability():
 
 
 def load_for_build(load):
-    """Let a compile-only loader derive its target with no build-time GPU."""
+    """Let a compile-only loader derive its target with no build-time GPU.
+
+    EVERY loader needs this now: since the 2026-08-01 arch-flag fix, each
+    module is compiled for the live device's capability instead of inheriting
+    TORCH_CUDA_ARCH_LIST, and `docker build` has no GPU to ask. The image's
+    single-arch build argument is the intended target, so pin it here.
+    """
     import torch
     original = torch.cuda.get_device_capability
     torch.cuda.get_device_capability = lambda *args, **kwargs: build_capability()
@@ -323,7 +333,7 @@ def load_for_build(load):
 # fails closed when this extension is unavailable, so an image that cannot
 # build it cannot serve CB operators.
 t = time.time()
-if cuda_ext.get_ext() is None:
+if load_for_build(cuda_ext.get_ext) is None:
     print("\n[gridbook] FATAL: the CUDA decode-GEMV extension failed to build "
           "at image build time (reason printed above). This is the production "
           "decode path — refusing to ship an image whose native CB execution "
@@ -335,7 +345,7 @@ print(f"[gridbook] prewarmed decode-GEMV extension in {time.time() - t:.1f}s")
 # needs this module even when PRISMAQUANT_CB_GEMV=inherited. Do not call its
 # device prepare here: docker build has no GPU, and model load owns that check.
 t = time.time()
-if cuda_ext.get_ext_v2() is None:
+if load_for_build(cuda_ext.get_ext_v2) is None:
     print("\n[gridbook] FATAL: the required FP4-v2 expansion extension failed "
           "to build at image build time (reason printed above). Refusing to "
           "ship an image missing a required quality-path module.",

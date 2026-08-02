@@ -40,6 +40,90 @@ if fused is None:
 
 DEV = "cuda"
 
+# K1.2. Every per-rung gate below is parametrized over what the LOADED MODULE
+# says it compiled, not over a literal ladder. That is the point of the change:
+# a hand-written `[36, 40, 44, 48]` tested four of the six compiled rungs and
+# could not notice a seventh appearing or a fourth disappearing. Reading the
+# binding makes the coverage follow the kernel by construction.
+COMPILED_RUNGS = sorted(int(k) for k in fused.cb_fused_kbits())
+
+
+# ---------------------------------------------------------------------------
+# K1.2 — the RUNG SURFACE itself.
+#
+# The product FP8-CB ladder is every integer k in [28, 48]; this lane backs the
+# multiples of 4, because type_size = 4k must be a 16-byte TMA box multiple AND
+# the mainloop's single CbSubW = k/4 sub-table width is the format's real layout
+# only then (csrc/cb_gemv.cu `SubSplit` splits raggedly otherwise). Three things
+# then have to agree, forever: the kernel's compiled set, the Python law
+# dispatch gates on, and what dispatch actually accepts.
+# ---------------------------------------------------------------------------
+def test_compiled_rungs_are_exactly_the_law():
+    """The module's compiled set == codec.FP8_FUSED_KBITS.
+
+    This is the join that makes the cheap host-side gate safe. `linear.py` and
+    `moe.py` filter on the LAW before touching the extension (asking the module
+    first would force a JIT build at first forward merely to learn a rung is
+    ineligible), and only then confirm against the module. If the law were ever
+    a superset, dispatch would offer an uncompiled rung; if a subset, it would
+    silently miss a compiled one. Both are caught here.
+    """
+    assert tuple(COMPILED_RUNGS) == codec.FP8_FUSED_KBITS
+
+
+def test_law_is_the_multiples_of_four_in_the_product_range():
+    """...and the law is the FORMAT's law, stated independently of the kernel."""
+    assert COMPILED_RUNGS == [k for k in range(28, 49) if 4 * k % 16 == 0]
+    # The ragged-split half of the law: n_sub=4 gives one uniform sub-table
+    # width only on these rungs (csrc/cb_gemv.cu SubSplit: base + (i < extra)).
+    for k in COMPILED_RUNGS:
+        assert len({k // 4 + (1 if i < k % 4 else 0) for i in range(4)}) == 1
+
+
+@pytest.mark.parametrize("k", [29, 30, 31, 37, 47])
+def test_rungs_off_the_law_are_rejected_by_the_law(k):
+    """A product rung this lane cannot serve must be REFUSED, with the reason.
+
+    These are real production rungs (the published 27B artifact's K36-K47
+    ladder contains several), so the failure an operator can hit must name the
+    law and say the rung is still served elsewhere — not "unsupported k_bits".
+    """
+    assert not codec.fp8_fused_rung_supported(k)
+    packed, cb8 = _synth(32, N=256, K=1024, seed=5)   # shapes are irrelevant
+    xq = torch.zeros(16, 1024, device=DEV).to(torch.float8_e4m3fn)
+    with pytest.raises(RuntimeError) as exc:
+        fused.cb_fused_prefill_mm(xq, packed, cb8, 256, 1024, k)
+    message = str(exc.value)
+    assert "rung law" in message
+    assert "16-byte" in message and "CbSubW" in message
+
+
+def test_grouped_tile_sizes_are_reported_per_rung():
+    """Every compiled rung offers at least TileM=128, and the smem-bound tiles
+    are reported per rung rather than as a union — so a caller enumerating
+    `cb_fused_moe_tile_sizes_for_kbits` can never select an uncompiled cell."""
+    union = set(int(t) for t in fused.cb_fused_moe_tile_sizes())
+    for k in COMPILED_RUNGS:
+        tiles = [int(t) for t in fused.cb_fused_moe_tile_sizes_for_kbits(k)]
+        assert tiles and tiles == sorted(tiles)
+        assert set(tiles) <= union
+        assert 128 in tiles
+        # The measured smem ceiling: TileM=256 fits only the two lowest rungs
+        # (256/k32 lands on EXACTLY 101,376 B — the zero-margin cell).
+        assert (256 in tiles) == (k <= 32)
+
+
+def test_smem_report_covers_every_compiled_rung():
+    """The per-rung smem report is generated from the same list the switches
+    are, so it cannot fall behind the dispatch (it used to be hand-written)."""
+    flat = [int(v) for v in fused.smem_report_rungs()]
+    rows = [flat[i:i + 4] for i in range(0, len(flat), 4)]
+    assert [r[0] for r in rows[:-1]] == COMPILED_RUNGS
+    ceiling = rows[-1][1]
+    for k, total, lut_bytes, subs in rows[:-1]:
+        assert 0 < total <= ceiling
+        assert lut_bytes == subs * (1 << (k // 4)) * 2
+
 
 def _synth(k, N, K, seed):
     g = torch.Generator(device="cpu").manual_seed(seed)
@@ -65,7 +149,7 @@ def _ref_and_fused(packed, cb8, N, K, k, M, seed=1):
     return y_ref, y_f
 
 
-@pytest.mark.parametrize("k", [36, 40, 44, 48])
+@pytest.mark.parametrize("k", COMPILED_RUNGS)
 def test_fused_bitexact_synth(k):
     packed, cb8 = _synth(k, N=256, K=1024, seed=k)
     y_ref, y_f = _ref_and_fused(packed, cb8, 256, 1024, k, M=384)
@@ -162,7 +246,7 @@ def _scaled_case(k, N, K, M, seed):
     return xq, W, sa, ws, y_scaled, y_unscaled, ref32
 
 
-@pytest.mark.parametrize("k", [36, 40, 44, 48])
+@pytest.mark.parametrize("k", COMPILED_RUNGS)
 def test_fused_scaled_matches_fp32_reference(k):
     """In-epilogue scaling must be a correct-rounding of the fp32 product, and
     never worse than the round-then-scale path it replaces."""
@@ -209,7 +293,7 @@ def _padded_view(packed):
     return view
 
 
-@pytest.mark.parametrize("k", [28, 44])
+@pytest.mark.parametrize("k", COMPILED_RUNGS)
 def test_fused_padded_view_bitexact_vs_contiguous(k):
     N, K, M = 320, 1536, 96
     packed, cb8 = _synth(k, N=N, K=K, seed=100 + k)
@@ -220,7 +304,7 @@ def test_fused_padded_view_bitexact_vs_contiguous(k):
     assert torch.equal(y_c.view(torch.uint16), y_v.view(torch.uint16))
 
 
-@pytest.mark.parametrize("k", [28, 44])
+@pytest.mark.parametrize("k", COMPILED_RUNGS)
 def test_fused_scaled_padded_view_bitexact_vs_contiguous(k):
     """The default-on mid-M serving entry (linear.py:_apply_inline)."""
     N, K, M = 320, 1536, 96

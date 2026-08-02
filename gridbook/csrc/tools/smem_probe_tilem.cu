@@ -1,5 +1,11 @@
 // HOST-ONLY smem budget probe for the grouped (MoE) fused CB GEMM.
 //
+// A standalone main() developer tool, NOT a serving source: nothing loads it,
+// and everything under csrc/tools/ is kept in the repo and the sdist but
+// excluded from the wheel (see pyproject.toml / MANIFEST.in). Its OUTPUT is
+// what ships -- the smem table baked into cb_fused_gemm.cu -- so re-run it
+// whenever a tile shape, stage count, or the collective's storage changes.
+//
 // Compiles the SAME collective/epilogue types cb_fused_gemm.cu instantiates,
 // for TileM x k_bits, and printf()s the SharedStorage byte sizes. There is NO
 // kernel launch and NO CUDA runtime call, so this binary runs on a GPU-less
@@ -12,12 +18,14 @@
 //                      + sizeof(Mainloop::TensorStorage)
 //                      + pipeline/scheduler storage
 //
-// build:
+// build (from the repo root; -I must name the csrc directory itself, since the
+// cutlass_fork/ includes below are relative to it):
 //   nvcc -std=c++17 -arch=sm_120a -O3 --expt-relaxed-constexpr \
-//     -I$CUTLASS/include -I$CUTLASS/tools/util/include -Icsrc \
+//     -I$CUTLASS/include -I$CUTLASS/tools/util/include -Igridbook/csrc \
 //     -I$TORCH/include -I$TORCH/include/torch/csrc/api/include \
-//     -I/usr/include/python3.12 smem_probe_tilem.cu -o probe
+//     -I/usr/include/python3.12 gridbook/csrc/tools/smem_probe_tilem.cu -o probe
 #include <cstdio>
+#include <utility>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
@@ -31,6 +39,11 @@
 
 #include "cutlass_fork/sm120_cb_fused_mma.hpp"
 #include "cutlass_fork/sm120_expert_row_broadcast.hpp"
+// The expert-indexed EVT tree comes from the same shared header the serving
+// kernels use, so this probe can never report the sizes of a DIFFERENT
+// epilogue than the one cb_fused_gemm.cu instantiates (2026-08-01 audit §4
+// dedupe #2). It is why the build line above needs the torch/python includes.
+#include "cb_grouped_common.hpp"
 
 namespace {
 
@@ -47,21 +60,8 @@ constexpr int AlignD = 8;
 using ClusterShape = Shape<_1, _1, _1>;
 
 template <class TileShape>
-struct MoeScaledFusion {
-  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
-      0, TileShape, float, float, Stride<_1, _0, _0>>;
-  using ScaleB = cutlass::epilogue::fusion::Sm120CbExpertRowBroadcast<
-      0, TileShape, float, float, Stride<_0, _1, _0>>;
-  using AccFetch = cutlass::epilogue::fusion::Sm90AccFetch;
-  using MulA = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies, ElementAcc, ElementAcc,
-      cutlass::FloatRoundStyle::round_to_nearest>;
-  using MulB = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies, ElementD, ElementAcc,
-      cutlass::FloatRoundStyle::round_to_nearest>;
-  using EVTA = cutlass::epilogue::fusion::Sm90EVT<MulA, ScaleA, AccFetch>;
-  using type = cutlass::epilogue::fusion::Sm90EVT<MulB, ScaleB, EVTA>;
-};
+using MoeScaledFusion = gridbook::grouped::MoeScaledFusion<TileShape,
+                                                           ElementAcc, ElementD>;
 
 template <class TileShape>
 struct CfgMoeScaled {
@@ -118,17 +118,59 @@ void row() {
          est <= cutlass::arch::sm120_smem_capacity_bytes ? "FIT" : "OVER");
 }
 
+// THE RUNG LAW (K1.2, verified 2026-08-02 by trying to probe otherwise).
+//
+// The producer's FP8-CB ladder is every INTEGER k_bits in [28, 48]
+// (prismaquant/format_registry.py: `for _k in range(28, 49)` -- 3.5..6.0 bpw in
+// 0.125 steps). The fused mid-M collective can serve only the multiples of 4,
+// and that is a property of the FORMAT and of TMA, not a missing instantiation:
+//
+//   1. TMA BOX. Packed B is read by SM90_TMA_LOAD with a box of
+//      (TileN, CbTypeSize) bytes over the [N, n_sb*CbTypeSize] byte stream,
+//      where CbTypeSize = 4*k_bits is one 256-weight superblock. TMA requires
+//      the box's contiguous extent to be a 16-byte multiple, i.e.
+//      4*k_bits % 16 == 0  <=>  k_bits % 4 == 0.
+//      (sm120_cb_fused_mma.hpp: `static_assert(CbTypeSize % 16 == 0`.)
+//   2. UNIFORM SUB-TABLE WIDTH. The collective decodes a codeword with
+//      CbSubW = KBits/4 and indexes the flat codebook at `(s << CbSubW) + idx`
+//      -- one width, one stride, for all four sub-tables. The FORMAT splits
+//      k_bits over n_sub=4 RAGGEDLY (csrc/cb_gemv.cu `SubSplit`:
+//      `base = k_bits/NSUB, extra = k_bits%NSUB`, width_i = base + (i<extra)),
+//      so at k_bits=37 the true widths are (10,9,9,9) with non-uniform table
+//      offsets. A uniform-width decode would therefore be WRONG, not merely
+//      unaligned, for every rung with k_bits % 4 != 0.
+//
+// Both laws bite at the same place, so the probe walks the law's rungs. The
+// other 15 integer rungs are not "unmeasured" -- they cannot be instantiated at
+// all (the collective static_asserts before any smem question arises), which is
+// itself the measurement. See the rung-surface note in cb_fused_gemm.cu.
+constexpr int kKbLo = 28;
+constexpr int kKbHi = 48;
+constexpr int kKbStep = 4;
+constexpr int kKbCount = (kKbHi - kKbLo) / kKbStep + 1;
+
+template <int TM, int... I>
+void block_impl(std::integer_sequence<int, I...>) {
+  (row<TM, kKbLo + kKbStep * I>(), ...);
+}
+
 template <int TM>
 void block() {
-  row<TM, 28>(); row<TM, 32>(); row<TM, 36>();
-  row<TM, 40>(); row<TM, 44>(); row<TM, 48>();
+  block_impl<TM>(std::make_integer_sequence<int, kKbCount>{});
   printf("\n");
 }
 
-// EXACT kernel-layer size. Only instantiable for configs that pass the kernel's
-// own `SharedStorageSize <= sm120_smem_capacity_bytes` static_assert, so this is
-// itself the feasibility oracle: a config that does not compile here is
-// infeasible, full stop.
+// EXACT kernel-layer size -- the number the compiled matrix is decided on.
+//
+// CORRECTED 2026-08-02: an earlier revision of this comment claimed `exact` was
+// a COMPILE-TIME oracle (that an over-budget cell would fail to instantiate).
+// It is not, and cb_fused_gemm.cu says why: the sm90-family cooperative kernel
+// layer does NOT static_assert its own SharedStorageSize against the arch
+// capacity -- only the sm120 asymmetric-DMA kernel does. Measured: `exact<256,
+// 48>` compiles cleanly and prints 109,568 (OVER). The serving TU's gate is
+// `gridbook::grouped::AssertSmemFits` (cb_grouped_common.hpp), which is where
+// an over-budget instantiation actually becomes a compile error. So the
+// verdict to read here is the PRINTED FIT/OVER, and every cell is instantiated.
 template <int TM, int KB>
 void exact() {
   using TileShape = Shape<Int<TM>, _64, _128>;
@@ -143,7 +185,31 @@ void exact() {
                  cutlass::arch::sm120_smem_capacity_bytes ? "FIT" : "OVER");
 }
 
+template <int TM, int... I>
+void exact_block_impl(std::integer_sequence<int, I...>) {
+  (exact<TM, kKbLo + kKbStep * I>(), ...);
+}
+
+// Exact sizes for a CLOSED rung range [kKbLo, HI] on the law's step. Because
+// `exact` is only instantiable for feasible cells, "the largest HI for which
+// this TU compiles" IS the compiled-matrix boundary for that TileM.
+template <int TM, int HI>
+void exact_block() {
+  exact_block_impl<TM>(
+      std::make_integer_sequence<int, (HI - kKbLo) / kKbStep + 1>{});
+}
+
 }  // namespace
+
+// Feasibility oracle knobs (see the K1.2 rung-coverage note in
+// cb_fused_gemm.cu). Recompiling with -DPROBE_256_HI=<k> is the ONLY honest way
+// to establish the TileM=256 boundary: the kernel layer static_asserts its own
+// SharedStorageSize against the arch capacity, so an over-budget cell is a
+// COMPILE ERROR here rather than a printed "OVER" line. Bisect it: the largest
+// value of PROBE_256_HI that compiles is the last rung TileM=256 admits.
+#ifndef PROBE_256_HI
+#define PROBE_256_HI 32
+#endif
 
 int main() {
   printf("sm120_smem_capacity_bytes = %d\n\n",
@@ -151,13 +217,11 @@ int main() {
   block<128>();
   block<256>();
   block<384>();
-  exact<128, 28>(); exact<128, 32>(); exact<128, 36>();
-  exact<128, 40>(); exact<128, 44>(); exact<128, 48>();
+  // TileM=128 is feasible across the whole range, so the exact oracle runs the
+  // full compiled ladder there.
+  exact_block<128, kKbHi>();
 #ifndef PROBE_NO_256
-  exact<256, 28>(); exact<256, 32>();
-#endif
-#ifdef PROBE_256_HIGH
-  exact<256, 36>(); exact<256, 40>(); exact<256, 44>(); exact<256, 48>();
+  exact_block<256, PROBE_256_HI>();
 #endif
   return 0;
 }

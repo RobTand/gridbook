@@ -101,13 +101,15 @@ def _install_toplevel_cb_expert_loaders() -> None:
 
 
 def register() -> None:
-    # Residency-matched A/B support: force-build+load the fused ext even when
-    # its dispatch env is off, so both arms of a served logprob comparison
-    # carry identical CUDA-extension residency (the session-arithmetic-drift
-    # mechanism otherwise confounds the gate).
+    # Residency-matched A/B support: force-build+load every native extension
+    # even when its dispatch env is off, so both arms of a served logprob
+    # comparison carry identical CUDA-extension residency (the
+    # session-arithmetic-drift mechanism otherwise confounds the gate). The
+    # env var keeps its published name; what it warms is now the FULL module
+    # inventory, not only the two fused ones (2026-08-01 audit §3 P4).
     if os.environ.get("PRISMAQUANT_PRELOAD_FUSED") == "1":
-        from .cuda_ext import preload_fused_extensions
-        preload_fused_extensions()
+        from .cuda_ext import preload_native_extensions
+        preload_native_extensions()
     for quant_method in _QUANTIZATION_METHODS:
         try:
             register_quantization_config(quant_method)(PrismaQuantConfig)

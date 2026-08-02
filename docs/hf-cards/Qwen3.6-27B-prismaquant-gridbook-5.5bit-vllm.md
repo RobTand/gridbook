@@ -40,7 +40,7 @@ tags:
 | | |
 |---|---|
 | **Plugin** | [`gridbook`](https://github.com/RobTand/gridbook) — an out-of-tree vLLM quantization plugin. Stock vLLM, no fork, no core patches. |
-| **GPU** | NVIDIA Blackwell, compute capability `sm_120` / `sm_121`. Measured on GB10 / DGX Spark (`sm_121`). On older GPUs the plugin still loads but runs its **Triton fallback** kernels — correct, not fast, and not a production serving target. |
+| **GPU** | NVIDIA Blackwell, compute capability `sm_120` / `sm_121`. Measured on GB10 / DGX Spark (`sm_121`). There is **no Triton fallback**: on a GPU that cannot run the native CUDA/CUTLASS kernel an artifact requires, serving **fails closed** with the missing operation instead of continuing on a slower one. Older GPU classes are unqualified — see the [compatibility table](https://github.com/RobTand/gridbook/blob/master/README.md#compatibility). |
 | **Memory** | **20.8 GiB weights** + KV cache, measured on one 128 GB unified-memory GB10 (`Model loading took 20.82 GiB`). Before gridbook 0.1.0 the same artifact loaded at **35.86 GiB** — dense codebook weights were resident twice ([issue #1](https://github.com/RobTand/gridbook/issues/1), fixed in [0.1.0](https://github.com/RobTand/gridbook/releases/tag/v0.1.0)); **use 0.1.0 or newer**. A 32 GB consumer Blackwell (RTX 5090, `sm_120`) should now fit weights plus a useful KV budget, and the issue reporter measured 20.54 GiB with 32k context using equivalent patches — but **we have not verified 0.1.0 on a 32 GB card ourselves**. |
 | **vLLM** | Served here on the `vllm-node` image used for the 0.1.0 verification; also exercised on 0.25.1 and 0.23.1rc1.dev1060 by an external reporter ([issue #1](https://github.com/RobTand/gridbook/issues/1)). The plugin surface is small but vLLM internals drift — pin a version you have tested. |
 | **Toolchain** | CUDA toolkit with `nvcc` on `PATH` **in the serving container** — the plugin JIT-builds its kernels on first model load (~30 s, cached). `nvcc` 13.0 is the tested toolchain. |
@@ -64,30 +64,30 @@ curl -s http://localhost:8000/v1/chat/completions \
   -d '{"model":"rdtand/Qwen3.6-27B-prismaquant-gridbook-5.5bit-vllm","messages":[{"role":"user","content":"Say hello in five words."}],"max_tokens":32}'
 ```
 
-**How to tell the fast path is active.** The plugin *fail-softs*: if the CUDA
-extension cannot be built it still serves, through Triton fallback kernels, at a
-fraction of the speed. That is not a crash — it is a line on stderr, tagged
-`[prismaquant-cb]`:
+**How to verify native readiness.** Gridbook has no Triton dependency or serving
+fallback. If a required CUDA/CUTLASS extension cannot be built, the relevant
+load/forward fails closed after a line on stderr tagged `[prismaquant-cb]`:
 
 ```bash
 vllm serve ... 2>&1 | grep '\[prismaquant-cb\]'
 ```
 
-Any `WARNING` or `ERROR` on that tag means the CUDA decode path did **not**
-load, and the numbers on this card are **not** reachable on your box. (The tag
-is also used for a few harmless informational lines; it is the `WARNING` /
-`ERROR` ones that matter.) The exact wording differs between plugin versions —
-**grep the tag, not the sentence.** The two that matter read roughly:
+A `WARNING` or `ERROR` that explicitly says a **required** native operation is
+unavailable means the model cannot be served through Gridbook on that
+environment. A shape-specialized optimization may be unavailable only when the
+same diagnostic names a separately qualified native CUDA/CUTLASS route. The tag
+also carries harmless informational lines, so read the message after grepping
+the stable tag. The two fatal forms read roughly:
 
 ```
-[prismaquant-cb] WARNING: gridbook's CUDA decode-GEMV extension could not be built (<ExcType>: …); falling back to the Triton decode path (slow prototype). To get the CUDA path: …
+[prismaquant-cb] WARNING: gridbook's CUDA decode-GEMV extension could not be built (<ExcType>: …); native Gridbook execution is unavailable and serving will fail closed. To enable the native path: …
 [prismaquant-cb] ERROR: broken gridbook install — gridbook is installed without its CUDA sources: …
 ```
 
 The first is an environment problem (usually no `nvcc` in the serving
 container, or a torch/CUDA version mismatch); the second is a defect in the
 install itself. Both are diagnosed in
-[troubleshooting](https://github.com/RobTand/gridbook/blob/master/docs/TROUBLESHOOTING.md#the-cuda-extension-did-not-load-triton-fallback).
+[troubleshooting](https://github.com/RobTand/gridbook/blob/master/docs/TROUBLESHOOTING.md#the-native-extension-did-not-load).
 Set `PRISMAQUANT_CB_EXT_DIR` to a writable, persistent directory to keep the
 one-time JIT build across restarts (important in containers).
 
@@ -127,11 +127,11 @@ Notes for this model:
 
 | Live card | Staged | Why |
 |---|---|---|
-| `pip install gridbook   # JIT-builds kernels for your GPU (capability >= 8.0 floor)` | `pip install gridbook`, with the capability story moved into the GPU row | The `>= 8.0` figure is real (`config.py: get_min_capability() -> 80`) but it is the *gate to load*, not the gate to be fast. Advertising it invites A100/H100/4090 users to install, pass the gate, silently get the Triton path, and measure numbers far below this card. |
+| `pip install gridbook   # JIT-builds kernels for your GPU (capability >= 8.0 floor)` | `pip install gridbook`, with the capability story moved into the GPU row | The `>= 8.0` figure is real (`config.py: get_min_capability() -> 80`) but it is the *gate to load*, not the gate to serve. Advertising it invites A100/H100/4090 users to install and pass the gate into a configuration this card does not cover. On the plugin of that date they silently got the Triton path and measured numbers far below this card; current Gridbook fails closed on the first required native operation the device cannot run. |
 | No `--enforce-eager` | `--enforce-eager` added | **The one derived flag in this staging set — it is not from this artifact's own validated invocation.** It preserves the configuration behind the published 27B measurements. The opaque dispatch now makes mode-0 `FULL_DECODE_ONLY` a supported candidate, but only the close-rate 0.6B canary has cleared exact replay and timing so far; do not silently promote that result to this artifact. See the verification item below; `_TEMPLATE.md` rule 3 permits a derived flag only when it is labelled like this. |
 | No `--host/--port` | added | loopback bind is unreachable from another host. |
 | "RTX 5090 (32 GB, sm_120) is the natural consumer target — 23 GB weights + ~7 GB KV" | "intended target but **not currently verified**", with issue #1 linked | Issue #1 reports OOM at 30.5 GiB on exactly that card. The root cause — dense CB weights double-resident, `linear.process_weights_after_loading` keeping both `cb_qweight` and `_cb_qw_padded` — is **unfixed at published `master` `b4694e3`**. A fix (16-byte pad so the padded buffer can be shared, `cb_qweight.data` re-pointed at a `narrow` view, original storage released) exists in the development tree but is **uncommitted and unpushed**, and no 32 GB box has been measured either way. Publishing the positive claim is not defensible under either state. **Revert this row to a positive claim only when the fix is public *and* a 32 GB verification exists** — the fix landing is not by itself sufficient. |
-| No verification step | `curl` + a `[prismaquant-cb]` stderr check | Silent degradation to the Triton path is the single most likely thing to go wrong for a first-time user, and no *card* mentions it. (The repo's `docs/TROUBLESHOOTING.md` does, and uses the same grep-the-tag advice — but that page postdates published `master` `b4694e3`, and a reader who never leaves the Hub never sees it.) |
+| No verification step | `curl` + a `[prismaquant-cb]` stderr check | A native extension that does not build is the single most likely thing to go wrong for a first-time user, and no *card* mentions it. When this staging was written that meant silent degradation to Triton; current Gridbook fails closed, so the same check now confirms the model can be served at all. (The repo's `docs/TROUBLESHOOTING.md` does, and uses the same grep-the-tag advice — but that page postdates published `master` `b4694e3`, and a reader who never leaves the Hub never sees it.) |
 | No cross-links | links to the other two gridbook artifacts | Every gridbook card is currently a dead end. |
 
 **⚠ Verify before applying: `--enforce-eager` on this artifact is derived, not
