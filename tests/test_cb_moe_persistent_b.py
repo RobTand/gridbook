@@ -1,10 +1,10 @@
 """Correctness gates for the persistent-B grouped MoE decode-in-mainloop lane.
 
 ``csrc/cb_moe_persistent_b.cu`` (ROADMAP K1.1) fuses the FP4-CB v2 weight
-decode into a grouped-MoE mainloop: a CTA owns one ``(expert, N-tile)``, decodes
-that weight tile from the packed CB bytes into shared memory, and streams the
-expert's routed rows through it.  There is no ``[E, N, K]`` BF16 HBM transient
-and no dense entry point in the translation unit.
+decode into a grouped-MoE mainloop: a CTA owns one ``(expert, N-tile)``,
+decodes that weight tile from the packed CB bytes into shared memory, and
+streams the expert's routed rows through it.  There is no ``[E, N, K]`` BF16
+HBM transient and no dense entry point in the translation unit.
 
 WHAT IS PROVEN HERE, AND WITH WHICH INSTRUMENT
 
@@ -16,12 +16,12 @@ WHAT IS PROVEN HERE, AND WITH WHICH INSTRUMENT
   that the substitution really is algebraic.  Odd and even ``k`` are both
   covered because the ceil-first bit split puts a different width in the low
   half; k=24 is the largest LUT.
-* The whole OPERATOR is not an identity and cannot be.  It is an fp32-accumulate
-  GEMM with its own tile shape, K walk and warp partition, so it differs from a
-  per-expert GEMM by REDUCTION ORDER.  The discipline is the one
-  ``test_bf16_grouped_cutlass.py`` established: measure the lane's relative L2
-  against an FP32 reference built from the SAME BF16 operands, and require it to
-  be no worse than a per-segment BF16 ``F.linear`` computing the same thing.
+* The whole OPERATOR is not an identity and cannot be.  It is an
+  fp32-accumulate GEMM with its own tile shape, K walk and warp partition, so
+  it differs from a per-expert GEMM by REDUCTION ORDER.  The discipline is the
+  one ``test_bf16_grouped_cutlass.py`` established: measure the lane's relative
+  L2 against an FP32 reference built from the SAME BF16 operands, and require
+  it to be no worse than a per-segment BF16 ``F.linear`` computing the same.
   The BF16 operands are the activations the caller passes and the weights the
   kernel's own (bit-exact) decode produces, so the reference describes exactly
   the arithmetic the kernel claims to do.
@@ -29,18 +29,18 @@ WHAT IS PROVEN HERE, AND WITH WHICH INSTRUMENT
   rejections are ordinary behavioural gates.
 
 N SCOPE NOTE.  ``cb_moe_persistent_b_prefill`` requires ``N % 8 == 0`` (the
-epilogue stores pairs of BF16), and ``cfg=0`` additionally refuses an N narrower
-than the narrowest compiled TN.  Those two floors do not agree, so this file
-gates the operator only down to the narrowest compiled TN and takes no position
-on the gap; see the accompanying report.  The decode probe has neither
-constraint, because it walks a flat byte plane.  So the "N is not a nice
-multiple" coverage splits:
-the decode tests use N=17 and N=33 (not multiples of 8 or 32, so the flat
-plane's rows line up with no codeword or LUT-gather boundary), the prefill tests
-use N=40 and N=200 (multiples of 8, never of 32, so every compiled TN masks a
-partial tile) down to the narrowest compiled TN, and the N%8 rejection is gated
-explicitly.  Every tile-shaped constant is ENUMERATED from
-``cb_moe_persistent_b_configs()``; this file hardcodes no tile.
+epilogue stores pairs of BF16), and ``cfg=0`` additionally refuses an N
+narrower than the narrowest compiled TN.  Those two floors do not agree, so
+this file gates the operator only down to the narrowest compiled TN and takes
+no position on the gap; see the accompanying report.  The decode probe has
+neither constraint, because it walks a flat byte plane.  So the "N is not a
+nice multiple" coverage splits: the decode tests use N=17 and N=33 (not
+multiples of 8 or 32, so the flat plane's rows line up with no codeword or
+LUT-gather boundary), the prefill tests use N=40 and N=200 (multiples of 8,
+never of 32, so every compiled TN masks a partial tile) down to the narrowest
+compiled TN, and the N%8 rejection is gated explicitly.  Every tile-shaped
+constant is ENUMERATED from ``cb_moe_persistent_b_configs()``; this file
+hardcodes no tile.
 
 Container-only, like the rest of the native-kernel suite: the module skips
 cleanly (never vacuously) without CUDA, without prismaquant, or off the
@@ -59,7 +59,8 @@ import torch.nn.functional as F
 codec = pytest.importorskip("gridbook.codec")
 pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
 
-from gridbook.cuda_ext import get_ext_v2, get_moe_persistent_b_ext  # noqa: E402
+from gridbook.cuda_ext import (get_ext_v2,  # noqa: E402
+                               get_moe_persistent_b_ext)
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA is unavailable", allow_module_level=True)
@@ -112,7 +113,7 @@ def _true_fp32_matmul():
 # ===========================================================================
 @functools.lru_cache(maxsize=None)
 def _pack(k: int, K: int, E: int, N: int, seed: int):
-    """``(qw [E,N,row_bytes] uint8, lut, compose, type_size)`` for FP4-CB v2."""
+    """``(qw [E,N,row_bytes], lut, compose, type_size)`` for FP4-CB v2."""
     cb = pq._resolve_codebook(k, "fp4", "product", None, DEV)
     generator = torch.Generator(device="cpu").manual_seed(seed)
     weight = (torch.randn(E, N, K, generator=generator) * 0.02).to(DEV)
@@ -184,7 +185,7 @@ def _rel_l2(y, reference):
 
 
 def _assert_reassociation_only(y, bf16_linear, fp32, label):
-    """The two-part tolerance gate: absolute backstop + relative to F.linear."""
+    """The two-part gate: absolute backstop + relative to ``F.linear``."""
     kernel_rel = _rel_l2(y, fp32)
     linear_rel = _rel_l2(bf16_linear, fp32)
     assert torch.isfinite(y).all(), f"{label}: non-finite output"
@@ -288,8 +289,8 @@ def test_whole_operator_error_matches_a_per_segment_bf16_reference(
         counts, k, K, N):
     """The fused-decode GEMM may not consume more error than a per-expert GEMM.
 
-    Both sides consume the SAME BF16 operands — the caller's activations and the
-    weights this kernel's own decode produces — so the only admissible
+    Both sides consume the SAME BF16 operands — the caller's activations and
+    the weights this kernel's own decode produces — so the only admissible
     difference is the fp32 summation order.
 
     MEASURED (GB10, cc 12.1) on ``counts=[10,0,130,3]``, k=16, K=1024, N=256:
@@ -313,7 +314,8 @@ def test_whole_operator_error_matches_a_per_segment_bf16_reference(
 
 
 # ===========================================================================
-# 3. Routing breadth, and the promise that nothing outside a segment is written.
+# 3. Routing breadth, and the promise that nothing outside a segment is
+#    written.
 # ===========================================================================
 _ROUTING = [
     ([0, 7, 5], "leading-empty"),
@@ -355,8 +357,9 @@ def test_routing_breadth_is_correct_and_writes_only_routed_rows(counts):
     torch.cuda.synchronize()
 
     tail = out[total:]
+    sentinel = torch.full_like(tail, float("nan"))
     assert torch.equal(tail.view(torch.int16),
-                       torch.full_like(tail, float("nan")).view(torch.int16)), (
+                       sentinel.view(torch.int16)), (
         f"counts={counts}: the kernel wrote {int((~tail.isnan()).sum())} "
         f"values past the last routed row")
 
@@ -473,7 +476,7 @@ def _stream_case():
 
 
 def test_nondefault_stream_matches_the_default_stream_result():
-    """The kernel honours ``getCurrentCUDAStream``; the answer does not move."""
+    """It honours ``getCurrentCUDAStream``; the answer does not move."""
     a, qw, lut, compose, ends, k, type_size, P, N = _stream_case()
 
     default = torch.full((P, N), float("nan"),
@@ -655,7 +658,7 @@ def test_rejects_contract_violations(mutate, message):
 
 
 def test_rejects_an_n_that_is_not_a_multiple_of_eight():
-    """The epilogue stores BF16 PAIRS, so a ragged N is refused, not rounded."""
+    """The epilogue stores BF16 PAIRS, so a ragged N is refused."""
     k, K, E, N = 16, 512, 2, 12
     qw, lut, compose, type_size = _pack(k, K, E, N, seed=808)
     a = torch.randn(4, K, device=DEV, dtype=torch.bfloat16)
@@ -697,7 +700,7 @@ def test_decode_probe_rejects_contract_violations(mutate, message):
 # 8. The ROADMAP K1.3 firewall, and 9. what was actually compiled.
 # ===========================================================================
 def test_the_module_has_no_dense_entry_point():
-    """K1.3 keeps dense large-M closed; this translation unit must not reopen it.
+    """K1.3 keeps dense large-M closed; this module must not reopen it.
 
     The firewall is structural, not documentary: every ``cb_*`` binding either
     takes ``expert_ends`` (so a dense caller cannot reach the schedule) or is a
@@ -745,8 +748,8 @@ def test_compiled_configs_are_sane():
         # W4's grouped-BF16 collective measured what a slip to one costs.
         # Stated in ATTESTED numbers only, so it survives a retuned budget.
         assert 2 * smem <= capacity, (
-            f"{label}: {smem} B leaves room for only one CTA in the {capacity} "
-            f"B budget")
+            f"{label}: {smem} B leaves room for only one CTA in the "
+            f"{capacity} B budget")
         # The kernel's own static_asserts, restated on the host side.
         wn = tn // 32
         assert warps % wn == 0, f"{label}: the warp grid must cover the CTA"
