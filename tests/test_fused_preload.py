@@ -127,3 +127,60 @@ def test_published_fused_name_still_warms_everything(monkeypatch):
     else:  # pragma: no cover - strict mode must fail closed
         raise AssertionError("strict preload accepted unavailable extensions")
     assert sorted(calls) == sorted(LOADERS)
+
+
+def test_every_registered_family_name_resolves():
+    """A registry entry naming a loader this module lacks is a DEFECT.
+
+    ``_PRELOAD_FAMILIES`` holds loaders BY NAME so a lane can register from
+    inside its own additive block. The cost of that indirection is that a
+    typo or a rename produces a whole module silently absent from every
+    residency match, reported identically to a Blackwell-only lane on an Ada
+    box — so it is asserted here rather than discovered in a bench report.
+    """
+    unresolved = [f"{family} -> {name}"
+                  for family, name in cuda_ext._PRELOAD_FAMILIES
+                  if not callable(getattr(cuda_ext, name, None))]
+    assert not unresolved, (
+        f"the preload registry names loaders cuda_ext does not define: "
+        f"{unresolved}")
+
+
+def test_a_registry_defect_is_reported_as_a_defect_not_as_unavailable(
+        monkeypatch, capsys):
+    """The two failure modes must be distinguishable in one glance."""
+    calls = []
+    _patch_all(monkeypatch, calls, resident=tuple(LOADERS))
+    monkeypatch.setattr(
+        cuda_ext, "_PRELOAD_FAMILIES",
+        list(cuda_ext._PRELOAD_FAMILIES) + [("ghost", "get_ghost_ext")])
+
+    status = cuda_ext.preload_native_extensions()
+
+    assert status["ghost"] is False
+    error = capsys.readouterr().err
+    assert "preload registry names loaders" in error
+    assert "ghost -> get_ghost_ext" in error
+    assert "This is a Gridbook defect, not a property of this machine" in error
+    # And every real family was still warmed: one broken entry must not skip
+    # the rest, or the residency match is quietly partial again.
+    assert sorted(calls) == sorted(LOADERS)
+
+
+def test_a_partial_warm_up_is_never_silent(monkeypatch, capsys):
+    """plugin.register discards the status, so the loader must say so itself.
+
+    A half-warmed process is precisely the ±17% measurement-arithmetic
+    confound PRISMAQUANT_PRELOAD_FUSED exists to remove, and it is invisible
+    in the results — it shows up only as a residency mismatch between arms.
+    """
+    calls = []
+    _patch_all(monkeypatch, calls, resident=("gemv", "gemv_v2", "fp8"))
+
+    status = cuda_ext.preload_native_extensions()
+
+    assert status["fp4"] is False and status["gemv"] is True
+    error = capsys.readouterr().err
+    assert "did not warm every family" in error
+    assert "fp4=unavailable" in error
+    assert "only comparable if BOTH warm the same set" in error
