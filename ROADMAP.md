@@ -102,14 +102,22 @@ resident weight copy, decoder, or matmul merely to create another route.
   activation probe plus routed-intermediate replay, re-export through the CB
   exporter, and confirm the harness returns `attested_and_verified`. Only then
   do K0.5/K0.6 have a lawful MoE artifact to measure.
-- [ ] **K0.3 — Finish shared fused-JIT attestation and fail-fast loading.** The
-  fused-FP4 source/header/ABI identity and strict two-module preload validation
-  shipped in 0.4.2. Extract that facility and apply it to every header-bearing
-  fused extension, including FP8, so packaged sources/headers, target
-  architecture, Python/Torch/CUDA/compiler ABI, and external CUTLASS sentinels
-  key every affected module and cache. Reject non-`sm_120`/`sm_121` targets
-  before either fused build starts, and make required validation fail when the
-  requested call route—not merely its module—does not execute.
+- [x] **K0.3 — Finish shared fused-JIT attestation and fail-fast loading.
+  IMPLEMENTED (2026-08-02).** The fused-FP4 source/header/ABI identity and
+  strict two-module preload validation shipped in 0.4.2. That facility is now
+  extracted (`cuda_ext._fused_build_identity`) and keys every header-bearing
+  native module — fused FP8 (`fused/<digest>`), the grouped-BF16 bridge
+  (`bf16_grouped/<digest>`), the fused FP4-v2 mid-M lane, and the persistent-B
+  MoE lane — over packaged sources/headers (including the shared
+  `cb_grouped_common.hpp`), target architecture and lane macros, Python/Torch/
+  CUDA/compiler ABI, and the external CUTLASS sentinels. Non-`sm_120`/`sm_121`
+  targets are rejected before either fused build starts (the FP4 loader gained
+  the same precheck the FP8 loader had), and required validation now fails when
+  the requested call route — not merely its module — does not execute: the FP8
+  contract requires the grouped bindings, and each opt-in lane attests every
+  symbol its forward path dereferences at model load, with negative-control
+  tests. Evidence: `tests/test_ext_build_identity.py`,
+  `tests/test_ext_symbols.py`, the per-lane attestation tests.
 - [x] **K0.4 — Finish grouped-MoE routing and telemetry. IMPLEMENTED
   (2026-08-02).** `moe_routing.cb_grouped_tile_m` replaces the manual choice —
   which was worse than "manual": the FP8 grouped path resolved `tile_m=None` to
