@@ -759,8 +759,15 @@ class PrismaQuantConfig(QuantizationConfig):
         suffixes = _MOE_DECLARATION_SUFFIXES if moe else ("",)
         for base in _candidate_bases(prefix):
             for suffix in suffixes:
-                matched = find_matched_target(base + suffix, layer, targets,
-                                              fused)
+                try:
+                    matched = find_matched_target(base + suffix, layer,
+                                                  targets, fused)
+                except ValueError:
+                    # Older compressed-tensors raised for "no match" where the
+                    # audited builds return None. Either way it means this
+                    # prefix is not a delegated target; the unconditional
+                    # Triton rule still runs on whatever vLLM resolved.
+                    continue
                 if matched is None:
                     continue
                 group_name = self._stock_group_by_target[matched]
