@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- ROADMAP K0.2 (consumer half): recognise and verify PrismaQuant's routed-MoE
+  stage attestation. `gridbook/nvfp4_activation_contract.py` accepts both the
+  v1 record and the new stage-attested
+  `prismaquant.nvfp4_w4a4_activation.v2` record, whose whole-model
+  `target_names`/`target_count`/`target_values_sha256` fields are bit-identical
+  to v1 (the digest framing constant stays pinned at the v1 literal). A v1
+  record carrying a stage section, or a v2 record without one, fails closed.
+  The new reader validates every packed FusedMoE module's `w13`/`w2` pair,
+  their physical targets, policy coherence, stage-legal calibration sources,
+  and both the per-stage and section digests.
+- The fused-NVFP4 validation harness emits a machine-readable K0.2 readiness
+  verdict (`attested_and_verified`, `missing_stages`, `digest_mismatch`,
+  `not_attested`, `contract_absent`, `artifact_unreadable`) computed from the
+  artifact alone — no GPU, no vLLM, no model load — naming the failing module
+  and stage. Both `scripts/validate_fused_nvfp4_ab.py` and
+  `scripts/validate_fused_nvfp4_three_arm.py` consume it as a core integrity
+  gate and promotion-contract precondition: a routed-MoE A/B against an
+  unattested artifact is now reported as `fallback_telemetry_not_evidence`
+  rather than publishing a zero-difference fallback comparison. Dense runs are
+  unaffected — a dense-only artifact carries no stage section and stays valid.
+- Serving dispatch is unchanged: `moe.py`, `linear.py`, and `config.py` were
+  not touched, and `validate_payload` still verifies exactly what it always
+  verified.
+
 ## 0.5.1 — 2026-08-01
 
 - Documentation-only release. Add the ultraplan performance audit

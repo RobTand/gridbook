@@ -84,6 +84,24 @@ resident weight copy, decoder, or matmul merely to create another route.
   `input_global_scale` values for both `w13` and `w2`. The existing partial LFM
   artifact has no such payload, so all fused attempts correctly fail closed;
   inventing a runtime scale is not an acceptable workaround.
+  *Status: the attestation plumbing has landed on both sides and the remaining
+  gate is the re-export run itself.* PrismaQuant's execution-contract record now
+  carries a per-FusedMoE-module stage section
+  (`prismaquant.nvfp4_w4a4_activation_stages.v1`, record schema bumped to
+  `prismaquant.nvfp4_w4a4_activation.v2`) naming each stage's physical target,
+  policy, calibration source (experts-module input vs routed-intermediate
+  replay), and per-stage value digest; all three exporters build it from one
+  shared builder and fail closed on a half-calibrated module. Gridbook's
+  validation harness verifies that section against the serialized scalars
+  before any engine loads and emits a machine-readable K0.2 verdict
+  (`attested_and_verified` / `missing_stages` / `digest_mismatch` /
+  `not_attested`) that both A/B entry points consume as a precondition: a
+  routed-MoE A/B against an unattested artifact is now reported as
+  `fallback_telemetry_not_evidence` instead of proceeding silently. What remains
+  is the GPU work: pick a manageable representative routed-MoE model, run the
+  activation probe plus routed-intermediate replay, re-export through the CB
+  exporter, and confirm the harness returns `attested_and_verified`. Only then
+  do K0.5/K0.6 have a lawful MoE artifact to measure.
 - [ ] **K0.3 — Finish shared fused-JIT attestation and fail-fast loading.** The
   fused-FP4 source/header/ABI identity and strict two-module preload validation
   shipped in 0.4.2. Extract that facility and apply it to every header-bearing

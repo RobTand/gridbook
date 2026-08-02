@@ -10,6 +10,16 @@ the original fixed-residual policy. Its current model evidence is nevertheless
 mixed across prompt lengths, covers only Qwen3-0.6B, and does not qualify MoE.
 Neither path should become the default yet.
 
+Status addendum (2026-08-01, ROADMAP K0.2): the findings below are unchanged.
+What changed is that the "fallback telemetry, not evidence" judgement is now
+mechanised rather than editorial. PrismaQuant's execution contract carries a
+per-FusedMoE-module `w13`/`w2` stage attestation
+(`prismaquant.nvfp4_w4a4_activation_stages.v1`), and both fused-NVFP4 A/B entry
+points verify it against the artifact's serialized scalars before loading an
+engine, labelling a routed-MoE run against an unattested artifact
+`fallback_telemetry_not_evidence`. The required producer re-export with
+stage-specific serialized scales is still outstanding; MoE remains unqualified.
+
 ## Decision basis
 
 The fused kernel is bit-exact with the native NVFP4 reference when both consume the same packed E2M1 activations and UE4M3 scale factors. That does not make it numerically equivalent to Gridbook's current served baseline:

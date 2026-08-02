@@ -423,11 +423,13 @@ def core_integrity_gates(
     permutation_attestations: Mapping[str, Mapping[str, Any]],
     expected_measurements: int,
     chunked_prefill_contract: Mapping[str, Any],
+    k02_verdict: Mapping[str, Any],
 ) -> dict[str, Any]:
     observed_pids = sorted({
         pid for arm in ARMS for pid in dispatch[arm]["pids"]
     })
     gates: dict[str, Any] = {
+        "routed_moe_stage_attestation": dict(k02_verdict),
         "same_process_dispatch": {
             "expected_pid": os.getpid(),
             "observed_pids": observed_pids,
@@ -583,7 +585,18 @@ def _finalize_report(
         args.max_teacher_mean_kl is not None
         and args.max_teacher_kl_regression is not None
     )
+    k02_verdict = core_gates.get("routed_moe_stage_attestation")
+    k02_blocks_evidence = bool(
+        isinstance(k02_verdict, Mapping) and k02_verdict.get("pass") is not True
+    )
     promotion_contract = {
+        "requires_routed_moe_stage_attestation": True,
+        "routed_moe_stage_attestation_verdict": (
+            k02_verdict.get("verdict")
+            if isinstance(k02_verdict, Mapping)
+            else None
+        ),
+        "routed_moe_stage_attestation_pass": not k02_blocks_evidence,
         "requires_exact_full_vocab_teacher": True,
         "teacher_present": args.teacher_model is not None,
         "teacher_full_vocab_kl": bool(args.teacher_full_vocab_kl),
@@ -595,6 +608,7 @@ def _finalize_report(
             and args.teacher_model is not None
             and args.teacher_full_vocab_kl
             and teacher_thresholds
+            and not k02_blocks_evidence
         ),
     }
     report.update({
@@ -604,7 +618,14 @@ def _finalize_report(
         "configured_gates_pass": gates_pass,
         "promotion_contract": promotion_contract,
     })
-    if not measurement_valid or gates_pass is False:
+    if k02_blocks_evidence:
+        # Every fused MoE attempt fails closed to the baseline loop on an
+        # unattested artifact, so this report compares baselines, not lanes.
+        report["status"] = "gate_failed"
+        report["promotion_recommendation"] = (
+            validation_common.EVIDENCE_FALLBACK_TELEMETRY
+        )
+    elif not measurement_valid or gates_pass is False:
         report["status"] = "gate_failed"
         report["promotion_recommendation"] = "do_not_enable"
     elif args.measurement_only:
@@ -653,6 +674,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     prompts = bootstrap.prompts
     dataset = bootstrap.dataset
     quality_kl_mode = bootstrap.quality_kl_mode
+    # K0.2 precondition, decided before the engine exists (see the v5 harness).
+    k02_verdict = validation_common.k02_readiness_verdict(
+        bootstrap.candidate_path, mode=args.mode
+    )
     static_dense_mode, _rowwise_dense_mode = _dense_modes(args.dense_range)
     probe = (
         v5.DenseDispatchProbe(
@@ -858,6 +883,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         permutation_attestations=permutation_attestations,
         expected_measurements=expected_measurements,
         chunked_prefill_contract=chunked_prefill_contract,
+        k02_verdict=k02_verdict,
     )
     kl_limitation = (
         "Exact full-vocabulary KL was requested and cardinality-attested."
@@ -923,6 +949,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "runtime": runtime,
         "extension": extension,
+        "k02_stage_attestation": k02_verdict,
         "candidate_artifact_provenance": candidate_artifact_provenance,
         "dataset": dataset,
         "model_load_seconds": model_load_s,

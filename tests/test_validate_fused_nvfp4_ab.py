@@ -1818,3 +1818,225 @@ def test_main_status_separates_measurement_screening_and_promotion(
     )
     assert ab.main([]) == expected_rc
     assert written["status"] == expected_status
+
+
+# ---------------------------------------------------------------------------
+# ROADMAP K0.2 — the routed-MoE stage attestation precondition
+# ---------------------------------------------------------------------------
+
+_K02_W13 = "model.layers.0.feed_forward.experts.gate_up_proj"
+_K02_W2 = "model.layers.0.feed_forward.experts.down_proj"
+_K02_MODULE = "model.layers.0.feed_forward.experts"
+
+
+def _write_k02_artifact(root, *, scales, attest=None, contract=True):
+    """Write a synthetic artifact: quant_config plus serialized F32 scalars."""
+
+    import torch
+    from safetensors.torch import save_file
+
+    from gridbook import nvfp4_activation_contract as gc
+
+    root.mkdir(parents=True, exist_ok=True)
+    attested = scales if attest is None else attest
+    quant_config = {"quant_method": "gridbook", "config_groups": {}}
+    if contract:
+        record = {
+            "schema": gc.CONTRACT_SCHEMA,
+            "contract": gc.EXECUTION_CONTRACT,
+            "group_size": gc.GROUP_SIZE,
+            "tensor_suffix": gc.TENSOR_SUFFIX,
+            "value_dtype": gc.VALUE_DTYPE,
+            "input_global_scale_policy": gc.LEGACY_POLICY,
+            "target_count": len(attested),
+            "target_names": sorted(attested),
+            "target_values_sha256": gc.target_values_sha256(
+                attested, policy=gc.LEGACY_POLICY
+            ),
+        }
+        if {_K02_W13, _K02_W2} <= set(attested):
+            sources = {
+                "w13": gc.SOURCE_PARENT_MODULE_CACHE,
+                "w2": gc.SOURCE_SUPPLEMENTAL_ROUTED_REPLAY,
+            }
+            targets = {"w13": _K02_W13, "w2": _K02_W2}
+            modules = {
+                _K02_MODULE: {
+                    stage: {
+                        "stage": stage,
+                        "target": targets[stage],
+                        "input_global_scale_policy": gc.LEGACY_POLICY,
+                        "calibration_source": sources[stage],
+                        "stage_values_sha256": gc.stage_values_sha256(
+                            stage=stage,
+                            target=targets[stage],
+                            policy=gc.LEGACY_POLICY,
+                            calibration_source=sources[stage],
+                            value=attested[targets[stage]],
+                        ),
+                    }
+                    for stage in gc.ROUTED_MOE_STAGES
+                }
+            }
+            record["schema"] = gc.CONTRACT_SCHEMA_V2
+            record[gc.ROUTED_MOE_STAGE_KEY] = {
+                "schema": gc.ROUTED_MOE_STAGE_SCHEMA,
+                "stages": list(gc.ROUTED_MOE_STAGES),
+                "module_count": len(modules),
+                "module_names": sorted(modules),
+                "modules": modules,
+                "stages_sha256": gc.routed_moe_stages_sha256(modules),
+            }
+        quant_config["execution_contracts"] = {gc.CONTRACT_KEY: record}
+    (root / "quant_config.json").write_text(
+        json.dumps(quant_config, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    save_file(
+        {
+            f"{target}.{gc.TENSOR_SUFFIX}": torch.tensor(
+                [value], dtype=torch.float32
+            )
+            for target, value in scales.items()
+        },
+        str(root / "model.safetensors"),
+    )
+    return root
+
+
+def test_k02_verdict_attests_verified_routed_moe_artifact(tmp_path):
+    common = ab.validation_common
+    artifact = _write_k02_artifact(
+        tmp_path / "attested", scales={_K02_W13: 2.0, _K02_W2: 4.0}
+    )
+    verdict = common.k02_readiness_verdict(artifact, mode="moe128")
+    assert verdict["verdict"] == common.K02_ATTESTED
+    assert verdict["pass"] is True
+    assert verdict["evidence_class"] == common.EVIDENCE_STAGE_ATTESTED
+    assert verdict["fused_moe_ab_is_evidence"] is True
+    assert verdict["modules"] == [_K02_MODULE]
+    assert verdict["contract_schema"].endswith(".v2")
+
+
+def test_k02_verdict_names_the_module_with_a_missing_stage(tmp_path):
+    common = ab.validation_common
+    # Attested for both stages, but only w13 was actually serialized.
+    artifact = _write_k02_artifact(
+        tmp_path / "half",
+        scales={_K02_W13: 2.0},
+        attest={_K02_W13: 2.0, _K02_W2: 4.0},
+    )
+    verdict = common.k02_readiness_verdict(artifact, mode="moe256")
+    assert verdict["verdict"] == common.K02_MISSING_STAGES
+    assert verdict["failing_module"] == _K02_MODULE
+    assert verdict["failing_stage"] == "w2"
+    assert verdict["pass"] is False
+    assert verdict["evidence_class"] == common.EVIDENCE_FALLBACK_TELEMETRY
+
+
+def test_k02_verdict_reports_a_stage_digest_mismatch(tmp_path):
+    common = ab.validation_common
+    artifact = _write_k02_artifact(
+        tmp_path / "mismatch",
+        scales={_K02_W13: 2.0, _K02_W2: 8.0},
+        attest={_K02_W13: 2.0, _K02_W2: 4.0},
+    )
+    verdict = common.k02_readiness_verdict(artifact, mode="moe128")
+    assert verdict["verdict"] == common.K02_DIGEST_MISMATCH
+    assert verdict["failing_module"] == _K02_MODULE
+    assert verdict["failing_stage"] == "w2"
+    assert verdict["pass"] is False
+    assert verdict["evidence_class"] == common.EVIDENCE_FALLBACK_TELEMETRY
+
+
+def test_k02_verdict_labels_unattested_and_contract_free_artifacts(tmp_path):
+    common = ab.validation_common
+    dense_only = _write_k02_artifact(
+        tmp_path / "dense", scales={"model.layers.0.self_attn.q_proj": 2.0}
+    )
+    routed = common.k02_readiness_verdict(dense_only, mode="moe128")
+    assert routed["verdict"] == common.K02_NOT_ATTESTED
+    assert routed["pass"] is False
+    assert routed["evidence_class"] == common.EVIDENCE_FALLBACK_TELEMETRY
+    # The same artifact is perfectly valid for a dense run.
+    dense = common.k02_readiness_verdict(dense_only, mode="dense")
+    assert dense["verdict"] == common.K02_NOT_ATTESTED
+    assert dense["pass"] is True
+    assert dense["evidence_class"] == common.EVIDENCE_DENSE_SCOPE
+    assert dense["fused_moe_ab_is_evidence"] is None
+
+    legacy = _write_k02_artifact(
+        tmp_path / "legacy", scales={_K02_W13: 2.0}, contract=False
+    )
+    absent = common.k02_readiness_verdict(legacy, mode="moe128")
+    assert absent["verdict"] == common.K02_CONTRACT_ABSENT
+    assert absent["pass"] is False
+
+    unreadable = common.k02_readiness_verdict(
+        tmp_path / "does-not-exist", mode="moe128"
+    )
+    assert unreadable["verdict"] == common.K02_ARTIFACT_UNREADABLE
+    assert unreadable["pass"] is False
+    assert unreadable["evidence_class"] == common.EVIDENCE_FALLBACK_TELEMETRY
+
+
+def test_unattested_moe_ab_is_labelled_fallback_telemetry_not_evidence():
+    common = ab.validation_common
+    args = SimpleNamespace(
+        max_mean_kl=None,
+        max_mean_nll_regression=None,
+        max_ppl_relative_regression=None,
+        max_teacher_fused_mean_kl=0.2,
+        max_teacher_fused_kl_regression=0.01,
+        min_timing_speedup=None,
+        teacher_full_vocab_kl=True,
+        measurement_only=False,
+    )
+    teacher_quality = {
+        arm: {
+            "kl_mode": ab.KL_FULL_VOCAB,
+            "kl_reference_to_candidate": {"mean": 0.01},
+        }
+        for arm in ab.ARMS
+    }
+    unattested = {
+        "quality": {"delta": {}},
+        "teacher_quality": teacher_quality,
+        "settings": {"chunked_prefill_contract": {
+            "promotion_compatible": True
+        }},
+        "k02_stage_attestation": {
+            "verdict": common.K02_NOT_ATTESTED,
+            "evidence_class": common.EVIDENCE_FALLBACK_TELEMETRY,
+            "pass": False,
+        },
+    }
+    core_gates = {"routed_moe_stage_attestation": {"pass": False}}
+    ab._finalize_gate_report(args, unattested, core_gates)
+    assert unattested["promotion_recommendation"] == (
+        common.EVIDENCE_FALLBACK_TELEMETRY
+    )
+    assert unattested["promotion_contract"][
+        "routed_moe_stage_attestation_pass"
+    ] is False
+    assert unattested["promotion_contract"]["complete"] is False
+    assert unattested["measurement_valid"] is False
+
+    attested = {
+        "quality": {"delta": {}},
+        "teacher_quality": teacher_quality,
+        "settings": {"chunked_prefill_contract": {
+            "promotion_compatible": True
+        }},
+        "k02_stage_attestation": {
+            "verdict": common.K02_ATTESTED,
+            "evidence_class": common.EVIDENCE_STAGE_ATTESTED,
+            "pass": True,
+        },
+    }
+    ab._finalize_gate_report(
+        args, attested, {"routed_moe_stage_attestation": {"pass": True}}
+    )
+    assert attested["promotion_contract"]["complete"] is True
+    assert attested["promotion_recommendation"] == (
+        "candidate_only_requires_served_validation"
+    )
