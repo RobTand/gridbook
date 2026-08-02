@@ -269,16 +269,23 @@ tooling and model cards — see the README's naming section.)
 | `PRISMAQUANT_CB_FUSED_FP4_MOE` | off | Grouped-MoE fp4-CB native-FP4 prefill opt-in. Static `1`/`128` and `256` select TileM 128 and 256 and require both attested stage scalars. `static_lsq`/`static_lsq128` and `static_lsq256` select those same tiles while reusing the shared fixed-`G` LSQ quantizer. `rowwise`/`rowwise128` and `rowwise256` use independent runtime row scales and may serve legacy artifacts. An ineligible attempt records its cached reason and returns to the exact native BF16 quality bridge; unknown spellings and mid-process changes fail. Keep this off pending the dated audit's routed-quality, workload, and routing-policy gates. |
 | `PRISMAQUANT_CB_FUSED_MIDM` | `1` | Resolved during model load. `0` skips the CUTLASS mid-M FP8 fused specialization and its JIT build; the exact native expansion/CUTLASS route remains. Any other supported setting is loaded/probed before the model becomes serve-ready. Changing the value later raises. |
 | `PRISMAQUANT_CB_DECODE_CONTRACT` | `v1` | `v2` selects the scale-epilogue-hoist decode contract. Measured **null** on the served 27B; kept for reproducibility. |
-| `PRISMAQUANT_CB_EXPAND` | native CUDA (fp8-CB) / raw view (fp4-CB) | `pad` restores the historical padded-copy input on the fp4-CB branch for a native-vs-native bisection. No value selects Triton. |
 | `PRISMAQUANT_DEBUG_PREFIXES` | off | `1` prints, per Linear, whether it resolved to a CB scheme or to a config-declared non-CB group — the first tool to reach for when memory use is higher than expected. |
 | `PRISMAQUANT_PRELOAD_FUSED` | off | `1` independently attempts to build/preload both fused extensions (FP8-CB and NVFP4-CB) at registration so both arms of a served A/B can carry identical extension residency. Registration treats this as a capability probe; a serving caller still requires its selected native operation and fails closed (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |
 
-The retired values `PRISMAQUANT_CB_DECODE=triton`,
-`PRISMAQUANT_CB_EXPAND=triton`, and the former
-`PRISMAQUANT_CB_PREFILL={auto,stock,loop,batched,...}` family are not serving
-modes. The former dispatch-mode environment variable is also removed; opaque
-whole-call dispatch is unconditional. Remove these settings from old scripts
-and model-card commands.
+**Variables that no longer exist.** `PRISMAQUANT_CB_DECODE` and
+`PRISMAQUANT_CB_EXPAND` (whose `=triton` values are the ones you will find in
+old scripts and model cards), the former
+`PRISMAQUANT_CB_PREFILL={auto,stock,loop,batched,...}` family, and the former
+dispatch-mode variable have **no reader in the code** — they are not retired
+*values* of live variables, they are gone entirely, so setting one has no
+effect whatsoever, not even a warning. Opaque whole-call dispatch is
+unconditional. Delete these settings from old scripts and model-card commands
+rather than carrying them forward as inert text. (`PRISMAQUANT_CB_EXPAND`'s
+last reader went with the Triton removal; its documentation row outlived it by
+one release and was deleted per
+[`audits/ultraplan_perf_2026-08-01.md`](audits/ultraplan_perf_2026-08-01.md)
+§4. The regeneration command below is what keeps this section honest — a
+documented variable that the grep does not find is a ghost.)
 
 ### The rest of them
 

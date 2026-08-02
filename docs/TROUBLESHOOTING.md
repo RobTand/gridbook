@@ -72,9 +72,11 @@ states which parts were measured and which were inferred.
 | A compiler error from `nvcc` | Toolchain/torch mismatch, or an `nvcc` too old for your GPU's architecture. | `nvcc` 13.0 is the tested toolchain. Match the CUDA major version your torch was built against. |
 | Anything, but only inside a container that used to work | The ephemeral build cache is being rebuilt and failing. | See [persisting the cache](INSTALL.md#persisting-the-jit-build-cache). |
 
-No current environment switch enables Triton. Remove obsolete
-`PRISMAQUANT_CB_DECODE=triton` or `PRISMAQUANT_CB_EXPAND=triton` settings from
-old scripts/model-card commands rather than relying on them for bisection.
+No current environment switch enables Triton. `PRISMAQUANT_CB_DECODE` and
+`PRISMAQUANT_CB_EXPAND` have no reader left in the code at all, so an inherited
+`=triton` setting is inert rather than dangerous — but delete it from old
+scripts/model-card commands anyway, because a variable that looks like a
+bisection lever and silently does nothing is worse than no lever.
 
 ---
 
