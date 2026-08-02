@@ -153,7 +153,8 @@ def supports(ext, layer, *, N: int, K: int, k_bits: int, n_sub: int,
         return (f"k={k_bits} is not a rung this build compiled "
                 f"({list(kbits(ext))})")
     if K <= 0 or K % 256 != 0:
-        return f"K={K} is not a positive multiple of the 256-element superblock"
+        return (f"K={K} is not a positive multiple of the 256-element "
+                f"superblock")
     if N <= 0 or N % 8 != 0:
         return (f"N={N} is not a positive multiple of the BF16 epilogue's "
                 f"8-element access")

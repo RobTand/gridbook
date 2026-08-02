@@ -378,10 +378,19 @@ def test_padding_trim_is_bit_identical(monkeypatch):
     torch.manual_seed(12)
     x = torch.randn(
         33, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+    # The trim flag is process-stable since 2026-08-02, so flipping it mid-run
+    # raises rather than taking effect. An operator switches arms by
+    # restarting; clearing that one latch is this test's stand-in for the
+    # restart, and running both arms in one process is what makes the
+    # bit-identity claim checkable at all.
+    from gridbook import lane_select
+
     monkeypatch.setenv("PRISMAQUANT_CB_GROUPED_TRIM", "1")
+    lane_select.reset_for_tests("PRISMAQUANT_CB_GROUPED_TRIM")
     trimmed = method._apply_prefill_grouped_fused_v2(
         layer, x, weights, ids, act)
     monkeypatch.setenv("PRISMAQUANT_CB_GROUPED_TRIM", "0")
+    lane_select.reset_for_tests("PRISMAQUANT_CB_GROUPED_TRIM")
     full = method._apply_prefill_grouped_fused_v2(
         layer, x, weights, ids, act)
     assert torch.equal(trimmed, full)
@@ -701,8 +710,14 @@ def test_sm120_bridge_lane_survives_a_single_expert_chunk():
 
     layer._cb_bf16_sm120 = None
     reference = method._apply_prefill_native_bf16(layer, x, weights, ids, act)
+    # Same restart stand-in as the trim A/B above: the chunk knob is latched
+    # process-stable because it gates the packed expert ORDER, and this case
+    # deliberately runs both settings in one process to compare them.
+    from gridbook import lane_select
+
     previous = os.environ.get("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
     os.environ["PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK"] = "1"
+    lane_select.reset_for_tests("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
     layer._cb_bf16_sm120 = ext
     try:
         candidate = method._apply_prefill_native_bf16(
@@ -713,6 +728,7 @@ def test_sm120_bridge_lane_survives_a_single_expert_chunk():
             os.environ.pop("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", None)
         else:
             os.environ["PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK"] = previous
+        lane_select.reset_for_tests("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
 
     assert _report("sm120-lane[chunk=1]-vs-sm80-bridge",
                    reference, candidate) <= _REL

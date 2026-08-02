@@ -1,4 +1,4 @@
-"""One implementation of Gridbook's environment-flag and lane-attestation rules.
+"""One implementation of Gridbook's env-flag and lane-attestation rules.
 
 Three opt-in lanes (``bf16_grouped_lane``, ``fp4v2_fused_midm_lane``,
 ``moe_persistent_b_lane``) each carried a byte-identical ~30-line copy of the
@@ -141,14 +141,14 @@ def require_lane(operation: str, *, flag: str, lane: str, source: str,
     loader's, under a comment claiming the two agreed, is why this argument
     exists rather than a per-lane literal.
 
-    THE DEVICE IS ACTUALLY CHECKED. Two of the three lanes used to compute the
-    live capability and then use it only to decorate a symbols-missing message,
+    THE DEVICE IS ACTUALLY CHECKED. Two of the three lanes computed the live
+    capability and then used it only to decorate a symbols-missing message,
     so on a mixed-capability box a module built for device 0 was attested for
     device N and failed at first launch — the one place this function exists to
     make impossible. Both the capability and, when the module records it, the
     capability the module was BUILT for are compared against ``device`` here.
 
-    ``prepare`` names an optional per-device binding (the shared-memory opt-in).
+    ``prepare`` names an optional per-device binding (the smem opt-in).
     Calling it here is what keeps ``cudaFuncSetAttribute`` — which is not
     stream-ordered work — out of a first forward and out of a graph capture.
     """
@@ -162,17 +162,19 @@ def require_lane(operation: str, *, flag: str, lane: str, source: str,
         raise NativeKernelUnavailableError(
             f"{operation} requested {lane} ({flag}=1), but Gridbook's "
             f"{source} is unavailable or does not carry it (missing "
-            f"{missing}; device capability {capability}). The lane is compiled "
-            f"only for compute capability 12.0/12.1"
+            f"{missing}; device capability {capability}). The lane is "
+            f"compiled only for compute capability 12.0/12.1"
             + ("" if capability is None or buildable(capability)
                else f", and this device reports "
                     f"{capability[0]}.{capability[1]}")
             + f". Unset {flag} to use {alternative}; Gridbook does not "
-            f"substitute a different kernel behind an explicit lane selection.")
+            f"substitute a different kernel behind an explicit lane "
+            f"selection.")
 
     if capability is not None and not buildable(capability):
         raise NativeKernelUnavailableError(
-            f"{operation} requested {lane} ({flag}=1), and the loaded {source} "
+            f"{operation} requested {lane} ({flag}=1), and the loaded "
+            f"{source} "
             f"carries it, but THIS device reports compute capability "
             f"{capability[0]}.{capability[1]}, which the lane is not compiled "
             f"for. On a mixed-capability host the module is built for one "
@@ -183,8 +185,8 @@ def require_lane(operation: str, *, flag: str, lane: str, source: str,
     if (built_for is not None and capability is not None
             and tuple(built_for) != tuple(capability)):
         raise NativeKernelUnavailableError(
-            f"{operation} requested {lane} ({flag}=1), but the loaded {source} "
-            f"was compiled for compute capability {built_for[0]}."
+            f"{operation} requested {lane} ({flag}=1), but the loaded "
+            f"{source} was compiled for compute capability {built_for[0]}."
             f"{built_for[1]} while this device reports {capability[0]}."
             f"{capability[1]}. These lanes pin an architecture-ACCELERATED "
             f"target (sm_120a / sm_121a), so the binary is not portable "
@@ -208,7 +210,8 @@ def require_lane(operation: str, *, flag: str, lane: str, source: str,
             raise NativeKernelUnavailableError(
                 f"{operation} requested {lane} ({flag}=1), but load-time "
                 f"device attestation failed ({type(exc).__name__}: {exc}). "
-                f"The schedule needs CUDA compute capability 12.0 or 12.1 with "
+                f"The schedule needs CUDA compute capability 12.0 or 12.1 "
+                f"with "
                 f"enough opt-in shared memory for its largest compiled tile; "
                 f"the kernel's own check reports the exact bound. Gridbook "
                 f"does not defer this failure to first prefill or serve "
