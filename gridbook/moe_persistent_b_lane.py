@@ -122,7 +122,9 @@ def supports(*, is_fp4: bool, is_v2: bool, n_sub: int, k_bits: int,
         return "serialized row type_size is not FP4-CB layout v2 (4*k+9)"
     # Superblock alignment (256) is the binding constraint and it implies the
     # kernel's own `N % 8 == 0` check for both projection widths, since 2*inter
-    # and hidden are then multiples of 256.
+    # and hidden are then multiples of 256.  There is deliberately no minimum
+    # on N: a projection narrower than the narrowest compiled tile is served by
+    # clamping to that tile, which the kernel's column masking makes correct.
     if hidden % 256 or inter % 256:
         return ("hidden and intermediate sizes must be superblock aligned "
                 f"(256), got hidden={hidden}, intermediate={inter}")

@@ -817,24 +817,30 @@ void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
     // ~64 mean rows, TM=128/TN=64 through ~192, TM=256/TN=64 above.
     const int64_t mean_rows = P / E;
     idx = (mean_rows <= 64) ? 3 : 0;   // TM=64,TN=128 : TM=128,TN=64
-    // A tile wider than N would decode columns that do not exist; step down
-    // to the widest compiled tile that fits, keeping the chosen TM where one
-    // exists.
-    while (kCfgs[idx].tn > N) {
+    // A tile wider than N decodes columns that do not exist, so step down to
+    // the widest compiled tile that fits.  This is purely a WORK-SAVING step:
+    // correctness never depends on it, because a wide TN is masked in all
+    // three places it could matter (`gn < N` in the packed staging, `n0+n < N`
+    // in the decode, `col >= N` in the epilogue).  When N is narrower than
+    // every compiled tile — a legal FP4-CB layer only needs N % 8 == 0 — the
+    // narrowest tile is kept and the masking carries it, rather than failing a
+    // shape the kernel computes correctly.
+    if (kCfgs[idx].tn > N) {
       int next = -1;
       for (int i = 0; i < kNumCfgs; ++i) {
-        if (kCfgs[i].tn <= N &&
-            (next < 0 || kCfgs[i].tn > kCfgs[next].tn ||
-             (kCfgs[i].tn == kCfgs[next].tn &&
-              kCfgs[i].tm > kCfgs[next].tm))) {
+        const bool fits = kCfgs[i].tn <= N;
+        const bool best_fits = next >= 0 && kCfgs[next].tn <= N;
+        if (next < 0) {
           next = i;
+        } else if (fits && !best_fits) {
+          next = i;                       // any fitting tile beats a wide one
+        } else if (fits && best_fits && kCfgs[i].tn > kCfgs[next].tn) {
+          next = i;                       // widest that fits
+        } else if (!fits && !best_fits && kCfgs[i].tn < kCfgs[next].tn) {
+          next = i;                       // else the narrowest overall
         }
       }
-      TORCH_CHECK(next >= 0,
-                  "cb_moe_persistent_b: no compiled tile fits N=", N,
-                  "; the narrowest is TN=", kCfgs[2].tn);
       idx = next;
-      break;
     }
   }
   const TileCfg cfg = kCfgs[idx];

@@ -366,12 +366,114 @@ already parameterise it), or an A-side row gather inside the mainloop that
 removes the padded copy entirely. `scripts/bench_bf16_grouped_sm120.py`
 produces proposal data only.
 
+### Persistent-B decode-in-mainloop (opt-in, `PRISMAQUANT_CB_MOE_PERSISTENT_B`)
+
+ROADMAP **K1.1**, audit §3 **P2b**. Both lanes above still *materialize* the
+decoded weights: `cb_expand_fp4_v2` writes an `[E,N,K]` BF16 tile to HBM and
+the grouped GEMM reads it back. That expansion runs over **every** expert,
+routed or not, at 2 bytes/weight — 4× FP8-CB's direct-to-E4M3 transient, and
+~35% of MoE layer time at Laguna scale. This kernel
+(`csrc/cb_moe_persistent_b.cu`) deletes it: the packed CB bytes (~0.3
+B/weight) are read once, decoded to BF16 **in shared memory inside the
+mainloop**, and consumed in place.
+
+**Design — persistent-B along M.** A CTA owns one `(expert, N-tile)` work
+unit. It reads that expert's exact routed segment from `expert_ends` and loops
+the segment in `TM`-row M-tiles **inside the kernel**, so the per-(expert,
+N-tile) setup is hoisted out of the M loop and each decoded weight value feeds
+`TM` activation rows before it is discarded. This is the inverse of the two
+fused lanes, whose CTAs are *M-tile-indexed*: there a second M-tile of the
+same expert is a different CTA that re-decodes B from scratch, which is why
+FP8-CB's fused lane is gated at `M≤128` and measures 0.22× at `M≈1400`.
+
+**It is not the retired persistent-N kernel.** That one owned a bare N-slice
+per CTA and walked M with CUDA-core/SM89-class atoms on the **dense** path.
+This is MoE-only (every binding takes `expert_ids`/`expert_ends`; there is no
+dense entry point in the translation unit, and `cb_moe_persistent_b_is_moe_only()`
+is gated by a test), it uses `mma.sync.m16n8k16` tensor cores, and its win
+comes from amortizing a **decode** the dense kernel never had. Dense large-M
+stays behind [`K1.3`](../ROADMAP.md#kernel-todo-canonical).
+
+**Grouping: exact segments, not padded tiles.** Unlike every CUTLASS lane in
+this tree, the mainloop is hand-assembled from `mma.sync` / `ldmatrix` /
+`cp.async`, so it is not bound by a uniform tile that cannot straddle two
+experts. It therefore consumes the **exact** `expert_ends` segments the
+default quality path already builds — same stable argsort, same
+`cumsum(bincount(...))`, same `index_select`/`index_add_` combine. Consequences:
+zero padded rows (the padded layout can inflate a 4,096-row `E=256` prefill by
+up to `256×(TileM−1)` rows), and **zero host reads** — the padded lanes each
+spend one `.item()` on the real block total, this path spends none, because
+the launch geometry is `E × ceil(N/TN)` CTAs, a function of the layer shape
+alone. Empty experts cost two int32 loads and a CTA return. Skew costs a
+longer CTA, never a serialized grid.
+
+**Measured configuration** (GB10, cc 12.1; reproduce with
+`csrc/tools/persistent_b_probe.cu`). `TK` is fixed at 64 BF16 columns = 128 B
+per row = the 8 sixteen-byte chunks an XOR swizzle needs to make `ldmatrix`
+conflict-free over 8 rows, and it divides the 256-column CB superblock evenly.
+Bytes quoted at `k=24`, the widest packed superblock:
+
+| cfg | TM | TN | warps | A | B | packed | smem | CTAs/SM | accum regs/thread |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 128 | 64 | 8 | 32,768 | 8,192 | 7,424 | 48,384 | 2 | 32 |
+| 2 | 64 | 64 | 4 | 16,384 | 8,192 | 7,424 | 32,000 | 3 | 32 |
+| 3 | 128 | 32 | 4 | 32,768 | 4,096 | 3,712 | 40,576 | 2 | 32 |
+| 4 | 64 | 128 | 8 | 16,384 | 16,384 | 14,848 | 47,616 | 2 | 32 |
+
+Every compiled config holds **≥2 CTAs/SM including the ~1 KiB the hardware
+reserves per CTA**, and the binding `TORCH_CHECK`s exactly that — the lesson
+W4 paid for when its first collective wanted 75,776 B and got one CTA per SM.
+Two wider tiles were compiled, measured and **dropped**: `128×128` (64,000 B)
+and `256×64` (81,152 B) both fall to 1 CTA/SM and neither won a single sweep
+cell — `256×64` halves the decode repetition at large rows-per-expert, exactly
+the regime it should own, and still lost there (18.6 vs 7.8 ms, DSV4 `w2`,
+`T=2048`). Occupancy dominates decode amortization on this device. A resident
+codebook in shared memory (`cb_gemv_v2.cu`'s DS=2 idea) was measured and
+**rejected** for the same reason: the 4 KiB `k=16` table pushed the default
+config from 46,336 to 50,432 B, which is under half the 102,400 B SM budget
+but not once the per-CTA reservation is counted, costing 1.9× (4.09 → 7.76 ms)
+while buying ~1% where it did fit. The gathers already hit L1 at the rungs
+where the table is small.
+
+**Tile selection is a function of SHAPES, never of a routing value.** `cfg=0`
+(the production setting) picks from `P/E`, the mean routed rows per expert,
+where `P` is `a.size(0)` and `E` is `qw.size(0)` — both known to the host
+without touching device memory, so the choice stays a trace-time constant and
+the launch is capturable as-is. Measured crossover: cfg 4 below ~64 mean rows,
+cfg 1 above.
+
+**Requalification surface.** Activations are untouched — the same exact
+group-16 RTN QDQ payload, before FC1 and between FC1 and FC2. The decode is
+**bit-identical to `cb_expand_v2`**, and that is a tested fact rather than an
+asserted one: `cb_moe_persistent_b_decode` exposes the mainloop's own decode
+stage and the suite compares it to the expander with `torch.equal` across the
+`k=12…24` rungs, on both full and windowed row ranges. Accumulation is FP32
+with one BF16 round. What changes is the FP32 **reduction order** —
+reassociation-class, the same surface the sm12x lane and the promoted FP8
+mid-M fused kernel cleared.
+
+**Status: OPT-IN** behind `PRISMAQUANT_CB_MOE_PERSISTENT_B=1`, resolved at
+model load (never at first forward), FP4-CB-v2 layers only, and failing the
+load if the flag is on where the lane cannot serve — including the tile
+override `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG`, which is validated against
+what this build actually compiled. With the flag unset the dispatch is
+byte-for-byte what it was. **Promotion checklist:** decode bit-exactness gate
+— **done**; whole-operator numerics under the reduction-order discipline —
+**done**; routing breadth (empty / single / one-row / skewed) — **done**;
+graph capture-replay and non-default-stream — **done**; whole-routed-operator
+microbenchmark — **done, wins** (table below); whole-routed-operator served
+[NATIVE-PARITY](NATIVE-PARITY.md) protocol — **not run**, and that is what
+stands between this lane and a default. `scripts/bench_moe_persistent_b.py`
+produces proposal data only.
+
 MoE dispatch is separate from the dense M boundary: `M≤16` uses the owned
 grouped CUDA GEMV. Above 16, FP8-CB first attempts its quality-green fused
 CUTLASS path and otherwise uses exact BF16 expansion plus the owned CUTLASS
-grouped bridge; FP4-CB uses exact BF16 expansion plus that bridge. Only expert
-chunk size / transient-byte-budget overrides remain—there is no stock/loop/
-batched/L2 production selector.
+grouped bridge; FP4-CB uses exact BF16 expansion plus that bridge, or — behind
+`PRISMAQUANT_CB_MOE_PERSISTENT_B=1` — the decode-in-mainloop schedule above,
+which replaces both halves of that pair. Only expert chunk size /
+transient-byte-budget overrides remain—there is no stock/loop/ batched/L2
+production selector.
 
 The predecessor native chunk-expander path measured **293 → 1,821 tok/s at 8k**
 and **207 → 1,822 tok/s at 63k** on Laguna-S-2.1 (117B MoE). Those numbers are
@@ -385,10 +487,10 @@ activation factors materially changed the served distribution. It must not be
 promoted on kernel parity or raw speed alone; see the
 [fused-NVFP4 enablement audit](audits/fused_nvfp4_enablement_2026-07-31.md).
 
-The remaining MoE prefill target is an activation-contract-preserving
-persistent/grouped decode-in-mainloop schedule (the expand is ~35% of MoE
-layer time at Laguna scale) — see
-[`K1.1` in the kernel TODO](../ROADMAP.md#kernel-todo-canonical).
+The activation-contract-preserving decode-in-mainloop schedule that target
+called for is now implemented behind `PRISMAQUANT_CB_MOE_PERSISTENT_B=1` (the
+section above); what remains open on [`K1.1`](../ROADMAP.md#kernel-todo-canonical)
+is the served promotion gate, not the kernel.
 
 ---
 
@@ -467,6 +569,7 @@ too.
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
 | FP8-CB fused decode-in-prologue prefill | **Bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128**; native transient expansion + CUTLASS serves ineligible and large-M shapes |
 | NVFP4-CB fused native-FP4 prefill (dense and MoE) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, MoE routed-quality, and p95 served gates remain open |
+| MoE persistent-B decode-in-mainloop prefill (FP4-CB v2) | **Opt-in** (`PRISMAQUANT_CB_MOE_PERSISTENT_B=1`), ROADMAP K1.1. Decodes each expert weight tile once and streams that expert's exact routed segment through it, eliminating the `[E,N,K]` BF16 transient and all work for unrouted experts. Weight decode bit-identical to `cb_expand_v2` (`torch.equal`); reduction-order-class output difference vs the bridge, gated at parity with per-segment `F.linear`. Whole-routed-operator microbenchmark wins; served protocol **not run** |
 | Persistent-N large-M dense prefill | **RETIRED FROM SERVING; MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. The serving selector, custom op, package loader, and switch are deleted. The `.cu` remains accessible only to the explicit direct research test. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
 | MoE prefill | **Native-only production lane**: grouped CUDA GEMV at M≤16; above 16, eligible quality-green FP8 fused CUTLASS or exact CUDA expansion + owned CUTLASS grouped GEMM. The current generic SM80-compatible grouped bridge is not Blackwell-optimized and measured 6–17% slower than segmented BF16 matmuls on warm synthetic DSV4 shapes; an sm12x-native CUTLASS 3.x collective for the same bridge exists **opt-in** (`PRISMAQUANT_CB_BF16_SM120`, pingpong 64×128×64): measured 1.18–1.27× that bridge and 1.02–1.05× segmented matmuls at T=128, but only 0.83–0.92× segmented at T=512, where the ragged row-padding tax of the tile-indexed construction binds — bit-gated, served protocol not run. Historical Laguna-S-2.1 measurements for the predecessor native chunk-expander path were 293 → 1,821 tok/s @8k and 207 → 1,822 @63k; they must not be relabelled as measurements of the new bridge. The v0.4.2 fused native-NVFP4 route remains an explicit A/B opt-in without MoE quality qualification |
 | Missing required native kernel | **Fails closed** with an operation-specific diagnostic; no Triton dependency or serving fallback |
