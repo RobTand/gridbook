@@ -1,10 +1,14 @@
-"""Correctness gates for the active FP8-CB fused CUTLASS MoE kernels.
+"""Correctness gates for the active FP8-CB fused CUTLASS MoE kernel.
 
-Round 1 decodes CB weights in each CUTLASS GEMM prologue. Round 2 replaces
-Round 1's expert launch loop with one padded grouped launch per projection.
-Both are production candidates only for quality-green FP8-CB shapes; every
-miss uses Gridbook's exact-QDQ, exact-weight-expansion, grouped-BF16 CUTLASS
-bridge. There is no stock, loop, batched, L2, or runtime-autoselector oracle.
+``cb_fused_moe_grouped`` decodes CB weights in the CUTLASS GEMM prologue and
+serves the whole routed collective with one padded grouped launch per
+projection. It is a production candidate only for quality-green FP8-CB shapes;
+every miss uses Gridbook's exact-QDQ, exact-weight-expansion, grouped-BF16
+CUTLASS bridge, which is therefore the ONLY oracle here — there is no stock,
+loop, batched, L2, or runtime-autoselector one. (The per-expert host-loop
+"round 1" that used to sit between them was retired on 2026-08-01: the grouped
+launch supersedes it, and its own gate could no longer differ. Its cases are
+gone; the quality assertions it carried now point at the bridge.)
 
 The routing tests are CPU-only. Forward tests require the serving vLLM/CUDA
 stack plus Gridbook's fused and grouped-BF16 extensions.
@@ -271,26 +275,20 @@ def test_padded_routing_capacity_bound_randomized(seed):
 # ---------------------------------------------------------------------------
 # CUDA quality and dispatch gates
 # ---------------------------------------------------------------------------
-def _require_r1(method, layer):
+def _require_grouped_fused(method, layer):
     _require_stack()
-    if not method._gf_ok(layer):
-        pytest.skip("FP8-CB fused CUTLASS Round 1 unavailable")
+    if not method._gf2_ok(layer):
+        pytest.skip("FP8-CB grouped fused CUTLASS prefill unavailable")
     from gridbook.cuda_ext import get_bf16_grouped_ext
     if get_bf16_grouped_ext() is None:
         pytest.skip("owned grouped-BF16 CUTLASS reference unavailable")
 
 
-def _require_r2(method, layer):
-    _require_r1(method, layer)
-    if not method._gf2_ok(layer):
-        pytest.skip("FP8-CB fused CUTLASS Round 2 unavailable")
-
-
 @pytest.mark.parametrize("distribution", ["uniform", "subset"])
 @pytest.mark.parametrize("topk", [2, 4])
-def test_round1_matches_native_quality_bridge(distribution, topk):
+def test_grouped_fused_matches_native_quality_bridge(distribution, topk):
     method, layer, dims = _build(seed=1)
-    _require_r1(method, layer)
+    _require_grouped_fused(method, layer)
     act = _silu_act()
     tokens = 48
     ids, weights = _routing(
@@ -300,18 +298,18 @@ def test_round1_matches_native_quality_bridge(distribution, topk):
         tokens, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
     reference = method._apply_prefill_native_bf16(
         layer, x, weights, ids, act)
-    candidate = method._apply_prefill_grouped_fused(
+    candidate = method._apply_prefill_grouped_fused_v2(
         layer, x, weights, ids, act)
     assert candidate is not None
     rel = _report(
-        f"r1-vs-native[{distribution},topk={topk}]", reference, candidate)
+        f"grouped-vs-native[{distribution},topk={topk}]", reference, candidate)
     assert rel <= _REL
 
 
 @pytest.mark.parametrize("tokens", [17, 33, 129])
-def test_round1_partial_tiles_match_native_quality_bridge(tokens):
+def test_grouped_fused_partial_tiles_match_native_quality_bridge(tokens):
     method, layer, dims = _build(seed=3)
-    _require_r1(method, layer)
+    _require_grouped_fused(method, layer)
     act = _silu_act()
     ids, weights = _routing(
         tokens, dims["E"], 2, "uniform", seed=5)
@@ -320,35 +318,16 @@ def test_round1_partial_tiles_match_native_quality_bridge(tokens):
         tokens, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
     reference = method._apply_prefill_native_bf16(
         layer, x, weights, ids, act)
-    candidate = method._apply_prefill_grouped_fused(
+    candidate = method._apply_prefill_grouped_fused_v2(
         layer, x, weights, ids, act)
-    assert _report(f"r1-vs-native[M={tokens}]", reference, candidate) <= _REL
-
-
-@pytest.mark.parametrize("distribution", ["uniform", "subset"])
-@pytest.mark.parametrize("topk", [2, 4])
-def test_round2_matches_round1(distribution, topk):
-    method, layer, dims = _build(seed=1)
-    _require_r2(method, layer)
-    act = _silu_act()
-    tokens = 48
-    ids, weights = _routing(
-        tokens, dims["E"], topk, distribution, seed=7)
-    torch.manual_seed(2)
-    x = torch.randn(
-        tokens, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    round1 = method._apply_prefill_grouped_fused(
-        layer, x, weights, ids, act)
-    round2 = method._apply_prefill_grouped_fused_v2(
-        layer, x, weights, ids, act)
-    assert round2 is not None
+    assert candidate is not None
     assert _report(
-        f"r2-vs-r1[{distribution},topk={topk}]", round1, round2) <= _REL
+        f"grouped-vs-native[M={tokens}]", reference, candidate) <= _REL
 
 
-def test_round2_padding_trim_is_bit_identical(monkeypatch):
+def test_padding_trim_is_bit_identical(monkeypatch):
     method, layer, dims = _build(seed=11)
-    _require_r2(method, layer)
+    _require_grouped_fused(method, layer)
     act = _silu_act()
     ids, weights = _routing(33, dims["E"], 2, "uniform", seed=3)
     torch.manual_seed(12)
@@ -363,9 +342,9 @@ def test_round2_padding_trim_is_bit_identical(monkeypatch):
     assert torch.equal(trimmed, full)
 
 
-def test_native_dispatch_prefers_round2():
+def test_native_dispatch_prefers_the_grouped_fused_kernel():
     method, layer, dims = _build(seed=14)
-    _require_r2(method, layer)
+    _require_grouped_fused(method, layer)
     seen = {}
     original = method._apply_prefill_grouped_fused_v2
 
@@ -382,23 +361,39 @@ def test_native_dispatch_prefers_round2():
     assert out.shape == (32, dims["hidden"])
 
 
-def test_native_dispatch_falls_from_round2_to_round1():
+def test_native_dispatch_falls_from_grouped_fused_to_native_bridge():
+    """An ineligible layer goes straight to the owned BF16 bridge.
+
+    This is the whole fallback cascade now that the per-expert host loop is
+    retired: exactly one fused arm, then the exact native route. Nothing may
+    sit between them.
+    """
     method, layer, dims = _build(seed=13)
-    _require_r1(method, layer)
+    _require_stack()
+    from gridbook.cuda_ext import get_bf16_grouped_ext
+    if get_bf16_grouped_ext() is None:
+        pytest.skip("owned grouped-BF16 CUTLASS reference unavailable")
     layer._cb_gf2_ok = False
     seen = {}
-    original = method._apply_prefill_grouped_fused
+    bridge = method._apply_prefill_native_bf16
+    fused = method._apply_prefill_grouped_fused_v2
 
-    def spy(*args, **kwargs):
-        seen["hit"] = True
-        return original(*args, **kwargs)
+    def bridge_spy(*args, **kwargs):
+        seen["bridge"] = True
+        return bridge(*args, **kwargs)
 
-    method._apply_prefill_grouped_fused = spy
+    def fused_spy(*args, **kwargs):
+        seen["fused"] = fused(*args, **kwargs)
+        return seen["fused"]
+
+    method._apply_prefill_native_bf16 = bridge_spy
+    method._apply_prefill_grouped_fused_v2 = fused_spy
     ids, weights = _routing(32, dims["E"], 2, "uniform", seed=2)
     x = torch.randn(
         32, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
     out = method._apply_inline(layer, x, weights, ids)
-    assert seen.get("hit")
+    assert "fused" in seen and seen["fused"] is None  # the gate declined
+    assert seen.get("bridge")                         # the bridge served it
     assert out.shape == (32, dims["hidden"])
 
 
@@ -409,30 +404,30 @@ def _tile_sizes(method, layer):
     return sizes
 
 
-def test_round2_quality_at_every_compiled_tile():
+def test_quality_at_every_compiled_tile():
     method, layer, dims = _build(seed=1)
-    _require_r2(method, layer)
+    _require_grouped_fused(method, layer)
     act = _silu_act()
     ids, weights = _routing(48, dims["E"], 2, "uniform", seed=7)
     torch.manual_seed(2)
     x = torch.randn(
         48, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    round1 = method._apply_prefill_grouped_fused(
+    reference = method._apply_prefill_native_bf16(
         layer, x, weights, ids, act)
     for tile_m in _tile_sizes(method, layer):
         candidate = method._apply_prefill_grouped_fused_v2(
             layer, x, weights, ids, act, tile_m=tile_m)
         assert candidate is not None
         assert _report(
-            f"r2[tile={tile_m}]-vs-r1", round1, candidate) <= _REL
+            f"grouped[tile={tile_m}]-vs-native", reference, candidate) <= _REL
 
 
 @pytest.mark.parametrize(
     "distribution,tokens", [("one_expert", 40), ("subset", 17),
                              ("uniform", 33)])
-def test_round2_ragged_at_tile_256(distribution, tokens):
+def test_ragged_routing_at_tile_256(distribution, tokens):
     method, layer, dims = _build(seed=6)
-    _require_r2(method, layer)
+    _require_grouped_fused(method, layer)
     if 256 not in method._gf2_tile_sizes(layer):
         pytest.skip("tile_m=256 not compiled")
     act = _silu_act()
@@ -442,10 +437,11 @@ def test_round2_ragged_at_tile_256(distribution, tokens):
     torch.manual_seed(8)
     x = torch.randn(
         tokens, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
-    round1 = method._apply_prefill_grouped_fused(
+    reference = method._apply_prefill_native_bf16(
         layer, x, weights, ids, act)
-    round2 = method._apply_prefill_grouped_fused_v2(
+    candidate = method._apply_prefill_grouped_fused_v2(
         layer, x, weights, ids, act, tile_m=256)
+    assert candidate is not None
     assert _report(
-        f"r2[tile=256,{distribution},M={tokens}]-vs-r1",
-        round1, round2) <= _REL
+        f"grouped[tile=256,{distribution},M={tokens}]-vs-native",
+        reference, candidate) <= _REL
