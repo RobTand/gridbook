@@ -754,7 +754,7 @@ def _load_bf16_grouped_ext_locked():
         # MEASURED (GB10, cc 12.1, CUTLASS 4.3.4): the sm12x lane needs the
         # ``a``-suffixed target even though its MMA (`m16n8k16` bf16) is
         # architecture-GENERIC. The reason is the kernel LAYER, not the
-        # instruction: sm90_gemm_tma_warpspecialized_cooperative.hpp compiles
+        # instruction: sm90_gemm_tma_warpspecialized_pingpong.hpp compiles
         # its operator() body only under __CUDA_ARCH_FEAT_SM90/120/121_ALL (or
         # a conditional/family target), and otherwise emits
         # CUTE_INVALID_CONTROL_PATH. Built as plain ``sm_121`` the module

@@ -17,9 +17,14 @@
   `PRISMAQUANT_CB_BF16_SM120=1`, resolved at model load and failing closed:
   it is bit-gated against the torch reference (both lanes and a per-segment
   `F.linear` share one relative-L2 band), but it changes the FP32 reduction
-  order, and its measured 1.06–1.25× over the bridge it would replace still
-  trails segmented BF16 matmuls — proposal data only, served protocol not run.
-  `scripts/bench_bf16_grouped_sm120.py` reproduces the table.
+  order. Measured on the GB10 with the compiled rung (pingpong 64×128×64, 3
+  stages): 1.18–1.27× the bridge it would replace and 1.02–1.05× segmented
+  BF16 matmuls at T=128, 0.83–0.92× segmented at T=512. The residual is the
+  tile-indexed construction's ragged row padding, not the schedule — with the
+  padding removed the same kernel runs 1.08–1.13× segmented — so the next step
+  is a TileM ladder or an in-mainloop A gather, not more tuning. Proposal data
+  only, served protocol not run; `scripts/bench_bf16_grouped_sm120.py`
+  reproduces the tables.
 - Key the grouped-BF16 module's JIT identity like the two fused modules: its
   packaged sources, Gridbook headers, compiled-in lane macro, target and
   toolchain ABI decide the module name and the `bf16_grouped/<digest>` build

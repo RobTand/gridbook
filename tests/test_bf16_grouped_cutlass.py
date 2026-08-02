@@ -192,12 +192,24 @@ def _real_rows(padded, source, total):
 
 @sm120
 def test_sm120_config_fits_the_sm120_shared_memory_budget():
-    tile_m, tile_n, tile_k, stages, smem, capacity = \
+    """The compiled rung, pinned: pingpong 64x128x64, 3 stages, in budget.
+
+    TileM=64 is the padding granularity and the reason the PINGPONG kernel
+    layer is used (cooperative's 256-thread TiledMma floors TileM at 128); the
+    128 MMA threads assert that layer is really the one instantiated.
+    """
+    (tile_m, tile_n, tile_k, stages, smem, capacity, mma_threads,
+     swizzle_small, swizzle_large, threshold) = \
         ext.cb_bf16_grouped_sm120_config()
-    assert (tile_m, tile_n, tile_k) == (128, 128, 64)
+    assert (tile_m, tile_n, tile_k) == (64, 128, 64)
+    assert mma_threads == 128, "TileM=64 requires the pingpong kernel layer"
     assert stages >= 2, "a TMA warp-specialized mainloop needs two stages"
     assert 0 < smem <= capacity
     assert ext.cb_bf16_grouped_sm120_tile_sizes() == [tile_m]
+    # The swizzle policy is a tile ORDER knob: it may never be zero (invalid to
+    # CUTLASS) and its two measured values must straddle the threshold.
+    assert swizzle_small >= 1 and swizzle_large >= swizzle_small
+    assert threshold > 0
 
 
 @sm120
@@ -207,15 +219,20 @@ def test_sm120_config_fits_the_sm120_shared_memory_budget():
     ([128, 128, 128, 128, 128, 128, 128, 128], 256, 1024),  # exact multiples
     ([1] * 8, 256, 128),                               # one row per expert
     ([64, 65, 191, 192, 193, 0, 7, 256], 1024, 4096),  # tile boundaries
+    ([65] * 64, 256, 128),                             # large grid: swizzle 8
 ], ids=["uneven-empty", "single-expert-longK", "exact-multiple",
-        "one-row-each", "tile-boundaries"])
+        "one-row-each", "tile-boundaries", "large-grid-swizzle"])
 def test_sm120_error_matches_a_per_segment_bf16_reference(counts, k, n):
     """The lane's fp32-accumulate error may not exceed a BF16 F.linear's.
 
     Every routing shape the served operator can produce: empty experts (absent
     from ``expert_ids`` by construction), a single expert, segments that are
-    exact tile multiples, one-row segments (127 padding rows per tile), and
-    lengths straddling the tile boundary at 64/65/191/192/193.
+    exact tile multiples, one-row segments (the whole rest of the tile is
+    padding), and lengths straddling the tile boundary at 64/65/191/192/193.
+
+    The last case crosses the grid size at which the kernel switches its
+    tile-scheduler swizzle. That switch is a tile-ORDER argument and must not
+    move a bit, which is exactly what this gate then measures.
     """
     torch.manual_seed(20260801)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -378,10 +395,19 @@ def test_sm120_rejects_contract_violations(mutate, message):
 
 
 @sm120
-def test_sm120_refuses_an_uncompiled_tile_m():
+@pytest.mark.parametrize("factor", [2, 4], ids=["double", "quadruple"])
+def test_sm120_refuses_an_uncompiled_tile_m(factor):
+    """A tile_m the module did not instantiate is refused, not approximated.
+
+    Derived from the binding rather than hardcoded: the compiled rung is a
+    schedule decision that has already changed once (128 -> 64), and a test
+    naming a literal would silently start asserting the wrong thing.
+    """
+    uncompiled = TILE_M * factor
+    assert uncompiled not in ext.cb_bf16_grouped_sm120_tile_sizes()
     k, n = 256, 128
     a = torch.randn(TILE_M, k, device=DEV, dtype=torch.bfloat16)
     weights = torch.randn(1, n, k, device=DEV, dtype=torch.bfloat16)
     ids = torch.zeros(1, dtype=torch.int32, device=DEV)
     with pytest.raises(RuntimeError, match="compiles tile_m"):
-        ops.cb_bf16_grouped_mm_sm120(a, weights, ids, 64)
+        ops.cb_bf16_grouped_mm_sm120(a, weights, ids, uncompiled)
