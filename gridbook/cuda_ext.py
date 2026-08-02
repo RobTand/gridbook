@@ -815,7 +815,8 @@ def _build_bf16_grouped_half(torch, cpp_extension, *, capability,
     return _require_fused_identity(
         mod, expected_name=module_name, identity=identity,
         abi_schema=_BF16_GROUPED_ABI_SCHEMA,
-        build_dir=build_dir, source="cb_bf16_grouped_gemm.cu")
+        build_dir=build_dir, source="cb_bf16_grouped_gemm.cu",
+        capability=capability)
 
 
 def _load_bf16_grouped_ext_locked():
@@ -1020,13 +1021,23 @@ def _fused_build_identity(torch, cpp_extension, *, src_dir: str,
 
 
 def _require_fused_identity(mod, *, expected_name: str, identity: str,
-                            abi_schema: int, build_dir: str, source: str):
+                            abi_schema: int, build_dir: str, source: str,
+                            capability: tuple[int, int] | None = None):
     """Validate the identity-bearing ``PyInit_*`` module ABI.
 
     ``TORCH_EXTENSION_NAME`` makes the requested name part of the compiled
     module's exported initializer.  Requiring that same name after import is a
     practical ABI attestation without maintaining a second C++ version
     literal.  The full digest is then exposed for release/runtime telemetry.
+
+    ``capability`` is recorded on the module because these builds target ONE
+    compute capability — the arch-pinned lanes use an accelerated
+    ``sm_120a``/``sm_121a`` target, which is not portable even between the two
+    — while ``_target_capability`` reads the CURRENT device with no argument.
+    On a mixed-capability host that is how a binary built for device 0 gets
+    attested for device N and aborts at first launch, so the lanes compare
+    this against the device they are being resolved for
+    (``lane_select.require_lane``).
     """
     actual = getattr(mod, "__name__", None)
     if actual != expected_name:
@@ -1036,6 +1047,8 @@ def _require_fused_identity(mod, *, expected_name: str, identity: str,
                          f"{expected_name!r}, loaded {actual!r}")))
     mod.__gridbook_jit_identity__ = identity
     mod.__gridbook_jit_abi_schema__ = abi_schema
+    if capability is not None:
+        mod.__gridbook_jit_capability__ = tuple(capability)
     return mod
 
 
@@ -1302,7 +1315,8 @@ def _load_fused_fp4_ext_locked():
         _fused_fp4 = _require_fused_identity(
             mod, expected_name=module_name, identity=identity,
             abi_schema=_FUSED_FP4_ABI_SCHEMA,
-            build_dir=build_dir, source="cb_fused_fp4_gemm.cu")
+            build_dir=build_dir, source="cb_fused_fp4_gemm.cu",
+            capability=cc)
     except StaleExtensionError as exc:
         print(f"[prismaquant-cb] ERROR: incompatible fused fp4 prefill "
               f"extension — {exc} fp4 prefill stays on the exact native "
@@ -1454,7 +1468,8 @@ def _load_fused_ext_locked():
         _fused = _require_fused_identity(
             mod, expected_name=module_name, identity=identity,
             abi_schema=_FUSED_ABI_SCHEMA,
-            build_dir=build_dir, source="cb_fused_gemm.cu")
+            build_dir=build_dir, source="cb_fused_gemm.cu",
+            capability=cc)
     except StaleExtensionError as exc:
         print(f"[prismaquant-cb] ERROR: incompatible fused prefill "
               f"extension — {exc} Fused dense and grouped prefill stay on "
@@ -1621,7 +1636,8 @@ def _load_fused_fp4v2_ext_locked():
         _fused_fp4v2 = _require_fused_identity(
             mod, expected_name=module_name, identity=identity,
             abi_schema=_FUSED_FP4V2_ABI_SCHEMA,
-            build_dir=build_dir, source="cb_fused_fp4v2_gemm.cu")
+            build_dir=build_dir, source="cb_fused_fp4v2_gemm.cu",
+            capability=cc)
     except StaleExtensionError as exc:
         print(f"[prismaquant-cb] ERROR: incompatible fused FP4-v2 quality "
               f"prefill extension — {exc} FP4 prefill stays on the exact "
@@ -1780,7 +1796,8 @@ def _load_moe_persistent_b_ext_locked():
         _moe_persistent_b = _require_fused_identity(
             mod, expected_name=module_name, identity=identity,
             abi_schema=_MOE_PERSISTENT_B_ABI_SCHEMA,
-            build_dir=build_dir, source="cb_moe_persistent_b.cu")
+            build_dir=build_dir, source="cb_moe_persistent_b.cu",
+            capability=cc)
     except StaleExtensionError as exc:
         print("[prismaquant-cb] ERROR: incompatible persistent-B grouped MoE "
               f"extension — {exc} The FP4-CB MoE quality prefill stays on the "

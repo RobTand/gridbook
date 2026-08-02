@@ -121,6 +121,31 @@ ROUTE_FIELDS = (
 )
 
 
+# The contract each fused-NVFP4 activation MODE actually runs, so the dense and
+# routed dispatch sites cannot describe the same mode differently. The mode
+# strings are the env vocabulary (``rowwise256``, ``static_lsq_midm``, ...);
+# what RAN is one of three things regardless of tile or M band.
+def fused_fp4_contract(*, rowwise: bool, static_lsq: bool) -> str:
+    """The ``ROUTE_CONTRACTS`` member a fused NVFP4 lane serves."""
+    if rowwise:
+        return "nvfp4_rowwise"
+    if static_lsq:
+        return "nvfp4_static_lsq"
+    return "nvfp4_static_G"
+
+
+def bridge_contract(is_fp4: bool) -> str:
+    """The contract every QUALITY route serves — bridge, sm12x, fused mid-M.
+
+    All of them consume the exact native QDQ the decode path uses, so they
+    share one contract and differ only in GEMM schedule. Recording that is the
+    point: a report reader must be able to see that an opt-in schedule lane did
+    NOT change the activation contract, which is exactly what distinguishes it
+    from the fused-NVFP4 modes above.
+    """
+    return "fp4_group16_rtn" if is_fp4 else "fp8_per_token_dynamic"
+
+
 def emit_route(layer, *, kind: str, policy: str, symbol: str, tile_m: int = 0,
                shape: str = "", contract: str = "", state: str = "served",
                reason=None, tile_candidate_ctas: int = 0,
@@ -758,7 +783,9 @@ __all__ = [
     "ROUTE_CONTRACTS",
     "ROUTE_FIELDS",
     "ROUTE_STATES",
+    "bridge_contract",
     "emit_route",
+    "fused_fp4_contract",
     "read_route",
     "FULL_E4M3_POLICY",
     "GROUP_SIZE",

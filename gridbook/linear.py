@@ -44,7 +44,9 @@ from .ops import (cb_bf16_grouped_mm, cb_gemv_fp4_v2, cb_gemv_fp8,
                   fp4_act_qdq_or_codec)
 from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
+    bridge_contract as _route_bridge_contract,
     emit_route,
+    fused_fp4_contract as _route_fused_fp4_contract,
     reciprocal_vector as _nvfp4_reciprocal_vector,
     require_identical_loaded_scales,
     rowwise_range_multiplier as _nvfp4_rowwise_range_multiplier,
@@ -846,7 +848,23 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # Preserve the historical call shape for instrumentation and
             # compatibility wrappers that know only the rowwise flag.
             eligible = self._fused_fp4_ok(layer, K, rowwise=rowwise)
+        # K0.4 dense record for the fused NVFP4 lane. The lane carried only the
+        # three TileM integers, so a report could see WHICH tile ran but not
+        # whether the fused route ran at all — and the alternative serves a
+        # DIFFERENT activation contract, which is the one distinction the
+        # record exists to make. Tensor-free and sync-free, like the FP8 twin.
+        route_common = dict(
+            kind="dense",
+            policy=(getattr(layer, "_cb_fused_fp4_mode", None)
+                    or ("rowwise" if rowwise else
+                        "static_lsq" if static_lsq else "1")),
+            contract=_route_fused_fp4_contract(
+                rowwise=rowwise, static_lsq=static_lsq),
+            shape=f"M{int(M)}:N{int(N)}:K{int(K)}")
         if not eligible:
+            emit_route(layer, symbol="", state="fallback", tile_m=0,
+                       reason="fused fp4 dense eligibility gate declined",
+                       **route_common)
             return None
         from .cuda_ext import get_fused_fp4_ext
         fext = get_fused_fp4_ext()
@@ -881,6 +899,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         x2 = x.reshape(-1, K)
         if rowwise:
             if x2.dtype not in (torch.bfloat16, torch.float16):
+                emit_route(layer, symbol="", state="fallback", tile_m=0,
+                           reason=(f"activation dtype {x2.dtype} is not half "
+                                   f"precision; cb_nvfp4_quantize_rows "
+                                   f"requires it"),
+                           **route_common)
                 return None
             # Full UE4M3 range per row. The extension returns the exact three
             # operands consumed by the existing fused GEMM; no weight decoder,
@@ -890,6 +913,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             )
         elif static_lsq:
             if x2.dtype not in (torch.bfloat16, torch.float16):
+                emit_route(layer, symbol="", state="fallback", tile_m=0,
+                           reason=(f"activation dtype {x2.dtype} is not half "
+                                   f"precision; "
+                                   f"cb_nvfp4_quantize_static_lsq requires it"),
+                           **route_common)
                 return None
             # Keep the producer-attested G and its native E2M1/SFA payload.
             # The shared activation kernel changes only the existing per-row
@@ -921,11 +949,21 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             * ((N + FP4_FUSED_TILE_N - 1) // FP4_FUSED_TILE_N)
         )
         layer._cb_fp4_fused_sm_count = sm_count
+        route_common["tile_m"] = int(tile_m)
+        route_common["tile_candidate_ctas"] = int(
+            layer._cb_fp4_fused_tile_candidate_ctas)
+        route_common["tile_sm_count"] = int(sm_count)
+        route_common["tile_compiled"] = f"{FP4_FUSED_TILE_M_WIDE},128"
+        emit_route(layer, symbol="cb_fused_fp4_prefill_mm_scaled",
+                   state="error", reason="launch did not return",
+                   **route_common)
         y = fext.cb_fused_fp4_prefill_mm_scaled(
             aq, sfa.view(torch.uint8).reshape(-1), layer._cb_qw_padded,
             layer._cb_fp4_lut, layer._cb_fp4_compose_u8, a_scales,
             layer._cb_fp4_ones, N, K, self.k, self.n_sub, self.type_size,
             self.is_v2, lut_tile_ids, tile_m)
+        emit_route(layer, symbol="cb_fused_fp4_prefill_mm_scaled",
+                   state="served", reason=None, **route_common)
         return y.reshape(*x.shape[:-1], N)
 
     def _expand_fp4_quality_weight(self, layer, N: int,
@@ -1051,6 +1089,14 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 # xq, so only the FP32 reduction order differs. Unset (the
                 # default) leaves the route below byte-for-byte unchanged.
                 midm = getattr(layer, "_cb_fp4v2_midm", None)
+                # K0.4: all three routes below serve the SAME activation
+                # contract and differ only in GEMM schedule, so the symbol is
+                # the only field that separates them in a report — which is
+                # exactly what an opt-in schedule A/B needs to read back.
+                quality_route = dict(
+                    kind="dense", shape=f"M{int(M)}:N{int(N)}:K{int(K)}",
+                    contract=_route_bridge_contract(True),
+                    state="served", reason=None, tile_m=0)
                 if midm is not None and fp4v2_midm_eligible(
                         midm, layer, M=M, N=N, K=K, k_bits=self.k,
                         n_sub=self.n_sub, type_size=self.type_size,
@@ -1058,6 +1104,9 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                     y = fp4v2_midm_fused_mm(
                         midm, xq.reshape(M, K).contiguous(), layer,
                         N=N, K=K, k_bits=self.k)
+                    emit_route(layer, policy="fp4v2_midm",
+                               symbol="cb_fused_fp4v2_prefill_mm",
+                               **quality_route)
                 else:
                     # Exact FP4-CB-v2 -> BF16 expansion followed by the same
                     # owned device-scheduled CUTLASS grouped kernel as MoE
@@ -1075,11 +1124,18 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                         # single bf16 round; only the fp32 reduction order
                         # differs.
                         y = bf16_sm120_dense_mm(lane, xq2, W)
+                        emit_route(
+                            layer, policy="bf16_sm120",
+                            symbol="cb_bf16_grouped_mm_sm120_gather",
+                            **quality_route)
                     else:
                         expert_ends = torch.full(
                             (1,), M, dtype=torch.int32, device=x.device)
                         y = cb_bf16_grouped_mm(
                             xq2, W.unsqueeze(0), expert_ends, 0)
+                        emit_route(layer, policy="bf16_grouped_bridge",
+                                   symbol="cb_bf16_grouped_mm",
+                                   **quality_route)
                     del W
                 y = y.reshape(*x.shape[:-1], N)
             if bias is not None:

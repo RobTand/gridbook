@@ -68,7 +68,9 @@ from .native_cutlass import (native_fp4_quant, native_fp8_quant,
                              require_native_moe_activation)
 from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
+    bridge_contract as _route_bridge_contract,
     emit_route,
+    fused_fp4_contract as _route_fused_fp4_contract,
     reciprocal_vector as _nvfp4_reciprocal_vector,
     require_identical_loaded_scales,
     rowwise_range_multiplier as _nvfp4_rowwise_range_multiplier,
@@ -916,16 +918,49 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         (the swizzled SFA plane is row-block-interleaved and cannot be
         gathered), which is bit-equivalent per row at a fixed global scale.
         Returns None on any constraint miss."""
+        # K0.4 routed record for the fused NVFP4 MoE lane, which had none: a
+        # served fused routed prefill was indistinguishable in a dispatch
+        # report from one that took the bridge, which is the single thing the
+        # report exists to tell apart (the two run DIFFERENT activation
+        # contracts). Same mechanism as the FP8 grouped lane below — tensor-
+        # free, sync-free, last-write-wins.
+        route_common = dict(
+            kind="moe",
+            policy=(getattr(layer, "_cb_fused_fp4_moe_mode", None)
+                    or ("rowwise" if rowwise else
+                        "static_lsq" if static_lsq else "1")),
+            contract=_route_fused_fp4_contract(
+                rowwise=rowwise, static_lsq=static_lsq),
+            tile_m=int(tile_m), shape=_moe_shape(layer, topk_ids),
+            tile_sm_count=cb_sm_count(x.device))
         if not self._gf4_ok(
             layer, rowwise=rowwise, static_lsq=static_lsq
         ):
+            cache_attr = ("_cb_gf4_rowwise_ok_reason" if rowwise else
+                          "_cb_gf4_static_lsq_ok_reason" if static_lsq else
+                          "_cb_gf4_static_ok_reason")
+            emit_route(layer, symbol="", state="fallback",
+                       reason=(getattr(layer, cache_attr, None)
+                               or "fused fp4 MoE gate declined"),
+                       **route_common)
             return None
         if x.dtype not in (torch.bfloat16, torch.float16):
+            emit_route(layer, symbol="", state="fallback",
+                       reason=(f"activation dtype {x.dtype} is not half "
+                               f"precision; the NVFP4 quantizers require it"),
+                       **route_common)
             return None
         if tile_m not in (128, 256):
+            emit_route(layer, symbol="", state="fallback",
+                       reason=f"tile_m={tile_m} is not a compiled TileM",
+                       **route_common)
             return None
         from .cuda_ext import get_fused_fp4_ext
         fext = get_fused_fp4_ext()
+        # Phase one of the two-phase write: if either launch below raises, the
+        # record still names the symbol that was invoked and says so.
+        emit_route(layer, symbol="cb_fused_fp4_moe_grouped", state="error",
+                   reason="launch did not return", **route_common)
 
         E = layer._cb_E
         T = x.shape[0]
@@ -991,6 +1026,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         y = y * pw_pad[:, None].to(y.dtype)
         out = torch.zeros((T + 1, Kh), dtype=x.dtype, device=dev)
         out.index_add_(0, dest, y.to(out.dtype))
+        emit_route(layer, symbol="cb_fused_fp4_moe_grouped", state="served",
+                   reason=None, **route_common)
         return out[:T]
 
     def _native_bf16_chunk(self, layer) -> int:
@@ -1153,6 +1190,15 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 pair_output, aq, weight, expert_ends, c0)
             del weight
 
+        # K0.4: the DEFAULT quality bridge records itself too. Without this a
+        # fused-lane fallback left its own "fallback" record as the last write
+        # and a report could not say which route then served the request — the
+        # last-write-wins semantics only work if every route writes.
+        emit_route(layer, kind="moe", policy="bf16_grouped_bridge",
+                   symbol="cb_bf16_grouped_mm_out", tile_m=0,
+                   shape=_moe_shape(layer, topk_ids),
+                   contract=_route_bridge_contract(self.is_fp4),
+                   state="served", reason=None)
         pair_weight = topk_weights.reshape(-1).index_select(0, order) \
             .to(pair_output.dtype)
         pair_output.mul_(pair_weight[:, None])
@@ -1266,6 +1312,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         pair_output.mul_(pair_weight[:, None])
         output = torch.zeros((T, hidden), dtype=x.dtype, device=dev)
         output.index_add_(0, rows, pair_output.to(output.dtype))
+        emit_route(layer, kind="moe", policy="moe_persistent_b",
+                   symbol="cb_moe_persistent_b_prefill", tile_m=int(cfg),
+                   shape=_moe_shape(layer, topk_ids),
+                   contract=_route_bridge_contract(self.is_fp4),
+                   state="served", reason=None)
         return output
 
     def _apply_prefill_native_bf16_sm120(self, layer, x, topk_weights,
@@ -1384,6 +1435,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         y = y * pw_pad[:, None].to(y.dtype)
         out = torch.zeros((T + 1, hidden), dtype=x.dtype, device=dev)
         out.index_add_(0, dest, y.to(out.dtype))
+        # K0.4: naming the SM120 gather symbol is the point — this lane and the
+        # default bridge serve the same activation contract and differ only in
+        # schedule, so the symbol is the only field that tells them apart.
+        emit_route(layer, kind="moe", policy="bf16_sm120",
+                   symbol="cb_bf16_grouped_mm_sm120_gather_out",
+                   tile_m=int(tile_m), shape=_moe_shape(layer, topk_ids),
+                   contract=_route_bridge_contract(self.is_fp4),
+                   state="served", reason=None)
         return out[:T]
 
     # -- prefill: grouped FUSED (decode-in-prologue, one launch/stage) ------

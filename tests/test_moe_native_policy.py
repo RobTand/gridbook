@@ -879,3 +879,92 @@ def test_persistent_b_serves_once_the_contract_flag_is_absent(monkeypatch):
 
     assert method._apply_inline(layer, x, torch.ones(64, 2), ids) == "pb"
     assert taken == ["persistent-b"]
+
+
+# --- K0.4 telemetry: no route may serve without recording itself -----------
+
+
+def test_fused_fp4_moe_records_the_exact_fallback_reason():
+    """The fused NVFP4 MoE lane had no telemetry at all.
+
+    A served fused routed prefill was indistinguishable in a dispatch report
+    from one that took the bridge — and those two run DIFFERENT activation
+    contracts, which is precisely what the report exists to tell apart.
+    """
+    from gridbook.nvfp4_activation_contract import (ROUTE_CONTRACTS,
+                                                    ROUTE_FIELDS, read_route)
+
+    method = _method(k=16)
+    layer = _layer(experts=4, hidden=256, inter=256)
+    layer._cb_gf4_rowwise_ok_reason = "sentinel: gate declined, stated reason"
+    method._gf4_ok = lambda *_a, **_k: False
+    ids = torch.zeros(32, 2, dtype=torch.int32)
+    x = torch.zeros(32, 256, dtype=torch.bfloat16)
+
+    assert method._apply_prefill_grouped_fused_fp4(
+        layer, x, torch.ones(32, 2), ids, "silu", rowwise=True) is None
+
+    record = read_route(layer)
+    assert set(record) == set(ROUTE_FIELDS)
+    assert record["kind"] == "moe"
+    assert record["state"] == "fallback" and record["symbol"] == ""
+    assert record["reason"] == "sentinel: gate declined, stated reason"
+    assert record["policy"] == "rowwise"
+    assert record["contract"] == "nvfp4_rowwise"
+    assert record["contract"] in ROUTE_CONTRACTS
+    assert record["shape"] == "T32:P64:E4:H256:I256:topk2"
+    assert record["tile_m"] == 128
+
+
+def test_fused_fp4_moe_records_a_non_half_activation_as_the_reason():
+    from gridbook.nvfp4_activation_contract import read_route
+
+    method = _method(k=16)
+    layer = _layer(experts=4, hidden=256, inter=256)
+    method._gf4_ok = lambda *_a, **_k: True
+    ids = torch.zeros(32, 2, dtype=torch.int32)
+
+    assert method._apply_prefill_grouped_fused_fp4(
+        layer, torch.zeros(32, 256, dtype=torch.float32), torch.ones(32, 2),
+        ids, "silu", static_lsq=True, tile_m=256) is None
+
+    record = read_route(layer)
+    assert record["state"] == "fallback"
+    assert record["contract"] == "nvfp4_static_lsq"
+    assert record["tile_m"] == 256
+    assert "torch.float32" in record["reason"]
+
+
+def test_every_serving_route_writes_a_dispatch_record():
+    """A new lane must not be able to ship untelemetered.
+
+    K0.4's claim is that the requested policy, the kernel symbol, the tile, the
+    shape, the activation contract and the fallback state are attestable on
+    every route. That was true of the FP8 lanes only: the fused NVFP4 lanes
+    (dense and routed) and all three quality routes had no record, so the
+    claim was false for most of the dispatch surface.
+    """
+    import inspect
+
+    for owner, names in (
+        (moe.PrismaQuantCBMoEMethod, (
+            "_apply_prefill_grouped_fused_fp4",
+            "_apply_prefill_grouped_fused_v2",
+            "_apply_prefill_native_bf16",
+            "_apply_prefill_native_bf16_sm120",
+            "_apply_prefill_native_bf16_persistent_b",
+        )),
+    ):
+        for name in names:
+            source = inspect.getsource(getattr(owner, name))
+            assert "emit_route(" in source, (
+                f"{owner.__name__}.{name} serves a request without recording "
+                f"the route; K0.4's attestability claim covers every lane")
+
+    from gridbook.linear import PrismaQuantCBLinearMethod
+
+    for name in ("_try_fused_fp4", "_apply_inline"):
+        source = inspect.getsource(getattr(PrismaQuantCBLinearMethod, name))
+        assert "emit_route(" in source, (
+            f"PrismaQuantCBLinearMethod.{name} serves a request without "
+            f"recording the route")

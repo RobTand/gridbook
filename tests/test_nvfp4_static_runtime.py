@@ -599,3 +599,113 @@ def test_dense_fused_fp4_still_serves_the_contract_it_attested(monkeypatch):
     y = method._apply_inline(
         layer, torch.zeros(32, 256, dtype=torch.bfloat16))
     assert y.shape == (32, 8)
+
+
+# --- K0.4 telemetry: every dense route records what it served --------------
+
+
+def test_dense_fused_fp4_records_the_served_route(monkeypatch):
+    """The fused NVFP4 dense lane had only its three TileM integers.
+
+    A report could see WHICH tile ran but not whether the fused route ran at
+    all — and the alternative serves a different activation contract, which is
+    the one distinction the record exists to make.
+    """
+    from gridbook.nvfp4_activation_contract import (ROUTE_CONTRACTS,
+                                                    ROUTE_FIELDS, read_route)
+
+    method = _rowwise_dense_method()
+    layer = types.SimpleNamespace(
+        _cb_N=8, _cb_K=256, _cb_fused_fp4_mode="rowwise",
+        _cb_fp4_lut=torch.ones(1),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(8),
+        _cb_qw_padded=torch.ones(8, 73, dtype=torch.uint8),
+    )
+    from gridbook import cuda_ext
+
+    class Ext:
+        @staticmethod
+        def cb_nvfp4_quantize_rows(x, multiplier):
+            return (x[:, :128].to(torch.uint8),
+                    torch.zeros(x.shape[0] * 16, dtype=torch.uint8),
+                    torch.ones(x.shape[0], dtype=torch.float32))
+
+        @staticmethod
+        def cb_fused_fp4_prefill_mm_scaled(aq, *args, **kwargs):
+            # The two-phase write must already name the symbol when the launch
+            # is entered, so a raise mid-launch stays attributable.
+            record = read_route(layer)
+            assert record["state"] == "error"
+            assert record["symbol"] == "cb_fused_fp4_prefill_mm_scaled"
+            return torch.zeros(aq.shape[0], 8, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: Ext())
+    method._try_fused_fp4(
+        layer, torch.zeros(32, 256, dtype=torch.bfloat16), 8, 256, 32,
+        rowwise=True)
+
+    record = read_route(layer)
+    assert set(record) == set(ROUTE_FIELDS)
+    assert record["kind"] == "dense"
+    assert record["state"] == "served" and record["reason"] is None
+    assert record["policy"] == "rowwise"
+    assert record["contract"] == "nvfp4_rowwise"
+    assert record["contract"] in ROUTE_CONTRACTS
+    assert record["symbol"] == "cb_fused_fp4_prefill_mm_scaled"
+    assert record["shape"] == "M32:N8:K256"
+    assert record["tile_m"] in (128, 256)
+    assert record["tile_candidate_ctas"] > 0
+    assert record["tile_compiled"] == "256,128"
+
+
+@pytest.mark.parametrize("mode,flags,contract", [
+    ("rowwise", {"rowwise": True}, "nvfp4_rowwise"),
+    ("static_lsq", {"static_lsq": True}, "nvfp4_static_lsq"),
+])
+def test_dense_fused_fp4_records_the_exact_fallback_reason(
+    monkeypatch, mode, flags, contract,
+):
+    """A declined call must say WHY, in the vocabulary the report validates."""
+    from gridbook.nvfp4_activation_contract import read_route
+
+    method = _rowwise_dense_method()
+    layer = types.SimpleNamespace(
+        _cb_N=8, _cb_K=256, _cb_fused_fp4_mode=mode,
+        _cb_fp4_input_global_scale_f32=3.0,
+        _cb_fp4_lut=torch.ones(1),
+        _cb_fp4_compose_u8=torch.ones(1, dtype=torch.uint8),
+        _cb_fp4_ones=torch.ones(8),
+        _cb_qw_padded=torch.ones(8, 73, dtype=torch.uint8),
+    )
+    from gridbook import cuda_ext
+
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext",
+                        lambda: types.SimpleNamespace())
+    assert method._try_fused_fp4(
+        layer, torch.zeros(32, 256, dtype=torch.float32), 8, 256, 32,
+        **flags) is None
+
+    record = read_route(layer)
+    assert record["state"] == "fallback"
+    assert record["symbol"] == ""
+    assert record["policy"] == mode
+    assert record["contract"] == contract
+    assert "torch.float32" in record["reason"]
+    assert "half precision" in record["reason"]
+
+
+def test_the_eligibility_gate_declining_is_also_recorded(monkeypatch):
+    from gridbook.nvfp4_activation_contract import read_route
+
+    method = _rowwise_dense_method()
+    method._fused_fp4_ok = (
+        lambda layer, K, *, rowwise=False, static_lsq=False: False)
+    layer = types.SimpleNamespace(_cb_N=8, _cb_K=256,
+                                  _cb_fused_fp4_mode="rowwise")
+    assert method._try_fused_fp4(
+        layer, torch.zeros(32, 256, dtype=torch.bfloat16), 8, 256, 32,
+        rowwise=True) is None
+    record = read_route(layer)
+    assert record["state"] == "fallback"
+    assert record["reason"] == "fused fp4 dense eligibility gate declined"
