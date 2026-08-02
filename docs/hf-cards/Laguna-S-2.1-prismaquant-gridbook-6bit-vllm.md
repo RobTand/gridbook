@@ -40,7 +40,7 @@ tags:
 | | |
 |---|---|
 | **Plugin** | [`gridbook`](https://github.com/RobTand/gridbook) — an out-of-tree vLLM quantization plugin. Stock vLLM, no fork, no core patches. |
-| **GPU** | NVIDIA Blackwell, compute capability `sm_120` / `sm_121`. Measured on GB10 / DGX Spark (`sm_121`). On older GPUs the plugin still loads but runs its **Triton fallback** kernels — correct, not fast, and not a production serving target. |
+| **GPU** | NVIDIA Blackwell, compute capability `sm_120` / `sm_121`. Measured on GB10 / DGX Spark (`sm_121`). There is **no Triton fallback**: on a GPU that cannot run the native CUDA/CUTLASS kernel an artifact requires, serving **fails closed** with the missing operation instead of continuing on a slower one. Older GPU classes are unqualified — see the [compatibility table](https://github.com/RobTand/gridbook/blob/master/README.md#compatibility). |
 | **Memory** | 89.4 GB of weights on disk = **83.2 GiB** resident. Needs a ~128 GB unified/VRAM pool: measured on one DGX Spark at `--gpu-memory-utilization 0.85`. Only 12 of 48 layers are full-attention (the rest slide at w=512), so a full 256k request costs ~6 GiB of fp8 KV — model + 256k cache fit the Spark's pool. |
 | **vLLM** | Version used for these measurements is not recorded on this card. |
 | **Toolchain** | CUDA toolkit with `nvcc` on `PATH` **in the serving container** — the plugin JIT-builds its kernels on first model load (~30 s, cached). `nvcc` 13.0 is the tested toolchain. |
@@ -66,30 +66,30 @@ curl -s http://localhost:8000/v1/chat/completions \
   -d '{"model":"rdtand/Laguna-S-2.1-prismaquant-gridbook-6bit-vllm","messages":[{"role":"user","content":"Say hello in five words."}],"max_tokens":32}'
 ```
 
-**How to tell the fast path is active.** The plugin *fail-softs*: if the CUDA
-extension cannot be built it still serves, through Triton fallback kernels, at a
-fraction of the speed. That is not a crash — it is a line on stderr, tagged
-`[prismaquant-cb]`:
+**How to verify native readiness.** Gridbook has no Triton dependency or serving
+fallback. If a required CUDA/CUTLASS extension cannot be built, the relevant
+load/forward fails closed after a line on stderr tagged `[prismaquant-cb]`:
 
 ```bash
 vllm serve ... 2>&1 | grep '\[prismaquant-cb\]'
 ```
 
-Any `WARNING` or `ERROR` on that tag means the CUDA decode path did **not**
-load, and the numbers on this card are **not** reachable on your box. (The tag
-is also used for a few harmless informational lines; it is the `WARNING` /
-`ERROR` ones that matter.) The exact wording differs between plugin versions —
-**grep the tag, not the sentence.** The two that matter read roughly:
+A `WARNING` or `ERROR` that explicitly says a **required** native operation is
+unavailable means the model cannot be served through Gridbook on that
+environment. A shape-specialized optimization may be unavailable only when the
+same diagnostic names a separately qualified native CUDA/CUTLASS route. The tag
+also carries harmless informational lines, so read the message after grepping
+the stable tag. The two fatal forms read roughly:
 
 ```
-[prismaquant-cb] WARNING: gridbook's CUDA decode-GEMV extension could not be built (<ExcType>: …); falling back to the Triton decode path (slow prototype). To get the CUDA path: …
+[prismaquant-cb] WARNING: gridbook's CUDA decode-GEMV extension could not be built (<ExcType>: …); native Gridbook execution is unavailable and serving will fail closed. To enable the native path: …
 [prismaquant-cb] ERROR: broken gridbook install — gridbook is installed without its CUDA sources: …
 ```
 
 The first is an environment problem (usually no `nvcc` in the serving
 container, or a torch/CUDA version mismatch); the second is a defect in the
 install itself. Both are diagnosed in
-[troubleshooting](https://github.com/RobTand/gridbook/blob/master/docs/TROUBLESHOOTING.md#the-cuda-extension-did-not-load-triton-fallback).
+[troubleshooting](https://github.com/RobTand/gridbook/blob/master/docs/TROUBLESHOOTING.md#the-native-extension-did-not-load).
 Set `PRISMAQUANT_CB_EXT_DIR` to a writable, persistent directory to keep the
 one-time JIT build across restarts (important in containers).
 
@@ -129,9 +129,9 @@ Notes for this model:
 
 | Live card | Staged | Why |
 |---|---|---|
-| `pip install git+https://github.com/RobTand/gridbook` | `pip install gridbook` | The live command is the **worst** of the three across the family: it installs cleanly and non-editably, so `<site-packages>/csrc` does not exist, every CUDA build fails, the plugin fail-softs to Triton — and the user gets a working server that is several times slower than this card's own 14.9 tok/s / 1,822 tok/s numbers, with only a stderr line to say so. It is also unpinned. |
+| `pip install git+https://github.com/RobTand/gridbook` | `pip install gridbook` | The live command is the **worst** of the three across the family: it installs cleanly and non-editably, so `<site-packages>/csrc` does not exist, every CUDA build fails. On the fail-soft plugin of that date the user got a working server several times slower than this card's own 14.9 tok/s / 1,822 tok/s numbers, with only a stderr line to say so; current Gridbook has no Triton path and fails closed on the same install, so those numbers can no longer be silently unreachable. It is also unpinned. |
 | Serve flags spread across the intro bullet, the `## Serve` block, and a parenthetical under the A/B table | one block + one "pick per workload" note | The concurrency/prefill tradeoff is real and should be stated once, next to the command it modifies. |
-| Target hardware in prose ("Blackwell (GB10 / sm_120+)") | requirements table | `sm_120+` is not the right statement — the plugin has a `sm_80` load floor and a `sm_120`/`sm_121` *fast* path; a Hopper user passes the floor and gets Triton. |
+| Target hardware in prose ("Blackwell (GB10 / sm_120+)") | requirements table | `sm_120+` is not the right statement — the plugin has a `sm_80` load floor and a `sm_120`/`sm_121` *qualified* path; a Hopper user passes the load floor into an unqualified configuration, with no Triton path left to absorb it. |
 | No verification step | `curl` + a `[prismaquant-cb]` stderr check | Same reasoning as the other cards. |
 | No cross-links | links to the other two gridbook artifacts | Every gridbook card is currently a dead end. |
 

@@ -172,7 +172,15 @@ resident weight copy, decoder, or matmul merely to create another route.
   producer packers/metadata, and a version-attested upstream vLLM backend for
   rank-3 stock NVFP4/FP8 experts. Do not create another packer, loader, or
   native kernel. Fail closed if a selected backend drops activation scales and
-  changes a declared W4A4 unit into W4A16.
+  changes a declared W4A4 unit into W4A16. **The fail-closed clause is
+  SHIPPED and generalized** (`gridbook/delegated_preflight.py`, called from the
+  single delegation choke point in `config.py`): at model load a delegated
+  group whose resolved backend is Triton-backed, is documented to discard
+  declared activation scales, or is simply unaudited for an NVFP4 W4A4
+  declaration, raises with the backend class, the group, and the contract it
+  would violate. No environment variable bypasses it. The rest of D0.2 — the
+  packed-expert loader work itself — remains open and is only needed if the
+  assignment calls for it.
 - [ ] **D0.3 — Close the exact-rate evidence gap.** Rerun exact-byte
   0.6B/4B/27B endpoints and optimized menus over the representative workload
   matrix. At 4.5 bpp compare native NVFP4 with FP8-CB K36 using exact

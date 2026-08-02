@@ -31,7 +31,19 @@ Gridbook has **no Triton dependency or serving lane**. Its production operators
 are packaged native CUDA support kernels and CUTLASS GEMM/grouped-GEMM kernels;
 if the native kernel required by an artifact, shape, or GPU cannot be loaded,
 serving fails closed with the missing operation and build guidance. It does not
-continue on a slower implementation. The old Triton prototype measured **4.20
+continue on a slower implementation. That guarantee is scoped to Gridbook's own
+operators: a vLLM installation may still load and run Triton for components
+Gridbook does not own — its attention backend, and under `VLLM_COMPILE` the
+Inductor-lowered *surrounding* model graph, which Gridbook's opaque op bodies
+are excluded from by design. Inside that lane the claim is enforced rather than
+asserted: a static ratchet scans the package, `scripts/`, and `tests/` for any
+Triton-reaching import; a GPU-lane check proves that executing a Gridbook op
+imports no Triton module vLLM had not already loaded; and a model-load preflight
+fails closed if a delegated `compressed-tensors` group resolves to a
+Triton-backed backend or to one that would silently drop its declared activation
+scales ([`tests/test_no_triton_runtime.py`](tests/test_no_triton_runtime.py),
+[`gridbook/delegated_preflight.py`](gridbook/delegated_preflight.py)).
+The old Triton prototype measured **4.20
 tok/s** on the 27B where the native CUDA GEMV measured **10.28 tok/s**; that is
 historical evidence from the retired path, not a selectable fallback or a
 current benchmark. See

@@ -40,7 +40,7 @@ tags:
 | | |
 |---|---|
 | **Plugin** | [`gridbook`](https://github.com/RobTand/gridbook) — an out-of-tree vLLM quantization plugin. Stock vLLM, no fork, no core patches. |
-| **GPU** | NVIDIA Blackwell, compute capability `sm_120` / `sm_121`. Measured on GB10 / DGX Spark (`sm_121`). On older GPUs the plugin still loads but runs its **Triton fallback** kernels — correct, not fast, and not a production serving target. |
+| **GPU** | NVIDIA Blackwell, compute capability `sm_120` / `sm_121`. Measured on GB10 / DGX Spark (`sm_121`). There is **no Triton fallback**: on a GPU that cannot run the native CUDA/CUTLASS kernel an artifact requires, serving **fails closed** with the missing operation instead of continuing on a slower one. Older GPU classes are unqualified — see the [compatibility table](https://github.com/RobTand/gridbook/blob/master/README.md#compatibility). |
 | **Memory** | ~106 GB resident weights (including the CB-quantized MTP drafter) on a ~121 GB usable unified pool — one 128 GB DGX Spark. `--gpu-memory-utilization 0.90` is the **validated** setting; higher values OOM'd under long-prefill activation spikes. |
 | **vLLM** | **≥ 0.23** with `HYV3ForCausalLM` (stock — no fork). Speed numbers on this card were measured on vLLM 0.23. |
 | **Toolchain** | CUDA toolkit with `nvcc` on `PATH` **in the serving container** — the plugin JIT-builds its kernels on first model load (~30 s, cached). `nvcc` 13.0 is the tested toolchain. |
@@ -70,30 +70,30 @@ curl -s http://localhost:8000/v1/chat/completions \
   -d '{"model":"hy3","messages":[{"role":"user","content":"Say hello in five words."}],"max_tokens":32}'
 ```
 
-**How to tell the fast path is active.** The plugin *fail-softs*: if the CUDA
-extension cannot be built it still serves, through Triton fallback kernels, at a
-fraction of the speed. That is not a crash — it is a line on stderr, tagged
-`[prismaquant-cb]`:
+**How to verify native readiness.** Gridbook has no Triton dependency or serving
+fallback. If a required CUDA/CUTLASS extension cannot be built, the relevant
+load/forward fails closed after a line on stderr tagged `[prismaquant-cb]`:
 
 ```bash
 vllm serve ... 2>&1 | grep '\[prismaquant-cb\]'
 ```
 
-Any `WARNING` or `ERROR` on that tag means the CUDA decode path did **not**
-load, and the numbers on this card are **not** reachable on your box. (The tag
-is also used for a few harmless informational lines; it is the `WARNING` /
-`ERROR` ones that matter.) The exact wording differs between plugin versions —
-**grep the tag, not the sentence.** The two that matter read roughly:
+A `WARNING` or `ERROR` that explicitly says a **required** native operation is
+unavailable means the model cannot be served through Gridbook on that
+environment. A shape-specialized optimization may be unavailable only when the
+same diagnostic names a separately qualified native CUDA/CUTLASS route. The tag
+also carries harmless informational lines, so read the message after grepping
+the stable tag. The two fatal forms read roughly:
 
 ```
-[prismaquant-cb] WARNING: gridbook's CUDA decode-GEMV extension could not be built (<ExcType>: …); falling back to the Triton decode path (slow prototype). To get the CUDA path: …
+[prismaquant-cb] WARNING: gridbook's CUDA decode-GEMV extension could not be built (<ExcType>: …); native Gridbook execution is unavailable and serving will fail closed. To enable the native path: …
 [prismaquant-cb] ERROR: broken gridbook install — gridbook is installed without its CUDA sources: …
 ```
 
 The first is an environment problem (usually no `nvcc` in the serving
 container, or a torch/CUDA version mismatch); the second is a defect in the
 install itself. Both are diagnosed in
-[troubleshooting](https://github.com/RobTand/gridbook/blob/master/docs/TROUBLESHOOTING.md#the-cuda-extension-did-not-load-triton-fallback).
+[troubleshooting](https://github.com/RobTand/gridbook/blob/master/docs/TROUBLESHOOTING.md#the-native-extension-did-not-load).
 Set `PRISMAQUANT_CB_EXT_DIR` to a writable, persistent directory to keep the
 one-time JIT build across restarts (important in containers).
 
@@ -102,10 +102,25 @@ Notes for this model:
 - **MTP speculative decoding is on by default above** (`k=1`), and is what the
   card's 16.1 tok/s prose-decode figure was measured with. To serve without it,
   drop the last two flags (`--attention-backend` and `--speculative-config`).
-- **With spec decode, both models must run `TRITON_ATTN`.** FlashInfer only
-  captures single-token-decode graphs; if the drafter and target disagree on the
-  backend, vLLM silently disables *all* CUDA graphs. `k=1` is the optimum on
-  current vLLM — the drafter runs uncaptured and its host cost scales with `k`.
+- **The attention backend is outside Gridbook's operator lane.** Gridbook's
+  no-Triton guarantee covers *its own* operators — decode GEMV, codebook
+  expansion, activation QDQ, routing/combine, and the CUTLASS GEMMs. It does
+  not cover vLLM's attention kernels, which are vLLM's choice and are
+  unaffected by this plugin. The `TRITON_ATTN` pair above is therefore
+  **what was measured at publication, not a recommendation**: with spec decode
+  the drafter and target must agree on a backend, and on the vLLM of that date
+  FlashInfer captured only single-token-decode graphs, so a disagreeing pair
+  made vLLM silently disable *all* CUDA graphs. `k=1` was the optimum on that
+  vLLM — the drafter runs uncaptured and its host cost scales with `k`.
+- **Serving without a Triton attention backend.** Dropping the last two flags
+  serves this artifact drafter-free on vLLM's default attention backend, with
+  no `TRITON_ATTN` anywhere; the 16.1 tok/s prose-decode figure was measured
+  *with* spec decode and does not carry over to that configuration. Keeping
+  spec decode on a non-Triton backend — `--attention-backend FLASHINFER` plus
+  the matching `"attention_backend"` inside `--speculative-config` — is the
+  option to try, but it is **UNTESTED for this artifact**: re-qualifying it
+  needs a served 295B run, and none has been made. Do not read it as qualified,
+  and do not carry this card's spec-decode numbers across a backend change.
 - **This artifact uses a `FULL_DECODE_ONLY` graph capture, not `--enforce-eager`**
   — unlike the other two gridbook artifacts. Its hot decode paths are the FP4-v2
   grouped MoE kernels, which have no host-side branching, so capture is safe and
