@@ -235,17 +235,21 @@ experimental native-FP4 prefill, **off by default**:
   decoder, or matmul. Kernel parity and raw speed do not promote either flag;
   see the [dated served-evidence decision](audits/fused_nvfp4_enablement_2026-07-31.md).
 
-**`gridbook/csrc/cb_persistent_prefill.cu`** and
 **`gridbook/csrc/cb_persistent_tc.cu`**
 (research source only, **not serving-reachable**) — the persistent-N schedule:
 decode each B N-tile **once** into smem and stream M through it (no `[N,K]` in
-HBM, INV-1). The first is an f32-FMA schedule/correctness reference; the second
-is the tensor-core build. **Verdict: measured negative for dense prefill** —
-parity-green but 2–5.7× slower than expand-then-GEMM at 27B shapes, because the
-CUDA expander had already cut the dense expand tax to ~10%. The serving
-selector, custom op, and JIT loader were deleted; the `.cu` files remain only
-for direct research tests. The MoE analog of the idea is tracked in the
-canonical [`kernel TODO`](../ROADMAP.md#kernel-todo-canonical).
+HBM, INV-1), with phase 2 on the fp8 tensor cores. **Verdict: measured negative
+for dense prefill** — parity-green but 2–5.7× slower than expand-then-GEMM at
+27B shapes, because the CUDA expander had already cut the dense expand tax to
+~10%. The serving selector, custom op, and JIT loader were deleted; this one
+`.cu` remains for direct research tests behind
+`GRIDBOOK_RESEARCH_PERSISTENT_TC=1` (`tests/test_persistent_tc.py` compiles it
+itself). Its f32-FMA twin `cb_persistent_prefill.cu` — the schedule's
+correctness reference, superseded verbatim by the tensor-core build — was
+deleted on 2026-08-01 per
+[`audits/ultraplan_perf_2026-08-01.md`](audits/ultraplan_perf_2026-08-01.md) §4.
+The MoE analog of the idea is tracked in the canonical
+[`kernel TODO`](../ROADMAP.md#kernel-todo-canonical).
 
 ## Environment switches
 
@@ -324,5 +328,6 @@ exported** 0.6B tensors and (a) matches `nvfp4_cb_reconstruct @ x` to ≤1e-2 re
 `tests/test_cuda_gemv.py` gates the `cb_gemv.cu` kernels (dense + grouped-MoE fp8
 and fp4-v2, QDQ bit-exactness, the expander) against independent PyTorch/FP64
 references. The grouped-BF16 bridge is gated against segmented BF16 matmul
-references, while `tests/test_fused_prefill.py` and
-`tests/test_persistent_prefill.py` gate the specialized prefill kernels.
+references, while `tests/test_fused_prefill.py` gates the specialized prefill
+kernels and `tests/test_persistent_tc.py` gates the research-only persistent-N
+source behind its opt-in.

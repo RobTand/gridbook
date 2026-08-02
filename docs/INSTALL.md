@@ -185,8 +185,9 @@ Nothing is compiled at `pip install` time. The extensions are built lazily by
 | `pq_cb_fused` (FP8-CB mid-M fused CUTLASS prefill) | `gridbook/csrc/cb_fused_gemm.cu` + `csrc/cutlass_fork/*.hpp` | **at weight load** when `PRISMAQUANT_CB_FUSED_MIDM` is enabled; availability and mode are fixed before serving, and later environment mutation raises | **Optional specialization.** An unavailable specialization stays on the exact native FP8 expansion/CUTLASS route; it is never first-built inside an eligible forward. |
 | `pq_cb_fused_fp4_<identity>` (native-NVFP4 fused CUTLASS prefill) | `gridbook/csrc/cb_fused_fp4_gemm.cu` + `csrc/cutlass_fork/*.hpp` | only when the explicit fused-FP4 experiment is preloaded or selected | **Optional, experimental, and default-off.** An unavailable specialization stays on the exact native FP4-v2 expansion/grouped-BF16 route. |
 
-The retained persistent-N `.cu` files are research sources, not a sixth serving
-extension: their selector, custom op, and package loader are deleted.
+The one retained persistent-N `.cu` file (`cb_persistent_tc.cu`) is a research
+source, not a sixth serving extension: its selector, custom op, and package
+loader are deleted, and its test compiles it directly behind an opt-in.
 
 **Where "~30 s" comes from.** Cold `get_ext()` in the reference container
 (`vllm-node:latest`, compile-only, **no** `--gpus`, `PRISMAQUANT_CB_EXT_DIR`
