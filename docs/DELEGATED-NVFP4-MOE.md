@@ -155,6 +155,16 @@ of the generic warning's wording.
 
 ## Preflight policy
 
+**Shipped.** Gridbook enforces this table at model load in
+`gridbook/delegated_preflight.py`, called from the single delegation choke point
+in `config.py` (`_delegate`). A delegated group is refused when its resolved
+backend is Triton-backed, when the backend is documented to discard declared
+activation scales, or when an NVFP4 W4A4 declaration resolves to a backend that
+is not in the audited table — UNKNOWN fails closed rather than becoming a false
+pass. The error names the resolved backend class, the group, and the declared
+contract. There is no environment-variable bypass. Extending the tables is the
+supported way to admit a newly audited backend.
+
 A useful preflight has three outcomes:
 
 | Declared scheme | Requested backend | Result |

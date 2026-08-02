@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Fail closed at model load when a delegated `compressed-tensors` group
+  resolves to a backend that is Triton-backed, discards the declared activation
+  scales (Marlin's NVFP4 W4A4 → W4A16 conversion), or is unaudited for an NVFP4
+  W4A4 declaration. The error names the resolved backend class, the group, and
+  the violated contract; there is no environment-variable bypass. Weight-only
+  declarations are unaffected, including the published 27B's stock NVFP4 W4A16
+  vision tower, which vLLM legitimately serves on Marlin.
+- Extend the no-Triton ratchet to `scripts/` and `tests/`, pin
+  `runtime_contract.json`'s dynamically imported model-module list to a
+  reviewed allow-list, and add a GPU-lane assertion that executing a
+  Gridbook-owned op imports no Triton module vLLM had not already loaded.
+- Correct the staged HF card blocks and the README's no-Triton sentence: the
+  cards no longer describe a Triton decode fallback or quote its retired
+  warning string, the Hy3 card documents `TRITON_ATTN` as the attention backend
+  measured at publication rather than a recommendation, and the README carries
+  the operator-lane scope qualifier the other docs already use.
+
 ## 0.5.0 — 2026-08-01
 
 - Remove Gridbook's Triton dependency and every Gridbook-defined Triton

@@ -31,18 +31,28 @@ block and a markdown **body** block — plus an un-fenced "notes" section that i
 ## APPLY GATE — read before pasting anything
 
 The rendered blocks tell a reader to run `pip install gridbook`. **That command
-is not yet true.** Three preconditions, **none of which is satisfied by this
-repository as published today**. Check each one against the *published* repo —
-not against a local development tree — because that is what a reader installs.
+is not yet true.** Three preconditions, none of which was satisfied by this
+repository when this page was written. Check each one against the *published*
+repo — not against a local development tree — because that is what a reader
+installs.
+
+**Status on this tree (0.5.0):** preconditions 1 and 2 now **invert** — the
+sources live at `gridbook/csrc/`, `cuda_ext.py` resolves them through
+`importlib.resources` with no `os.pardir` in code, and it emits the
+`could not be built` wording quoted below. Precondition 3 (PyPI) is
+**UNVERIFIED** here: it is a network fact and was not re-checked for this edit.
+The clean-venv wheel test below is still the gate that matters.
 
 **1. Packaging — fixed upstream, NOT YET IN THIS REPO.**
 
 `gridbook/cuda_ext.py` resolves the CUDA sources repo-root-relative
 (`.../gridbook/../csrc/...`) while `pyproject.toml` ships only the `gridbook*`
 package. Under any **non-editable** install, `<site-packages>/csrc` does not
-exist, every extension build raises `FileNotFoundError`, and the plugin
-fail-softs to the slow Triton path. Confirmed in the wild: the "Additional note"
-in [issue #1](https://github.com/RobTand/gridbook/issues/1).
+exist and every extension build raises `FileNotFoundError`. On the plugin of
+that date this fail-softed to the slow Triton path; current Gridbook has no such
+path and fails closed instead, so the same defect is loud rather than silent.
+Confirmed in the wild: the "Additional note" in
+[issue #1](https://github.com/RobTand/gridbook/issues/1).
 
 The fix — sources moved *inside* the package as `gridbook/csrc/`, resolved
 through `importlib.resources`, plus a distinct `IncompleteInstallError` so a
