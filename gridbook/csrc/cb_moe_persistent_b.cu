@@ -464,8 +464,10 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
       cp_async_commit();
 
       for (int st = 0; st < total_stages; ++st) {
-        // Packed superblock staging, once per kStagesPerSb TK-slices.  Safe
-        // against the previous slice's decode by the (2) barrier below.
+        // Packed superblock staging, once per kStagesPerSb TK-slices.  Its
+        // only reader is `decode_B`, and barrier (2) of the previous stage
+        // separates that read from this write.  It touches neither `sA` nor
+        // `sB`, so it is safe this side of barrier (1).
         if (st % kStagesPerSb == 0) {
           const int sbi = st / kStagesPerSb;
           for (int n = warp; n < TN; n += WARPS) {
@@ -484,7 +486,21 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
           }
         }
 
-        // Prefetch the next A slice into the other buffer.
+        // Wait for THIS stage's A slice (the only group outstanding here) and
+        // publish it.  Barrier (1) does double duty, and the second duty is
+        // what makes the two-barrier loop correct: every thread reaches it
+        // only after finishing `mma(st-1)`, so once past it no thread is
+        // still reading `sA[(st-1)&1]` or `sB`.  The prefetch below and the
+        // decode below therefore both write buffers nobody is reading.
+        cp_async_wait<0>();
+        __syncthreads();                                            // (1)
+
+        // Prefetch the NEXT A slice into the other buffer.  This must come
+        // AFTER barrier (1): `(st+1) & 1 == (st-1) & 1`, so issuing it before
+        // the barrier would let one warp's async copy overwrite the exact tile
+        // another warp is still feeding to `mma(st-1)` -- a WAR race that is
+        // invisible while warps happen to run in lockstep and corrupts as soon
+        // as they do not.
         if (st + 1 < total_stages) {
           const int kb = (st + 1) * kTK;
           uint16_t* dstbuf = sA + ((st + 1) & 1) * (TM * kTK);
@@ -501,8 +517,6 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
           }
         }
         cp_async_commit();
-        cp_async_wait<1>();
-        __syncthreads();                                            // (1)
 
         // ---- DECODE: TN weight rows x TK columns, once per stage ---------
         {

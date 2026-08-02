@@ -77,17 +77,22 @@ except ModuleNotFoundError:  # pragma: no cover - the container always has it
     raise SystemExit(2)
 
 _GRIDBOOK_MODULES = {
-    "gridbook", "gridbook.codec", "gridbook.cuda_ext", "gridbook.moe_routing",
-    "gridbook.moe_persistent_b_lane", "gridbook.native_cutlass", "gridbook.ops",
+    "gridbook", "gridbook.codec", "gridbook.cuda_ext", "gridbook.ops",
+    "gridbook.moe_persistent_b_lane", "gridbook.moe_routing",
+    "gridbook.native_cutlass",
 }
 try:
+    # gridbook.moe itself is deliberately NOT imported: it pulls in vLLM, and
+    # every routing helper the arms need is in these leaf modules.
     from gridbook import codec, ops
-    from gridbook.cuda_ext import (NativeKernelUnavailableError, get_bf16_grouped_ext,
-                                   get_ext, get_ext_v2, get_moe_persistent_b_ext)
-    from gridbook.moe_persistent_b_lane import config as persistent_b_config
-    from gridbook.moe_persistent_b_lane import resolve_cfg as persistent_b_resolve_cfg
-    from gridbook.moe_persistent_b_lane import supports as persistent_b_supports
-    from gridbook.moe_routing import cb_grouped_block_offsets, cb_grouped_pad_routing
+    from gridbook.cuda_ext import (NativeKernelUnavailableError,
+                                   get_bf16_grouped_ext, get_ext, get_ext_v2,
+                                   get_moe_persistent_b_ext)
+    from gridbook.moe_persistent_b_lane import (config as pb_config,
+                                                resolve_cfg as pb_resolve_cfg,
+                                                supports as pb_supports)
+    from gridbook.moe_routing import (cb_grouped_block_offsets,
+                                      cb_grouped_pad_routing)
     from gridbook.native_cutlass import (native_moe_activation,
                                          require_native_moe_activation)
 except ModuleNotFoundError as exc:  # pragma: no cover - checkout fallback
@@ -95,12 +100,14 @@ except ModuleNotFoundError as exc:  # pragma: no cover - checkout fallback
         raise
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from gridbook import codec, ops
-    from gridbook.cuda_ext import (NativeKernelUnavailableError, get_bf16_grouped_ext,
-                                   get_ext, get_ext_v2, get_moe_persistent_b_ext)
-    from gridbook.moe_persistent_b_lane import config as persistent_b_config
-    from gridbook.moe_persistent_b_lane import resolve_cfg as persistent_b_resolve_cfg
-    from gridbook.moe_persistent_b_lane import supports as persistent_b_supports
-    from gridbook.moe_routing import cb_grouped_block_offsets, cb_grouped_pad_routing
+    from gridbook.cuda_ext import (NativeKernelUnavailableError,
+                                   get_bf16_grouped_ext, get_ext, get_ext_v2,
+                                   get_moe_persistent_b_ext)
+    from gridbook.moe_persistent_b_lane import (config as pb_config,
+                                                resolve_cfg as pb_resolve_cfg,
+                                                supports as pb_supports)
+    from gridbook.moe_routing import (cb_grouped_block_offsets,
+                                      cb_grouped_pad_routing)
     from gridbook.native_cutlass import (native_moe_activation,
                                          require_native_moe_activation)
 
@@ -426,7 +433,7 @@ def bench(args) -> int:
     type_size = 4 * args.k + 9
     has_sm120 = hasattr(bf16_ext, "cb_bf16_grouped_mm_sm120_out")
     tile_m = int(bf16_ext.cb_bf16_grouped_sm120_tile_m()) if has_sm120 else 0
-    cfg = persistent_b_resolve_cfg(pb_ext)
+    cfg = pb_resolve_cfg(pb_ext)
 
     device_name = torch.cuda.get_device_name()
     major, minor = torch.cuda.get_device_capability()
@@ -435,8 +442,9 @@ def bench(args) -> int:
     print(f"# fp4-CB-v2 k={args.k} type_size={type_size} "
           f"top_k={args.top_k} seed={args.seed} tol={args.tol:g} "
           f"iters={args.iters} warmup={args.warmup}")
-    print(f"# persistent_b cfg={cfg} tile_k={pb_ext.cb_moe_persistent_b_tile_k()} "
-          f"configs={persistent_b_config(pb_ext)}")
+    print(f"# persistent_b cfg={cfg} "
+          f"tile_k={pb_ext.cb_moe_persistent_b_tile_k()} "
+          f"configs={pb_config(pb_ext)}")
     if has_sm120:
         print(f"# sm120 bridge tile_m={tile_m}, config="
               f"{bf16_ext.cb_bf16_grouped_sm120_config()}")
@@ -454,11 +462,12 @@ def bench(args) -> int:
         key = f"{label} E={E}"
         if args.only and args.only.lower() not in key.lower():
             continue
-        reason = persistent_b_supports(
+        reason = pb_supports(
             is_fp4=True, is_v2=True, n_sub=2, k_bits=args.k,
             type_size=type_size, hidden=hidden, inter=inter)
         if reason is not None:
-            print(f"# SKIP {key}: persistent-B lane cannot serve it ({reason})")
+            print(f"# SKIP {key}: persistent-B lane cannot serve it "
+                  f"({reason})")
             continue
         weights = _weights(shape, args)
         for tokens in args.tokens:
@@ -531,7 +540,8 @@ def main(argv=None) -> int:
     parser.add_argument("--tol", type=float, default=4e-3,
                         help="max relative L2 between arms (reassociation)")
     parser.add_argument("--only", type=str, default="",
-                        help="run only rows whose 'label E=N' key contains this")
+                        help="run only rows whose 'label E=N' key contains "
+                             "this substring (iteration aid)")
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=10)
     return bench(parser.parse_args(argv))
