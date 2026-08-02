@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.5.1 — 2026-08-01
+
+- Documentation-only release. Add the ultraplan performance audit
+  (`docs/audits/ultraplan_perf_2026-08-01.md`): the FP8-CB ↔ NVFP4-CB
+  convergence diagnosis and phased plan of record (P0–P5), the redundancy and
+  dead-code ledger, the remaining process-level Triton surface, and the
+  producer-side NVFP4-vs-FP8-CB allocation analysis at matched bytes
+  (prismaquant @ `dca6f80`). No runtime, kernel, packaging, or dispatch
+  changes; the served behavior of 0.5.0 is unchanged.
+
 ## 0.5.0 — 2026-08-01
 
 - Remove Gridbook's Triton dependency and every Gridbook-defined Triton
