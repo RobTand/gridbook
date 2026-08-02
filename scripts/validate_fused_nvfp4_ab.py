@@ -2067,11 +2067,23 @@ def _finalize_gate_report(
         isinstance(chunked_prefill_contract, Mapping)
         and chunked_prefill_contract.get("promotion_compatible") is True
     )
+    k02_verdict = report.get("k02_stage_attestation")
+    k02_blocks_evidence = bool(
+        isinstance(k02_verdict, Mapping) and k02_verdict.get("pass") is not True
+    )
     promotion_contract_complete = (
         full_vocab_teacher_present and not teacher_quality_thresholds_missing
         and chunked_prefill_promotion_compatible
+        and not k02_blocks_evidence
     )
     report["promotion_contract"] = {
+        "routed_moe_stage_attestation_required": True,
+        "routed_moe_stage_attestation_verdict": (
+            k02_verdict.get("verdict")
+            if isinstance(k02_verdict, Mapping)
+            else None
+        ),
+        "routed_moe_stage_attestation_pass": not k02_blocks_evidence,
         "teacher_full_vocab_kl_required": True,
         "teacher_full_vocab_kl_requested": full_vocab_teacher_requested,
         "teacher_full_vocab_kl_observed": full_vocab_teacher_observed,
@@ -2089,7 +2101,11 @@ def _finalize_gate_report(
         "coarse_kl_may_reject_but_cannot_greenlight": True,
     }
     report["promotion_recommendation"] = (
-        "measurement_failed"
+        # An unattested routed-MoE artifact fails every fused attempt closed to
+        # the baseline loop, so the comparison never measured the fused path.
+        validation_common.EVIDENCE_FALLBACK_TELEMETRY
+        if k02_blocks_evidence
+        else "measurement_failed"
         if not report["measurement_valid"]
         else "measurement_only_no_promotion_thresholds_configured"
         if measurement_only
@@ -2139,6 +2155,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     prompts = bootstrap.prompts
     dataset = bootstrap.dataset
     quality_kl_mode = bootstrap.quality_kl_mode
+    # K0.2 precondition: decide BEFORE the engine exists whether a routed-MoE
+    # comparison against this artifact can be evidence at all.  No GPU, no
+    # vLLM, no model load — just the producer's stage attestation against the
+    # serialized scalars.
+    k02_verdict = validation_common.k02_readiness_verdict(
+        bootstrap.candidate_path, mode=args.mode
+    )
 
     probe = (
         DenseDispatchProbe(
@@ -2298,6 +2321,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     fused_dispatch = aggregate_dispatch(fused_records)
     observed_pids = sorted(set(baseline_dispatch["pids"] + fused_dispatch["pids"]))
     core_gates = {
+        "routed_moe_stage_attestation": k02_verdict,
         "chunked_prefill_execution_contract": (
             validation_common.chunked_prefill_integrity_gate(
                 chunked_prefill_contract
@@ -2461,6 +2485,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "runtime": runtime,
         "extension": extension,
+        "k02_stage_attestation": k02_verdict,
         "candidate_artifact_provenance": candidate_artifact_provenance,
         "dataset": dataset,
         "model_load_seconds": model_load_s,

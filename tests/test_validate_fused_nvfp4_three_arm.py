@@ -420,6 +420,19 @@ def test_report_records_requested_and_resolved_chunked_prefill(tmp_path):
     assert settings["chunked_prefill_contract"] == contract
 
 
+_K02_PASS = {
+    "verdict": "attested_and_verified",
+    "evidence_class": "stage_attested_fused_moe_evidence_eligible",
+    "pass": True,
+}
+_K02_FALLBACK_TELEMETRY = {
+    "verdict": "not_attested",
+    "evidence_class": "fallback_telemetry_not_evidence",
+    "failing_module": None,
+    "pass": False,
+}
+
+
 def _dispatch(
     *, success=3, fallback=0, opportunities=3, attempts=3,
     native_bf16_calls=0, native_bf16_errors=0,
@@ -456,6 +469,7 @@ def test_static_and_rowwise_dispatch_are_independent_hard_gates():
         permutation_attestations=permutations,
         expected_measurements=1,
         chunked_prefill_contract={"promotion_compatible": True},
+        k02_verdict=_K02_PASS,
     )
     assert gates["static_dispatch"]["zero_fallbacks"]["pass"] is True
     assert gates["static_dispatch"]["complete_fused_coverage"]["pass"] is True
@@ -485,6 +499,7 @@ def test_unsupported_chunked_prefill_override_invalidates_measurement():
             "would_trigger_vllm_warning": True,
             "promotion_compatible": False,
         },
+        k02_verdict=_K02_PASS,
     )
     contract = gates["chunked_prefill_execution_contract"]
     assert contract["would_trigger_vllm_warning"] is True
@@ -510,6 +525,7 @@ def test_moe_integrity_requires_native_bf16_only_for_quality_baseline():
         },
         expected_measurements=1,
         chunked_prefill_contract={"promotion_compatible": True},
+        k02_verdict=_K02_PASS,
     )
     assert gates["baseline_positive_native_bf16_dispatch"]["pass"] is True
     assert gates["baseline_native_bf16_no_errors"]["pass"] is True
@@ -615,3 +631,60 @@ def test_entry_point_help_is_cpu_only_and_does_not_import_vllm():
     )
     assert "baseline/static/rowwise" in completed.stdout
     assert "--dense-range" in completed.stdout
+
+
+def test_k02_stage_attestation_is_a_core_gate_and_evidence_label():
+    common = three.validation_common
+    dispatch = {arm: _dispatch() for arm in three.ARMS}
+    dispatch["baseline"] = _dispatch(success=0, opportunities=0, attempts=0)
+    kwargs = dict(
+        dispatch=dispatch,
+        execution_mode="moe128",
+        selector_attestations=[{"label": "one", "pass": True}],
+        permutation_attestations={
+            "quality": {"pass": True},
+            "warmup": {"pass": True},
+        },
+        expected_measurements=1,
+        chunked_prefill_contract={"promotion_compatible": True},
+    )
+    dispatch["baseline"]["native_bf16_calls"] = 3
+    unattested = three.core_integrity_gates(
+        k02_verdict=_K02_FALLBACK_TELEMETRY, **kwargs
+    )
+    assert unattested["routed_moe_stage_attestation"]["pass"] is False
+    assert three._all_gate_leaves_pass(unattested) is False
+    attested = three.core_integrity_gates(k02_verdict=_K02_PASS, **kwargs)
+    assert three._all_gate_leaves_pass(attested) is True
+
+    args = SimpleNamespace(
+        max_mean_kl=None,
+        max_mean_nll_regression=None,
+        max_ppl_relative_regression=None,
+        max_teacher_mean_kl=0.2,
+        max_teacher_kl_regression=0.01,
+        min_timing_speedup=None,
+        teacher_model="/models/teacher",
+        teacher_full_vocab_kl=True,
+        measurement_only=False,
+    )
+    report = {"quality": {"comparisons": {
+        f"baseline_vs_{arm}": {
+            "kl_baseline_to_candidate": {"mean": 0.0},
+            "nll": {"delta": 0.0},
+            "ppl": {"relative_delta": 0.0},
+        }
+        for arm in three.CANDIDATE_ARMS
+    }}, "teacher_quality": {
+        arm: {"kl_reference_to_candidate": {"mean": 0.0}}
+        for arm in three.ARMS
+    }}
+    three._finalize_report(args, report, unattested)
+    assert report["status"] == "gate_failed"
+    assert report["promotion_recommendation"] == (
+        common.EVIDENCE_FALLBACK_TELEMETRY
+    )
+    assert report["promotion_contract"][
+        "routed_moe_stage_attestation_pass"
+    ] is False
+    assert report["promotion_contract"]["complete"] is False
