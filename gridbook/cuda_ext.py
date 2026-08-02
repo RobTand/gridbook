@@ -629,14 +629,24 @@ _bf16_grouped_tried = False
 _bf16_grouped_lock = threading.Lock()
 
 # The packaged files that define the grouped BF16 bridge: the translation unit,
-# the shared grouping glue and the expert-indexed mainloop fork. All three are
-# hashed into the module identity — the module is now header-bearing, and
-# torch's extension versioner hashes only the ``.cu`` it is handed (2026-08-01
+# the shared grouping glue, the expert-indexed mainloop fork, and the
+# expert-row-broadcast EVT node the glue itself includes. All four are hashed
+# into the module identity — the module is header-bearing, and torch's
+# extension versioner hashes only the ``.cu`` it is handed (2026-08-01
 # performance audit, §3 P0.3/P1).
+#
+# TRANSITIVE, not just direct. ``sm120_expert_row_broadcast.hpp`` is reached
+# through ``cb_grouped_common.hpp``, not named by the ``.cu``, and it was
+# missing here until 2026-08-02 while the other three digest-keyed modules all
+# declared it — so an edit to that header moved their identities and left this
+# one serving a stale binary. The identity tests are transitive for exactly
+# this reason: they follow #include edges through Gridbook-owned headers rather
+# than reading the ``.cu``'s first level only.
 _BF16_GROUPED_BUILD_INPUTS = (
     "cb_bf16_grouped_gemm.cu",
     "cb_grouped_common.hpp",
     "cutlass_fork/sm120_bf16_expert_mma.hpp",
+    "cutlass_fork/sm120_expert_row_broadcast.hpp",
 )
 # Starts at 1: this module's identity payload is new.
 _BF16_GROUPED_ABI_SCHEMA = 1
@@ -668,11 +678,30 @@ _BF16_GROUPED_SM120_CAPABILITIES = ((12, 0), (12, 1))
 # (see ``_bf16_grouped_build_identity``) so a cache entry built without the
 # lane can never be served as one that has it.
 _BF16_GROUPED_SM120_DEFINE = "PRISMAQUANT_CB_BF16_SM120"
+# The ENVIRONMENT variable that opts the lane in at dispatch
+# (``bf16_grouped_lane._FLAG``). Deliberately the same string as the nvcc macro
+# — one name for one lane — but read here for a different question: not "does
+# this build contain the lane" but "did the operator ASK for it", which is what
+# decides whether a failed sm12x half may fall back to the SM80 half below.
+_BF16_GROUPED_SM120_FLAG = _BF16_GROUPED_SM120_DEFINE
 
 
 def bf16_grouped_sm120_buildable(capability) -> bool:
     """Whether the sm12x-native BF16 lane is compiled for ``capability``."""
     return tuple(capability) in _BF16_GROUPED_SM120_CAPABILITIES
+
+
+def _bf16_grouped_sm120_opted_in() -> bool:
+    """Whether the operator asked for the sm12x lane, for the fallback gate.
+
+    Read directly rather than through ``bf16_grouped_lane.requested()``: this
+    runs inside the loader's failure handling, where that function's typo
+    ValueError and its process-stable latch would both be actively unhelpful.
+    Anything other than unset/``0`` counts as opted IN, so a typo keeps the
+    strict fail-closed behaviour here and is then diagnosed properly by
+    ``requested()`` at the dispatch site.
+    """
+    return os.environ.get(_BF16_GROUPED_SM120_FLAG, "").strip() not in ("", "0")
 
 
 def get_bf16_grouped_ext():
@@ -723,10 +752,64 @@ def _bf16_grouped_build_identity(torch, cpp_extension, *, src_dir: str,
         defines=({_BF16_GROUPED_SM120_DEFINE: "1"} if sm120_lane else {}))
 
 
+def _build_bf16_grouped_half(torch, cpp_extension, *, capability,
+                             sm120_lane: bool):
+    """Build ONE compiled configuration of the grouped BF16 bridge.
+
+    Split out of the loader so the sm12x half and the SM80-only half are the
+    same code path with one flag between them: the retry below is then a second
+    call rather than a duplicated build recipe that could drift from this one.
+    Returns the validated module; the caller owns the fail-soft reporting.
+    """
+    src_dir = _require_csrc(*_BF16_GROUPED_BUILD_INPUTS)
+    cut_inc = _find_cutlass_include()
+    util_inc = os.path.join(os.path.dirname(cut_inc), "tools", "util",
+                            "include")
+    identity, _identity_payload = _bf16_grouped_build_identity(
+        torch, cpp_extension, src_dir=src_dir, cutlass_include=cut_inc,
+        util_include=util_inc, capability=capability, sm120_lane=sm120_lane)
+    module_name = f"pq_cb_bf16_grouped_{identity}"
+    build_root = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
+    build_dir = os.path.join(build_root, "bf16_grouped", identity)
+    os.makedirs(build_dir, exist_ok=True)
+    flags = ["-O3", "--expt-relaxed-constexpr"]
+    if sm120_lane:
+        flags.append(f"-D{_BF16_GROUPED_SM120_DEFINE}=1")
+    # MEASURED (GB10, cc 12.1, CUTLASS 4.3.4): the sm12x lane needs the
+    # ``a``-suffixed target even though its MMA (`m16n8k16` bf16) is
+    # architecture-GENERIC. The reason is the kernel LAYER, not the
+    # instruction: sm90_gemm_tma_warpspecialized_pingpong.hpp compiles
+    # its operator() body only under __CUDA_ARCH_FEAT_SM90/120/121_ALL (or
+    # a conditional/family target), and otherwise emits
+    # CUTE_INVALID_CONTROL_PATH. Built as plain ``sm_121`` the module
+    # compiles and loads, then every launch aborts with "Arch conditional
+    # MMA instruction used without targeting appropriate compute
+    # capability". Built as ``sm_121a`` the same source passes its bit
+    # tests. A build WITHOUT the lane keeps the portable generic target,
+    # since it compiles only the SM80 lane — on 12.x as well as elsewhere.
+    flags.append(_gencode_flag(capability, accelerated=sm120_lane))
+    mod = cpp_extension.load(
+        name=module_name,
+        sources=[os.path.join(src_dir, "cb_bf16_grouped_gemm.cu")],
+        extra_include_paths=[cut_inc, util_inc, src_dir],
+        extra_cuda_cflags=flags,
+        build_directory=build_dir,
+        verbose=False)
+    required = _BF16_GROUPED_SYMBOLS + (
+        _BF16_GROUPED_SM120_SYMBOLS if sm120_lane else ())
+    mod = _require_symbols(
+        mod, required, build_dir=build_dir,
+        source="cb_bf16_grouped_gemm.cu")
+    return _require_fused_identity(
+        mod, expected_name=module_name, identity=identity,
+        abi_schema=_BF16_GROUPED_ABI_SCHEMA,
+        build_dir=build_dir, source="cb_bf16_grouped_gemm.cu")
+
+
 def _load_bf16_grouped_ext_locked():
     """Build and publish grouped BF16 with ``_bf16_grouped_lock`` held."""
     global _bf16_grouped, _bf16_grouped_tried
-    build_dir = "<unresolved>"
     try:
         import torch  # noqa: F401  (must import before cpp_extension)
         from torch.utils import cpp_extension
@@ -738,50 +821,45 @@ def _load_bf16_grouped_ext_locked():
                 f"CUTLASS grouped BF16 requires compute capability >= 8.0, "
                 f"got {cc[0]}.{cc[1]}")
         sm120_lane = bf16_grouped_sm120_buildable(cc)
-        src_dir = _require_csrc(*_BF16_GROUPED_BUILD_INPUTS)
-        cut_inc = _find_cutlass_include()
-        util_inc = os.path.join(os.path.dirname(cut_inc), "tools", "util",
-                                "include")
-        identity, _identity_payload = _bf16_grouped_build_identity(
-            torch, cpp_extension, src_dir=src_dir, cutlass_include=cut_inc,
-            util_include=util_inc, capability=cc, sm120_lane=sm120_lane)
-        module_name = f"pq_cb_bf16_grouped_{identity}"
-        build_root = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
-            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
-        build_dir = os.path.join(build_root, "bf16_grouped", identity)
-        os.makedirs(build_dir, exist_ok=True)
-        flags = ["-O3", "--expt-relaxed-constexpr"]
-        if sm120_lane:
-            flags.append(f"-D{_BF16_GROUPED_SM120_DEFINE}=1")
-        # MEASURED (GB10, cc 12.1, CUTLASS 4.3.4): the sm12x lane needs the
-        # ``a``-suffixed target even though its MMA (`m16n8k16` bf16) is
-        # architecture-GENERIC. The reason is the kernel LAYER, not the
-        # instruction: sm90_gemm_tma_warpspecialized_pingpong.hpp compiles
-        # its operator() body only under __CUDA_ARCH_FEAT_SM90/120/121_ALL (or
-        # a conditional/family target), and otherwise emits
-        # CUTE_INVALID_CONTROL_PATH. Built as plain ``sm_121`` the module
-        # compiles and loads, then every launch aborts with "Arch conditional
-        # MMA instruction used without targeting appropriate compute
-        # capability". Built as ``sm_121a`` the same source passes its bit
-        # tests. Non-12.x devices keep the portable generic target, since they
-        # compile only the SM80 lane.
-        flags.append(_gencode_flag(cc, accelerated=sm120_lane))
-        mod = cpp_extension.load(
-            name=module_name,
-            sources=[os.path.join(src_dir, "cb_bf16_grouped_gemm.cu")],
-            extra_include_paths=[cut_inc, util_inc, src_dir],
-            extra_cuda_cflags=flags,
-            build_directory=build_dir,
-            verbose=False)
-        required = _BF16_GROUPED_SYMBOLS + (
-            _BF16_GROUPED_SM120_SYMBOLS if sm120_lane else ())
-        mod = _require_symbols(
-            mod, required, build_dir=build_dir,
-            source="cb_bf16_grouped_gemm.cu")
-        _bf16_grouped = _require_fused_identity(
-            mod, expected_name=module_name, identity=identity,
-            abi_schema=_BF16_GROUPED_ABI_SCHEMA,
-            build_dir=build_dir, source="cb_bf16_grouped_gemm.cu")
+        try:
+            _bf16_grouped = _build_bf16_grouped_half(
+                torch, cpp_extension, capability=cc, sm120_lane=sm120_lane)
+        except IncompleteInstallError:
+            # A packaged source is missing. Both halves compile from exactly
+            # those files, so a retry cannot succeed; report the install
+            # defect.
+            raise
+        except Exception as exc:  # noqa: BLE001 — decide, then re-raise or not
+            # THE DEFAULT BRIDGE DOES NOT DEPEND ON THE OPT-IN LANE. On cc
+            # 12.x the sm12x collective is compiled in unconditionally, and
+            # before 2026-08-02 any failure of that half — an nvcc error in the
+            # CUTLASS 3.x collective, a missing sm120 binding — left
+            # ``_bf16_grouped`` None, which made ``require_bf16_grouped_ext``
+            # fail EVERY CB model load on a GB10, including the overwhelming
+            # majority that never set the flag. The lane is opt-in; its build
+            # failure must cost only the lane.
+            #
+            # So: retry WITHOUT the lane macro. That is a genuinely different
+            # build with a different identity, hence a different module name
+            # and build directory, so nothing about the strict cache-identity
+            # contract is bent to do it — the SM80-only configuration is the
+            # same one every non-Blackwell device already builds and serves.
+            #
+            # With the flag SET the old behaviour is exactly right and is kept:
+            # the operator asked to measure that lane, and silently serving the
+            # SM80 schedule would answer a different question.
+            if not sm120_lane or _bf16_grouped_sm120_opted_in():
+                raise
+            print("[prismaquant-cb] WARNING: the OPT-IN sm12x-native BF16 "
+                  f"grouped lane failed to build ({type(exc).__name__}: "
+                  f"{exc}). {_BF16_GROUPED_SM120_FLAG} is unset, so Gridbook "
+                  "is rebuilding the DEFAULT SM80-schedule bridge without it. "
+                  "Serving is unaffected — the default NVFP4-CB prefill never "
+                  f"uses the lane — but {_BF16_GROUPED_SM120_FLAG}=1 will "
+                  "fail the model load on this box until the lane builds.",
+                  file=sys.stderr, flush=True)
+            _bf16_grouped = _build_bf16_grouped_half(
+                torch, cpp_extension, capability=cc, sm120_lane=False)
     except StaleExtensionError as exc:
         print("[prismaquant-cb] ERROR: incompatible CUTLASS grouped BF16 "
               f"extension — {exc} Native quality prefill is unavailable and "

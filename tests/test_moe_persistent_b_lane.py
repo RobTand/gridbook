@@ -30,6 +30,8 @@ import types
 
 import pytest
 
+from conftest import gridbook_include_closure
+
 torch = pytest.importorskip("torch")
 cuda_ext = pytest.importorskip(
     "gridbook.cuda_ext", reason="gridbook not importable")
@@ -457,11 +459,14 @@ def test_declared_build_inputs_cover_every_gridbook_include():
 
     Adding a Gridbook include to ``cb_moe_persistent_b.cu`` without declaring
     it here would leave that header out of the cache key — the stale-kernel
-    class the identity mechanism exists to prevent.
+    class the identity mechanism exists to prevent. TRANSITIVE since
+    2026-08-02: this source includes no Gridbook header today, so the closure
+    is empty and the assertion is a standing guard rather than a live check —
+    but if it ever grows one that itself includes another, both must land in
+    the tuple, which is precisely the case the grouped-BF16 module got wrong.
     """
-    with open(_source_path(), encoding="utf-8") as source:
-        included = set(re.findall(
-            r'#include\s+"((?:cutlass_fork/|cb_)[^"]+)"', source.read()))
+    included = gridbook_include_closure(cuda_ext.csrc_dir(),
+                                        "cb_moe_persistent_b.cu")
     declared = set(cuda_ext._MOE_PERSISTENT_B_BUILD_INPUTS)
     assert "cb_moe_persistent_b.cu" in declared
     assert included <= declared, (

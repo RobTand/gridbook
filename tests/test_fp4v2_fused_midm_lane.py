@@ -38,6 +38,8 @@ import types
 
 import pytest
 
+from conftest import gridbook_include_closure
+
 torch = pytest.importorskip("torch")
 
 from gridbook import cuda_ext  # noqa: E402
@@ -417,19 +419,20 @@ def test_the_declared_inputs_cover_the_fork_and_the_shared_glue():
 def test_the_declared_inputs_are_read_from_the_source_not_restated():
     """Adding a Gridbook include without declaring it must fail here.
 
-    The same gate the FP8 and grouped-BF16 modules carry: the declared set is
-    checked AGAINST the translation unit rather than trusted, so the one edit
-    that reintroduces the stale-kernel class cannot pass review silently.
+    The same gate the FP8 and grouped-BF16 modules carry, and TRANSITIVE since
+    2026-08-02: a header reached only through ``cb_grouped_common.hpp`` changes
+    this binary exactly as a directly included one does, and reading the
+    translation unit's own include list alone is how the grouped-BF16 module
+    lost ``sm120_expert_row_broadcast.hpp`` from its cache key.
     """
     path = os.path.join(cuda_ext.csrc_dir(), "cb_fused_fp4v2_gemm.cu")
     if not os.path.isfile(path):
         pytest.skip("cb_fused_fp4v2_gemm.cu not present in this install")
-    with open(path, encoding="utf-8") as source:
-        included = set(re.findall(
-            r'#include\s+"((?:cutlass_fork/|cb_)[^"]+)"', source.read()))
+    included = gridbook_include_closure(cuda_ext.csrc_dir(),
+                                        "cb_fused_fp4v2_gemm.cu")
     declared = set(cuda_ext._FUSED_FP4V2_BUILD_INPUTS)
     assert included <= declared, (
-        f"cb_fused_fp4v2_gemm.cu includes {sorted(included - declared)}, "
+        f"cb_fused_fp4v2_gemm.cu reaches {sorted(included - declared)}, "
         f"which do not key its build identity — a cached kernel built from "
         f"an older copy of those headers would be served")
 

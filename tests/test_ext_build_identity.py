@@ -24,6 +24,8 @@ import types
 
 import pytest
 
+from conftest import gridbook_include_closure
+
 cuda_ext = pytest.importorskip(
     "gridbook.cuda_ext", reason="gridbook not importable")
 
@@ -235,22 +237,24 @@ def _fp8_identity_fixture(tmp_path):
 
 
 def test_fp8_identity_names_every_packaged_build_input():
-    """The declared inputs are the .cu plus the headers it includes.
+    """The declared inputs are the .cu plus every header it reaches.
 
-    Read from the packaged source rather than restated, so adding a
-    ``cutlass_fork`` include to ``cb_fused_gemm.cu`` without declaring it here
-    fails instead of quietly leaving that header out of the cache key.
+    Read from the packaged source rather than restated, and TRANSITIVELY: a
+    ``cutlass_fork`` include added to ``cb_fused_gemm.cu`` *or to any Gridbook
+    header it already includes* must key the cache, because either edit changes
+    the binary. Checking only the ``.cu``'s own include list is what let
+    ``sm120_expert_row_broadcast.hpp`` drop out of the grouped-BF16 identity
+    while three sibling modules declared it.
     """
     path = os.path.join(cuda_ext.csrc_dir(), "cb_fused_gemm.cu")
     if not os.path.isfile(path):
         pytest.skip("cb_fused_gemm.cu not present in this install")
-    with open(path, encoding="utf-8") as source:
-        included = set(re.findall(
-            r'#include\s+"(cutlass_fork/[^"]+)"', source.read()))
+    included = gridbook_include_closure(cuda_ext.csrc_dir(),
+                                        "cb_fused_gemm.cu")
     declared = set(cuda_ext._FUSED_BUILD_INPUTS)
     assert "cb_fused_gemm.cu" in declared
     assert included <= declared, (
-        f"cb_fused_gemm.cu includes {sorted(included - declared)}, which do "
+        f"cb_fused_gemm.cu reaches {sorted(included - declared)}, which do "
         f"not key its build identity — a cached kernel built from an older "
         f"copy of those headers would be served")
 
@@ -353,38 +357,50 @@ def _bf16_identity_fixture(tmp_path):
 def test_bf16_identity_names_every_packaged_build_input():
     """Declared inputs are read from the source, not restated.
 
-    Adding an include to ``cb_bf16_grouped_gemm.cu`` without declaring it here
-    would leave that header out of the cache key — the stale-kernel class the
-    identity mechanism exists to prevent.
+    TRANSITIVE (2026-08-02): this module's declared set covered its direct
+    includes and stopped, so ``cutlass_fork/sm120_expert_row_broadcast.hpp`` —
+    reached through ``cb_grouped_common.hpp``, and declared by all three
+    sibling modules — was absent from the grouped-BF16 cache key. Editing that
+    header moved every other module's identity and left this one serving the
+    binary built from the old copy.
     """
     path = os.path.join(cuda_ext.csrc_dir(), "cb_bf16_grouped_gemm.cu")
     if not os.path.isfile(path):
         pytest.skip("cb_bf16_grouped_gemm.cu not present in this install")
-    with open(path, encoding="utf-8") as source:
-        included = set(re.findall(
-            r'#include\s+"((?:cutlass_fork/|cb_)[^"]+)"', source.read()))
+    included = gridbook_include_closure(cuda_ext.csrc_dir(),
+                                        "cb_bf16_grouped_gemm.cu")
     declared = set(cuda_ext._BF16_GROUPED_BUILD_INPUTS)
     assert "cb_bf16_grouped_gemm.cu" in declared
+    assert "cutlass_fork/sm120_expert_row_broadcast.hpp" in included, (
+        "the closure walker no longer reaches the transitively included "
+        "header this test exists to catch; the walk itself is broken")
     assert included <= declared, (
-        f"cb_bf16_grouped_gemm.cu includes {sorted(included - declared)}, "
+        f"cb_bf16_grouped_gemm.cu reaches {sorted(included - declared)}, "
         f"which do not key its build identity")
 
 
 def test_shared_grouping_header_keys_every_module_that_includes_it():
-    """cb_grouped_common.hpp is a build input of all three CUTLASS modules."""
+    """Every module reaching cb_grouped_common.hpp keys IT AND ITS INCLUDES.
+
+    Four modules include the shared grouping glue, and the glue itself includes
+    the expert-row-broadcast EVT node — so "declares the shared header" is only
+    half the property. Both halves are asserted from the closure.
+    """
     for source, declared in (
         ("cb_fused_gemm.cu", cuda_ext._FUSED_BUILD_INPUTS),
         ("cb_fused_fp4_gemm.cu", cuda_ext._FUSED_FP4_BUILD_INPUTS),
         ("cb_bf16_grouped_gemm.cu", cuda_ext._BF16_GROUPED_BUILD_INPUTS),
+        ("cb_fused_fp4v2_gemm.cu", cuda_ext._FUSED_FP4V2_BUILD_INPUTS),
     ):
         path = os.path.join(cuda_ext.csrc_dir(), source)
         if not os.path.isfile(path):
             pytest.skip(f"{source} not present in this install")
-        with open(path, encoding="utf-8") as handle:
-            assert '#include "cb_grouped_common.hpp"' in handle.read()
-        assert "cb_grouped_common.hpp" in declared, (
-            f"{source} includes the shared grouping header without keying it "
-            f"into its build identity")
+        included = gridbook_include_closure(cuda_ext.csrc_dir(), source)
+        assert "cb_grouped_common.hpp" in included
+        assert included <= set(declared), (
+            f"{source} reaches {sorted(included - set(declared))} through the "
+            f"shared grouping header without keying them into its build "
+            f"identity")
 
 
 @pytest.mark.parametrize("mutated", cuda_ext._BF16_GROUPED_BUILD_INPUTS)
@@ -479,20 +495,129 @@ def test_bf16_bridge_stays_generic_off_blackwell(monkeypatch, tmp_path):
     assert not any("a," in flag or flag.endswith("a") for flag in flags)
 
 
-def test_bf16_bridge_requires_the_sm120_bindings_where_it_compiles_them(
+def _patch_load_sequence(monkeypatch, results):
+    """Serve one ``results`` entry per ``load`` call; Exceptions are raised.
+
+    The sm12x fallback below is the only place two builds happen in one
+    resolution, and telling them apart is the whole point of the test.
+    """
+    pytest.importorskip("torch")
+    cpp_extension = pytest.importorskip("torch.utils.cpp_extension")
+    calls = []
+    pending = list(results)
+
+    def fake_load(*args, **kwargs):
+        calls.append((args, kwargs))
+        outcome = pending.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if "name" in kwargs:
+            outcome.__name__ = kwargs["name"]
+        return outcome
+
+    monkeypatch.setattr(cpp_extension, "load", fake_load)
+    return calls
+
+
+def test_bf16_bridge_requires_the_sm120_bindings_when_the_lane_is_REQUESTED(
         monkeypatch, capsys, tmp_path):
-    """On 12.x a module missing the lane is a broken build, so it is refused."""
+    """With the flag SET, a module missing the lane fails the load closed.
+
+    The operator asked to measure that schedule; quietly serving the SM80 one
+    would answer a different question, so this half keeps the strict behaviour
+    the lane shipped with.
+    """
     monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    monkeypatch.setenv("PRISMAQUANT_CB_BF16_SM120", "1")
     _patch_capability(monkeypatch, (12, 1))
     monkeypatch.setattr(cuda_ext, "_find_cutlass_include",
                         lambda: str(_cutlass_tree(tmp_path)))
-    _patch_load(monkeypatch, _stub(cuda_ext._BF16_GROUPED_SYMBOLS))
+    calls = _patch_load(monkeypatch, _stub(cuda_ext._BF16_GROUPED_SYMBOLS))
 
     assert cuda_ext.get_bf16_grouped_ext() is None
+    assert len(calls) == 1, "a requested lane must not be retried away"
     error = capsys.readouterr().err
     assert "incompatible CUTLASS grouped BF16" in error
     for name in cuda_ext._BF16_GROUPED_SM120_SYMBOLS:
         assert name in error
+
+
+@pytest.mark.parametrize("flag", [None, "0"])
+@pytest.mark.parametrize("failure", [
+    RuntimeError("nvcc: sm120 collective failed to compile"),
+    "missing-bindings",
+])
+def test_a_failed_optin_lane_falls_back_to_the_default_bridge(
+        monkeypatch, capsys, tmp_path, flag, failure):
+    """An OPT-IN lane's build failure must cost only the lane.
+
+    cc 12.x compiles the sm12x collective into the bridge unconditionally, so
+    before 2026-08-02 any failure of that half — an nvcc error, or a module
+    that came back without the seven sm120 bindings — published
+    ``_bf16_grouped = None``. ``require_bf16_grouped_ext`` is called on the
+    DEFAULT path by both ``linear.py`` and ``moe.py``, so that failed EVERY CB
+    model load on a GB10, including the overwhelming majority with the flag
+    unset. The retry is a genuinely different build (no lane macro, generic
+    target, therefore a different identity and directory), which is exactly
+    what the identity mechanism is for.
+    """
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    monkeypatch.delenv("PRISMAQUANT_CB_BF16_SM120", raising=False)
+    if flag is not None:
+        monkeypatch.setenv("PRISMAQUANT_CB_BF16_SM120", flag)
+    _patch_capability(monkeypatch, (12, 1))
+    # Built ONCE: the fallback resolves the include tree twice, and
+    # ``_cutlass_tree`` creates directories.
+    include = str(_cutlass_tree(tmp_path))
+    monkeypatch.setattr(cuda_ext, "_find_cutlass_include", lambda: include)
+    good = _stub(cuda_ext._BF16_GROUPED_SYMBOLS)
+    first = (_stub(cuda_ext._BF16_GROUPED_SYMBOLS)
+             if failure == "missing-bindings" else failure)
+    calls = _patch_load_sequence(monkeypatch, [first, good])
+
+    assert cuda_ext.get_bf16_grouped_ext() is good
+    assert len(calls) == 2, "the SM80 half was never rebuilt"
+
+    lane_flags, plain_flags = (call[1]["extra_cuda_cflags"] for call in calls)
+    assert "-DPRISMAQUANT_CB_BF16_SM120=1" in lane_flags
+    assert "-gencode=arch=compute_121a,code=sm_121a" in lane_flags
+    # The retry is the same configuration every non-Blackwell device builds:
+    # no lane macro, and therefore the portable generic target.
+    assert not any(f.startswith("-DPRISMAQUANT_CB_BF16_SM120")
+                   for f in plain_flags)
+    assert "-gencode=arch=compute_121,code=sm_121" in plain_flags
+    # Distinct identities, hence distinct module names AND build directories:
+    # the fallback never reuses the failed half's cache entry.
+    assert calls[0][1]["name"] != calls[1][1]["name"]
+    assert (calls[0][1]["build_directory"]
+            != calls[1][1]["build_directory"])
+
+    error = capsys.readouterr().err
+    assert "OPT-IN sm12x-native BF16 grouped lane failed to build" in error
+    assert "PRISMAQUANT_CB_BF16_SM120=1 will fail the model load" in error
+
+
+def test_a_missing_packaged_source_is_not_retried_as_a_lane_failure(
+        monkeypatch, capsys, tmp_path):
+    """Both halves compile from the same files, so a broken install cannot
+    be rebuilt into a working bridge — it is reported as the packaging defect
+    it is, with no second nvcc run."""
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    monkeypatch.delenv("PRISMAQUANT_CB_BF16_SM120", raising=False)
+    _patch_capability(monkeypatch, (12, 1))
+    monkeypatch.setattr(cuda_ext, "_find_cutlass_include",
+                        lambda: str(_cutlass_tree(tmp_path)))
+    monkeypatch.setattr(
+        cuda_ext, "_require_csrc",
+        lambda *names: (_ for _ in ()).throw(
+            cuda_ext.IncompleteInstallError("cb_bf16_grouped_gemm.cu missing")))
+    calls = _patch_load(monkeypatch, _stub(cuda_ext._BF16_GROUPED_SYMBOLS))
+
+    assert cuda_ext.get_bf16_grouped_ext() is None
+    assert calls == []
+    error = capsys.readouterr().err
+    assert "broken gridbook install" in error
+    assert "sm12x-native BF16 grouped lane failed to build" not in error
 
 
 # ---------------------------------------------------------------------------
