@@ -199,7 +199,7 @@ def test_sm120_config_fits_the_sm120_shared_memory_budget():
     128 MMA threads assert that layer is really the one instantiated.
     """
     (tile_m, tile_n, tile_k, stages, smem, capacity, mma_threads,
-     swizzle_small, swizzle_large, threshold) = \
+     swizzle_small, swizzle_large, threshold, gather_mainloop) = \
         ext.cb_bf16_grouped_sm120_config()
     assert (tile_m, tile_n, tile_k) == (64, 128, 64)
     assert mma_threads == 128, "TileM=64 requires the pingpong kernel layer"
@@ -210,6 +210,8 @@ def test_sm120_config_fits_the_sm120_shared_memory_budget():
     # CUTLASS) and its two measured values must straddle the threshold.
     assert swizzle_small >= 1 and swizzle_large >= swizzle_small
     assert threshold > 0
+    # The in-mainloop A-row gather mode is part of the compiled lane.
+    assert gather_mainloop == 1
 
 
 @sm120
@@ -392,6 +394,225 @@ def test_sm120_rejects_contract_violations(mutate, message):
     bad_a, bad_w, bad_ids = mutate(a, weights, ids)
     with pytest.raises(RuntimeError, match=message):
         ops.cb_bf16_grouped_mm_sm120(bad_a, bad_w, bad_ids, TILE_M)
+
+
+# ===========================================================================
+# The IN-MAINLOOP A-ROW GATHER mode of the same collective.
+#
+# Its contract is BIT-IDENTITY with the padded-copy mode: the producer loads
+# the same smem bytes (indexed cp.async with zero-fill instead of TMA over a
+# materialized padded copy), the consumer/MMA/epilogue are the same code, so
+# the outputs must be equal to the bit — a stronger gate than the tolerance
+# band, and it is exactly why the gather mode is not a requalification event.
+# ===========================================================================
+
+
+def _row_src32(source):
+    """The padded-copy layout's source vector, as the gather kernel takes it.
+
+    Padding rows may carry ANY id outside [0, S); -1 is what the routed
+    layout uses, so that is what the gate feeds."""
+    return source.to(torch.int32)
+
+
+@sm120
+@pytest.mark.parametrize("counts,k,n", [
+    ([0, 3, 0, 300, 0, 129, 1, 0], 512, 256),          # uneven + empty
+    ([0, 0, 0, 0, 0, 0, 0, 900], 4096, 512),           # single expert, long K
+    ([128, 128, 128, 128, 128, 128, 128, 128], 256, 1024),  # exact multiples
+    ([1] * 8, 256, 128),                               # one row per expert
+    ([64, 65, 191, 192, 193, 0, 7, 256], 1024, 4096),  # tile boundaries
+    ([65] * 64, 256, 128),                             # large grid: swizzle 8
+    ([17, 0, 260, 33, 128, 5], 1032, 264),             # K-residue: K%64 != 0
+    ([5, 2, 9], 8, 128),                               # K below one k-tile
+], ids=["uneven-empty", "single-expert-longK", "exact-multiple",
+        "one-row-each", "tile-boundaries", "large-grid-swizzle",
+        "k-residue", "k-align-floor"])
+def test_sm120_gather_matches_padded_copy_bitwise(counts, k, n):
+    """Gather mode == padded-copy mode, to the BIT, on every routing shape.
+
+    The K-residue case matters: the TMA path zero-fills the out-of-bounds
+    K tail of its box, and the gather path's predicate must reproduce those
+    zeros exactly or the last k-tile's MMA consumes different bytes.
+    """
+    torch.manual_seed(20260802)
+    experts = len(counts)
+    pairs = sum(counts)
+    a = torch.randn(pairs, k, device=DEV, dtype=torch.bfloat16)
+    weights = torch.randn(experts, n, k, device=DEV, dtype=torch.bfloat16)
+
+    padded_ref, source = _run_padded(a, weights, counts)
+    expert_ids, _ = _padded_layout(counts)
+    gathered = ops.cb_bf16_grouped_mm_sm120_gather(
+        a, _row_src32(source), weights, expert_ids, TILE_M)
+
+    assert gathered.shape == padded_ref.shape
+    assert torch.equal(gathered, padded_ref), (
+        "the in-mainloop gather loaded different bytes than the padded copy")
+
+
+@sm120
+def test_sm120_gather_reads_duplicated_rows_like_the_routed_operator():
+    """row_src may name one source row many times (top_k duplication)."""
+    torch.manual_seed(11)
+    counts = [70, 70, 70]
+    k, n = 512, 256
+    source_rows = 70  # every expert reads the same 70 rows
+    a = torch.randn(source_rows, k, device=DEV, dtype=torch.bfloat16)
+    weights = torch.randn(len(counts), n, k, device=DEV,
+                          dtype=torch.bfloat16)
+    expert_ids, source = _padded_layout(counts)
+    dup_source = torch.where(source < 0, source, source % source_rows)
+
+    zext = torch.cat([a, a.new_zeros((1, k))])
+    gather = torch.where(dup_source < 0,
+                         torch.full_like(dup_source, source_rows), dup_source)
+    a_pad = zext.index_select(0, gather).contiguous()
+    padded_ref = ops.cb_bf16_grouped_mm_sm120(a_pad, weights, expert_ids,
+                                              TILE_M)
+    gathered = ops.cb_bf16_grouped_mm_sm120_gather(
+        a, dup_source.to(torch.int32), weights, expert_ids, TILE_M)
+    assert torch.equal(gathered, padded_ref)
+
+
+@sm120
+def test_sm120_gather_dense_e1_matches_the_padded_helper():
+    """The dense helper's layout: row_src = arange(Mp), ids >= M read zeros."""
+    torch.manual_seed(4242)
+    m, k, n = 300, 1024, 3072
+    a = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
+    blocks = (m + TILE_M - 1) // TILE_M
+    mp = blocks * TILE_M
+
+    row_src = torch.arange(mp, dtype=torch.int32, device=DEV)
+    ids = torch.zeros(blocks, dtype=torch.int32, device=DEV)
+    gathered = ops.cb_bf16_grouped_mm_sm120_gather(
+        a, row_src, weight.unsqueeze(0), ids, TILE_M)
+
+    a_pad = torch.cat([a, a.new_zeros((mp - m, k))]).contiguous()
+    padded_ref = ops.cb_bf16_grouped_mm_sm120(a_pad, weight.unsqueeze(0),
+                                              ids, TILE_M)
+    assert torch.equal(gathered, padded_ref)
+    assert not gathered[m:].any(), "rows past M gather zeros"
+
+
+@sm120
+def test_sm120_gather_oob_ids_produce_zero_rows():
+    """Any id outside [0, S) — negative or too large — is a zero row.
+
+    The reference is the padded-copy MODE on the equivalent materialized
+    tile (bit-identity is the gather contract); rows whose ids are -1, == S
+    or far beyond S must all come out exactly as the zero rows the padded
+    copy would carry there.
+    """
+    k, n = 256, 128
+    a = torch.randn(10, k, device=DEV, dtype=torch.bfloat16)
+    weights = torch.randn(2, n, k, device=DEV, dtype=torch.bfloat16)
+    ids = torch.zeros(1, dtype=torch.int32, device=DEV)
+    row_src = torch.full((TILE_M,), -1, dtype=torch.int32, device=DEV)
+    row_src[0] = 3
+    row_src[1] = 10        # == S: out of bounds
+    row_src[2] = 2 ** 30   # far out of bounds
+    out = ops.cb_bf16_grouped_mm_sm120_gather(a, row_src, weights, ids,
+                                              TILE_M)
+    assert torch.isfinite(out).all()
+    a_pad = torch.zeros(TILE_M, k, device=DEV, dtype=torch.bfloat16)
+    a_pad[0] = a[3]
+    padded_ref = ops.cb_bf16_grouped_mm_sm120(a_pad, weights, ids, TILE_M)
+    assert torch.equal(out, padded_ref)
+    assert not out[1:].any(), "every out-of-range id must read a zero row"
+
+
+@sm120
+def test_sm120_gather_out_variant_writes_the_same_bytes_in_place():
+    torch.manual_seed(5)
+    counts = [200, 0, 60]
+    k, n = 512, 256
+    a = torch.randn(sum(counts), k, device=DEV, dtype=torch.bfloat16)
+    weights = torch.randn(len(counts), n, k, device=DEV, dtype=torch.bfloat16)
+    expert_ids, source = _padded_layout(counts)
+    allocating = ops.cb_bf16_grouped_mm_sm120_gather(
+        a, _row_src32(source), weights, expert_ids, TILE_M)
+    into = torch.empty_like(allocating)
+    ops.cb_bf16_grouped_mm_sm120_gather_out(
+        into, a, _row_src32(source), weights, expert_ids, TILE_M)
+    assert torch.equal(into, allocating)
+
+
+@sm120
+@pytest.mark.parametrize("mutate,message", [
+    (lambda a, r, w, e: (a, r[:-1], w, e), "multiple of the grouped tile_m"),
+    (lambda a, r, w, e: (a, r.to(torch.int64), w, e),
+     "row_src must be a contiguous int32"),
+    (lambda a, r, w, e: (a, r.cpu(), w, e),
+     "row_src must be a contiguous int32"),
+    (lambda a, r, w, e: (a, r, w, e[:-1]), "expert_ids must be contiguous"),
+    (lambda a, r, w, e: (a.float(), r, w, e), "must be BF16"),
+], ids=["ragged-row-src", "int64-row-src", "cpu-row-src", "short-ids",
+        "fp32-a"])
+def test_sm120_gather_rejects_contract_violations(mutate, message):
+    k, n = 256, 128
+    a = torch.randn(40, k, device=DEV, dtype=torch.bfloat16)
+    weights = torch.randn(2, n, k, device=DEV, dtype=torch.bfloat16)
+    row_src = torch.arange(2 * TILE_M, dtype=torch.int32, device=DEV)
+    ids = torch.zeros(2, dtype=torch.int32, device=DEV)
+    bad = mutate(a, row_src, weights, ids)
+    with pytest.raises(RuntimeError, match=message):
+        ops.cb_bf16_grouped_mm_sm120_gather(*bad, TILE_M)
+
+
+@sm120
+def test_sm120_packed_expert_order_is_a_pure_block_permutation():
+    """The swizzle-group-aligned expert ORDER changes no output bit.
+
+    A tile's result depends on its A rows and its expert's B slice, never on
+    the tile's position in the launch — position is scheduler order, the same
+    thing the swizzle already permutes. The packed order must therefore give
+    bit-identical per-row results after undoing the permutation. This is the
+    bit gate for the tile-order policy the T=512 measurements motivate.
+    """
+    from gridbook.bf16_grouped_lane import pack_expert_blocks
+
+    torch.manual_seed(20260802)
+    counts = [130, 0, 61, 258, 64, 5, 129, 190]
+    k, n = 512, 256
+    pairs = sum(counts)
+    a = torch.randn(pairs, k, device=DEV, dtype=torch.bfloat16)
+    weights = torch.randn(len(counts), n, k, device=DEV,
+                          dtype=torch.bfloat16)
+
+    order, touched, minimum = pack_expert_blocks(counts, TILE_M, 8)
+    assert sorted(order) == [e for e, r in enumerate(counts) if r]
+    assert touched >= minimum
+
+    def layout(expert_order):
+        expert_ids, source = [], []
+        starts = [0] * len(counts)
+        s = 0
+        for e, r in enumerate(counts):
+            starts[e] = s
+            s += r
+        for e in expert_order:
+            for b in range((counts[e] + TILE_M - 1) // TILE_M):
+                expert_ids.append(e)
+                for i in range(TILE_M):
+                    idx = b * TILE_M + i
+                    source.append(starts[e] + idx if idx < counts[e] else -1)
+        return (torch.tensor(expert_ids, dtype=torch.int32, device=DEV),
+                torch.tensor(source, dtype=torch.int32, device=DEV))
+
+    natural = [e for e, r in enumerate(counts) if r]
+    y = {}
+    for name, expert_order in (("natural", natural), ("packed", order)):
+        expert_ids, source = layout(expert_order)
+        out = ops.cb_bf16_grouped_mm_sm120_gather(a, source, weights,
+                                                  expert_ids, TILE_M)
+        real = source >= 0
+        dense = torch.empty((pairs, n), dtype=out.dtype, device=DEV)
+        dense.index_copy_(0, source[real].long(), out[real])
+        y[name] = dense
+    assert torch.equal(y["natural"], y["packed"])
 
 
 @sm120

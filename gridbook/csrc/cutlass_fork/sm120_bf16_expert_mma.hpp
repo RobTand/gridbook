@@ -38,6 +38,8 @@
 #include "cutlass/detail/dependent_false.hpp"
 #include "cutlass/trace.h"
 #include "cutlass/numeric_types.h"
+#include "cutlass/arch/memory_sm80.h"   // cp_async_zfill (A-row gather)
+#include "cutlass/arch/barrier.h"       // cpasync_barrier_arrive_noinc
 
 #include "cute/arch/cluster_sm90.hpp"
 #include "cute/arch/copy_sm90.hpp"
@@ -53,7 +55,7 @@
 //
 // Source: vendored CUTLASS 4.3.4 sm120_mma_tma.hpp — the same file
 // sm120_cb_mma_tma.hpp forks without change (kept pristine alongside as
-// sm120_mma_tma_orig.hpp for diffing). This fork carries exactly THREE
+// sm120_mma_tma_orig.hpp for diffing). This fork carries exactly FOUR
 // additions, each marked "PRISMAQUANT ADDITION":
 //
 //   1. Arguments/Params gain {int const* ptr_expert_ids; int num_experts;}.
@@ -63,22 +65,42 @@
 //   3. `load()` takes the B tile's l-coordinate from expert_ids[m_tile]
 //      (one scalar gmem read, uniform across the CTA) rather than from the
 //      problem's l-coordinate.
+//   4. An IN-MAINLOOP A-ROW GATHER: with {int const* ptr_row_src;
+//      int source_rows;} set, the producer warp reads each padded row m of
+//      the launch from row ptr_row_src[m] of a COMPACT [source_rows, K]
+//      activation tensor via predicated 16-byte cp.async (ids outside
+//      [0, source_rows) zero-fill), instead of TMA-reading a materialized
+//      row-padded copy. The smem stage bytes are IDENTICAL to what the TMA
+//      path loads from the padded copy — padding rows are zero either way,
+//      and TMA's own out-of-bounds K-residue zero-fill is matched by the
+//      cp.async zfill predicate — so the two A paths produce bit-identical
+//      output (gated by test_bf16_grouped_cutlass.py). The pipeline pattern
+//      (NumProducerThreadEvents = 33 = one TMA leader arrive_and_expect_tx
+//      + 32 per-lane cp.async noinc arrivals, transaction bytes NK-only in
+//      gather mode) is exactly upstream's own
+//      sm120_mma_tma_blockwise_scaling.hpp producer idiom.
 //
-// With ptr_expert_ids == nullptr and num_experts == 1 this is the unmodified
-// upstream mainloop, which is what the dense (E=1) path uses.
+// With ptr_expert_ids == nullptr and num_experts == 1 and
+// ptr_row_src == nullptr this is the unmodified upstream mainloop schedule,
+// which is what the dense (E=1) path uses.
 //
 // WHY. Upstream CUTLASS 4.3.4 has NO sm120 ptr-array/grouped collective
 // (`sm120_mma_builder.inl` static_asserts `!IsPtrArrayKernel`), so Gridbook
-// groups the way its two fused kernels already do: the caller pre-gathers and
-// PADS A's rows so every expert's segment spans whole TileM blocks, and the
-// launch is ONE ordinary single-problem GEMM of shape (Mp, N, K) in which each
-// M-tile reads a different expert's B. No tensormap updates, no ptr-arrays;
-// the descriptors stay host-built and immutable. See cb_grouped_common.hpp.
+// groups the way its two fused kernels already do: every expert's rows span
+// whole TileM blocks, and the launch is ONE ordinary single-problem GEMM of
+// shape (Mp, N, K) in which each M-tile reads a different expert's B. No
+// tensormap updates, no ptr-arrays; the descriptors stay host-built and
+// immutable. Addition 4 removes the one real cost of that construction the
+// 2026-08-01 T=512 measurements identified: the row-padded activation COPY
+// (an HBM write plus a padded re-read too large for L2), replacing it with
+// direct indexed reads of the compact activation, which IS L2-resident at
+// serving sizes. See cb_grouped_common.hpp.
 //
 // WHAT IS NOT HERE. No packed-B/LUT machinery: B is plain BF16, TMA'd straight
 // into smem. This mainloop is a pure GEMM schedule change relative to the SM80
 // `DefaultGemmGrouped` bridge it replaces; the only numerical consequence is
-// FP32 accumulation ORDER (the epilogue still rounds once to bf16).
+// FP32 accumulation ORDER (the epilogue still rounds once to bf16), and the
+// gather path does not even change that — same smem bytes, same MMA schedule.
 // ---------------------------------------------------------------------------
 namespace cutlass::gemm {
 template<
@@ -168,8 +190,13 @@ struct CollectiveMma<
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState  = typename cutlass::PipelineState<DispatchPolicy::Stages>;
 
-  // One threads per CTA are producers (1 for operand tile)
-  static constexpr int NumProducerThreadEvents = 1;
+  // PRISMAQUANT ADDITION 4: 33 producer events per stage — the TMA leader's
+  // arrive_and_expect_tx plus one cp.async `noinc` arrival from each of the
+  // 32 producer-warp lanes. This is the exact producer accounting upstream's
+  // sm120_mma_tma_blockwise_scaling.hpp uses for its TMA + cp.async stage.
+  // In TMA-A mode a lane's noinc arrival simply fires immediately (no prior
+  // cp.async), so both A paths satisfy the same barrier arithmetic.
+  static constexpr int NumProducerThreadEvents = 33;
 
   static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
   static_assert((size<0>(TileShape{}) % size<0>(SmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
@@ -263,6 +290,14 @@ struct CollectiveMma<
     // nullptr => dense path: the B batch coordinate is the problem's l.
     int const* ptr_expert_ids{nullptr};
     int num_experts{1};              // E (defaults to 1 == dense)
+    // --- PRISMAQUANT ADDITION 4: in-mainloop A-row gather. ---
+    // When ptr_row_src != nullptr, ptr_A is a COMPACT row-major
+    // [source_rows, K] tensor (row stride exactly K elements) and padded row
+    // m of the launch loads source row ptr_row_src[m]; any id outside
+    // [0, source_rows) yields a zero row (the padding rows). nullptr => A is
+    // TMA'd from a row-padded [Mp, K] tensor exactly as upstream.
+    int const* ptr_row_src{nullptr};
+    int source_rows{0};
   };
 
   // Device side kernel params
@@ -289,6 +324,13 @@ struct CollectiveMma<
     // PRISMAQUANT ADDITION 1 (device side).
     int const* ptr_expert_ids = nullptr;
     int num_experts = 1;
+    // PRISMAQUANT ADDITION 4 (device side). ptr_a duplicates the raw A
+    // pointer because in gather mode A is read by address arithmetic, not
+    // through the (built but unissued) TMA descriptor. a_cols is K.
+    int const* ptr_row_src = nullptr;
+    int source_rows = 0;
+    ElementA const* ptr_a = nullptr;
+    int a_cols = 0;
   };
 
   //
@@ -311,6 +353,12 @@ struct CollectiveMma<
     // problem's L. For the dense path num_experts == 1 == L, so the descriptor
     // is bit-identical to the upstream one.
     const int32_t b_batch = args.num_experts > 0 ? args.num_experts : 1;
+    // PRISMAQUANT ADDITION 4: in gather mode the A descriptor is built (the
+    // kernel layer prefetches it and load_init derives the k-tile count from
+    // its shape) but never issued — the problem's M is the padded Mp while
+    // ptr_A holds only source_rows rows, so issuing it would be out of
+    // bounds. The transaction bytes the pipeline expects are NK-only, since
+    // A arrives by per-lane cp.async arrivals instead of TMA bytes.
     Tensor tensor_a = make_tensor(ptr_A, make_layout(make_shape(M,K,L), args.dA));
     Tensor tensor_b = make_tensor(ptr_B, make_layout(make_shape(N,K,b_batch), args.dB));
     typename Params::TMA_A tma_load_a = make_tma_copy(
@@ -325,14 +373,19 @@ struct CollectiveMma<
         SmemLayoutB{}(_,_,cute::Int<0>{}),
         make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
         size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+    const bool gather_a = args.ptr_row_src != nullptr;
     return {
       tma_load_a,
       tma_load_b,
-      TmaTransactionBytes,
+      gather_a ? TmaTransactionBytesNK : TmaTransactionBytes,
       TmaTransactionBytesMK,
       TmaTransactionBytesNK,
       args.ptr_expert_ids,
-      b_batch
+      b_batch,
+      args.ptr_row_src,
+      args.source_rows,
+      args.ptr_A,
+      int(K)
     };
   }
 
@@ -354,6 +407,10 @@ struct CollectiveMma<
     // PRISMAQUANT ADDITION 2 (alignment): B is checked at its own batch extent.
     implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_B>(cute::make_shape(N,K,args.num_experts), StrideB{});
     implementable = implementable && (args.num_experts >= 1);
+    // PRISMAQUANT ADDITION 4: gather mode needs a non-negative source extent.
+    // (Row alignment is the same K % 8 the A TMA check above enforces; the
+    // 16-byte cp.async chunks start at multiples of 8 elements.)
+    implementable = implementable && (args.ptr_row_src == nullptr || args.source_rows >= 0);
 
     if (!implementable) {
       CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Problem Size doesn't meet the minimum alignment requirements for TMA.\n");
@@ -412,67 +469,73 @@ struct CollectiveMma<
       int thread_idx,
       uint32_t block_rank_in_cluster,
       TensorStorage& shared_tensors) {
+    // PRISMAQUANT ADDITION 4: the whole producer WARP participates. TMA
+    // issue stays behind elect_one; the A-row gather (when enabled) uses all
+    // 32 lanes; every lane contributes one `noinc` arrival per stage (see
+    // NumProducerThreadEvents). This is the produce structure of upstream's
+    // sm120_mma_tma_blockwise_scaling.hpp.
     int lane_predicate = cute::elect_one_sync();
 
-    if (lane_predicate) {
-      Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.data()), SmemLayoutA{});        // (BLK_M,BLK_K,PIPE)
-      Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.data()), SmemLayoutB{});        // (BLK_N,BLK_K,PIPE)
+    Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.data()), SmemLayoutA{});          // (BLK_M,BLK_K,PIPE)
+    Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.data()), SmemLayoutB{});          // (BLK_N,BLK_K,PIPE)
 
-      //
-      // Prepare the TMA loads for A and B
-      //
+    //
+    // Prepare the TMA loads for A and B
+    //
 
-      constexpr uint32_t cluster_shape_x = get<0>(typename DispatchPolicy::ClusterShape());
-      uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
+    constexpr uint32_t cluster_shape_x = get<0>(typename DispatchPolicy::ClusterShape());
+    uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
 
-      Tensor gA_mkl = get<0>(load_inputs);
-      Tensor gB_nkl = get<1>(load_inputs);
+    Tensor gA_mkl = get<0>(load_inputs);
+    Tensor gB_nkl = get<1>(load_inputs);
 
-      auto block_tma_a = mainloop_params.tma_load_a.get_slice(cluster_local_block_id.y);
-      auto block_tma_b = mainloop_params.tma_load_b.get_slice(cluster_local_block_id.x);
+    auto block_tma_a = mainloop_params.tma_load_a.get_slice(cluster_local_block_id.y);
+    auto block_tma_b = mainloop_params.tma_load_b.get_slice(cluster_local_block_id.x);
 
-      // Partition the inputs based on the current block coordinates.
-      auto [m_coord, n_coord, k_coord, l_coord] = blk_coord;
-      Tensor gA = gA_mkl(_,_,m_coord,_,l_coord);                                                     // (BLK_M,BLK_K,k)
-      // PRISMAQUANT ADDITION 3: tile-indexed grouping. For the MoE path the B
-      // batch coordinate is the expert this M-tile belongs to (uniform across
-      // the CTA, one scalar gmem read). Padding tiles may carry -1; clamp so
-      // the TMA never goes out of bounds (their output rows are discarded by
-      // the caller's unpermute).
-      int b_l = l_coord;
-      if (mainloop_params.ptr_expert_ids != nullptr) {
-        int eid = __ldg(mainloop_params.ptr_expert_ids + m_coord);
-        b_l = (eid < 0) ? 0 : eid;
+    // Partition the inputs based on the current block coordinates.
+    auto [m_coord, n_coord, k_coord, l_coord] = blk_coord;
+    Tensor gA = gA_mkl(_,_,m_coord,_,l_coord);                                                     // (BLK_M,BLK_K,k)
+    // PRISMAQUANT ADDITION 3: tile-indexed grouping. For the MoE path the B
+    // batch coordinate is the expert this M-tile belongs to (uniform across
+    // the CTA, one scalar gmem read). Padding tiles may carry -1; clamp so
+    // the TMA never goes out of bounds (their output rows are discarded by
+    // the caller's unpermute).
+    int b_l = l_coord;
+    if (mainloop_params.ptr_expert_ids != nullptr) {
+      int eid = __ldg(mainloop_params.ptr_expert_ids + m_coord);
+      b_l = (eid < 0) ? 0 : eid;
+    }
+    Tensor gB = gB_nkl(_,_,n_coord,_,b_l);                                                         // (BLK_N,BLK_K,k)
+
+    // Applies the mapping from block_tma_a
+    Tensor tAgA = block_tma_a.partition_S(gA);                                                 // (TMA,TMA_M,TMA_K,k)
+    Tensor tAsA = block_tma_a.partition_D(sA);                                              // (TMA,TMA_M,TMA_K,PIPE)
+
+    Tensor tBgB = block_tma_b.partition_S(gB);                                                 // (TMA,TMA_N,TMA_K,k)
+    Tensor tBsB = block_tma_b.partition_D(sB);                                              // (TMA,TMA_N,TMA_K,PIPE)
+
+    uint16_t mcast_mask_a = 0;
+    uint16_t mcast_mask_b = 0;
+
+    // Issue TmaLoads
+    // Maps the tile -> block, value
+    if constexpr (cute::is_same_v<GmemTiledCopyA, SM90_TMA_LOAD_MULTICAST>) {
+      auto block_layout = Layout<typename DispatchPolicy::ClusterShape>{};                       // (m,n) -> block_id
+      for (int n = 0; n < size<1>(block_layout); ++n) {
+        mcast_mask_a |= (uint16_t(1) << block_layout(cluster_local_block_id.x,n,Int<0>{}));
       }
-      Tensor gB = gB_nkl(_,_,n_coord,_,b_l);                                                         // (BLK_N,BLK_K,k)
+    }
 
-      // Applies the mapping from block_tma_a
-      Tensor tAgA = block_tma_a.partition_S(gA);                                                 // (TMA,TMA_M,TMA_K,k)
-      Tensor tAsA = block_tma_a.partition_D(sA);                                              // (TMA,TMA_M,TMA_K,PIPE)
-
-      Tensor tBgB = block_tma_b.partition_S(gB);                                                 // (TMA,TMA_N,TMA_K,k)
-      Tensor tBsB = block_tma_b.partition_D(sB);                                              // (TMA,TMA_N,TMA_K,PIPE)
-
-      uint16_t mcast_mask_a = 0;
-      uint16_t mcast_mask_b = 0;
-
-      // Issue TmaLoads
-      // Maps the tile -> block, value
-      if constexpr (cute::is_same_v<GmemTiledCopyA, SM90_TMA_LOAD_MULTICAST>) {
-        auto block_layout = Layout<typename DispatchPolicy::ClusterShape>{};                       // (m,n) -> block_id
-        for (int n = 0; n < size<1>(block_layout); ++n) {
-          mcast_mask_a |= (uint16_t(1) << block_layout(cluster_local_block_id.x,n,Int<0>{}));
-        }
+    if constexpr (cute::is_same_v<GmemTiledCopyB, SM90_TMA_LOAD_MULTICAST>) {
+      auto block_layout = Layout<typename DispatchPolicy::ClusterShape>{}; // (m,n) -> block_id
+      for (int m = 0; m < size<0>(block_layout); ++m) {
+        mcast_mask_b |= (uint16_t(1) << block_layout(m,cluster_local_block_id.y,Int<0>{}));
       }
+    }
 
-      if constexpr (cute::is_same_v<GmemTiledCopyB, SM90_TMA_LOAD_MULTICAST>) {
-        auto block_layout = Layout<typename DispatchPolicy::ClusterShape>{}; // (m,n) -> block_id
-        for (int m = 0; m < size<0>(block_layout); ++m) {
-          mcast_mask_b |= (uint16_t(1) << block_layout(m,cluster_local_block_id.y,Int<0>{}));
-        }
-      }
-
-      // Mainloop
+    if (mainloop_params.ptr_row_src == nullptr) {
+      // ----- TMA-A mode: the upstream mainloop body, plus the per-lane
+      // arrival every stage now expects. -----
       CUTLASS_PRAGMA_NO_UNROLL
       for ( ; k_tile_count > 0; --k_tile_count) {
         // LOCK smem_pipe_write for _writing_
@@ -482,17 +545,90 @@ struct CollectiveMma<
         // Copy gmem to smem for *k_tile_iter
         //
 
-        using BarrierType = typename MainloopPipeline::ProducerBarrierType;
-        BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
-
         int write_stage = smem_pipe_write.index();
-        copy(mainloop_params.tma_load_a.with(*tma_barrier, mcast_mask_a), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
-        copy(mainloop_params.tma_load_b.with(*tma_barrier, mcast_mask_b), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
+        if (lane_predicate) {
+          using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+          BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+
+          copy(mainloop_params.tma_load_a.with(*tma_barrier, mcast_mask_a), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
+          copy(mainloop_params.tma_load_b.with(*tma_barrier, mcast_mask_b), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
+        }
+        // With no cp.async pending, each lane's arrival fires immediately.
+        pipeline.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive_noinc);
         ++k_tile_iter;
 
         // Advance smem_pipe_write
         ++smem_pipe_write;
       }
+      return;
+    }
+
+    // ----- Gather-A mode (PRISMAQUANT ADDITION 4): B is TMA'd exactly as
+    // above; each A stage is gathered row-by-row from the compact source by
+    // all 32 lanes with predicated, zero-filling 16-byte cp.async. The smem
+    // bytes are identical to what TMA-A mode loads from a materialized
+    // padded copy: ids outside [0, source_rows) produce zero rows (the
+    // padded copy gathers an appended zero row there) and chunks beyond K
+    // produce zeros (TMA zero-fills its out-of-bounds K residue). -----
+    constexpr int kTileM = size<0>(TileShape{});
+    constexpr int kTileK = size<2>(TileShape{});
+    constexpr int kChunkElems = 16 / int(sizeof(ElementA));       // one cp.async
+    constexpr int kRowChunks = kTileK / kChunkElems;              // chunks/row
+    static_assert(kTileK % kChunkElems == 0,
+                  "TileK must be a whole number of 16-byte cp.async chunks");
+    static_assert((kTileM * kRowChunks) % 32 == 0,
+                  "the A tile must divide evenly over the 32 producer lanes");
+    constexpr int kIters = kTileM * kRowChunks / 32;
+    // Lane l, iteration i covers row (l / kRowChunks) + i * (32 / kRowChunks),
+    // chunk l % kRowChunks: each warp instruction reads 32/kRowChunks rows in
+    // kRowChunks consecutive 16-byte pieces — coalesced per row, and the row
+    // ids broadcast from L1 across the lanes that share a row.
+    int const* row_ids = mainloop_params.ptr_row_src + m_coord * kTileM;
+    ElementA const* src_a = mainloop_params.ptr_a;
+    int const src_rows = mainloop_params.source_rows;
+    int const src_cols = mainloop_params.a_cols;
+    int const lane_row0 = thread_idx / kRowChunks;
+    int const lane_chunk = (thread_idx % kRowChunks) * kChunkElems;
+    int k_tile_base = 0;
+
+    CUTLASS_PRAGMA_NO_UNROLL
+    for ( ; k_tile_count > 0; --k_tile_count) {
+      // LOCK smem_pipe_write for _writing_ (all lanes wait; the leader lane
+      // performs the arrive_and_expect_tx for the NK transaction bytes).
+      pipeline.producer_acquire(smem_pipe_write);
+
+      int write_stage = smem_pipe_write.index();
+      if (lane_predicate) {
+        using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+        BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+        copy(mainloop_params.tma_load_b.with(*tma_barrier, mcast_mask_b), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
+      }
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < kIters; ++i) {
+        int const row = lane_row0 + i * (32 / kRowChunks);
+        int const kk = k_tile_base + lane_chunk;                // global K offset
+        int const src_row = __ldg(row_ids + row);
+        bool const pred =
+            (unsigned(src_row) < unsigned(src_rows)) && (kk < src_cols);
+        // A well-formed (in-tensor) address even when predicated off; a
+        // zero-size cp.async performs no read.
+        int64_t const src_off =
+            pred ? int64_t(src_row) * src_cols + kk : int64_t(0);
+        cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(
+            raw_pointer_cast(&sA(row, lane_chunk, write_stage)),
+            src_a + src_off, pred);
+      }
+      // Each lane's arrival fires when its cp.asyncs above have completed;
+      // together with the leader's expect_tx these are the 33 producer
+      // events the barrier was initialized with.
+      pipeline.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive_noinc);
+
+      ++k_tile_iter;
+      k_tile_base += kTileK;
+
+      // Advance smem_pipe_write
+      ++smem_pipe_write;
     }
   }
 

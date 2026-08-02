@@ -291,13 +291,46 @@ CUTLASS's own K-major `rs_smem_selector` for a swizzled tile that TMA writes
 and LDSM reads. Stages come from the builder's own `StageCountAutoCarveout`.
 
 **Grouping** is the row-padded, TILE-INDEXED construction the two fused
-kernels already use, extracted into `csrc/cb_grouped_common.hpp`: the caller
-pre-gathers and PADS activation rows so each expert's segment spans whole
-`TileM` blocks, B carries a batch mode of per-expert stride `N*K` (exactly a
-contiguous `[E,N,K]` stack), and each M-tile reads `expert_ids[m_tile]` as its
-B `l`-coordinate. That one selection lives in a thin fork of the standard
-sm120 TMA mainloop (`csrc/cutlass_fork/sm120_bf16_expert_mma.hpp`, three marked
-additions). No packed-B or LUT machinery: B is plain BF16.
+kernels already use, extracted into `csrc/cb_grouped_common.hpp`: each
+expert's rows span whole `TileM` blocks, B carries a batch mode of per-expert
+stride `N*K` (exactly a contiguous `[E,N,K]` stack), and each M-tile reads
+`expert_ids[m_tile]` as its B `l`-coordinate. The expert selection and the
+A-side row sourcing live in a thin fork of the standard sm120 TMA mainloop
+(`csrc/cutlass_fork/sm120_bf16_expert_mma.hpp`, four marked additions). No
+packed-B or LUT machinery: B is plain BF16.
+
+**Two A-source modes, one collective.** The ONE compiled kernel reads its A
+tiles either way at runtime:
+
+* *padded-copy mode* (`cb_bf16_grouped_mm_sm120[_out]`) — the caller
+  materializes the row-padded `[Mp, K]` activation and the producer TMA-reads
+  it, exactly the original construction;
+* *in-mainloop gather mode* (`cb_bf16_grouped_mm_sm120_gather[_out]`) — the
+  producer warp reads each padded row `m` from row `row_src[m]` of the
+  COMPACT activation with predicated, zero-filling 16-byte `cp.async` (ids
+  outside `[0, S)` are the padding rows), so the padded copy never exists.
+  The pipeline accounting is upstream's own
+  `sm120_mma_tma_blockwise_scaling.hpp` producer idiom (33 producer events:
+  the TMA leader's `arrive_and_expect_tx` for the B-only transaction bytes
+  plus one `cp.async` `noinc` arrival per lane).
+
+The two modes load byte-identical smem tiles — padding rows are zeros either
+way, and the gather predicate reproduces TMA's out-of-bounds K-residue
+zero-fill — so their outputs are **bit-identical**, asserted with
+`torch.equal` in `tests/test_bf16_grouped_cutlass.py`. The gather mode is
+therefore not a requalification event: the lane's numerics class is pinned by
+the padded mode's existing gate.
+
+**Tile-order policy (swizzle-group-aligned expert packing).** The persistent
+scheduler sweeps N with groups of `swizzle` M-tiles, so an expert whose tiles
+straddle a group boundary has its B slice fetched from DRAM once per group
+touched rather than once. `bf16_grouped_lane.pack_expert_blocks` orders
+experts first-fit-decreasing on padded block counts so group boundaries
+coincide with expert boundaries wherever the histogram allows — deterministic
+host math on the routing histogram, telemetered as
+`(groups_touched, groups_minimum)`. Tile order is scheduler order (the same
+thing the swizzle argument already permutes): the bit gate asserts a packed
+order is a pure block permutation of the natural one.
 
 **Measured configuration** (GB10, cc 12.1, CUTLASS 4.3.4): **pingpong
 `64×128×64`, 3 mainloop stages, 83,968 B** of the 101,376-byte budget, plus a
@@ -328,6 +361,10 @@ outputs were bit-identical on every one of them. That is not a promise the
 kernels make — bf16×bf16 products are exact in fp32, so the lanes differ only
 in the ~2⁻²⁴ rounding of their partial sums, an order of magnitude below the
 2⁻⁸ quantum of the bf16 result — so the tests gate a bound, not equality.
+Within the sm12x lane, the gather mode and the tile-order policy sit BELOW
+this surface entirely: gather-vs-padded is gated bit-equal, and a block
+permutation of tile order cannot change any row's accumulation, also gated
+bit-equal.
 
 **Cost the lane adds, and what bounds it.** The construction re-reads an
 expert's B slice once per padded M-tile, and at these shapes the operator is

@@ -2,7 +2,31 @@
 
 ## Unreleased
 
-- Add an **sm12x-native CUTLASS 3.x lane** to the quality-preserving BF16
+- Close the sm12x grouped-BF16 lane's ragged-padding tax with two
+  construction changes to the SAME compiled collective (schedule, tile,
+  stages and smem untouched; audit §3 P1 follow-through):
+  **an in-mainloop A-row gather** — the mainloop fork gains a fourth marked
+  addition: the producer warp reads each padded row through ``row_src[m]``
+  from the COMPACT activation with predicated zero-filling 16-byte
+  ``cp.async`` (upstream's own `sm120_mma_tma_blockwise_scaling.hpp`
+  producer idiom: 33 producer events, B-only transaction bytes), so the
+  row-padded activation copy — an HBM write plus a padded re-read too large
+  for L2 — no longer exists (`cb_bf16_grouped_mm_sm120_gather[_out]`; the
+  padded-copy entry points are unchanged and the two modes are gated
+  BIT-IDENTICAL, `torch.equal`, because they load byte-identical smem
+  tiles); and **a swizzle-group-aligned expert order**
+  (`bf16_grouped_lane.pack_expert_blocks`) — the persistent scheduler sweeps
+  N in groups of 8 M-tiles, so an expert straddling a group boundary has its
+  whole B slice fetched from DRAM once per group touched; packing experts
+  into groups (deterministic first-fit-decreasing on the routing histogram,
+  telemetered as groups-touched vs minimum) removes the straddle excess,
+  measured 14–17% GEMM time at ``T=512`` and neutral at ``T=128``. The dense
+  ``E=1`` helper now uses the gather mode too (``row_src = arange``; no
+  padded copy, no concat). BENCH_NUMBERS_SENTENCE Bit gates extended to
+  every new boundary (gather==padded bitwise on every routing shape incl.
+  K-residue, OOB ids read zeros, packed order is a pure block permutation);
+  flag semantics, the SM80 lane, and flag-off dispatch are byte-for-byte
+  unchanged. Proposal data; the served NATIVE-PARITY protocol has not run.
   grouped bridge (`csrc/cb_bf16_grouped_gemm.cu`, audit §3 P1): TMA
   warp-specialized mainloop, stages carved out of the sm120 shared-memory
   budget, and the row-padded tile-indexed grouping the two fused kernels

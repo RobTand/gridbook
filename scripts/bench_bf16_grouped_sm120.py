@@ -5,23 +5,35 @@ PROPOSAL DATA ONLY. Per [NATIVE-PARITY](../docs/NATIVE-PARITY.md) a kernel
 microbenchmark proposes; only the served protocol promotes. Nothing here is a
 serving claim, a TTFT number, or grounds for changing a default.
 
-WHAT IS TIMED. The three ways the same routed BF16 GEMM can be executed, each
+WHAT IS TIMED. The four ways the same routed BF16 GEMM can be executed, each
 measured as the WHOLE operator the serving path would run, not the inner GEMM:
 
-* ``sm120``     — the padded-gather + one grouped launch of the opt-in lane.
-                  The gather is charged to the lane, because the lane is what
-                  requires it (the sm12x collective has no ptr-array grouping,
-                  so every expert's rows must start on a TileM boundary).
+* ``sm120``     — the padded-copy mode of the opt-in lane: padded gather +
+                  one grouped launch, natural expert-major tile order. The
+                  gather is charged to the lane, because this mode is what
+                  requires it (every expert's rows must start on a TileM
+                  boundary and the copy materializes that layout).
+* ``sm120g``    — the lane's IN-MAINLOOP A-ROW GATHER mode with the
+                  swizzle-group-aligned expert order: NO padded copy exists
+                  (the kernel reads rows of the compact activation through
+                  ``row_src``), so the whole operator is one launch. The
+                  tile-order packing is pure host math on the routing
+                  histogram (`bf16_grouped_lane.pack_expert_blocks`,
+                  microseconds, done at dispatch where the routing already
+                  reads the per-expert block offsets).
 * ``sm80``      — today's default: exact per-expert segments through the
                   device-scheduled CUTLASS 2.x grouped kernel, no padding.
 * ``segmented`` — the retired reference the published 6-17% deficit was
                   measured against: one BF16 ``F.linear`` per expert writing
                   into a preallocated output.
 
-Everything upstream of the GEMM that the three share — routing, weight
+Everything upstream of the GEMM that the four share — routing, weight
 expansion, activation QDQ, the router combine — is excluded, exactly as the
 2026-08-01 DSV4 bridge microbenchmark in docs/BENCHMARKS.md excluded it, so the
-numbers are comparable to that table.
+numbers are comparable to that table. The ``row_src``/``expert_ids`` layout
+vectors of both sm120 modes are routing outputs of that same excluded class
+(``cb_grouped_pad_routing`` products), and the padded-COPY of the ``sm120``
+arm stays inside the timed region exactly as before.
 
 Run it in the serving container::
 
@@ -46,12 +58,15 @@ import torch.nn.functional as F
 
 try:
     from gridbook import ops
+    from gridbook.bf16_grouped_lane import pack_expert_blocks
     from gridbook.cuda_ext import get_bf16_grouped_ext
 except ModuleNotFoundError as exc:  # pragma: no cover - checkout fallback
-    if exc.name not in {"gridbook", "gridbook.ops", "gridbook.cuda_ext"}:
+    if exc.name not in {"gridbook", "gridbook.ops", "gridbook.cuda_ext",
+                        "gridbook.bf16_grouped_lane"}:
         raise
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from gridbook import ops
+    from gridbook.bf16_grouped_lane import pack_expert_blocks
     from gridbook.cuda_ext import get_bf16_grouped_ext
 
 
@@ -72,16 +87,26 @@ def _routing(experts: int, tokens: int, top_k: int, seed: int):
     return counts.tolist()
 
 
-def _padded_layout(counts, tile_m, device):
-    expert_ids, source = [], []
-    start = 0
+def _padded_layout(counts, tile_m, device, order=None):
+    """Row-padded tile-indexed layout, optionally in a permuted expert order.
+
+    ``source`` names each padded row's index into the expert-sorted activation
+    (``P`` for a padding row — the appended zero row of the copy).
+    """
+    if order is None:
+        order = [e for e, rows in enumerate(counts) if rows]
+    starts, s = [0] * len(counts), 0
     for expert, rows in enumerate(counts):
+        starts[expert] = s
+        s += rows
+    expert_ids, source = [], []
+    for expert in order:
+        rows, start = counts[expert], starts[expert]
         for block in range((rows + tile_m - 1) // tile_m):
             expert_ids.append(expert)
             for r in range(tile_m):
                 index = block * tile_m + r
-                source.append(start + index if index < rows else rows + start)
-        start += rows
+                source.append(start + index if index < rows else s)
     return (torch.tensor(expert_ids, dtype=torch.int32, device=device),
             torch.tensor(source, dtype=torch.int64, device=device))
 
@@ -122,17 +147,18 @@ def bench(args) -> int:
               file=sys.stderr)
         return 2
     tile_m = int(ext.cb_bf16_grouped_sm120_tile_m())
+    config = ext.cb_bf16_grouped_sm120_config()
+    group = int(config[8])  # large-grid swizzle = the tile-order group size
     device = "cuda"
     name = torch.cuda.get_device_name()
     major, minor = torch.cuda.get_device_capability()
     print(f"# device {name} (sm_{major}{minor}), torch {torch.__version__}")
-    print(f"# tile_m={tile_m}, config="
-          f"{ext.cb_bf16_grouped_sm120_config()}")
+    print(f"# tile_m={tile_m}, config={config}")
     print(f"# tokens={args.tokens} top_k={args.top_k} seed={args.seed} "
           f"iters={args.iters} warmup={args.warmup}")
-    print(f"\n{'shape':>26} {'P':>6} {'Mp':>6} {'sm120 warm':>11} "
-          f"{'sm80 warm':>10} {'segmented':>10} {'sm120/sm80':>11} "
-          f"{'sm120/segd':>11}")
+    print(f"\n{'shape':>26} {'P':>6} {'Mp':>6} {'grp':>7} {'sm120g':>8} "
+          f"{'sm120':>8} {'sm80':>8} {'segmented':>9} {'g/sm80':>7} "
+          f"{'g/segd':>7} {'pad/segd':>8}")
 
     for label, experts, k, n in SHAPES:
         counts = _routing(experts, args.tokens, args.top_k, args.seed)
@@ -148,9 +174,21 @@ def bench(args) -> int:
         mp = int(source.numel())
         zero_extended = torch.cat([a, a.new_zeros((1, k))])
         # The gather index the serving path builds once per prefill; the GATHER
-        # itself is inside the timed region because the lane requires it.
+        # itself is inside the timed region because the padded mode requires
+        # it.
         gather = source.clamp(max=pairs)
         out_pad = torch.empty(mp, n, device=device, dtype=torch.bfloat16)
+
+        # Gather mode: swizzle-group-aligned expert order, row ids straight
+        # into the kernel (ids == P are the padding rows; P >= source rows
+        # so they zero-fill), no copy.
+        order, touched, minimum = pack_expert_blocks(counts, tile_m, group)
+        eids_g, src_g = _padded_layout(counts, tile_m, device, order)
+        row_src = src_g.to(torch.int32)
+
+        def run_sm120g():
+            ops.cb_bf16_grouped_mm_sm120_gather_out(out_pad, a, row_src,
+                                                    weights, eids_g, tile_m)
 
         def run_sm120():
             padded = zero_extended.index_select(0, gather).contiguous()
@@ -168,14 +206,19 @@ def bench(args) -> int:
                         a[start:start + rows], weights[expert])
                 start += rows
 
+        _, warm_g = _time(run_sm120g, args.iters, args.warmup)
         _, warm120 = _time(run_sm120, args.iters, args.warmup)
         _, warm80 = _time(run_sm80, args.iters, args.warmup)
         _, warm_seg = _time(run_segmented, args.iters, args.warmup)
-        print(f"{label:>26} {pairs:>6} {mp:>6} {warm120:>10.3f}m "
-              f"{warm80:>9.3f}m {warm_seg:>9.3f}m "
-              f"{warm80 / warm120:>11.3f} {warm_seg / warm120:>11.3f}")
+        print(f"{label:>26} {pairs:>6} {mp:>6} {touched:>3}/{minimum:>3} "
+              f"{warm_g:>7.3f}m {warm120:>7.3f}m {warm80:>7.3f}m "
+              f"{warm_seg:>8.3f}m {warm80 / warm_g:>7.3f} "
+              f"{warm_seg / warm_g:>7.3f} {warm_seg / warm120:>8.3f}")
 
-    print("\n# ratios > 1 mean the sm12x lane is FASTER than that baseline.")
+    print("\n# sm120g = in-mainloop A-row gather + swizzle-group-aligned "
+          "expert order (one launch, no copy);")
+    print("# sm120 = padded-copy mode, natural order. grp = swizzle groups "
+          "touched / minimum. ratios > 1 mean the sm12x mode is FASTER.")
     print("# PROPOSAL DATA (NATIVE-PARITY): microbenchmarks propose, only the "
           "served protocol promotes.")
     return 0
