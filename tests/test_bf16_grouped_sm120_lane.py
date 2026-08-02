@@ -106,11 +106,19 @@ def test_require_lane_accepts_a_complete_module(monkeypatch):
         cb_bf16_grouped_mm_sm120_gather=lambda *a, **k: None,
         cb_bf16_grouped_mm_sm120_gather_out=lambda *a, **k: None,
         cb_bf16_grouped_sm120_tile_m=lambda: 128,
+        # The forward path reads the swizzle group on every routed prefill
+        # (the packed expert order's group size), so a stub without it is not
+        # a COMPLETE module — accepting one here would have let `require_lane`
+        # call a build complete that then AttributeErrors at first forward,
+        # which is exactly what attesting at load exists to prevent.
+        cb_bf16_grouped_sm120_config=lambda: [64, 128, 64, 3, 0, 0, 128, 1,
+                                              8, 64, 1],
     )
     monkeypatch.setattr("gridbook.cuda_ext.get_bf16_grouped_ext",
                         lambda: stub)
     assert lane.require_lane("routed quality prefill") is stub
     assert lane.tile_m(stub) == 128
+    assert lane.swizzle_group(stub) == 8
 
 
 def test_require_lane_fails_closed_without_the_gather_mode(monkeypatch):
@@ -266,15 +274,15 @@ def test_pack_expert_blocks_group_one_never_straddles():
 # ===========================================================================
 DEV = "cuda"
 
-# The suite's documented reassociation envelope, from
-# tests/test_moe_grouped_fused.py — the same constant, for the same pair of
-# lanes, on the same justification: GB10/CUDA 13.0 measured 1.906-2.039e-2 over
-# the fixed routing cases (2026-08-01, torch 2.11+cu130) between the padded
-# grouped lanes and the native BF16 bridge. The sm12x lane and the default
-# SM80-schedule bridge quantize the same values and round ONCE to bf16; only
-# the FP32 reduction order and the combine reassociate. This is a regression
-# bound, not a claim of bit equivalence — the bit claims below are stated as
-# ``torch.equal`` where they hold.
+# The suite's documented reassociation envelope. NOT a new number: it is
+# tests/test_moe_grouped_fused.py's ``_REL``, on that file's justification —
+# a narrow envelope for two lanes that quantize the same values and round ONCE
+# to bf16 but accumulate them in different tensor-core orders (GB10/CUDA 13.0
+# measured 1.906-2.039e-2 there, 2026-08-01, torch 2.11+cu130). It is also the
+# bound the sibling's own sm12x-lane-vs-bridge cases already use, so flipping
+# the selector is held to exactly the same contract as swapping the lane object
+# by hand. A regression bound, not a claim of bit equivalence — the bit claims
+# below are stated as ``torch.equal`` where they hold.
 _REL = 2.1e-2
 
 # ``gridbook.moe`` imports vLLM at module scope; the wiring cases are skipped
@@ -430,7 +438,7 @@ def _resolve_lane_at_load(layer, device):
 
 
 def _spy_padded_route(monkeypatch):
-    """Record every ``_padded_route`` call the prefill makes, and its result."""
+    """Record every ``_padded_route`` call the prefill makes and its result."""
     from gridbook import moe
 
     real = moe._padded_route
@@ -656,7 +664,7 @@ def test_packed_expert_order_is_bit_neutral_end_to_end(monkeypatch):
 
     seen = _spy_padded_route(monkeypatch)
     packed = method._apply_prefill_native_bf16(layer, x, weights, ids, act)
-    monkeypatch.setattr(moe, "bf16_sm120_swizzle_group", lambda ext: 1)
+    monkeypatch.setattr(moe, "bf16_sm120_swizzle_group", lambda _ext: 1)
     plain = method._apply_prefill_native_bf16(layer, x, weights, ids, act)
 
     assert seen[0].pack_group == lane.swizzle_group(ext)

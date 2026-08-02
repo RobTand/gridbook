@@ -77,11 +77,19 @@ def require_lane(operation: str = "this operation", *, device=None):
             capability = torch.cuda.get_device_capability(device)
     except Exception:  # noqa: BLE001 — reported below as "unavailable"
         capability = None
+    # Every symbol the lane's FORWARD PATH dereferences, not just its GEMM
+    # entry points. `cb_bf16_grouped_sm120_config` was missing here while
+    # `swizzle_group()` (the packed expert order's group size) reads it on
+    # every routed prefill — so a module this function called "complete" could
+    # still AttributeError at first forward, which is precisely what attesting
+    # at load is supposed to make impossible. cuda_ext's own
+    # `_BF16_GROUPED_SM120_SYMBOLS` already required it; the two lists now agree.
     missing = [name for name in ("cb_bf16_grouped_mm_sm120",
                                  "cb_bf16_grouped_mm_sm120_out",
                                  "cb_bf16_grouped_mm_sm120_gather",
                                  "cb_bf16_grouped_mm_sm120_gather_out",
-                                 "cb_bf16_grouped_sm120_tile_m")
+                                 "cb_bf16_grouped_sm120_tile_m",
+                                 "cb_bf16_grouped_sm120_config")
                if not hasattr(ext, name)]
     if missing:
         raise NativeKernelUnavailableError(
