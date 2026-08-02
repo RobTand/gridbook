@@ -262,10 +262,11 @@ floor. The gate separately asserts that **nothing** under `gridbook/csrc` in
 the checkout is missing from the sdist, and that nothing except a short,
 declared **sdist-only** list is missing from the wheel (so retained research
 sources and any new kernel still cannot disappear because a `package-data`
-glob drifted). That list — standalone developer binaries under `csrc/tools/` —
-is gated in *both* directions: present in the sdist for auditability, absent
-from the wheel, so a widened glob or a stale `build/` cannot quietly re-ship
-them into every user's site-packages. The gate also asserts that no
+glob drifted). That list — standalone developer binaries under `csrc/tools/`
+and the pristine `cutlass_fork/*_orig.hpp` diff baselines — is gated in *both*
+directions: present in the sdist for auditability, absent from the wheel, so a
+widened glob or a stale `build/` cannot quietly re-ship them into every user's
+site-packages. The gate also asserts that no
 runtime-required source is on the sdist-only list, and that the **checkout**
 has no stale repo-root `csrc/` left over from before
 the packaging fix. That last one is checked against the checkout and not the

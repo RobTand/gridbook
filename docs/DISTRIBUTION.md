@@ -674,8 +674,9 @@ false of (B) for several hours on 2026-07-28.
       `csrc/cutlass_fork/` fork headers. A `package-data` glob that silently
       matches nothing is the exact failure mode this gate exists for; the
       opposite failure — a glob that matches *too much* — is gated by the
-      sdist-only list in `check_dist.py` (`csrc/tools/`), which must be present
-      in the sdist and absent from the wheel.
+      sdist-only list in `check_dist.py` (`csrc/tools/`,
+      `csrc/cutlass_fork/*_orig.hpp`), which must be present in the sdist and
+      absent from the wheel.
 - [ ] The CUTLASS question is **decided and written down**: `cuda_ext.py`
       currently globs CUTLASS headers out of the *installed vLLM's* directory
       (`_find_cutlass_include()`), and in the tested image two different CUTLASS

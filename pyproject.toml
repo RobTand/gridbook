@@ -116,5 +116,7 @@ gridbook = [
 [tool.setuptools.exclude-package-data]
 gridbook = [
     "csrc/tools/*",
+    "csrc/cutlass_fork/*_orig.hpp",
 ]
 "gridbook.csrc.tools" = ["*"]
+"gridbook.csrc.cutlass_fork" = ["*_orig.hpp"]

@@ -110,6 +110,9 @@ NATIVE_SUFFIXES = (".cu", ".cuh", ".hpp", ".h")
 #   csrc/tools/     standalone main() developer binaries (smem-budget probe,
 #                   toolchain probe). Their OUTPUT ships -- the smem table
 #                   baked into cb_fused_gemm.cu -- the binaries do not.
+#   *_orig.hpp      pristine CUTLASS copies the forks are diffed against
+#                   (~67 KB). Nothing #includes them; they exist so a reviewer
+#                   can see exactly what each fork changed.
 #
 # See docs/audits/ultraplan_perf_2026-08-01.md §4. The mechanism is the
 # single-level package-data globs in pyproject.toml plus the MANIFEST.in rules
@@ -117,6 +120,7 @@ NATIVE_SUFFIXES = (".cu", ".cuh", ".hpp", ".h")
 # gate rather than an accident of glob syntax.
 SDIST_ONLY_GLOBS = [
     f"{PKG}/csrc/tools/*",
+    f"{PKG}/csrc/cutlass_fork/*_orig.hpp",
 ]
 
 _errors: list[str] = []
