@@ -340,7 +340,7 @@ separate research pipeline that *produces* gridbook artifacts —
 
 - The plugin **does not patch vLLM core**. It does install a thin `load_weights`
   wrapper on specific *model classes* (HunYuan-V3, Laguna, Qwen3.5-MoE and their
-  MTP drafters) whose loaders map MoE experts at the top level and would
+  MTP drafters, DeepSeek-V4) whose loaders map MoE experts at the top level and would
   otherwise not recognise stacked codebook expert tensors. That wrap is inert for
   non-CB checkpoints. Shared-CB projections, including MTP-nested shared
   experts, are aliased to native CB Linears; resolving one to a plain BF16

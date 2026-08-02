@@ -390,6 +390,13 @@ _CONTRACT_MODEL_MODULES = {
     "vllm.model_executor.models.qwen3_5",
     "vllm.model_executor.models.qwen3_5_mtp",
     "vllm.model_executor.models.lfm2_moe",
+    # ROADMAP D0.1. vLLM 0.24 ships DeepSeek-V4 as a per-platform PACKAGE, not
+    # a module under model_executor/models: the registry maps
+    # DeepseekV4ForCausalLM to `vllm.models.deepseek_v4`, whose __init__ only
+    # re-exports the class that `vllm.models.deepseek_v4.nvidia.model` DEFINES.
+    # plugin.py installs on the defining module (__module__ guard), so that is
+    # the path the contract names and the path reviewed here.
+    "vllm.models.deepseek_v4.nvidia.model",
 }
 
 

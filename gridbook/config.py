@@ -71,6 +71,26 @@ _FUSED_FALLBACK = {
     "gate_up_proj": ["gate_proj", "up_proj"],
     "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
     "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    # DeepSeek-V4 MLA: the q-LoRA down-projection and the joint KV projection
+    # are ONE MergedColumnParallelLinear (vllm/models/deepseek_v4/attention.py,
+    # `fused_wqa_wkv`, [q_lora_rank, head_dim] = [1024, 512]). The checkpoint
+    # keeps them apart as `attn.wq_a` / `attn.wkv`, and the class publishes the
+    # merge only through its `stacked_params_mapping` — it defines NO
+    # `packed_modules_mapping` — so without this entry a CB `wq_a` target
+    # resolves to nothing under the served `…attn.fused_wqa_wkv` prefix and the
+    # layer silently falls through to BF16 / stock dispatch.
+    "fused_wqa_wkv": ["wq_a", "wkv"],
+}
+
+# A fused leaf can carry MORE THAN ONE valid shard spelling across
+# architectures. DeepSeek-V4's shared expert fuses the Mixtral-convention
+# `w1`/`w3` into the SAME `gate_up_proj` leaf that Llama-class models fuse
+# `gate_proj`/`up_proj` into, so one dict value cannot express both. Resolution
+# tries the primary spelling first and then each alternate, and the first
+# spelling with any hit wins WHOLE (never mixed) — the same rule
+# `shard_target_keys` already applies across namespace vintages.
+_FUSED_ALTERNATE_SHARDS = {
+    "gate_up_proj": (["w1", "w3"],),
 }
 
 
@@ -112,6 +132,17 @@ def _canonical_prefix(prefix: str) -> str:
     # ``_canonical_target``) keeps probe-side and target-side on one string.
     if prefix.startswith("model.language_model."):
         return "model." + prefix[len("model.language_model."):]
+    # Producer SOURCE namespace (DeepSeek-V4 class): the released checkpoint's
+    # keys start at `layers.N.` with no `model.` component at all, and the vLLM
+    # class re-attaches it inside its own `hf_to_vllm_mapper`
+    # (`{"layers.": "model.layers."}`) — i.e. AFTER a serving prefix has already
+    # been handed to get_quant_method. An artifact that stored its CB targets in
+    # that source spelling therefore has to be lifted here, or every DSV4 body
+    # Linear resolves no-scheme. `_candidate_bases` still tries the string as
+    # given first, so an architecture that genuinely owns a top-level `layers.`
+    # module keeps its exact match.
+    if prefix.startswith("layers."):
+        return "model." + prefix
     return prefix
 
 
@@ -705,16 +736,19 @@ class PrismaQuantConfig(QuantizationConfig):
         pmm = getattr(self, "packed_modules_mapping", {}) or {}
         for base in _candidate_bases(prefix):
             leaf = base.split(".")[-1]
-            shard_leaves = pmm.get(leaf) or _FUSED_FALLBACK.get(leaf)
-            if shard_leaves is None:
+            primary = pmm.get(leaf) or _FUSED_FALLBACK.get(leaf)
+            spellings = [primary] if primary is not None else []
+            spellings.extend(_FUSED_ALTERNATE_SHARDS.get(leaf, ()))
+            if not spellings:
                 if not unfused_fallback:
                     continue
-                shard_leaves = [leaf]
+                spellings = [[leaf]]
             stem = base[: -len(leaf)]
-            hits = [stem + sl for sl in shard_leaves
-                    if stem + sl in self.target_scheme]
-            if hits:
-                return hits
+            for shard_leaves in spellings:
+                hits = [stem + sl for sl in shard_leaves
+                        if stem + sl in self.target_scheme]
+                if hits:
+                    return hits
         return []
 
     def _scheme_for_prefix(self, prefix: str) -> dict | None:

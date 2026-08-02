@@ -37,8 +37,29 @@ router.gate, expert_bias, norms, embeddings, lm_head, attention) unchanged to
 the original loader. One line per arch registers it
 (``install_toplevel_cb_expert_loader(SomeForCausalLM)``). A future architecture
 with the same top-level expert mapping can reuse the wrapper, but it is not
-supported until its model class is explicitly registered and tested. In
-particular, the paused DSv4 lane is not registered in Gridbook 0.5.
+supported until its model class is explicitly registered and tested.
+
+**DeepSeek-V4 (ROADMAP D0.1).** ``DeepseekV4ForCausalLM`` is this shape and is
+now registered. Two properties of vLLM 0.24's class made it resolve here with
+no new per-arch loader:
+
+* its module attributes are ``attn`` / ``ffn`` (NOT ``self_attn`` / ``mlp``),
+  and the routed stack nests one level deeper again as
+  ``model.layers.N.ffn.experts.routed_experts.w13_cb_qweight``. The
+  ``.experts.`` prefix anchor in ``resolve_cb_expert_param`` matches on the
+  *stem before* ``.experts.`` and the target *leaf*, so it is indifferent to
+  both — the same property that already absorbed HunYuan V3's nesting;
+* the checkpoint carries no ``model.`` component (keys start at ``layers.N.``)
+  and the class re-attaches it in its own ``hf_to_vllm_mapper``
+  (``{"layers.": "model.layers."}``). ``_hf_mapper_rename`` below already
+  applies the model's own mapper before resolution, so
+  ``layers.N.ffn.experts.gate_up_proj.cb_qweight`` lands on the registered
+  param without a Gridbook-side rewrite.
+
+Its MTP/DSpark payload does NOT come through here: ``DeepseekV4ForCausalLM.
+load_weights`` builds ``AutoWeightsLoader(self, skip_substrs=["mtp."])``, so all
+``mtp.*`` tensors are dropped before any parameter lookup. See the
+``deepseek_v4`` notes in ``docs/PLUGIN.md``.
 
 **Shared-expert (``shared_mlp``) CB tensors.** ``config.py`` aliases the
 architecture's collapsed parent prefix (and its MTP ``.mtp_block`` form) so a
@@ -169,9 +190,26 @@ _INPUT_GLOBAL_SCALE_SUFFIX = ".input_global_scale"
 
 # Standard vLLM fusions, as a fallback when the model class exposes no
 # packed_modules_mapping (only the leaves we route matter here).
+#
+# DeepSeek-V4 is exactly the "exposes none" case — `DeepseekV4ForCausalLM`
+# defines no `packed_modules_mapping` at all (verified against vLLM 0.24.0), so
+# this table is the ONLY source of merge information the orphan guard below
+# has for it. Its two merges are `attn.fused_wqa_wkv` <- (`attn.wq_a`,
+# `attn.wkv`) and the shared expert's `gate_up_proj` <- (`w1`, `w3`); the
+# Mixtral-convention shard leaves coexist with the Llama-convention ones
+# because the reverse map is keyed by SHARD leaf, which stays unambiguous.
 _FUSED_FALLBACK = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
+    "fused_wqa_wkv": ["wq_a", "wkv"],
+}
+
+# Extra shard spellings for an ALREADY-listed fused leaf, merged into the
+# reverse map (which is keyed by shard leaf, so these never collide with the
+# primary spelling above).
+_FUSED_SHARD_ALIASES = {
+    "w1": ("gate_up_proj", 0),
+    "w3": ("gate_up_proj", 1),
 }
 
 
@@ -183,7 +221,7 @@ def _build_reverse_fusion(packed_modules_mapping) -> dict[str, tuple[str, int]]:
     the correct row block (gate=0, up=1)."""
     merged = dict(_FUSED_FALLBACK)
     merged.update(packed_modules_mapping or {})
-    rev: dict[str, tuple[str, int]] = {}
+    rev: dict[str, tuple[str, int]] = dict(_FUSED_SHARD_ALIASES)
     for fused_leaf, shards in merged.items():
         if isinstance(shards, (list, tuple)):
             for idx, shard_leaf in enumerate(shards):

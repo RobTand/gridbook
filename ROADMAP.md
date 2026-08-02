@@ -235,11 +235,61 @@ resident weight copy, decoder, or matmul merely to create another route.
 
 #### Before DSV4 Flash (integration, not new kernels)
 
-- [ ] **D0.1 — Establish the exact serving contract.** Verify the released
-  model's vLLM architecture, tensor-parallel requirement, expert layout, and
-  backend legality before promising support. Gridbook does not currently
-  register `deepseek_v4` and rejects TP greater than one; add only the runtime,
-  sharding, and export support the inspected model actually requires.
+- [x] **D0.1 — Establish the exact serving contract.** Done for the body, MTP
+  and DSpark, against vLLM **0.24.0** and the released
+  `deepseek-ai/DeepSeek-V4-Flash-0731` config. `deepseek_v4` is now a
+  registered producer profile and
+  `vllm.models.deepseek_v4.nvidia.model` a registered top-level loader module.
+  What the inspection actually established, each of which changed the wiring:
+  - **The architecture is not where the contract could name it.** vLLM 0.24
+    ships DSV4 as a per-platform *package*; `DeepseekV4ForCausalLM` is DEFINED
+    in `vllm/models/deepseek_v4/nvidia/model.py`, and the package `__init__`
+    only re-exports it. `plugin.py` installs on the defining module, so the
+    contract validator now accepts a second root, `vllm.models.`, alongside
+    `vllm.model_executor.models.` — still an explicit two-entry allow-list,
+    because every entry is a dynamic import into the serving process.
+  - **Module attributes are `attn`/`ffn`, not `self_attn`/`mlp`**, and the
+    routed stack nests again: FusedMoE prefix `model.layers.N.ffn.experts`,
+    parameters at `…ffn.experts.routed_experts.w13_*`. The shipped
+    stem-plus-leaf `.experts.` anchor absorbs both, so **no new per-model
+    loader module was needed** — the generic wrap covers DSV4.
+  - **The checkpoint carries no `model.` component** (keys start at
+    `layers.N.`); the class re-attaches it in its own `hf_to_vllm_mapper`
+    *after* serving prefixes are handed out. The loader already applies the
+    model's own mapper; `_canonical_prefix` gained the matching source-namespace
+    vintage so config-side target resolution crosses the same gap.
+  - **The class defines no `packed_modules_mapping`**, yet merges
+    `attn.wq_a`+`attn.wkv` into `fused_wqa_wkv` and the shared expert's
+    `w1`+`w3` into `gate_up_proj` (published only via
+    `stacked_params_mapping`). Gridbook's fused fallback tables now carry both,
+    so a CB shard resolves instead of silently falling through to BF16.
+  - **All 43 layers are MoE** — there is no `first_k_dense_replace` in the
+    config or in vLLM's DSV4 — so every layer contributes an expert stack the
+    fill guard checks.
+  - **TP stays 1.** Every TP guard in the class is a divisibility check that
+    `tp_size == 1` satisfies (`64 % 1`, `256 % 1`, `8 // 1`); MLA never shards
+    KV (`fused_wqa_wkv` is built `disable_tp=True`). No narrowly scoped TP
+    implementation is required, so none was added and the existing rejection
+    above one stands.
+  - **MTP/DSpark are passthrough, not served.** `DeepseekV4ForCausalLM.
+    load_weights` builds `AutoWeightsLoader(self, skip_substrs=["mtp."])`, so
+    all 4,705 `mtp.*` tensors are dropped before any parameter lookup; the
+    drafter `DeepSeekV4MTPModel` is reachable only through
+    `--speculative-config`; and `dspark` appears **nowhere** in the vLLM
+    package, so none of the four `dspark_*` config keys is read. The contract
+    therefore preserves them as producer passthrough and claims none of them —
+    it invents no support vLLM lacks.
+  - **Not every DSV4 Linear is CB-eligible.** `ffn.gate`, both
+    `compressor.fused_wkv_wgate`s, `indexer.weights_proj`, `lm_head` and
+    `embed_tokens` are built with no quant config, and `attn.wo_a` is created
+    and post-processed through the quant contract but **applied outside it**
+    (`nvidia/ops/o_proj.py` reads `.weight`/`.weight_scale_inv` directly), so a
+    CB layout there would serve silently wrong results. All of these are
+    documented as must-not-quantize in [`docs/PLUGIN.md`](docs/PLUGIN.md).
+
+  Remaining before a real artifact loads is not contract work — see the
+  DSV4-Flash study's release gate (items 4-5: production calibration of the
+  eight K14 expert groups, then export/load/generate/benchmark).
 - [ ] **D0.2 — Complete packed-expert native delegation if the assignment needs
   it.** Reuse Gridbook's existing top-level expert-loader path, canonical
   producer packers/metadata, and a version-attested upstream vLLM backend for
@@ -350,8 +400,10 @@ published artifact.
   the producer's search, packer, or exporter here would create two sources of
   truth.
 - **General tensor parallel.** No `tp > 1` support exists today and broad TP
-  support is not committed. D0.1 must establish whether DSV4 needs a narrowly
-  scoped implementation before that work is accepted.
+  support is not committed. D0.1 established that DSV4 does **not** need a
+  narrowly scoped implementation — the model fits one GB10 at the planned
+  92 GB, and every TP guard in vLLM's DSV4 class is satisfied at `tp_size == 1`
+  — so no TP work is accepted on its account.
 - **A vLLM fork or core patches.** Running on stock vLLM is the point.
 
 ---

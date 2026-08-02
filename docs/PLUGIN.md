@@ -117,13 +117,82 @@ second runtime tree or maintain a parallel loader table.
   given as a repo id rather than a local directory.
 - **No vLLM-core files are patched.** The plugin does wrap `load_weights` on
   specific *model classes* (HunYuan-V3 + its MTP drafter, Laguna, Qwen3.5-MoE +
-  its MTP) whose loaders map MoE experts at the top level and would otherwise not
+  its MTP, DeepSeek-V4) whose loaders map MoE experts at the top level and would
+  otherwise not
   recognise stacked codebook expert tensors. HunYuan-V3-style shared-CB targets
   are aliased to the native CB Linear at construction, including the collapsed
   and nested MTP prefix forms. If the checkpoint's CB tensor can resolve only
   to a plain BF16 parameter, load fails with the target name; the retired
   decode-to-BF16 compatibility path is not available. The wrap is inert for
   non-CB checkpoints.
+
+### Registered architectures
+
+Both lists live in `gridbook/runtime_contract.json` and nowhere else;
+`plugin.py` derives its install set from the second one. A `top_level_loader_modules`
+entry names the module that **defines** the entrypoint class, which for a
+per-platform vLLM package is a submodule rather than the package itself.
+
+| Producer profile | vLLM entrypoint class | Loader module in the contract |
+|---|---|---|
+| `hy_v3` | `HYV3ForCausalLM`, `HYV3MTP` | `vllm.model_executor.models.hy_v3`, `…hy_v3_mtp` |
+| `laguna` | `LagunaForCausalLM` | `vllm.model_executor.models.laguna` |
+| `qwen3_5`, `qwen3_5_dense`, `qwen3` | Qwen3.5-MoE `ForCausalLM` / `ForConditionalGeneration` + MTP | `vllm.model_executor.models.qwen3_5`, `…qwen3_5_mtp`, `…lfm2_moe` |
+| `deepseek_v4` | `DeepseekV4ForCausalLM` | `vllm.models.deepseek_v4.nvidia.model` |
+
+#### DeepSeek-V4 (`deepseek_v4`)
+
+Established against **vLLM 0.24.0** and the released DSV4-Flash config
+(43 layers, all MoE, 256 routed experts + 1 shared, top-6, MLA with
+`q_lora_rank`/`o_lora_rank` 1024 and `o_groups` 8). Single GPU, `tp=1`, and on
+GB10 the class selects a FlashInfer SM120 MLA backend that **requires
+`--kv-cache-dtype fp8`** — `auto` aborts model construction, independently of
+Gridbook.
+
+- **Native CB.** The routed expert stacks
+  (`…ffn.experts.routed_experts.w13/w2`), the MLA projections `attn.wq_a` +
+  `attn.wkv` (merged into `fused_wqa_wkv`), `attn.wq_b`, `attn.wo_b`,
+  `indexer.wq_b`, and the shared expert's `w1`/`w3`/`w2`. Note the DSV4
+  spellings: module attributes are `attn`/`ffn` (not `self_attn`/`mlp`), the
+  routed stack nests under `routed_experts`, and shared-expert shards use the
+  Mixtral `w1`/`w2`/`w3` convention while vLLM's merged leaf is `gate_up_proj`.
+  The class publishes **no** `packed_modules_mapping`, so Gridbook's fused
+  fallback tables supply the merge.
+- **Namespace.** The checkpoint has no `model.` component (keys start at
+  `layers.N.`); the class re-attaches it in its own `hf_to_vllm_mapper`. Both
+  the expert loader and config-side target resolution handle either spelling.
+- **Passthrough, not served: MTP and DSpark.** The artifact preserves
+  `mtp.*` (4,705 tensors across the three DSpark stages `mtp.0/1/2`) verbatim.
+  `DeepseekV4ForCausalLM.load_weights` builds
+  `AutoWeightsLoader(self, skip_substrs=["mtp."])`, so **every one of them is
+  dropped before any parameter lookup** at plain serving time. The drafter
+  class `DeepSeekV4MTPModel` exists but is reachable only under
+  `--speculative-config`, and it consumes the payload in its source format —
+  Gridbook writes no CB stacks there and registers no loader for it. `dspark`
+  appears nowhere in the vLLM package, so `dspark_block_size`,
+  `dspark_target_layer_ids`, `dspark_markov_rank` and `dspark_noise_token_id`
+  are read by nothing at serving time. Gridbook claims none of this and adds no
+  support vLLM lacks. If a future artifact ever does ship CB expert stacks for
+  an MTP layer, `cb_fill_guard` fails the load and names the module path to add.
+- **Passed through unquantized.** Hyper-connection parameters (`hc_mult` 4:
+  `hc_head_*`, `layers.N.hc_attn_*`, `layers.N.hc_ffn_*`), the hash-routing
+  tables (`num_hash_layers` 3: `ffn.gate.tid2eid`), `ffn.gate` and its
+  `e_score_correction_bias`, `compressor.ape`, `attn.attn_sink`, and all norms.
+  vLLM builds these as raw parameters or with `quant_config=None`, so
+  `get_quant_method` is never called for them.
+- **Must not be quantized.** `ffn.gate`, both `compressor.fused_wkv_wgate`
+  modules, `indexer.weights_proj`, `lm_head` and `embed_tokens` have no quant
+  config at all. Separately, `attn.wo_a` *is* created and post-processed through
+  the quant-method contract but its forward **bypasses `apply()`** — the grouped
+  output projection reads `.weight`/`.weight_scale_inv` directly — so a CB
+  layout there would serve wrong results silently rather than failing. It stays
+  on its source layout.
+- **Fail-closed.** Outside `mtp.*`, vLLM's DSV4 loader looks parameters up
+  unguarded, so any tensor the artifact emits with no matching parameter is a
+  hard load failure rather than a silent skip. On the Gridbook side the usual
+  three apply: a CB tensor that resolves only to a plain BF16 Linear stops the
+  load, a shape mismatch against the stacked `(E, out, bytes)` contract raises,
+  and a registered-but-never-filled expert stack is caught by `cb_fill_guard`.
 
 ## CUDA kernel set (decode-GEMV + prefill)
 

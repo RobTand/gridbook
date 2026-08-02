@@ -96,13 +96,20 @@ def test_contract_matches_runtime_registration_and_loader_table():
         "legacy": ["prismaquant"],
     }
     profiles = contract["producer_profiles"]
-    assert [module.rsplit(".", 1)[-1]
-            for module in profiles["top_level_loader_modules"]] == [
-        "hy_v3", "hy_v3_mtp", "laguna", "qwen3_5", "qwen3_5_mtp",
-        "lfm2_moe",
+    assert profiles["top_level_loader_modules"] == [
+        "vllm.model_executor.models.hy_v3",
+        "vllm.model_executor.models.hy_v3_mtp",
+        "vllm.model_executor.models.laguna",
+        "vllm.model_executor.models.qwen3_5",
+        "vllm.model_executor.models.qwen3_5_mtp",
+        "vllm.model_executor.models.lfm2_moe",
+        # DeepSeek-V4 is a per-platform package in vLLM 0.24; the entrypoint
+        # class is DEFINED in the platform submodule, which is what plugin.py
+        # has to match on (ROADMAP D0.1).
+        "vllm.models.deepseek_v4.nvidia.model",
     ]
     assert set(profiles["supported_ids"]) == {
-        "hy_v3", "laguna", "qwen3", "qwen3_5", "qwen3_5_dense",
+        "deepseek_v4", "hy_v3", "laguna", "qwen3", "qwen3_5", "qwen3_5_dense",
     }
 
 
@@ -150,6 +157,18 @@ def _wrong_loader_module(contract):
     contract["producer_profiles"]["top_level_loader_modules"][0] = "hy_v3"
 
 
+def _non_vllm_loader_root(contract):
+    # The two accepted roots are an allow-list, not a bare "vllm." prefix: the
+    # entries become dynamic imports into the serving process.
+    contract["producer_profiles"]["top_level_loader_modules"][0] = (
+        "vllm.model_executor.layers.hy_v3"
+    )
+
+
+def _empty_supported_ids(contract):
+    contract["producer_profiles"]["supported_ids"] = []
+
+
 def _wrong_scale_plane(contract):
     contract["layout"]["type_size_rules"][0]["scale_plane_bytes"] = 15
 
@@ -166,6 +185,8 @@ def _unsupported_format_mode(contract):
         (_duplicate_rung, "sorted, unique"),
         (_unsupported_family_layout, "unsupported ABI layout"),
         (_wrong_loader_module, "vllm.model_executor.models"),
+        (_non_vllm_loader_root, "vllm.model_executor.models or vllm.models"),
+        (_empty_supported_ids, "non-empty JSON array"),
         (_wrong_scale_plane, "type_size_rules"),
         (_unsupported_format_mode, "unsupported grid/mode pair"),
     ],

@@ -148,6 +148,7 @@
   ],
   "producer_profiles": {
     "supported_ids": [
+      "deepseek_v4",
       "hy_v3",
       "laguna",
       "qwen3",
@@ -160,7 +161,8 @@
       "vllm.model_executor.models.laguna",
       "vllm.model_executor.models.qwen3_5",
       "vllm.model_executor.models.qwen3_5_mtp",
-      "vllm.model_executor.models.lfm2_moe"
+      "vllm.model_executor.models.lfm2_moe",
+      "vllm.models.deepseek_v4.nvidia.model"
     ]
   }
 }
