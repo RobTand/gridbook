@@ -15,6 +15,7 @@ stack plus Gridbook's fused and grouped-BF16 extensions.
 """
 from __future__ import annotations
 
+import os
 import sys
 import types
 
@@ -449,3 +450,96 @@ def test_ragged_routing_at_tile_256(distribution, tokens):
     assert _report(
         f"grouped[tile=256,{distribution},M={tokens}]-vs-native",
         reference, candidate) <= _REL
+
+
+# ---------------------------------------------------------------------------
+# The OPT-IN sm12x-native bridge lane, end to end through the routed operator
+# ---------------------------------------------------------------------------
+def _sm120_bridge_lane():
+    """The grouped-BF16 extension when it carries the sm12x lane, else skip."""
+    _require_stack()
+    from gridbook.cuda_ext import get_bf16_grouped_ext
+
+    ext = get_bf16_grouped_ext()
+    if ext is None:
+        pytest.skip("owned grouped-BF16 CUTLASS extension unavailable")
+    if not hasattr(ext, "cb_bf16_grouped_mm_sm120"):
+        pytest.skip("this build carries no sm12x lane (needs cc 12.0/12.1)")
+    return ext
+
+
+@pytest.mark.parametrize("distribution,tokens,topk", [
+    ("uniform", 48, 2),
+    ("subset", 17, 4),
+    ("one_expert", 129, 1),
+])
+def test_sm120_bridge_lane_matches_the_default_bridge(distribution, tokens,
+                                                      topk):
+    """Both bridge lanes, one routed operator, end to end.
+
+    This is the integration counterpart to the kernel gates in
+    ``test_bf16_grouped_cutlass.py``: it runs the WHOLE quality bridge —
+    routing, weight expansion over expert CHUNKS, activation QDQ before and
+    between the projections, the router combine — once on the default
+    exact-segment SM80 lane and once on the padded sm12x lane, and requires the
+    two to agree to the suite's reassociation contract. It is the only test
+    that exercises the padded gather, the per-expert block offsets each chunked
+    launch slices with, and the throwaway-row scatter together.
+    """
+    ext = _sm120_bridge_lane()
+    method, layer, dims = _build(seed=2)
+    act = _silu_act()
+    ids, weights = _routing(tokens, dims["E"], topk, distribution, seed=11)
+    torch.manual_seed(3)
+    x = torch.randn(
+        tokens, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+
+    layer._cb_bf16_sm120 = None
+    reference = method._apply_prefill_native_bf16(layer, x, weights, ids, act)
+    layer._cb_bf16_sm120 = ext
+    try:
+        candidate = method._apply_prefill_native_bf16(
+            layer, x, weights, ids, act)
+    finally:
+        layer._cb_bf16_sm120 = None
+
+    assert candidate.shape == reference.shape
+    assert torch.isfinite(candidate).all()
+    assert _report(
+        f"sm120-lane-vs-sm80-bridge[{distribution},M={tokens},topk={topk}]",
+        reference, candidate) <= _REL
+
+
+def test_sm120_bridge_lane_survives_a_single_expert_chunk():
+    """One expert per chunk: every launch takes its own block sub-range.
+
+    ``PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK=1`` makes the chunk loop issue E
+    launches, each over the tiles of exactly one expert — the configuration
+    where a wrong block offset or a missing ``expert_ids - c0`` rebase would
+    multiply rows by another expert's weights instead of failing loudly.
+    """
+    ext = _sm120_bridge_lane()
+    method, layer, dims = _build(seed=4)
+    act = _silu_act()
+    ids, weights = _routing(40, dims["E"], 2, "uniform", seed=13)
+    torch.manual_seed(5)
+    x = torch.randn(
+        40, dims["hidden"], dtype=torch.bfloat16, device=DEV) * 0.5
+
+    layer._cb_bf16_sm120 = None
+    reference = method._apply_prefill_native_bf16(layer, x, weights, ids, act)
+    previous = os.environ.get("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
+    os.environ["PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK"] = "1"
+    layer._cb_bf16_sm120 = ext
+    try:
+        candidate = method._apply_prefill_native_bf16(
+            layer, x, weights, ids, act)
+    finally:
+        layer._cb_bf16_sm120 = None
+        if previous is None:
+            os.environ.pop("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", None)
+        else:
+            os.environ["PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK"] = previous
+
+    assert _report("sm120-lane[chunk=1]-vs-sm80-bridge",
+                   reference, candidate) <= _REL

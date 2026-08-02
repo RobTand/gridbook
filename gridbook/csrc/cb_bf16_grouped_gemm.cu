@@ -332,9 +332,11 @@ struct Cfg {
       cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
   // Stage count: (sm120 capacity - epilogue storage) / per-stage bytes, the
-  // builder's own arithmetic. A/B smem is the only per-stage tensor storage —
-  // no packed stream, no decoded buffer, so BF16 gets more stages than the
-  // fused lanes at the same tile.
+  // builder's own arithmetic. A/B smem is the only per-stage tensor storage
+  // here — no packed stream, no decoded buffer — but BF16 operands are 2 bytes,
+  // so 128x128x64 still costs 32 KiB/stage and MEASURES 2 stages (75,776 B of
+  // 101,376). That is one CTA per SM, which the benchmark identifies as the
+  // lane's occupancy ceiling (docs/BENCHMARKS.md).
   static constexpr int kStages =
       cutlass_detail::sm100_compute_stage_count_or_override<
           cutlass_detail::sm120_smem_capacity_bytes,
@@ -367,12 +369,19 @@ struct Cfg {
 };
 
 // TileM is the row-padding granularity python must respect. ONE rung is
-// compiled, deliberately: unlike the fused lanes — where a larger TileM
-// amortizes a per-tile B DECODE and the ladder is a real tradeoff — B here is
-// plain BF16 read through TMA, so a larger TileM buys no arithmetic and costs
-// strictly more padded rows on short experts. TileN=128/TileK=64 keeps the
-// 128-byte swizzle atom (K=64 bf16 = 128 B) and leaves room for several
-// stages.
+// compiled, for two independent reasons:
+//
+//  * FEASIBILITY. 256x128x64, 128x256x64 and 128x64x128 each need 48 KiB per
+//    stage, which StageCountAutoCarveout resolves to ONE stage — below this
+//    mainloop's Stages>=2 static_assert. Measured, not assumed; the sweep is
+//    recorded in docs/BENCHMARKS.md.
+//  * VALUE. Unlike the fused lanes — where a larger TileM amortizes a per-tile
+//    B DECODE and the ladder is a real tradeoff — B here is plain BF16 read
+//    through TMA, so a larger TileM buys no arithmetic and costs strictly more
+//    padded rows on short experts.
+//
+// TileN=128/TileK=64 keeps the 128-byte swizzle atom (K=64 bf16 = 128 B) and
+// was fastest or within noise of fastest on four of six benchmarked cells.
 using GroupedTile = Shape<_128, _128, _64>;
 constexpr int64_t kSm120TileM = size<0>(GroupedTile{});
 

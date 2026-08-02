@@ -122,11 +122,17 @@ def test_grouped_bf16_bridge_carries_this_devices_sass():
 
 
 def test_generic_modules_are_not_pinned_to_an_arch_conditional_target():
-    """``compute_XYa``/``sm_XYa`` belongs to the fused modules only.
+    """``compute_XYa``/``sm_XYa`` is requested, never inherited.
 
-    The generic sources are sm_80+ portable; an arch-conditional binary
-    refuses to load on any other capability at all, so pinning one here would
-    trade a JIT-target bug for a hard portability regression.
+    The two hot decode modules are sm_80+ portable and must stay generic: an
+    arch-conditional binary refuses to load on any other capability at all.
+    The two fused modules require the conditional target for their tensor-core
+    instructions, and since 2026-08-01 the grouped BF16 bridge requests it too
+    — but only where it compiles its sm12x lane (cc 12.x), because the
+    sm90-family cooperative kernel layer that lane goes through compiles its
+    body only under the architecture feature macro. Which callers ask for which
+    is asserted in ``tests/test_ext_build_identity.py``; this case pins the
+    helper both of them use.
     """
     flag = cuda_ext._gencode_flag((12, 1), accelerated=False)
     assert flag == "-gencode=arch=compute_121,code=sm_121"

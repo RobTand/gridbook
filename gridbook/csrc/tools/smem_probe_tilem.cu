@@ -38,6 +38,11 @@
 
 #include "cutlass_fork/sm120_cb_fused_mma.hpp"
 #include "cutlass_fork/sm120_expert_row_broadcast.hpp"
+// The expert-indexed EVT tree comes from the same shared header the serving
+// kernels use, so this probe can never report the sizes of a DIFFERENT
+// epilogue than the one cb_fused_gemm.cu instantiates (2026-08-01 audit §4
+// dedupe #2). It is why the build line above needs the torch/python includes.
+#include "cb_grouped_common.hpp"
 
 namespace {
 
@@ -54,21 +59,8 @@ constexpr int AlignD = 8;
 using ClusterShape = Shape<_1, _1, _1>;
 
 template <class TileShape>
-struct MoeScaledFusion {
-  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
-      0, TileShape, float, float, Stride<_1, _0, _0>>;
-  using ScaleB = cutlass::epilogue::fusion::Sm120CbExpertRowBroadcast<
-      0, TileShape, float, float, Stride<_0, _1, _0>>;
-  using AccFetch = cutlass::epilogue::fusion::Sm90AccFetch;
-  using MulA = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies, ElementAcc, ElementAcc,
-      cutlass::FloatRoundStyle::round_to_nearest>;
-  using MulB = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies, ElementD, ElementAcc,
-      cutlass::FloatRoundStyle::round_to_nearest>;
-  using EVTA = cutlass::epilogue::fusion::Sm90EVT<MulA, ScaleA, AccFetch>;
-  using type = cutlass::epilogue::fusion::Sm90EVT<MulB, ScaleB, EVTA>;
-};
+using MoeScaledFusion = gridbook::grouped::MoeScaledFusion<TileShape,
+                                                           ElementAcc, ElementD>;
 
 template <class TileShape>
 struct CfgMoeScaled {
