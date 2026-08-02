@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0 — 2026-08-02
+
 - **K1.2 — the FP8-CB fused mid-M rung surface, and why it is already
   complete.** The lane instantiated `k ∈ {28,32,36,40,44,48}` while production
   permits every integer K28–K48, which read like five missing instantiations on
