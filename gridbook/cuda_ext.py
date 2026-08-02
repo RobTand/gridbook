@@ -1019,24 +1019,48 @@ def get_fused_fp4_ext():
         return _load_fused_fp4_ext_locked()
 
 
-def preload_fused_extensions(*, strict: bool = False) -> dict[str, bool]:
-    """Attempt both independent fused JIT modules for residency-matched A/Bs.
+def preload_native_extensions(*, strict: bool = False) -> dict[str, bool]:
+    """Attempt EVERY independent native JIT module, for residency-matched A/Bs.
+
+    "Preload" has to mean the whole extension inventory, not a subset. Loading
+    *any* additional CUDA extension into the process shifts allocator addresses
+    and perturbs FP reduction order (the ±17% measurement-arithmetic confound —
+    docs/KERNELS.md "a measurement side-effect worth knowing"), so an arm that
+    warms only the two fused modules is still residency-MISmatched against an
+    arm that later touches ``cb_gemv_v2`` or the grouped BF16 bridge. This
+    warms all seven loaders so both arms of an A/B carry the same set
+    (2026-08-01 performance audit §3 P4, "preload completeness").
 
     Each loader is fail-soft in normal operation, but keep the attempts
-    independent even if a monkeypatch, import failure, or future strict mode
-    raises.  Loading only the FP8 module does not residency-match an NVFP4
-    baseline with its fused candidate.  The returned status lets validation
-    code prove residency; ``strict=True`` raises only after both attempts.
+    INDEPENDENT even if a monkeypatch, import failure, or future strict mode
+    raises: one module being unbuildable on this box (they gate on different
+    capabilities and different toolchain inputs) must not silently skip the
+    warm-up of the rest, or the residency match is quietly partial again.
+
+    The returned status names every family, so validation code can prove which
+    modules are resident rather than assuming. ``strict=True`` raises only
+    after every attempt has run.
     """
     status: dict[str, bool] = {}
     errors: dict[str, Exception] = {}
+    # Architecture-generic production modules first (cheapest, and the ones a
+    # decode A/B always touches), then the arch-pinned specializations. The
+    # keys are the stable status names; ``fp8``/``fp4`` keep the names they
+    # were published with. Resolved as globals at CALL time — three of these
+    # loaders are defined below this point, and a monkeypatched loader must be
+    # the one that actually runs.
     for family, load_ext in (
-        ("fp8", get_fused_ext),
-        ("fp4", get_fused_fp4_ext),
+        ("gemv", get_ext),                                # cb_gemv.cu
+        ("gemv_v2", get_ext_v2),                          # cb_gemv_v2.cu
+        ("bf16_grouped", get_bf16_grouped_ext),           # cb_bf16_grouped_gemm.cu
+        ("fp8", get_fused_ext),                           # cb_fused_gemm.cu
+        ("fp4", get_fused_fp4_ext),                       # cb_fused_fp4_gemm.cu
+        ("fp4v2", get_fused_fp4v2_ext),                   # cb_fused_fp4v2_gemm.cu
+        ("moe_persistent_b", get_moe_persistent_b_ext),   # cb_moe_persistent_b.cu
     ):
         try:
             status[family] = load_ext() is not None
-        except Exception as exc:  # noqa: BLE001 — report after both attempts
+        except Exception as exc:  # noqa: BLE001 — report after every attempt
             status[family] = False
             errors[family] = exc
     if strict and not all(status.values()):
@@ -1044,8 +1068,21 @@ def preload_fused_extensions(*, strict: bool = False) -> dict[str, bool]:
             f"{family}={errors.get(family, 'unavailable')}"
             for family, loaded in status.items() if not loaded
         )
-        raise RuntimeError(f"fused extension preload failed: {detail}")
+        raise RuntimeError(f"native extension preload failed: {detail}")
     return status
+
+
+def preload_fused_extensions(*, strict: bool = False) -> dict[str, bool]:
+    """The published name for :func:`preload_native_extensions`; delegates.
+
+    Kept because it is a documented public surface (``PRISMAQUANT_PRELOAD_FUSED``
+    in docs/PLUGIN.md) and an external caller may hold the name. It is no
+    longer accurate — the warm-up now covers every native module, not just the
+    two fused ones — so new code should call
+    :func:`preload_native_extensions`. Behaviour is identical, including the
+    ``fp8``/``fp4`` status keys, which now arrive alongside the other five.
+    """
+    return preload_native_extensions(strict=strict)
 
 
 def _load_fused_fp4_ext_locked():
@@ -1146,10 +1183,35 @@ _FUSED_ABI_SCHEMA = 1
 _FUSED_SYMBOLS = (
     "cb_fused_prefill_mm_scaled",          # dense mid-M + linear.py prefill
     "cb_fused_moe_grouped",                # routed prefill, one launch/stage
+    "cb_fused_kbits",                      # the COMPILED rung set (K1.2)
     "cb_fused_moe_tile_m",                 # the kernel's default TileM
     "cb_fused_moe_tile_sizes",             # every compiled TileM
     "cb_fused_moe_tile_sizes_for_kbits",   # ... that this rung can serve
 )
+
+
+def fused_fp8_kbits(ext) -> tuple[int, ...]:
+    """The k_bits rungs the loaded fused FP8 module actually COMPILED.
+
+    K1.2. The product FP8-CB ladder is every integer 28..48, but the fused
+    mid-M lane backs only the multiples of 4 — a format + TMA law spelled out
+    at the top of ``csrc/cb_fused_gemm.cu``, not a build option. Dispatch must
+    therefore ASK the module rather than carry a literal ladder: a duplicated
+    literal is exactly how a call site silently misses a compiled rung (or
+    offers an uncompiled one) when the kernel's surface moves.
+
+    Read ONCE and memoized on the module object, like
+    ``fp4v2_fused_midm_lane._facts`` — the cache then dies exactly when the
+    module does, and a read-only stub still works.
+    """
+    cached = getattr(ext, "_gridbook_fused_fp8_kbits", None)
+    if cached is None:
+        cached = tuple(sorted(int(k) for k in ext.cb_fused_kbits()))
+        try:
+            ext._gridbook_fused_fp8_kbits = cached
+        except Exception:  # noqa: BLE001 — a read-only stub still works
+            pass
+    return cached
 
 
 def get_fused_ext():

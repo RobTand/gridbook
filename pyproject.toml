@@ -97,6 +97,15 @@ gridbook = [
     "csrc/*.cu",
     "csrc/*.cuh",
     "csrc/*.h",
+    # csrc/*.hpp — added 2026-08-02. `cb_grouped_common.hpp` (the shared EVT
+    # trees, smem gate and grouped host validation, extracted by the 2026-08-01
+    # audit §4 dedupe) is the first top-level .hpp under csrc/, and NO glob here
+    # matched it: `.h` does not match `.hpp`, and `cutlass_fork/*.hpp` is a
+    # different directory. It is a declared build input of all four
+    # fused/grouped loaders, so an installed wheel could not JIT-build ANY of
+    # them (`_require_csrc` raises IncompleteInstallError). Single-level like
+    # its siblings, so csrc/tools/ stays wheel-excluded.
+    "csrc/*.hpp",
     "csrc/cutlass_fork/*.hpp",
 ]
 

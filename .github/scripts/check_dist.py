@@ -69,9 +69,29 @@ PKG = "gridbook"
 #                            (exact native quality bridge for dense/MoE)
 #   cb_fused_gemm.cu    -> cuda_ext.get_fused_ext()      (fused prefill)
 #   cb_fused_fp4_gemm.cu -> cuda_ext.get_fused_fp4_ext() (fused NVFP4 prefill)
+#   cb_fused_fp4v2_gemm.cu -> cuda_ext.get_fused_fp4v2_ext()
+#                            (contract-preserving fused FP4-v2 quality lane)
+#   cb_moe_persistent_b.cu -> cuda_ext.get_moe_persistent_b_ext()
+#                            (persistent-B grouped MoE decode-in-mainloop)
 # cb_fused_gemm.cu #includes the three cutlass_fork headers listed below.
 # cb_fused_fp4_gemm.cu #includes sm120_cb_fused_fp4_mma.hpp; both are also
 # JIT-identity inputs and therefore belong on this non-vacuous floor.
+# The Gridbook-owned headers are runtime-required for the same reason: every
+# one is a declared ``_*_BUILD_INPUTS`` entry, so it is both #included by a
+# JIT-compiled translation unit and hashed into that module's build identity.
+#   cb_grouped_common.hpp  shared grouping glue (EVT trees, smem gate, host
+#                          validation) -- pulled in by ALL FOUR of
+#                          get_fused_ext / get_fused_fp4_ext /
+#                          get_fused_fp4v2_ext / get_bf16_grouped_ext, so its
+#                          absence breaks every grouped and fused lane at once.
+#   sm120_cb_fp4v2_bf16_mma.hpp  the FP4-v2 CB->BF16 decode-in-prologue
+#                                mainloop fork (get_fused_fp4v2_ext).
+#   sm120_bf16_expert_mma.hpp    the expert-indexed BF16 mainloop fork
+#                                (get_bf16_grouped_ext, get_fused_fp4v2_ext).
+# NOTE: cb_grouped_common.hpp sits at csrc/ top level with a ``.hpp`` suffix,
+# which the pyproject package-data globs (csrc/*.cu, *.cuh, *.h and
+# csrc/cutlass_fork/*.hpp) do not match. Listing it here makes that a named
+# runtime-floor failure rather than a generic drift report.
 # A serving-reachable opt-in specialization still belongs on this floor: check
 # 3 (drift) would also notice it missing, but only while the file exists in the
 # checkout the CI job happens to be run against. Source-only research kernels
@@ -84,9 +104,14 @@ REQUIRED = [
     f"{PKG}/csrc/cb_bf16_grouped_gemm.cu",
     f"{PKG}/csrc/cb_fused_gemm.cu",
     f"{PKG}/csrc/cb_fused_fp4_gemm.cu",
+    f"{PKG}/csrc/cb_fused_fp4v2_gemm.cu",
+    f"{PKG}/csrc/cb_moe_persistent_b.cu",
+    f"{PKG}/csrc/cb_grouped_common.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_mma_tma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_fused_mma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
+    f"{PKG}/csrc/cutlass_fork/sm120_cb_fp4v2_bf16_mma.hpp",
+    f"{PKG}/csrc/cutlass_fork/sm120_bf16_expert_mma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_expert_row_broadcast.hpp",
 ]
 

@@ -38,6 +38,39 @@ def type_size(k: int, is_fp4: bool) -> int:
     return 4 * int(k) + (16 if is_fp4 else 0)
 
 
+# --- the FUSED mid-M lane's rung law (K1.2) --------------------------------
+#
+# The product FP8-CB ladder is every INTEGER k in [28, 48] (3.5..6.0 bpw in
+# 0.125 steps), and Gridbook SERVES all 21 of them — through the decode GEMV
+# and the expand+GEMM quality bridge. The decode-in-prologue FUSED lane
+# (csrc/cb_fused_gemm.cu) backs a strict SUBSET, and that is a property of the
+# format and of TMA rather than a build option:
+#
+#   * type_size = 4*k is the packed-B TMA box's contiguous extent, and TMA
+#     requires it to be a 16-byte multiple -> k % 4 == 0; and
+#   * the fused mainloop decodes with ONE sub-table width CbSubW = k/4, while
+#     the format splits k over n_sub=4 RAGGEDLY (csrc/cb_gemv.cu `SubSplit`:
+#     widths are k//4 + (i < k%4)), so a uniform width is the real layout only
+#     when k % 4 == 0.
+#
+# Both conditions are the same condition, so one law expresses them. This is a
+# LAW, not a transcription of the kernel's instantiation list: dispatch uses it
+# as the cheap host-side gate (it must not force an extension build just to ask
+# a question), and then CONFIRMS against `cuda_ext.fused_fp8_kbits(ext)`, which
+# is what the loaded module actually compiled. tests/test_fused_prefill.py pins
+# the law to the built module's `cb_fused_kbits()`, so the two cannot drift.
+FP8_FUSED_KBITS_LO = 28
+FP8_FUSED_KBITS_HI = 48
+FP8_FUSED_KBITS_STEP = 4
+FP8_FUSED_KBITS = tuple(
+    range(FP8_FUSED_KBITS_LO, FP8_FUSED_KBITS_HI + 1, FP8_FUSED_KBITS_STEP))
+
+
+def fp8_fused_rung_supported(k: int) -> bool:
+    """Whether ``k`` is on the fused mid-M lane's rung law (see above)."""
+    return int(k) in FP8_FUSED_KBITS
+
+
 def assert_cast_lossless(raw, cast, what: str, prefix: str) -> None:
     """Require ``cast`` to preserve every codebook value exactly.
 

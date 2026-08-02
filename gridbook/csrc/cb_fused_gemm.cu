@@ -29,7 +29,9 @@
 //    REFERENCE for the fused kernel (identical TiledMma/layout config).
 //  - cb_fused_prefill_mm: the decode-in-prologue FP8_CB GEMM — B is the
 //    PACKED byte stream + a global e4m3-byte LUT; the dense tile never
-//    exists in HBM. KBits in {28,32,36,40,44,48} template-dispatched (full even fp8 ladder).
+//    exists in HBM. KBits template-dispatched over the RUNG LAW below
+//    (28..48 step 4) — a strict subset of the 21-rung product ladder;
+//    cb_fused_kbits() reports what this build carries.
 //  - smem_report: per-config SharedStorage sizes (budget sanity).
 //
 // Scale convention:
@@ -81,6 +83,71 @@ using LayoutD = cutlass::layout::RowMajor;
 constexpr int AlignAB = 16;
 constexpr int AlignD = 8;
 using ClusterShape = Shape<_1, _1, _1>;
+
+// ===========================================================================
+// THE FUSED RUNG LAW (K1.2, established 2026-08-02).
+//
+// The producer's FP8-CB ladder is EVERY INTEGER k_bits in [28, 48]
+// (prismaquant/format_registry.py `for _k in range(28, 49)` — 3.5..6.0 bpw in
+// 0.125 steps; gridbook/runtime_contract.json carries the same 21 rungs). The
+// fused mid-M lane serves the MULTIPLES OF 4 and no others, and the K1.2
+// investigation established that this is a property of the FORMAT and of TMA
+// — not a missing template instantiation that could be added:
+//
+//  1. TMA BOX. Packed B is fetched by SM90_TMA_LOAD with a box of
+//     (TileN, CbTypeSize) BYTES over the [N, n_sb*CbTypeSize] byte stream,
+//     where CbTypeSize = 4*k_bits is one 256-weight superblock. TMA requires
+//     the box's contiguous extent to be a 16-byte multiple:
+//         4*k_bits % 16 == 0   <=>   k_bits % 4 == 0.
+//     (cutlass_fork/sm120_cb_fused_mma.hpp: `static_assert(CbTypeSize % 16
+//     == 0, "type_size must be a 16-byte multiple (TMA box)")`.)
+//
+//  2. UNIFORM SUB-TABLE WIDTH. The fused mainloop decodes a codeword with a
+//     SINGLE width `CbSubW = KBits/4` and indexes the flat codebook at
+//     `(s << CbSubW) + idx` — one width and one stride for all four
+//     sub-tables. The FORMAT splits k_bits over n_sub=4 RAGGEDLY: see
+//     `SubSplit` in csrc/cb_gemv.cu, the decode reference this kernel is
+//     bit-gated against — `base = k_bits/NSUB, extra = k_bits%NSUB`, and
+//     sub-table i has width `base + (i < extra)`. At k_bits=37 the true
+//     widths are (10,9,9,9) with non-uniform table offsets, so a uniform
+//     decode would be WRONG, not merely unaligned.
+//
+// The two laws coincide exactly, which is why one predicate expresses both.
+// Consequence for dispatch: the 21-rung product ladder is NOT fully backed by
+// this lane, and Python must therefore ASK for the backed set rather than
+// carry a literal (`cb_fused_kbits()` below). ROADMAP K1.2 offers exactly two
+// arms — instantiate every product rung, or "encode the concrete route so the
+// allocator cannot price an unbacked fast path". Arm one is closed by the
+// laws above; this file implements arm two, and makes the surface queryable.
+// ===========================================================================
+constexpr int64_t kFusedKbLo = 28;
+constexpr int64_t kFusedKbHi = 48;
+constexpr int64_t kFusedKbStep = 4;   // = 16 / gcd(4, 16), i.e. law 1 above.
+
+constexpr bool fused_kbits_supported(int64_t kb) {
+  return kb >= kFusedKbLo && kb <= kFusedKbHi &&
+         (kb - kFusedKbLo) % kFusedKbStep == 0;
+}
+
+// THE one rung list. Every switch, every report and every binding below is
+// generated from it, because 21-case switches hand-written N times is a bug
+// farm — the whole point of K1.2's dispatch half.
+#define PQ_FUSED_RUNGS(X) X(28) X(32) X(36) X(40) X(44) X(48)
+
+// ...and the list is proved equal to the law in BOTH directions: every member
+// satisfies the predicate, and the member count equals the law's cardinality.
+#define PQ_RUNG_IN_LAW(KB) \
+  static_assert(fused_kbits_supported(KB), "rung " #KB " violates the fused rung law");
+PQ_FUSED_RUNGS(PQ_RUNG_IN_LAW)
+#undef PQ_RUNG_IN_LAW
+#define PQ_RUNG_ONE(KB) +1
+static_assert((0 PQ_FUSED_RUNGS(PQ_RUNG_ONE)) ==
+                  (kFusedKbHi - kFusedKbLo) / kFusedKbStep + 1,
+              "PQ_FUSED_RUNGS must enumerate the law's rungs exhaustively");
+#undef PQ_RUNG_ONE
+
+// The TileM values with at least one compiled rung (see the grouped section).
+#define PQ_FUSED_MOE_TILES(X) X(128) X(256)
 
 // ---------------------------------------------------------------------------
 // Config factory: builder collective + epilogue at a given tile shape, plus
@@ -304,6 +371,24 @@ torch::Tensor run_fused(torch::Tensor a, torch::Tensor packed,
   return d;
 }
 
+// ONE rung rejection, phrased as the LAW rather than as a list — so an operator
+// who lands here with a k_bits=37 artifact is told the reason (and that the
+// rung is served, just not by this lane) instead of "unsupported".
+void check_fused_kbits(int64_t k_bits) {
+  TORCH_CHECK(
+      fused_kbits_supported(k_bits),
+      "k_bits=", k_bits, " is outside the FUSED lane's rung law. The fused "
+      "mid-M FP8-CB kernel serves k_bits in [", kFusedKbLo, ", ", kFusedKbHi,
+      "] on a step of ", kFusedKbStep, " (multiples of 4). This is a format + "
+      "TMA law, not a build option: type_size = 4*k_bits must be a 16-byte "
+      "multiple for the packed-B TMA box, and the mainloop's single "
+      "CbSubW = k_bits/4 sub-table width is only the format's real layout when "
+      "k_bits % 4 == 0 (csrc/cb_gemv.cu SubSplit splits raggedly otherwise). "
+      "Every integer rung 28..48 IS served by Gridbook — through the decode "
+      "GEMV and the expand+GEMM quality bridge — just not through this lane. "
+      "Enumerate cb_fused_kbits() rather than assuming a ladder.");
+}
+
 void check_fused_inputs(torch::Tensor a, torch::Tensor packed,
                         torch::Tensor lut, int64_t N, int64_t K,
                         int64_t k_bits) {
@@ -319,24 +404,17 @@ void check_fused_inputs(torch::Tensor a, torch::Tensor packed,
   TORCH_CHECK(packed.stride(0) >= (K / 256) * 4 * k_bits);
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8);
   TORCH_CHECK(K % 256 == 0);
-  TORCH_CHECK(k_bits == 28 || k_bits == 32 || k_bits == 36 ||
-              k_bits == 40 || k_bits == 44 || k_bits == 48,
-              "unsupported k_bits ", k_bits);
+  check_fused_kbits(k_bits);
 }
 
 torch::Tensor cb_fused_prefill_mm(torch::Tensor a, torch::Tensor packed,
                                   torch::Tensor lut, int64_t N, int64_t K,
                                   int64_t k_bits) {
   check_fused_inputs(a, packed, lut, N, K, k_bits);
-  switch (k_bits) {
-    case 28: return run_fused<28>(a, packed, lut, N, K);
-    case 32: return run_fused<32>(a, packed, lut, N, K);
-    case 36: return run_fused<36>(a, packed, lut, N, K);
-    case 40: return run_fused<40>(a, packed, lut, N, K);
-    case 44: return run_fused<44>(a, packed, lut, N, K);
-    case 48: return run_fused<48>(a, packed, lut, N, K);
-    default: TORCH_CHECK(false, "unsupported k_bits ", k_bits);
-  }
+#define PQ_DENSE_CASE(KB) case KB: return run_fused<KB>(a, packed, lut, N, K);
+  switch (k_bits) { PQ_FUSED_RUNGS(PQ_DENSE_CASE) default: break; }
+#undef PQ_DENSE_CASE
+  TORCH_CHECK(false, "unsupported k_bits ", k_bits);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,15 +480,11 @@ torch::Tensor cb_fused_prefill_mm_scaled(torch::Tensor a, torch::Tensor packed,
   TORCH_CHECK(b_scales.is_cuda() && b_scales.scalar_type() == torch::kFloat32 &&
                   b_scales.numel() == N && b_scales.is_contiguous(),
               "b_scales must be contiguous fp32 [N] (per-output-channel)");
-  switch (k_bits) {
-    case 28: return run_fused_scaled<28>(a, packed, lut, a_scales, b_scales, N, K);
-    case 32: return run_fused_scaled<32>(a, packed, lut, a_scales, b_scales, N, K);
-    case 36: return run_fused_scaled<36>(a, packed, lut, a_scales, b_scales, N, K);
-    case 40: return run_fused_scaled<40>(a, packed, lut, a_scales, b_scales, N, K);
-    case 44: return run_fused_scaled<44>(a, packed, lut, a_scales, b_scales, N, K);
-    case 48: return run_fused_scaled<48>(a, packed, lut, a_scales, b_scales, N, K);
-    default: TORCH_CHECK(false, "unsupported k_bits ", k_bits);
-  }
+#define PQ_DENSE_SCALED_CASE(KB) \
+  case KB: return run_fused_scaled<KB>(a, packed, lut, a_scales, b_scales, N, K);
+  switch (k_bits) { PQ_FUSED_RUNGS(PQ_DENSE_SCALED_CASE) default: break; }
+#undef PQ_DENSE_SCALED_CASE
+  TORCH_CHECK(false, "unsupported k_bits ", k_bits);
 }
 
 // ---------------------------------------------------------------------------
@@ -494,21 +568,31 @@ constexpr int64_t kMoeTileM = size<0>(TileF{});
 //
 // FEASIBILITY IS SMEM-BOUND, and the bound bites the HIGH rungs first, because
 // smem grows with BOTH TileM (smem_A = TileM*TileK*Stages) and k_bits
-// (smem_BP = TileN*4*k_bits*Stages). Measured exactly by
-// csrc/tools/smem_probe_tilem.cu (host-only, no launch) against CUTLASS's
-// cutlass::arch::sm120_smem_capacity_bytes = 101376 (= 99 KiB, the CUDA
-// cc-12.0 max opt-in dynamic smem per block):
+// (smem_BP = TileN*4*k_bits*Stages), and since R6 also with the staged
+// codebook LUT. Measured by csrc/tools/smem_probe_tilem.cu (host-only, no
+// launch) against cutlass::arch::sm120_smem_capacity_bytes = 101376 (= 99 KiB,
+// the CUDA cc-12.0 max opt-in dynamic smem per block):
 //
 //   GemmKernel::SharedStorageSize, TileN=64 TileK=128 Stages=2
+//   (REGENERATED 2026-08-02, GB10 / CUTLASS 4.3.4 — the previous table quoted
+//    the PRE-R6 base and was stale by up to 16,384 B once the LUT stage landed)
 //   TileM   k28     k32      k36      k40      k44      k48
-//   128    66560   68608    70656    72704    74752    76800     all FIT
-//   256    99328  101376   103424   105472   107520   109568     FIT only 28/32
-//   384   >=130624 (smem_A alone = 98304)                        none FIT
+//   128    67584   70656    74752    80896    91136    93184     all FIT
+//   256   100352  101376   103424  105472  107520  109568        FIT only 28/32
+//   384  >=132096 (smem_A alone = 98304)                         none FIT
 //
-// So the compiled matrix is: TileM=128 x all six rungs, plus TileM=256 x
+// So the compiled matrix is: TileM=128 x all six law rungs, plus TileM=256 x
 // {28, 32} ONLY. TileM=384 is infeasible at every rung and is not compiled.
+// (TileM must be a multiple of the TiledMma's 128-row M, so 128/256/384 are the
+// only candidates at all — there is no 192 rung to rescue the high k_bits.)
 // NOTE: TileM=256/k_bits=32 lands on EXACTLY the 101376-byte ceiling (zero
 // margin) — it is compiled, but must be launch-verified before being trusted.
+//
+// The predicate below is a LAW, not a transcription of that table: it is the
+// closed form the collective's own storage policy implies, and it is
+// static_asserted cell-by-cell against the twelve measured numbers, so a future
+// storage change that breaks the law is a compile error rather than a stale
+// comment. (The old hand-listed `kb == 28 || kb == 32` could not notice.)
 //
 // Nothing else changed: same SwapToFused mainloop, same MoeScaledFusion
 // expert-indexed epilogue, same Stages=2, same TileN=64/TileK=128, same
@@ -524,13 +608,57 @@ using MoeTile = Shape<Int<TM>, _64, _128>;
 static_assert(cute::is_same_v<MoeTile<128>, TileF>,
               "TileM=128 grouped path must remain the original TileF config");
 
-// Compiled-matrix predicate. Derived from the measured smem table above.
-constexpr bool moe_tile_supported(int64_t tm, int64_t kb) {
-  return tm == 128 ? (kb == 28 || kb == 32 || kb == 36 || kb == 40 ||
-                      kb == 44 || kb == 48)
-       : tm == 256 ? (kb == 28 || kb == 32)
-                   : false;
+// --- the smem closed form (mirrors sm120_cb_fused_mma.hpp's storage policy) --
+//
+// LUT stage: the flat codebook is 4 sub-tables x 2^CbSubW rows x 2 e4m3 bytes.
+// The collective stages `CbLutResidentSubs` of them, choosing 4 / 2 / 0 by the
+// headroom its TileM leaves (16 KB at TileM=128, 1 KB at TileM=256).
+constexpr int64_t moe_lut_bytes(int64_t tm, int64_t kb) {
+  const int64_t sub_bytes = (int64_t{1} << (kb / 4)) * 2;   // 2^CbSubW * 2
+  const int64_t subs = (tm <= 128) ? ((4 * sub_bytes <= 16384) ? 4 : 2)
+                                   : ((4 * sub_bytes <= 1024) ? 4 : 0);
+  return subs * sub_bytes;
 }
+
+// smem_A (TileM*TileK*Stages = 256*tm) + smem_BP (TileN*4*kb*Stages = 512*kb)
+// + 19,456 B fixed (decoded-B buffer + epilogue tensors + pipelines) + the LUT.
+constexpr int64_t moe_smem_bytes(int64_t tm, int64_t kb) {
+  return 256 * tm + 512 * kb + 19456 + moe_lut_bytes(tm, kb);
+}
+
+// Compiled-matrix predicate: the rung law AND the smem budget, both as laws.
+constexpr bool moe_tile_supported(int64_t tm, int64_t kb) {
+  return fused_kbits_supported(kb) && (tm == 128 || tm == 256 || tm == 384) &&
+         moe_smem_bytes(tm, kb) <=
+             (int64_t)cutlass::arch::sm120_smem_capacity_bytes;
+}
+
+// The closed form REPRODUCES the probe, cell by cell. If a CUTLASS bump or a
+// storage-policy edit moves any of these, this file stops compiling and the
+// table above must be regenerated (csrc/tools/smem_probe_tilem.cu) — which is
+// exactly the failure mode the stale pre-R6 table had no way to signal.
+#define PQ_ASSERT_SMEM(TM, KB, BYTES)                                       \
+  static_assert(moe_smem_bytes(TM, KB) == BYTES,                            \
+                "measured smem for (TileM=" #TM ", k" #KB ") no longer "    \
+                "matches the closed form; re-run smem_probe_tilem");
+PQ_ASSERT_SMEM(128, 28, 67584)  PQ_ASSERT_SMEM(128, 32, 70656)
+PQ_ASSERT_SMEM(128, 36, 74752)  PQ_ASSERT_SMEM(128, 40, 80896)
+PQ_ASSERT_SMEM(128, 44, 91136)  PQ_ASSERT_SMEM(128, 48, 93184)
+PQ_ASSERT_SMEM(256, 28, 100352) PQ_ASSERT_SMEM(256, 32, 101376)
+PQ_ASSERT_SMEM(256, 36, 103424) PQ_ASSERT_SMEM(256, 40, 105472)
+PQ_ASSERT_SMEM(256, 44, 107520) PQ_ASSERT_SMEM(256, 48, 109568)
+#undef PQ_ASSERT_SMEM
+
+// ...and therefore the predicate reproduces the compiled matrix exactly.
+static_assert(moe_tile_supported(256, 32) &&
+                  moe_smem_bytes(256, 32) ==
+                      (int64_t)cutlass::arch::sm120_smem_capacity_bytes,
+              "TileM=256/k32 is the documented ZERO-MARGIN cell; if it stops "
+              "landing exactly on the ceiling the caution above is wrong");
+static_assert(!moe_tile_supported(256, 36) && !moe_tile_supported(384, 28),
+              "smem-infeasible cells must stay out of the compiled matrix");
+static_assert(!moe_tile_supported(128, 30),
+              "the rung law must gate the grouped path too");
 
 template <int TM, int KB>
 torch::Tensor run_moe_grouped(torch::Tensor a, torch::Tensor packed,
@@ -588,10 +716,43 @@ torch::Tensor run_moe_grouped(torch::Tensor a, torch::Tensor packed,
   return d;
 }
 
+// Rung dispatch for ONE TileM, generated from the single rung list. The
+// `if constexpr` is what makes generation safe: a cell the law rejects emits no
+// code at all, so `run_moe_grouped`'s own static_assert (and AssertSmemFits
+// behind it) is never reached for an over-budget config. Adding a TileM or a
+// rung is therefore one edit to one macro list, not two nested switches kept in
+// sync by hand — the K1.2 "bug farm" this replaces.
+template <int TM, class... Args>
+torch::Tensor moe_dispatch_kbits(int64_t k_bits, Args&&... args) {
+#define PQ_MOE_RUNG(KB)                                                    \
+  if constexpr (moe_tile_supported(TM, KB)) {                              \
+    if (k_bits == KB) return run_moe_grouped<TM, KB>(args...);             \
+  }
+  PQ_FUSED_RUNGS(PQ_MOE_RUNG)
+#undef PQ_MOE_RUNG
+  TORCH_CHECK(false, "no compiled grouped kernel for (tile_m=", TM,
+              ", k_bits=", k_bits, ")");
+}
+
 int64_t cb_fused_moe_tile_m() { return kMoeTileM; }
 
+// THE compiled rung set, as the build actually carries it. Python must
+// enumerate this instead of duplicating a literal ladder: the fused lane backs
+// a strict SUBSET of the 21-rung product ladder (see the rung law at the top),
+// and a duplicated literal is how a dispatch silently misses a compiled rung or
+// selects an uncompiled one. Generated from the same list the switches are.
+std::vector<int64_t> cb_fused_kbits() {
+#define PQ_RUNG_VALUE(KB) KB,
+  return {PQ_FUSED_RUNGS(PQ_RUNG_VALUE)};
+#undef PQ_RUNG_VALUE
+}
+
 // Every TileM value for which AT LEAST ONE rung is compiled.
-std::vector<int64_t> cb_fused_moe_tile_sizes() { return {128, 256}; }
+std::vector<int64_t> cb_fused_moe_tile_sizes() {
+#define PQ_TILE_VALUE(TM) TM,
+  return {PQ_FUSED_MOE_TILES(PQ_TILE_VALUE)};
+#undef PQ_TILE_VALUE
+}
 
 // Per-rung candidate list — python should enumerate THIS, never the union,
 // so it can never select an uncompiled (TileM, k_bits) pair.
@@ -615,9 +776,7 @@ torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
               "a must be contiguous [Mp,K]");
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8);
   TORCH_CHECK(K % 256 == 0);
-  TORCH_CHECK(k_bits == 28 || k_bits == 32 || k_bits == 36 ||
-                  k_bits == 40 || k_bits == 44 || k_bits == 48,
-              "unsupported k_bits ", k_bits);
+  check_fused_kbits(k_bits);
   TORCH_CHECK(moe_tile_supported(tile_m, k_bits),
               "grouped tile_m=", tile_m, " is not compiled for k_bits=", k_bits,
               " (smem-infeasible on sm_120: limit 101376 B). Query "
@@ -646,28 +805,11 @@ torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
   gridbook::grouped::check_expert_ids(a, expert_ids, a.size(0), tile_m,
                                       packed.size(0));
 
-#define PQ_MOE_CALL(TM, KB) \
-  return run_moe_grouped<TM, KB>(a, packed, lut, a_scales, b_scales, expert_ids, N, K)
-  switch (tile_m) {
-    case 128:
-      switch (k_bits) {
-        case 28: PQ_MOE_CALL(128, 28);
-        case 32: PQ_MOE_CALL(128, 32);
-        case 36: PQ_MOE_CALL(128, 36);
-        case 40: PQ_MOE_CALL(128, 40);
-        case 44: PQ_MOE_CALL(128, 44);
-        case 48: PQ_MOE_CALL(128, 48);
-      }
-      break;
-    case 256:
-      // smem ceiling: only the two lowest rungs fit (see the table above).
-      switch (k_bits) {
-        case 28: PQ_MOE_CALL(256, 28);
-        case 32: PQ_MOE_CALL(256, 32);
-      }
-      break;
-  }
-#undef PQ_MOE_CALL
+#define PQ_MOE_TILE_CASE(TM)                                                 \
+  case TM: return moe_dispatch_kbits<TM>(k_bits, a, packed, lut, a_scales,   \
+                                         b_scales, expert_ids, N, K);
+  switch (tile_m) { PQ_FUSED_MOE_TILES(PQ_MOE_TILE_CASE) default: break; }
+#undef PQ_MOE_TILE_CASE
   TORCH_CHECK(false, "no compiled grouped kernel for (tile_m=", tile_m,
               ", k_bits=", k_bits, ")");
 }
@@ -700,11 +842,16 @@ static void push_rung(std::vector<int64_t>& out) {
   out.push_back((int64_t)ML::CbLutResidentSubs);
 }
 
-// Flat [k_bits, SharedStorageSize, lut_smem_bytes, resident_sub_tables] x 6.
+// Flat [k_bits, SharedStorageSize, lut_smem_bytes, resident_sub_tables] per
+// COMPILED rung — generated from the one rung list, so it can never fall behind
+// the dispatch (it did: this used to be a hand-written six-call sequence).
+// "All the rungs" here means all the rungs that EXIST in this lane; the 15
+// integer rungs the law excludes cannot be instantiated to be reported on.
 std::vector<int64_t> smem_report_rungs() {
   std::vector<int64_t> out;
-  push_rung<28>(out); push_rung<32>(out); push_rung<36>(out);
-  push_rung<40>(out); push_rung<44>(out); push_rung<48>(out);
+#define PQ_PUSH_RUNG(KB) push_rung<KB>(out);
+  PQ_FUSED_RUNGS(PQ_PUSH_RUNG)
+#undef PQ_PUSH_RUNG
   out.push_back(-1);
   out.push_back((int64_t)cutlass::arch::sm120_smem_capacity_bytes);
   out.push_back(-1);
@@ -735,6 +882,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("a"), py::arg("packed"), py::arg("lut"), py::arg("a_scales"),
         py::arg("b_scales"), py::arg("expert_ids"), py::arg("N"), py::arg("K"),
         py::arg("k_bits"), py::arg("tile_m") = kMoeTileM);
+  m.def("cb_fused_kbits", &cb_fused_kbits,
+        "the k_bits rungs this build actually COMPILED for the fused mid-M "
+        "lane, ascending. The product FP8-CB ladder is every integer 28..48; "
+        "this lane serves the multiples of 4 only, because type_size = 4*k "
+        "must be a 16-byte TMA box multiple AND the mainloop's single "
+        "CbSubW = k/4 sub-table width is the format's real layout only then. "
+        "Enumerate this to decide fused eligibility — never a literal ladder.");
   m.def("cb_fused_moe_tile_m", &cb_fused_moe_tile_m,
         "DEFAULT TileM of the grouped (MoE) path — the row-padding granularity");
   m.def("cb_fused_moe_tile_sizes", &cb_fused_moe_tile_sizes,
@@ -744,6 +898,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "this to pick a grouped tile_m; anything else TORCH_CHECKs");
   m.def("smem_report", &smem_report, "SharedStorage sizes [F44, F48, K44, K48, Epi]");
   m.def("smem_report_rungs", &smem_report_rungs,
-        "flat [k_bits, SharedStorageSize, lut_smem_bytes, resident_subs] x 6, "
+        "flat [k_bits, SharedStorageSize, lut_smem_bytes, resident_subs] per "
+        "COMPILED rung (see cb_fused_kbits), "
         "then [-1, sm120_capacity, -1, -1]");
 }

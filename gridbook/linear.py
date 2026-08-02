@@ -31,6 +31,7 @@ from .bf16_grouped_lane import (dense_mm as bf16_sm120_dense_mm,
                                 require_lane as bf16_sm120_require_lane,
                                 requested as bf16_sm120_requested)
 from .expand import expand_fp4_v2_to_weight
+from .fp8_fused_lane import rung_eligible as fp8_fused_rung_eligible
 from .fp4v2_fused_midm_lane import (eligible as fp4v2_midm_eligible,
                                     fused_mm as fp4v2_midm_fused_mm,
                                     require_lane as fp4v2_midm_require_lane,
@@ -1048,7 +1049,16 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # and rounds once to bf16 — the same rounding ORDER as
         # cutlass_scaled_mm (the older unscaled entry rounded first and scaled
         # in python, which moved served prompt logprobs by up to 0.86 nats).
-        # Step-4 rungs only (the kernel's KBits template dispatch).
+        # RUNG COVERAGE (K1.2). The lane serves the rung LAW —
+        # codec.FP8_FUSED_KBITS, k in [28,48] step 4 — and never a literal
+        # ladder copied from the .cu (this used to be an inline
+        # `self.k in (28, 32, 36, 40, 44, 48)`, one of two copies that could
+        # each drift from the kernel independently). The law is the cheap gate
+        # because asking the MODULE first would force a JIT build at first
+        # forward for rungs that can never take this path; once the module is
+        # in hand, `fused_fp8_kbits` is the authority and the law is only a
+        # filter over it. Rungs off the law are not "unsupported" — they take
+        # the exact expand + CUTLASS route below, which serves all 21.
         fused_midm = getattr(
             layer, "_cb_fp8_fused_midm",
             os.environ.get("PRISMAQUANT_CB_FUSED_MIDM", "1") != "0")
@@ -1060,12 +1070,12 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 "loaded; restart the process instead of changing the native "
                 "kernel set during serving")
         if (bias is None and FP8_CUDA_GEMV_M_MAX < x2.shape[0] <= 128
-                and self.k in (28, 32, 36, 40, 44, 48)
+                and codec.fp8_fused_rung_supported(self.k)
                 and fused_midm
                 and self._fused_fp8_lut_ok(layer)):
             from .cuda_ext import get_fused_ext
             fext = get_fused_ext()
-            if fext is not None and hasattr(fext, "cb_fused_prefill_mm_scaled"):
+            if fp8_fused_rung_eligible(fext, self.k):
                 y = fext.cb_fused_prefill_mm_scaled(
                     xq, layer.cb_qweight.data, layer._cb_flat_fp8,
                     sa.reshape(-1).to(torch.float32).contiguous(),

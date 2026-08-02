@@ -41,6 +41,7 @@ from .cb_fill_guard import (
     mark_filled,
     mark_unfilled,
 )
+from .fp8_fused_lane import rung_eligible as fp8_fused_rung_eligible
 from .moe_gemv_select import cb_gemv_choice
 from .bf16_grouped_lane import (require_lane as bf16_sm120_require_lane,
                                 requested as bf16_sm120_requested,
@@ -1210,8 +1211,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
           * fp8-CB only (the fused kernel's LUT is the 4-sub-table e4m3
             codebook; fp4 two-tier composes a scale the prologue can't);
-          * k in {28,32,36,40,44,48} — the KBits template dispatch, uniform
-            per layer by the export union-find;
+          * k on the fused lane's RUNG LAW (``codec.FP8_FUSED_KBITS``: 28..48
+            step 4), uniform per layer by the export union-find, and then
+            CONFIRMED against what this build compiled
+            (``fp8_fused_lane.rung_eligible``). The product ladder is all 21
+            integer rungs; this lane backs the multiples of 4 because
+            type_size = 4k must be a 16-byte TMA box multiple and the
+            mainloop's single CbSubW = k/4 sub-table width is the format's
+            real layout only then (see csrc/cb_fused_gemm.cu's rung law). The
+            other rungs are served by the BF16 quality bridge below, so a miss
+            here is a route choice, not a capability gap;
           * both projection K's are multiples of 256 (SUPERBLOCK, and the
             kernel's K%256 check);
           * packed row stride == row_bytes == (K/256)*4*k, which satisfies
@@ -1234,14 +1243,20 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             return ok
         ok = (not self.is_fp4
               and self.n_sub == 4
-              and self.k in (28, 32, 36, 40, 44, 48)
+              and codec.fp8_fused_rung_supported(self.k)
               and self.type_size == 4 * self.k
               and layer._cb_hidden % codec.SUPERBLOCK == 0
               and layer._cb_inter % codec.SUPERBLOCK == 0
               and hasattr(layer, "w13_weight_scale"))
         if ok:
+            # The law above is the free gate; the loaded module is the
+            # AUTHORITY on which rungs it compiled (K1.2). Querying it here —
+            # after the cheap predicates, where the extension is being resolved
+            # anyway — keeps a build that carries fewer rungs than the law from
+            # being handed one it cannot serve, without ever forcing a JIT
+            # build just to answer a question about an ineligible layer.
             from .cuda_ext import get_fused_ext
-            ok = get_fused_ext() is not None
+            ok = fp8_fused_rung_eligible(get_fused_ext(), self.k)
         if ok:
             # 3-D stacked buffers: [e] must give a 2-D CONTIGUOUS [out, bytes]
             # view (stride(1)==1, stride(0)==row_bytes) — true for a slice of a
