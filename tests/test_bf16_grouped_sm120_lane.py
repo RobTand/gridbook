@@ -745,7 +745,15 @@ def test_expert_chunking_turns_the_packed_order_off(monkeypatch):
     assert seen[-1].route.expert_ids.tolist() != sorted(
         seen[-1].route.expert_ids.tolist())
 
+    # The chunk knob is process-stable since 2026-08-02 — it gates the packed
+    # expert ORDER, so changing it mid-run would silently change the FP32
+    # reduction order between two forwards. An operator changes it by
+    # restarting; clearing the latch is this test's stand-in for that restart,
+    # and comparing the two halves is the whole point of the case.
+    from gridbook import lane_select
+
     monkeypatch.setenv("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK", "1")
+    lane_select.reset_for_tests("PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK")
     assert method._native_bf16_chunk(layer) == 1 < dims["E"]
     chunked = method._apply_prefill_native_bf16(layer, x, weights, ids, act)
 
