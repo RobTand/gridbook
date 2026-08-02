@@ -118,53 +118,98 @@ protocol promotes. Nothing here is a TTFT result or grounds for a default
 change; the lane ships opt-in.
 
 Execution identity: one GB10 (`sm_121`), Torch `2.11.0+cu130`, CUDA 13.0,
-`gridbook:test`, CUTLASS 4.3.4, lane config `128×128×64`, 2 stages, 75,776 B of
-the 101,376-byte sm120 budget. Reproduce with
+`gridbook:test`, CUTLASS 4.3.4. Lane config: **pingpong 64×128×64, 3 mainloop
+stages, 83,968 B of the 101,376-byte sm120 budget**, tile-scheduler swizzle 1
+below 64 padded M-tiles and 8 at or above. Reproduce with
 `python3 scripts/bench_bf16_grouped_sm120.py [--tokens T]`. Seed-731 uniform
 router, `E=32`, `top_k=8`; warm = median of 30 CUDA-event samples after 10
-warmups. **The sm12x column includes its padded-gather**, because the lane is
-what requires the padding; `Mp` is the padded row count against `P` real routed
-rows. Ratios above 1 mean the sm12x lane is faster.
+warmups, taken with the shared GB10 held exclusively. **The sm12x column
+includes its padded-gather**, because the lane is what requires the padding;
+`Mp` is the padded row count against `P` real routed rows. Ratios above 1 mean
+the sm12x lane is faster.
 
 | T | shape | P | Mp | sm12x warm | SM80 warm | segmented warm | sm12x / SM80 | sm12x / segmented |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
-| 128 | `w13` K=4096 N=4096 | 1,024 | 4,096 | 6.602 ms | 6.974 ms | 5.038 ms | **1.056×** | 0.763× |
-| 128 | `w2` K=2048 N=4096 | 1,024 | 4,096 | 2.842 ms | 3.130 ms | 2.655 ms | **1.102×** | 0.934× |
-| 128 | Laguna s1 K=3072 N=2048 | 1,024 | 4,096 | 2.192 ms | 2.375 ms | 2.045 ms | **1.083×** | 0.933× |
-| 128 | Laguna s2 K=1024 N=3072 | 1,024 | 4,096 | 1.120 ms | 1.348 ms | 1.060 ms | **1.203×** | 0.946× |
-| 512 | `w13` K=4096 N=4096 | 4,096 | 6,144 | 9.737 ms | 8.091 ms | 6.936 ms | 0.831× | 0.712× |
-| 512 | `w2` K=2048 N=4096 | 4,096 | 6,144 | 3.219 ms | 3.513 ms | 3.128 ms | **1.091×** | 0.972× |
-| 2048 | `w13` K=4096 N=4096 | 16,384 | 18,176 | 27.406 ms | 18.585 ms | 11.368 ms | 0.678× | 0.415× |
-| 2048 | `w2` K=2048 N=4096 | 16,384 | 18,176 | 5.769 ms | 7.199 ms | 4.602 ms | **1.248×** | 0.798× |
+| 128 | `w13` K=4096 N=4096 | 1,024 | 2,048 | 5.480 ms | 6.967 ms | 5.697 ms | **1.271×** | **1.040×** |
+| 128 | `w2` K=2048 N=4096 | 1,024 | 2,048 | 2.519 ms | 2.985 ms | 2.603 ms | **1.185×** | **1.033×** |
+| 128 | Laguna s1 K=3072 N=2048 | 1,024 | 2,048 | 1.948 ms | 2.291 ms | 1.985 ms | **1.176×** | **1.019×** |
+| 128 | Laguna s2 K=1024 N=3072 | 1,024 | 2,048 | 1.015 ms | 1.251 ms | 1.067 ms | **1.233×** | **1.051×** |
+| 512 | `w13` K=4096 N=4096 | 4,096 | 5,120 | 8.562 ms | 8.028 ms | 7.566 ms | 0.938× | 0.884× |
+| 512 | `w2` K=2048 N=4096 | 4,096 | 5,120 | 3.333 ms | 3.488 ms | 3.054 ms | **1.046×** | 0.916× |
+| 512 | Laguna s1 K=3072 N=2048 | 4,096 | 5,120 | 2.744 ms | 2.804 ms | 2.272 ms | **1.022×** | 0.828× |
+| 512 | Laguna s2 K=1024 N=3072 | 4,096 | 5,120 | 1.316 ms | 1.390 ms | 1.208 ms | **1.056×** | 0.918× |
+| 2048 | `w13` K=4096 N=4096 | 16,384 | 17,280 | 16.895 ms | 17.913 ms | 11.284 ms | **1.060×** | 0.668× |
+| 2048 | `w2` K=2048 N=4096 | 16,384 | 17,280 | 6.410 ms | 6.977 ms | 4.603 ms | **1.088×** | 0.718× |
+| 2048 | Laguna s1 K=3072 N=2048 | 16,384 | 17,280 | 5.188 ms | 4.661 ms | 3.234 ms | 0.898× | 0.623× |
+| 2048 | Laguna s2 K=1024 N=3072 | 16,384 | 17,280 | 1.869 ms | 1.894 ms | 2.226 ms | **1.013×** | **1.191×** |
 
-**Interpretation, stated against the target it was given.** The P1 target was
-"≥ segmented-BF16 parity warm". **It is not met.** The lane beats the DEFAULT
-SM80 bridge on six of eight cells (1.06–1.25×) and is closest to segmented
-parity on the shorter-`K` `w2`/Laguna projections (0.93–0.97× at T=128), but
-segmented BF16 matmuls remain ahead everywhere, and on the long-`K`
-`w13` shape the lane degrades with M — at T=2048 it is 0.68× of the SM80 lane
-and 0.42× of segmented.
+**Where this lands against the P1 target.** The target was "≥ segmented-BF16
+parity warm". At `T=128` — the token count of the published DSV4 bridge
+measurement above — it is **met on all four cells** (1.019–1.051×), and the
+lane beats the SM80 bridge it would replace by 1.18–1.27×. At `T=512` it is
+**not** met (0.83–0.92× of segmented) although the lane still beats the SM80
+bridge on three of four cells. At `T=2048`, outside the target band, only the
+short-`K` Laguna s2 cell reaches parity.
 
-Two mechanisms, both recorded rather than guessed at:
+### The mechanism, isolated
 
-- **Occupancy.** At 75,776 B per CTA only ONE CTA is resident per SM, so the
-  two-stage pipeline has no cross-CTA latency hiding. A sweep of every feasible
-  alternative (`128×128×32` at 2/3/5 stages, `128×64×64` at 2/3 stages) moved
-  the long-`K` large-M cell only between 25.1 and 33.0 ms — the tile shape is
-  not the lever, and `128×128×64` was best or near-best on four of six sweep
-  rows, which is why it is the compiled rung.
-- **Padding.** At `T=128` with `E=32` the padded layout is 4× the real rows.
-  That is not a new tax relative to the SM80 grouped kernel (its threadblock
-  tile is also 128×128, so a 4-row expert wastes the same tile), which is why
-  the lane still wins that comparison — but it is a real tax against segmented
-  matmuls, whose per-expert GEMM picks a tile that fits `m≈4`.
+This construction re-reads an expert's B slice **once per padded M-tile**, and
+at these shapes the operator is bound by that traffic. Two controlled
+measurements separate the SCHEDULE from the CONSTRUCTION, on the hardest cell
+(`w13`, K=N=4096, 4,096 routed rows, GEMM only, no gather):
 
-The lane therefore stays **opt-in on measured grounds, not only on
-qualification grounds**: it is a structural prerequisite (a real sm12x
-collective now exists, with the grouping construction shared with the fused
-lanes) and a win against the kernel it would replace, but it does not yet clear
-the bar that would justify promoting it, and the served protocol has not been
-run.
+| routing | padding | sm12x | segmented | SM80 | sm12x / segmented |
+|---|---:|---:|---:|---:|---:|
+| ragged (real, `T=512`) | 1.25× | 7.941 ms | 7.496 ms | 7.964 ms | 0.94× |
+| **packed, 128 rows/expert** | **1.00×** | 6.368 ms | 7.180 ms | 6.721 ms | **1.13×** |
+| **packed, 64 rows/expert** | **1.00×** | 5.402 ms | 5.830 ms | 6.709 ms | **1.08×** |
+
+With the ragged rounding removed the collective is **1.08–1.13× faster than
+segmented cuBLAS** and 1.05–1.24× faster than the SM80 lane. The schedule is
+not the deficit; the padding is. That is why the compiled rung is TileM=**64**
+(halving the rounding granularity) even though the 128-row tile is the more
+efficient GEMM per FLOP, and why the residual at `T=512` — where each expert
+holds ~128 rows and rounding costs 1.25× — cannot be tuned away at a fixed
+TileM.
+
+### What was swept
+
+Every candidate below was compiled and timed on all four shapes at `T=128` and
+`T=512` (12 kernels × 4 swizzles × 3 raster orders); the winner is the row in
+bold.
+
+| kernel layer | tile | stages | smem | verdict |
+|---|---|---:|---:|---|
+| cooperative (4×2×1 warps) | 128×128×64 | 2 | 75,776 | the previous rung; 0.71–0.97× segmented |
+| cooperative | 128×128×32 | 2 / 3 / 4 / 5 | 43k–92k | slower on every cell |
+| cooperative | 128×64×64 | 2 | 59,392 | 0.32–0.93×; worst tested |
+| **pingpong (2×2×1 warps)** | **64×128×64** | **3** | **83,968** | **winner: 1.02–1.05× at T=128** |
+| pingpong | 64×128×64 | 2 | 59,392 | 0.90–0.96× of the 3-stage rung |
+| pingpong | 64×256×64 | 2 | 92,160 | competitive at T=128, 0.75–0.86× at T=512 |
+| pingpong | 64×64×64 | 4 | 75,776 | wins Laguna s1/s2 by ~2%, loses w13 by 30% |
+| pingpong | 64×128×32 / 64×256×32 | 3 / 4 / 6 | 59k–84k | K-slice too thin; 0.50–0.93× |
+| pingpong | 128×128×64 | 2 | 75,776 | ≈ cooperative — TileM, not the layer, is the lever |
+| 256×128×64, 128×256×64, 128×64×128 | — | — | ≥48 KiB/stage | infeasible: auto-carves to ONE stage |
+
+Raster order: CUTLASS's `Heuristic` (which resolves to `AlongN` here) matched
+or beat `AlongN` everywhere and beat `AlongM` on every cell — `AlongM` cost up
+to 2× at `T=512`. Swizzle: at 32 padded M-tiles swizzle 1 was fastest on three
+of four shapes; at 80 M-tiles swizzle 8 was worth 1.36× on `w13`
+(11.17 → 8.16 ms) and never cost more than 7% elsewhere, so the shipped policy
+optimises the worst cell. Swizzle is a tile-ORDER argument and cannot move a
+bit of output.
+
+**Status.** The lane stays **opt-in**. It now strictly dominates the SM80
+bridge it would replace on every cell at `T ≤ 512` except one (`w13` at
+`T=512`, 0.938×), meets the segmented-parity target at `T=128`, and misses it
+at `T=512`. The two remaining structural costs are named and measured: the
+ragged padding tax above, and the padded activation gather (0.02–0.35 ms per
+launch here) that the exact-segment lane does not pay. Closing them needs a
+change of construction, not of schedule — a TileM ladder selected by measured
+rows-per-expert (which the fused lanes already have, and which the `tile_m`
+binding and dispatch helper already parameterise), or an A-side row-gather
+inside the mainloop. The served [NATIVE-PARITY](NATIVE-PARITY.md) protocol has
+not been run.
 
 ## What is being compared, and how
 

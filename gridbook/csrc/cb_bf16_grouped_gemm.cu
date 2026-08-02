@@ -270,11 +270,13 @@ void cb_bf16_grouped_mm_out(torch::Tensor output,
 //                 instruction on sm_120; rmem-sourced, which is exactly what
 //                 this mainloop requires (it static_asserts no GMMA
 //                 descriptor iterators).
-//   Atom layout   4x2x1 warps = 256 threads, the builder's cooperative shape.
-//   Permutation   Tile<_128,_32,_16>: M repeats the 4-warp row twice to cover
-//                 TileM=128, and N is widened to 32 (2 n-atoms) so ONE
-//                 ldmatrix.x4 fills a thread's B fragment — the same reason
-//                 upstream widens PermTileN to 32 for 8-bit.
+//   Atom layout   2x2x1 warps = 128 threads, the builder's PINGPONG shape.
+//                 (Its cooperative shape is 4x2x1 = 256 threads, whose kernel
+//                 layer floors TileM at 128 — see the tile choice below.)
+//   Permutation   Tile<_64,_32,_16>: M covers the tile with the 2-warp row,
+//                 and N is widened to 32 (2 n-atoms) so ONE ldmatrix.x4 fills
+//                 a thread's B fragment — the same reason upstream widens
+//                 PermTileN to 32 for 8-bit.
 //   Smem atom     rs_smem_selector<K-major> — CUTLASS's own selector for a
 //                 swizzled K-major tile that TMA writes and LDSM reads (the
 //                 sm90 "RS" mainloop uses it for precisely this pairing).
@@ -283,6 +285,16 @@ void cb_bf16_grouped_mm_out(torch::Tensor output,
 // is stock CUTLASS. The stage count comes from the same
 // StageCountAutoCarveout helper the builder uses, against the sm120 smem
 // budget with the epilogue's storage carved out.
+//
+// WHAT THE MEASUREMENTS SAID (GB10, cc 12.1; docs/BENCHMARKS.md has the
+// tables). The operator is bound by B traffic: this construction re-reads an
+// expert's B slice once per M-tile, so cost tracks the PADDED tile count, and
+// the ragged rounding of each expert's rows up to TileM is the whole tax. With
+// the padding removed (a synthetic routing whose expert counts are exact tile
+// multiples) this collective runs at 1.12-1.13x segmented cuBLAS and
+// 1.05-1.06x the SM80 lane — the SCHEDULE is not the problem. What closes most
+// of the remaining gap is halving the rounding granularity, which is why the
+// compiled rung is PINGPONG at TileM=64 rather than cooperative at 128.
 // ---------------------------------------------------------------------------
 namespace sm120_lane {
 
@@ -299,12 +311,12 @@ namespace cutlass_detail = cutlass::gemm::collective::detail;
 using ElementAcc = float;
 using ClusterShape = Shape<_1, _1, _1>;
 
-// The bf16 tensor-core atom, 8 warps cooperative, N widened for ldmatrix.x4.
+// The bf16 tensor-core atom, 4 warps pingpong, N widened for ldmatrix.x4.
 template <class TileShape>
 struct MmaCfg {
   using TiledMma = decltype(cute::make_tiled_mma(
       cute::MMA_Atom<cute::SM80_16x8x16_F32BF16BF16F32_TN>{},
-      cute::Layout<cute::Shape<_4, _2, _1>>{},
+      cute::Layout<cute::Shape<_2, _2, _1>>{},
       cute::Tile<decltype(cute::min(size<0>(TileShape{}), _128{})),
                  _32, _16>{}));
   using SmemLayoutAtomA = decltype(cutlass_detail::rs_smem_selector<
@@ -333,10 +345,8 @@ struct Cfg {
 
   // Stage count: (sm120 capacity - epilogue storage) / per-stage bytes, the
   // builder's own arithmetic. A/B smem is the only per-stage tensor storage
-  // here — no packed stream, no decoded buffer — but BF16 operands are 2 bytes,
-  // so 128x128x64 still costs 32 KiB/stage and MEASURES 2 stages (75,776 B of
-  // 101,376). That is one CTA per SM, which the benchmark identifies as the
-  // lane's occupancy ceiling (docs/BENCHMARKS.md).
+  // here — no packed stream, no decoded buffer — and at 64x128x64 that is
+  // 24 KiB/stage, which auto-carves to 3 stages (83,968 B of 101,376).
   static constexpr int kStages =
       cutlass_detail::sm100_compute_stage_count_or_override<
           cutlass_detail::sm120_smem_capacity_bytes,
@@ -351,7 +361,7 @@ struct Cfg {
   using DispatchPolicy =
       cutlass::gemm::MainloopSm120CbBf16ExpertTmaWarpSpecialized<
           kStages, /*SchedulerPipelineStageCount=*/2, ClusterShape,
-          cutlass::gemm::KernelTmaWarpSpecializedCooperativeSm120<2>>;
+          cutlass::gemm::KernelTmaWarpSpecializedPingpongSm120<2>>;
 
   using Mainloop = cutlass::gemm::collective::CollectiveMma<
       DispatchPolicy, TileShape,
@@ -368,22 +378,43 @@ struct Cfg {
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
-// TileM is the row-padding granularity python must respect. ONE rung is
-// compiled, for two independent reasons:
+// TileM is the row-padding granularity python must respect, and on this
+// construction it is the single most important number in the file: an expert's
+// rows are rounded UP to it, and every rounded-up tile re-reads that expert's
+// whole B slice. TileM=64 is therefore chosen over 128 even though the 128
+// tile is the more efficient GEMM per FLOP — measured across the DSV4 and
+// Laguna cells at T=128/512, halving the rounding granularity wins by more
+// than the tile efficiency loses (BENCHMARKS has both columns).
 //
-//  * FEASIBILITY. 256x128x64, 128x256x64 and 128x64x128 each need 48 KiB per
-//    stage, which StageCountAutoCarveout resolves to ONE stage — below this
-//    mainloop's Stages>=2 static_assert. Measured, not assumed; the sweep is
-//    recorded in docs/BENCHMARKS.md.
-//  * VALUE. Unlike the fused lanes — where a larger TileM amortizes a per-tile
-//    B DECODE and the ladder is a real tradeoff — B here is plain BF16 read
-//    through TMA, so a larger TileM buys no arithmetic and costs strictly more
-//    padded rows on short experts.
+// TileM=64 requires the PINGPONG kernel layer: the cooperative one
+// static_asserts a 256-thread TiledMma, whose 4x2x1 warp layout floors TileM
+// at 128.
 //
-// TileN=128/TileK=64 keeps the 128-byte swizzle atom (K=64 bf16 = 128 B) and
-// was fastest or within noise of fastest on four of six benchmarked cells.
-using GroupedTile = Shape<_128, _128, _64>;
+// ONE rung is compiled. 256x128x64, 128x256x64 and 128x64x128 each need 48 KiB
+// per stage, which StageCountAutoCarveout resolves to ONE stage — below the
+// mainloop's Stages>=2 static_assert — and the feasible alternatives
+// (128x128x64 coop, 128x128x32 at 2-5 stages, 64x256x64, 64x64x64, 64x128x32)
+// all measured slower or no better. TileN=128/TileK=64 keeps the 128-byte
+// swizzle atom (K=64 bf16 = 128 B).
+using GroupedTile = Shape<_64, _128, _64>;
 constexpr int64_t kSm120TileM = size<0>(GroupedTile{});
+
+// Tile-scheduler swizzle: a RUNTIME argument (it reorders CTAs and changes
+// nothing numerically), chosen by the padded grid because that is how it
+// measured. At the DSV4/Laguna cells with 32 padded M-tiles, swizzle 1 was
+// fastest on three of four shapes; at 80 M-tiles, swizzle 8 was worth up to
+// 1.36x on the long-K w13 shape (11.17 -> 8.16 ms) and never cost more than 7%
+// elsewhere, so the policy optimises the WORST cell rather than the mean.
+// Between them the crossover is unmeasured; 64 is the midpoint of the two
+// measured grids.
+constexpr int kSm120SwizzleSmallGrid = 1;
+constexpr int kSm120SwizzleLargeGrid = 8;
+constexpr int kSm120SwizzleGridThreshold = 64;  // padded M-tiles
+
+constexpr int sm120_swizzle_for(int64_t m_tiles) {
+  return m_tiles >= kSm120SwizzleGridThreshold ? kSm120SwizzleLargeGrid
+                                               : kSm120SwizzleSmallGrid;
+}
 
 using GroupedCfg = Cfg<GroupedTile>;
 static_assert(gridbook::grouped::AssertSmemFits<
@@ -456,7 +487,12 @@ void run_sm120_grouped(torch::Tensor output, torch::Tensor a,
        reinterpret_cast<const Element*>(weights.data_ptr()), sb,
        expert_ids.data_ptr<int>(), ei},
       {{1.0f, 0.0f}, nullptr, StrideC{},
-       reinterpret_cast<Element*>(output.data_ptr()), sd}};
+       reinterpret_cast<Element*>(output.data_ptr()), sd},
+      cutlass::KernelHardwareInfo{},
+      // Tile ORDER only — every output tile's accumulation is independent of
+      // it, so this cannot move a bit.
+      {sm120_swizzle_for(mp / tile_m),
+       cutlass::gemm::kernel::detail::RasterOrderOptions::Heuristic}};
 
   Gemm gemm;
   size_t ws = Gemm::get_workspace_size(args);
@@ -500,14 +536,19 @@ std::vector<int64_t> cb_bf16_grouped_sm120_tile_sizes() {
 
 // Host-only config attestation: what was actually compiled. Used by the tests
 // and by the KERNELS.md evidence table (no launch, no device needed).
-// [tile_m, tile_n, tile_k, stages, SharedStorageSize, sm120 capacity].
+// [tile_m, tile_n, tile_k, stages, SharedStorageSize, sm120 capacity,
+//  mma_threads, swizzle(small grid), swizzle(large grid), grid threshold].
 std::vector<int64_t> cb_bf16_grouped_sm120_config() {
   return {int64_t(size<0>(GroupedTile{})),
           int64_t(size<1>(GroupedTile{})),
           int64_t(size<2>(GroupedTile{})),
           int64_t(GroupedCfg::kStages),
           int64_t(GroupedCfg::GemmKernel::SharedStorageSize),
-          int64_t(cutlass::arch::sm120_smem_capacity_bytes)};
+          int64_t(cutlass::arch::sm120_smem_capacity_bytes),
+          int64_t(size(typename MmaCfg<GroupedTile>::TiledMma{})),
+          int64_t(kSm120SwizzleSmallGrid),
+          int64_t(kSm120SwizzleLargeGrid),
+          int64_t(kSm120SwizzleGridThreshold)};
 }
 
 }  // namespace sm120_lane
@@ -547,6 +588,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cb_bf16_grouped_sm120_tile_sizes", &sm120_lane::cb_bf16_grouped_sm120_tile_sizes,
         "every TileM compiled for the sm12x-native lane (enumerate THIS)");
   m.def("cb_bf16_grouped_sm120_config", &sm120_lane::cb_bf16_grouped_sm120_config,
-        "[tile_m, tile_n, tile_k, stages, SharedStorageSize, sm120 capacity]");
+        "[tile_m, tile_n, tile_k, stages, SharedStorageSize, sm120 capacity, "
+        "mma_threads (128 = pingpong layer, 256 = cooperative), "
+        "swizzle below the grid threshold, swizzle at/above it, threshold in "
+        "padded M-tiles]");
 #endif
 }
