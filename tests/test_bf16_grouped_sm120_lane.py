@@ -138,6 +138,32 @@ def test_require_lane_fails_closed_without_the_gather_mode(monkeypatch):
         lane.require_lane("routed quality prefill")
 
 
+def test_require_lane_fails_closed_without_the_config_query(monkeypatch):
+    """Every GEMM entry point, but no config query, is still incomplete.
+
+    ``swizzle_group`` reads ``cb_bf16_grouped_sm120_config`` on EVERY routed
+    prefill to size the packed expert order, so a module without it would pass
+    a load-time attestation and then ``AttributeError`` at the first forward —
+    the one failure mode attesting at load exists to make impossible. This is
+    the case that keeps the lane's own required-symbol list from drifting back
+    behind the list ``cuda_ext`` enforces on the compiled module.
+    """
+    stub = types.SimpleNamespace(
+        cb_bf16_grouped_mm=lambda *a, **k: None,
+        cb_bf16_grouped_mm_out=lambda *a, **k: None,
+        cb_bf16_grouped_mm_sm120=lambda *a, **k: None,
+        cb_bf16_grouped_mm_sm120_out=lambda *a, **k: None,
+        cb_bf16_grouped_mm_sm120_gather=lambda *a, **k: None,
+        cb_bf16_grouped_mm_sm120_gather_out=lambda *a, **k: None,
+        cb_bf16_grouped_sm120_tile_m=lambda: 128,
+    )
+    monkeypatch.setattr("gridbook.cuda_ext.get_bf16_grouped_ext",
+                        lambda: stub)
+    with pytest.raises(NativeKernelUnavailableError,
+                       match="cb_bf16_grouped_sm120_config"):
+        lane.require_lane("routed quality prefill")
+
+
 def test_dense_helper_pads_to_one_tile_and_slices_back(monkeypatch):
     """Without the gather mode (an old stub), M=100 becomes one padded tile."""
     seen = {}
