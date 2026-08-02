@@ -142,13 +142,22 @@ def _fake_torch():
 
 
 def _complete_stub():
-    return types.SimpleNamespace(
-        cb_moe_persistent_b_prefill=lambda *a, **k: None,
-        cb_moe_persistent_b_decode=lambda *a, **k: None,
-        cb_moe_persistent_b_configs=lambda: ((128, 64), (64, 128), (128, 128)),
-        cb_moe_persistent_b_tile_k=lambda: 64,
-        cb_moe_persistent_b_is_moe_only=lambda: True,
-    )
+    """A module carrying EVERY symbol the loader contract names.
+
+    Built FROM ``_MOE_PERSISTENT_B_SYMBOLS`` rather than a hand-written list,
+    so adding a binding to the contract cannot leave a stale "complete" stub
+    that quietly stops testing completeness.
+    """
+    answers = {
+        "cb_moe_persistent_b_configs": lambda: ((128, 64), (64, 128),
+                                                (128, 128)),
+        "cb_moe_persistent_b_tile_k": lambda: 64,
+        "cb_moe_persistent_b_is_moe_only": lambda: True,
+    }
+    return types.SimpleNamespace(**{
+        name: answers.get(name, lambda *a, **k: None)
+        for name in cuda_ext._MOE_PERSISTENT_B_SYMBOLS
+    })
 
 
 def _source_path():
@@ -511,41 +520,59 @@ def test_moe_dispatch_reads_this_exact_selector():
     assert moe.persistent_b_supports is lane.supports
 
 
-@requires_vllm
+# The tile override is resolved at MODEL LOAD against what the build actually
+# compiled (``lane.resolve_cfg``), not on the hot path -- so these cases need
+# no vLLM and no method object, only the stub's compiled-config list.
 def test_cfg_defaults_to_the_kernels_own_choice():
-    assert _bare_method()._persistent_b_cfg() == 0
+    assert lane.resolve_cfg(_complete_stub()) == 0
 
 
-@requires_vllm
 def test_cfg_parses_the_requested_index(monkeypatch):
     monkeypatch.setenv(_CFG_FLAG, "3")
-    assert _bare_method()._persistent_b_cfg() == 3
+    assert lane.resolve_cfg(_complete_stub()) == 3
 
 
-@requires_vllm
 def test_cfg_refuses_a_non_integer(monkeypatch):
     monkeypatch.setenv(_CFG_FLAG, "fastest")
-    with pytest.raises(ValueError, match="must be an integer"):
-        _bare_method()._persistent_b_cfg()
+    with pytest.raises(ValueError, match=_CFG_FLAG):
+        lane.resolve_cfg(_complete_stub())
 
 
-@requires_vllm
 def test_cfg_refuses_a_negative_index(monkeypatch):
     monkeypatch.setenv(_CFG_FLAG, "-1")
-    with pytest.raises(ValueError, match="non-negative"):
-        _bare_method()._persistent_b_cfg()
+    with pytest.raises(ValueError, match="not a compiled"):
+        lane.resolve_cfg(_complete_stub())
+
+
+def test_cfg_refuses_an_index_this_build_did_not_compile(monkeypatch):
+    """The stub advertises three tiles; a fourth must fail the LOAD, not the
+    first request that happens to carry routed rows."""
+    monkeypatch.setenv(_CFG_FLAG, "4")
+    with pytest.raises(ValueError, match="not a compiled tile config"):
+        lane.resolve_cfg(_complete_stub())
 
 
 @requires_vllm
-def test_cfg_is_read_once_and_cached(monkeypatch):
-    """The two GEMM stages of one forward cannot see different tile configs."""
-    method = _bare_method()
-    monkeypatch.setenv(_CFG_FLAG, "2")
-    assert method._persistent_b_cfg() == 2
-    monkeypatch.setenv(_CFG_FLAG, "5")
-    assert method._persistent_b_cfg() == 2
-    monkeypatch.delenv(_CFG_FLAG)
-    assert method._persistent_b_cfg() == 2
+def test_cfg_is_fixed_on_the_layer_at_load(monkeypatch):
+    """The two GEMM stages of one forward cannot see different tile configs.
+
+    The hot path reads a plain attribute set during
+    ``process_weights_after_loading``; it never consults the environment, so
+    changing the variable mid-process cannot reach a running forward.
+    """
+    import inspect
+
+    from gridbook.moe import PrismaQuantCBMoEMethod as Method
+
+    body = inspect.getsource(Method._apply_prefill_native_bf16_persistent_b)
+    assert "_cb_moe_persistent_b_cfg" in body
+    # Real code, not prose: an `os.environ` read or the variable's name
+    # appearing as a literal would both put the selector back on the hot path.
+    code = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
+    assert "os.environ" not in code and _CFG_FLAG not in code
+
+    load = inspect.getsource(Method.process_weights_after_loading)
+    assert "persistent_b_resolve_cfg" in load
 
 
 @requires_vllm

@@ -208,15 +208,27 @@ def _time(fn, iters: int, warmup: int):
     return cold, samples[len(samples) // 2]
 
 
-def _arms(shape, tokens, args, tile_m, cfg):
+def _weights(shape, args):
+    """Both packed expert stacks of one layer, at their real serving shapes.
+
+    Built ONCE per shape and shared by every token count, so a sweep quantizes
+    each layer once rather than once per T.
+    """
+    _, E, hidden, inter = shape
+    w13, lut, compose, ts = make(args.k, hidden, E, 2 * inter, args.seed,
+                                 "cuda")
+    w2, _, _, _ = make(args.k, inter, E, hidden, args.seed + 1, "cuda")
+    return w13, w2, lut, compose, ts
+
+
+def _arms(shape, tokens, args, tile_m, cfg, weights):
     """Build the three whole-operator closures plus the expand-only closure."""
     label, E, hidden, inter = shape
     dev = "cuda"
     top_k, k = args.top_k, args.k
     chunk = _native_bf16_chunk(E, hidden, inter)
 
-    w13, lut, compose, ts = make(k, hidden, E, 2 * inter, args.seed, dev)
-    w2, _, _, _ = make(k, inter, E, hidden, args.seed + 1, dev)
+    w13, w2, lut, compose, ts = weights
     torch.manual_seed(args.seed)
     x = torch.randn(tokens, hidden, device=dev, dtype=torch.bfloat16) * 0.1
     topk_ids, topk_weights = _router(E, tokens, top_k, args.seed, dev)
@@ -448,9 +460,10 @@ def bench(args) -> int:
         if reason is not None:
             print(f"# SKIP {key}: persistent-B lane cannot serve it ({reason})")
             continue
+        weights = _weights(shape, args)
         for tokens in args.tokens:
             (chunk, run_pb, run_sm80, run_sm120,
-             run_expand) = _arms(shape, tokens, args, tile_m, cfg)
+             run_expand) = _arms(shape, tokens, args, tile_m, cfg, weights)
             pairs = tokens * args.top_k
 
             # Agreement, OUTSIDE the timed region: a benchmark whose arms
@@ -491,14 +504,15 @@ def bench(args) -> int:
             rows_run += 1
             del run_pb, run_sm80, run_sm120, run_expand
             torch.cuda.empty_cache()
+        del weights
+        torch.cuda.empty_cache()
 
     if not rows_run:
         print(f"no shape matched --only {args.only!r}", file=sys.stderr)
         return 2
     print("\n# ratios > 1 mean the persistent-B lane is FASTER than that "
-          "baseline; expand% is the share of the DEFAULT (expand_sm80)")
-    print("# operator spent in the cb_expand_fp4_v2 transient the "
-          "persistent-B lane deletes.")
+          "baseline; expand% is the share of the DEFAULT (expand_sm80) "
+          "operator spent in the transient persistent-B deletes.")
     print("# PROPOSAL DATA (NATIVE-PARITY): microbenchmarks propose, only the "
           "served protocol promotes.")
     return 0

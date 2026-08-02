@@ -98,6 +98,29 @@ def require_lane(operation: str = "this operation", *, device=None):
             + f". Unset {_FLAG} to use the default expand + grouped-bridge "
             f"route; Gridbook does not substitute a different kernel behind "
             f"an explicit lane selection.")
+
+    # DEVICE ATTESTATION, on the model of ``require_fp4_v2_expander``.  Loading
+    # the module proves the symbols exist; this proves THIS device can serve
+    # them, and opts every compiled configuration in to the 99 KiB dynamic
+    # shared-memory budget.  Doing it here rather than lazily on first launch
+    # is what keeps ``cudaFuncSetAttribute`` — which is not stream-ordered
+    # work — out of a first forward and out of a CUDA-graph capture.
+    try:
+        if device is None:
+            ext.cb_moe_persistent_b_prepare()
+        else:
+            import torch
+
+            with torch.cuda.device(device):
+                ext.cb_moe_persistent_b_prepare()
+    except Exception as exc:  # noqa: BLE001 — normalize the load-time gate
+        raise NativeKernelUnavailableError(
+            f"{operation} requested the persistent-B grouped MoE lane "
+            f"({_FLAG}=1), but load-time device attestation failed "
+            f"({type(exc).__name__}: {exc}). The schedule needs CUDA compute "
+            "capability 12.0 or 12.1 with at least 99 KiB of opt-in shared "
+            "memory. Gridbook does not defer this failure to first prefill or "
+            "serve a different schedule instead.") from exc
     return ext
 
 

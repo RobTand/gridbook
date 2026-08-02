@@ -189,7 +189,10 @@
 
 #include <cuda_bf16.h>
 
+#include <array>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #define DEVINL __device__ __forceinline__
@@ -679,6 +682,68 @@ constexpr int64_t kSmemPerSm = 102400;
 // reservation so no future config can repeat the mistake silently.
 constexpr int64_t kSmemReservedPerCta = 1024;
 
+// ---------------------------------------------------------------------------
+// Per-device preparation, on the model of `cb_gemv_v2.cu::cb_gemv_v2_prepare`.
+//
+// WHY IT IS A SEPARATE ENTRY POINT RATHER THAN A LAZY FIRST-LAUNCH SETUP.
+// Opting a kernel in to the 99 KiB dynamic shared-memory budget is a
+// `cudaFuncSetAttribute` call, which is NOT stream-ordered work. Doing it
+// lazily on first launch means the very first call decides where it happens —
+// and for a prefill path that may be the inside of a CUDA-graph capture, or a
+// thread that has never launched before. The loader therefore attests this at
+// MODEL LOAD (`moe_persistent_b_lane.require_lane`), exactly as the FP4-v2
+// expander's contract is attested, so by the time any capture or first forward
+// runs, every compiled configuration is already prepared on that device. The
+// launcher still calls it, but the atomic fast path makes that a load.
+// ---------------------------------------------------------------------------
+constexpr int kMaxTrackedDevices = 16;
+std::array<std::atomic<bool>, kMaxTrackedDevices> pb_prepared{};
+std::mutex pb_prepare_mutex;
+
+void pb_prepare_device(int device) {
+  TORCH_CHECK(device >= 0 && device < kMaxTrackedDevices,
+              "cb_moe_persistent_b cannot track CUDA device index ", device,
+              " (maximum ", kMaxTrackedDevices - 1, ")");
+  if (pb_prepared[device].load(std::memory_order_acquire)) return;
+  std::lock_guard<std::mutex> lock(pb_prepare_mutex);
+  if (pb_prepared[device].load(std::memory_order_relaxed)) return;
+
+  const c10::cuda::OptionalCUDAGuard guard(c10::Device(c10::kCUDA, device));
+  cudaDeviceProp prop{};
+  C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+  TORCH_CHECK(prop.major == 12 && (prop.minor == 0 || prop.minor == 1),
+              "cb_moe_persistent_b supports only native compute capability "
+              "12.0/12.1, but cuda:", device, " reports ", prop.major, ".",
+              prop.minor);
+  TORCH_CHECK(prop.sharedMemPerBlockOptin >= kSm120SmemCapacity,
+              "cb_moe_persistent_b requires ", kSm120SmemCapacity,
+              " B opt-in shared memory, but cuda:", device, " advertises ",
+              prop.sharedMemPerBlockOptin, " B");
+  TORCH_CHECK(prop.sharedMemPerMultiprocessor >= kSmemPerSm,
+              "cb_moe_persistent_b sizes its tiles against ", kSmemPerSm,
+              " B of shared memory per SM, but cuda:", device, " advertises ",
+              prop.sharedMemPerMultiprocessor, " B");
+
+#define PB_SET_MAX_SMEM(TM_, TN_, W_)                                        \
+  C10_CUDA_CHECK(cudaFuncSetAttribute(                                       \
+      reinterpret_cast<const void*>(                                         \
+          cb_moe_persistent_b_kernel<TM_, TN_, W_>),                         \
+      cudaFuncAttributeMaxDynamicSharedMemorySize, kSm120SmemCapacity))
+  PB_SET_MAX_SMEM(128, 64, 8);
+  PB_SET_MAX_SMEM(64, 64, 4);
+  PB_SET_MAX_SMEM(128, 32, 4);
+  PB_SET_MAX_SMEM(64, 128, 8);
+#undef PB_SET_MAX_SMEM
+
+  pb_prepared[device].store(true, std::memory_order_release);
+}
+
+void cb_moe_persistent_b_prepare() {
+  int device = -1;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  pb_prepare_device(device);
+}
+
 template <int TM, int TN, int WARPS>
 void launch_cfg(const uint16_t* a, const uint8_t* qw, const uint16_t* lut,
                 const float* compose, const int32_t* expert_ends, uint16_t* y,
@@ -686,13 +751,6 @@ void launch_cfg(const uint16_t* a, const uint8_t* qw, const uint16_t* lut,
                 int64_t total_wu, int64_t smem, unsigned grid,
                 cudaStream_t stream) {
   auto kern = cb_moe_persistent_b_kernel<TM, TN, WARPS>;
-  static thread_local bool attr_set = false;
-  if (!attr_set) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        reinterpret_cast<const void*>(kern),
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kSm120SmemCapacity));
-    attr_set = true;
-  }
   kern<<<grid, WARPS * 32, (size_t)smem, stream>>>(
       a, qw, lut, compose, expert_ends, y, N, K, fmt, ts_pad, n_tiles,
       total_wu);
@@ -863,6 +921,7 @@ void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
       (unsigned)std::min<int64_t>(total_wu, 2147483647LL);
 
   const c10::cuda::OptionalCUDAGuard guard(a.device());
+  pb_prepare_device((int)a.device().index());
   auto stream = at::cuda::getCurrentCUDAStream();
 
   const uint16_t* ap = reinterpret_cast<const uint16_t*>(a.data_ptr());
@@ -991,6 +1050,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("qw_flat"), pybind11::arg("lut"),
         pybind11::arg("compose"), pybind11::arg("row0"), pybind11::arg("nrows"),
         pybind11::arg("K"), pybind11::arg("k_bits"), pybind11::arg("type_size"));
+  m.def("cb_moe_persistent_b_prepare", &cb_moe_persistent_b_prepare,
+        "opt every compiled configuration in to the 99 KiB dynamic "
+        "shared-memory budget on the CURRENT device, and attest the device is "
+        "one this schedule supports. Called at model load so no "
+        "cudaFuncSetAttribute happens inside a first forward or a graph "
+        "capture.");
   m.def("cb_moe_persistent_b_configs", &cb_moe_persistent_b_configs,
         "compiled tile configs: [tm, tn, warps, threads, smem_bytes_at_k24, "
         "sm120 capacity] each (enumerate THIS, never a hardcoded list)");

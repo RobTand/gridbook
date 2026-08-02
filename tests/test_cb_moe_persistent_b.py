@@ -711,7 +711,11 @@ def test_the_module_has_no_dense_entry_point():
     routed = {"cb_moe_persistent_b_prefill"}
     non_gemm = {"cb_moe_persistent_b_decode", "cb_moe_persistent_b_configs",
                 "cb_moe_persistent_b_tile_k",
-                "cb_moe_persistent_b_is_moe_only"}
+                "cb_moe_persistent_b_is_moe_only",
+                # Device attestation: sets the dynamic-smem opt-in for every
+                # compiled tile and validates the capability. No operands, no
+                # GEMM, so it cannot be a dense entry point.
+                "cb_moe_persistent_b_prepare"}
     exported = {name for name in dir(ext) if name.startswith("cb_")}
     assert exported == routed | non_gemm, (
         f"unexpected bindings {sorted(exported - (routed | non_gemm))}: a new "

@@ -1273,6 +1273,7 @@ _MOE_PERSISTENT_B_ABI_SCHEMA = 1
 _MOE_PERSISTENT_B_SYMBOLS = (
     "cb_moe_persistent_b_prefill",
     "cb_moe_persistent_b_decode",
+    "cb_moe_persistent_b_prepare",
     "cb_moe_persistent_b_configs",
     "cb_moe_persistent_b_tile_k",
     "cb_moe_persistent_b_is_moe_only",
