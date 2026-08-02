@@ -532,10 +532,18 @@ data-dependent control flow. The kernels follow these rules:
 2. **No host-side branching on tensor values inside a captured region**, and fixed
    shapes. Bit-exactness with capture **off** must always hold (capture-on ==
    capture-off logits).
-3. **All device-side constants are precomputed once per device.** A real bug this
-   caught: an activation-QDQ kernel built its FP4/E2M1 grid on the CPU and
-   H2D-copied it *every call* — a hidden sync in eager mode and a hard error under
-   capture. The grid is now cached per device.
+3. **All device-side constants and per-device kernel setup happen once, at model
+   load.** A real bug this caught: an activation-QDQ kernel built its FP4/E2M1
+   grid on the CPU and H2D-copied it *every call* — a hidden sync in eager mode
+   and a hard error under capture. The grid is now cached per device. The same
+   rule covers the **99 KiB dynamic-shared-memory opt-in**, which is a
+   `cudaFuncSetAttribute` call and therefore not stream-ordered work: a lazy
+   first-launch setup leaves it to whichever call happens to be first, which for
+   a prefill path can be the inside of a capture. `cb_gemv_v2_prepare` and
+   `cb_moe_persistent_b_prepare` are separate entry points that the loaders call
+   during `process_weights_after_loading`, so every compiled configuration is
+   prepared before any forward or capture runs; the launchers re-call them
+   behind a per-device atomic, which in steady state is one load.
 4. **Hoist the whole M-gated dispatch behind one opaque op.** The retired
    pre-hardening host branch was capture-hostile: a prefill-sized trace could
    bake the expand arm into decode. Every current Linear/MoE call permanently
