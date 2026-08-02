@@ -120,9 +120,7 @@ def dense_mm(ext, a, weight):
     blocks = (m + granularity - 1) // granularity
     padded = blocks * granularity
     if padded != m:
-        a = torch.cat(
-            [a, a.new_zeros((padded - m, a.shape[1]))]) if m else a.new_zeros(
-                (padded, a.shape[1]))
+        a = torch.cat([a, a.new_zeros((padded - m, a.shape[1]))])
     expert_ids = torch.zeros(blocks, dtype=torch.int32, device=a.device)
     y = cb_bf16_grouped_mm_sm120(a.contiguous(), weight.unsqueeze(0),
                                  expert_ids, granularity)
