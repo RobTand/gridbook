@@ -249,18 +249,18 @@ faster.
 
 | shape | E | T | P | pb warm | sm80 warm | sm120 warm | expand | expand% | sm80/pb | sm120/pb |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| DSV4 `h=4096 i=2048` | 32 | 128 | 1,024 | 5.837 ms | 19.353 ms | 17.112 ms | 8.695 ms | 44.9% | **3.316×** | **2.932×** |
-| DSV4 `h=4096 i=2048` | 32 | 512 | 4,096 | 10.302 ms | 22.074 ms | 22.498 ms | 8.682 ms | 39.3% | **2.143×** | **2.184×** |
-| DSV4 `h=4096 i=2048` | 32 | 2,048 | 16,384 | 28.933 ms | 40.002 ms | 35.805 ms | 8.683 ms | 21.7% | **1.383×** | **1.238×** |
-| Laguna `h=3072 i=1024` | 32 | 128 | 1,024 | 2.528 ms | 7.042 ms | 6.734 ms | 3.178 ms | 45.1% | **2.786×** | **2.664×** |
-| Laguna `h=3072 i=1024` | 32 | 512 | 4,096 | 4.423 ms | 7.950 ms | 8.322 ms | 3.178 ms | 40.0% | **1.797×** | **1.882×** |
-| Laguna `h=3072 i=1024` | 32 | 2,048 | 16,384 | 12.792 ms | 13.388 ms | 13.100 ms | 3.180 ms | 23.8% | **1.047×** | **1.024×** |
-| Laguna `h=3072 i=1024` | 128 | 128 | 1,024 | 8.862 ms | 27.226 ms | 26.345 ms | 12.671 ms | 46.5% | **3.072×** | **2.973×** |
-| Laguna `h=3072 i=1024` | 128 | 512 | 4,096 | 9.494 ms | 27.243 ms | 26.331 ms | 12.677 ms | 46.5% | **2.870×** | **2.774×** |
-| Laguna `h=3072 i=1024` | 128 | 2,048 | 16,384 | 16.788 ms | 33.080 ms | 31.410 ms | 12.671 ms | 38.3% | **1.970×** | **1.871×** |
+| DSV4 `h=4096 i=2048` | 32 | 128 | 1,024 | 5.768 ms | 19.354 ms | 17.027 ms | 8.663 ms | 44.8% | **3.355×** | **2.952×** |
+| DSV4 `h=4096 i=2048` | 32 | 512 | 4,096 | 10.181 ms | 21.921 ms | 22.550 ms | 8.666 ms | 39.5% | **2.153×** | **2.215×** |
+| DSV4 `h=4096 i=2048` | 32 | 2,048 | 16,384 | 28.672 ms | 41.506 ms | 36.125 ms | 8.671 ms | 20.9% | **1.448×** | **1.260×** |
+| Laguna `h=3072 i=1024` | 32 | 128 | 1,024 | 2.485 ms | 7.074 ms | 6.723 ms | 3.177 ms | 44.9% | **2.847×** | **2.705×** |
+| Laguna `h=3072 i=1024` | 32 | 512 | 4,096 | 4.360 ms | 7.948 ms | 8.316 ms | 3.182 ms | 40.0% | **1.823×** | **1.907×** |
+| Laguna `h=3072 i=1024` | 32 | 2,048 | 16,384 | 12.669 ms | 13.315 ms | 13.145 ms | 3.177 ms | 23.9% | **1.051×** | **1.038×** |
+| Laguna `h=3072 i=1024` | 128 | 128 | 1,024 | 8.755 ms | 27.207 ms | 26.396 ms | 12.662 ms | 46.5% | **3.108×** | **3.015×** |
+| Laguna `h=3072 i=1024` | 128 | 512 | 4,096 | 9.386 ms | 27.167 ms | 26.281 ms | 12.681 ms | 46.7% | **2.894×** | **2.800×** |
+| Laguna `h=3072 i=1024` | 128 | 2,048 | 16,384 | 16.687 ms | 32.952 ms | 31.390 ms | 12.659 ms | 38.4% | **1.975×** | **1.881×** |
 
 **The expand tax is real and it is the whole story at low `T`.** It measures
-**21.7–46.5%** of the default operator, bracketing the ~35% the 2026-08-01
+**20.9–46.7%** of the default operator, bracketing the ~35% the 2026-08-01
 audit quotes, and — the part that matters for production — it does **not**
 shrink with the expert count. At `E=128` it is 38–47% at every token count,
 because the expansion pays for all 128 experts whether or not the router used
@@ -268,15 +268,15 @@ them, while the GEMM only pays for the routed rows. That is the asymmetry the
 new schedule removes: its grid visits `(expert, N-tile)` pairs and an unrouted
 expert costs two int32 loads and a CTA return.
 
-**The lane wins every cell measured**, 1.05–3.32× over the default bridge and
-1.02–2.97× over the pingpong bridge, and the two baselines are close enough to
+**The lane wins every cell measured**, 1.05–3.36× over the default bridge and
+1.04–3.02× over the pingpong bridge, and the two baselines are close enough to
 each other that the win is against the *route*, not against a weak GEMM.
 
 **Where the win narrows, and why.** The ratio falls with mean routed rows per
 expert (`P/E`): the kernel decodes each weight tile once per `TM`-row M-tile,
 so at `P/E = 512` (`E=32`, `T=2048`) it decodes four times where the expansion
 decodes once, and the two costs nearly cancel (1.05×). The production-shaped
-`E=128` row keeps `P/E = 128` even at `T=2048` and holds **1.97×**. The kernel
+`E=128` row keeps `P/E = 128` even at `T=2048` and holds **1.98×**. The kernel
 answers this with a shape-driven tile choice (cfg 4 below ~64 mean rows, cfg 1
 above, selected from `P` and `E` alone so it stays capture-safe), and a
 kernel-level sweep of the alternatives is recorded in

@@ -461,9 +461,9 @@ byte-for-byte what it was. **Promotion checklist:** decode bit-exactness gate
 — **done**; whole-operator numerics under the reduction-order discipline —
 **done**; routing breadth (empty / single / one-row / skewed) — **done**;
 graph capture-replay and non-default-stream — **done**; whole-routed-operator
-microbenchmark — **done, wins every cell**: 1.05–3.32× over the default bridge
-and 1.02–2.97× over the pingpong bridge across nine whole-operator cells, with
-the eliminated expansion measuring 21.7–46.5% of the default operator
+microbenchmark — **done, wins every cell**: 1.05–3.36× over the default bridge
+and 1.04–3.02× over the pingpong bridge across nine whole-operator cells, with
+the eliminated expansion measuring 20.9–46.7% of the default operator
 ([table](BENCHMARKS.md#2026-08-02-persistent-b-grouped-moe-decode-in-mainloop-microbenchmark-proposal-data));
 whole-routed-operator served [NATIVE-PARITY](NATIVE-PARITY.md) protocol —
 **not run**, and that is what stands between this lane and a default.
@@ -472,7 +472,7 @@ whole-routed-operator served [NATIVE-PARITY](NATIVE-PARITY.md) protocol —
 The ratio narrows as mean routed rows per expert grows — the kernel decodes a
 weight tile once per `TM`-row M-tile, so at `P/E = 512` it decodes four times
 where the expansion decodes once and the costs nearly cancel (1.05×). The
-production-shaped `E=128` cells hold 1.97–3.07×. Raising `TM` past 128 without
+production-shaped `E=128` cells hold 1.98–3.11×. Raising `TM` past 128 without
 losing the second CTA per SM is the identified next step, and it is a change of
 tile, not of schedule.
 

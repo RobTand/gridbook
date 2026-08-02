@@ -34,13 +34,34 @@
   byte-for-byte what it was.
   Measured on nine **whole-routed-operator** cells (routing + QDQ + both
   projection stages + activation + combine, per the NATIVE-PARITY grouped-MoE
-  rule): **1.05–3.32× over the default bridge and 1.02–2.97× over the pingpong
+  rule): **1.05–3.36× over the default bridge and 1.04–3.02× over the pingpong
   bridge, winning every cell**, with the deleted expansion measuring
-  **21.7–46.5%** of the default operator and *not* shrinking with expert count
+  **20.9–46.7%** of the default operator and *not* shrinking with expert count
   — at `E=128` it is 38–47% at every token count, because the expansion pays
   for every expert whether the router used it or not.
   `scripts/bench_moe_persistent_b.py` reproduces the table; proposal data only,
   served protocol not run.
+- Harden that kernel against three defects a dedicated graph/stream audit
+  found, two of which no test in the suite could have caught. (1) A **WAR race
+  on the A double buffer**: the `cp.async` prefetch for stage `st+1` targets
+  the same buffer `mma(st-1)` is reading and sat above the barrier that
+  separates them, so a lagging warp could have its A fragment overwritten
+  mid-MMA. Latent — not reproducible in ~1.15e9 stage×warp opportunities under
+  SM contention — but reproducible at 400 cycles of injected warp skew, where
+  relative error went from 1.6e-3 to 0.3-0.6. The prefetch now issues below the
+  barrier. (2) `expert_ends` is DEVICE data whose **values** the host cannot
+  check, and the kernel used them unclamped for both the row predicate and the
+  store predicate; a hand-built out-of-range entry through the public binding
+  produced an illegal access. The segment is now clamped to `[0, P]` with one
+  register `min`. (3) The routing counted with `torch.bincount`, whose CUDA
+  implementation host-syncs (it sizes its output from `self.max().item()`), so
+  the lane's "no host read on this path" claim was false and the operator could
+  not be captured end to end. It counts with `scatter_add_` now — identical
+  integers, pure device work — and a test captures the whole routed operator
+  and a negative control proves the avoided call really does break capture.
+  Also added: alignment `TORCH_CHECK`s for the operands whose instruction
+  selection assumes them, an `NATOM % 2` static assert, and a device gate that
+  states the schedule's real shared-memory need instead of the whole budget.
 - Record two measured-negative results from that kernel's tile sweep rather
   than only its winners: the `128×128` and `256×64` tiles both fall to one CTA
   per SM and never won a sweep cell — `256×64` halves the decode repetition at
