@@ -1245,3 +1245,165 @@ def _load_fused_ext_locked():
     finally:
         _fused_tried = True
     return _fused
+
+
+# ===========================================================================
+# BEGIN P2a BLOCK — FP4-CB v2 fused mid-M lane loader
+# (2026-08-01 performance audit §3 P2a; csrc/cb_fused_fp4v2_gemm.cu).
+# Purely additive: nothing above this line is touched.
+# ===========================================================================
+_fused_fp4v2 = None
+_fused_fp4v2_tried = False
+_fused_fp4v2_lock = threading.Lock()
+
+
+# The packaged files that define the contract-preserving fused FP4-v2 quality
+# lane: the translation unit, its CB->BF16 decode-in-prologue mainloop fork and
+# the shared grouping glue it takes ``AssertSmemFits`` from (which pulls in the
+# expert-row-broadcast header). All are hashed into the module identity — the
+# module is header-bearing and torch's extension versioner hashes only the
+# ``.cu`` it is handed.
+_FUSED_FP4V2_BUILD_INPUTS = (
+    "cb_fused_fp4v2_gemm.cu",
+    "cutlass_fork/sm120_cb_fp4v2_bf16_mma.hpp",
+    "cutlass_fork/sm120_bf16_expert_mma.hpp",
+    "cb_grouped_common.hpp",
+    "cutlass_fork/sm120_expert_row_broadcast.hpp",
+)
+# Starts at 1: this module's identity payload is new.
+_FUSED_FP4V2_ABI_SCHEMA = 1
+
+# STRICT, not "any useful family". The identity keys both the module name and
+# the build directory, so a module that loads at all was built from exactly
+# these sources — a missing binding is a broken build, not an older one, and
+# accepting it would let an explicit lane selection serve a different kernel.
+_FUSED_FP4V2_SYMBOLS = (
+    "cb_fused_fp4v2_prefill_mm",       # the dense mid-M entry point
+    "sm120_fp4v2_bf16_mm_fork",        # the decode bit-exactness oracle
+    "cb_fused_fp4v2_max_m",            # the HARD mid-M ceiling
+    "cb_fused_fp4v2_kbits",            # every compiled rung
+    "cb_fused_fp4v2_lut_classes",      # compiled codebook smem-stage classes
+    "cb_fused_fp4v2_config",           # [tile_m, tile_n, tile_k, stages, cap]
+    "cb_fused_fp4v2_smem_report",      # measured SharedStorageSize per class
+    "cb_fused_fp4v2_lut_plan",         # the codebook residency ladder
+)
+
+# The capabilities whose kernel layer this lane needs. Same set the two fused
+# modules and the sm12x BF16 lane gate on.
+_FUSED_FP4V2_CAPABILITIES = ((12, 0), (12, 1))
+
+
+def fused_fp4v2_buildable(capability) -> bool:
+    """Whether the fused FP4-v2 quality lane is compiled for ``capability``."""
+    return tuple(capability) in _FUSED_FP4V2_CAPABILITIES
+
+
+def _fused_fp4v2_build_identity(torch, cpp_extension, *, src_dir: str,
+                                cutlass_include: str,
+                                util_include: str,
+                                capability: tuple[int, int]):
+    """``(digest, payload)`` for the fused FP4-v2 module's binary ABI."""
+    return _fused_build_identity(
+        torch, cpp_extension, src_dir=src_dir,
+        cutlass_include=cutlass_include, util_include=util_include,
+        capability=capability, build_inputs=_FUSED_FP4V2_BUILD_INPUTS,
+        bindings=(("fused FP4-CB v2 quality mid-M lane",
+                   _FUSED_FP4V2_SYMBOLS),),
+        abi_schema=_FUSED_FP4V2_ABI_SCHEMA)
+
+
+def get_fused_fp4v2_ext():
+    """The CONTRACT-PRESERVING fused FP4-CB v2 quality prefill extension
+    (cb_fused_fp4v2_gemm.cu), or None.
+
+    A separate module from both ``get_fused_ext`` (FP8-CB) and
+    ``get_fused_fp4_ext`` (the native-NVFP4 block-scaled lane, a DIFFERENT
+    served activation contract). This one decodes packed CB rows to BF16
+    values bit-identical to ``cb_expand_v2`` and multiplies them against the
+    same BF16 group-16-QDQ'd activations the shipping bridge consumes, so the
+    only requalification surface is the FP32 reduction order.
+
+    Needs the CUTLASS headers (``PRISMAQUANT_CUTLASS_INCLUDE``, else the vLLM
+    install's bundled copy) and the architecture-accelerated
+    ``sm_120a``/``sm_121a`` target: the sm90-family cooperative kernel layer
+    compiles its body only under the arch-feature macro, so a plain ``sm_121``
+    build loads and then aborts at launch. Fail-soft like every other loader —
+    a capability probe may inspect the ``None``; the dispatch calls
+    ``fp4v2_fused_midm_lane.require_lane`` and fails closed."""
+    if _fused_fp4v2_tried:
+        return _fused_fp4v2
+    with _fused_fp4v2_lock:
+        if _fused_fp4v2_tried:
+            return _fused_fp4v2
+        return _load_fused_fp4v2_ext_locked()
+
+
+def _load_fused_fp4v2_ext_locked():
+    """Build and publish fused FP4-v2 with ``_fused_fp4v2_lock`` held."""
+    global _fused_fp4v2, _fused_fp4v2_tried
+    try:
+        import torch
+        from torch.utils import cpp_extension
+
+        # FIRST, before any include discovery or build work: this lane's
+        # kernel layer exists only on sm_120a/sm_121a, so every other
+        # capability is a doomed multi-minute nvcc run inside the user's first
+        # request (2026-08-01 audit §3 P0.2).
+        cc = _target_capability(
+            "the fused FP4-CB v2 quality prefill extension "
+            "(cb_fused_fp4v2_gemm.cu)")
+        if not fused_fp4v2_buildable(cc):
+            raise RuntimeError(
+                "the fused FP4-CB v2 quality mid-M lane requires compute "
+                f"capability 12.0 or 12.1, got {cc[0]}.{cc[1]}")
+        cut_inc = _find_cutlass_include()
+        incs = [cut_inc]
+        util_inc = os.path.join(os.path.dirname(cut_inc), "tools", "util",
+                                "include")
+        if os.path.isdir(util_inc):
+            incs.append(util_inc)
+        src_dir = _require_csrc(*_FUSED_FP4V2_BUILD_INPUTS)
+        identity, _identity_payload = _fused_fp4v2_build_identity(
+            torch, cpp_extension, src_dir=src_dir,
+            cutlass_include=cut_inc, util_include=util_inc, capability=cc)
+        module_name = f"pq_cb_fused_fp4v2_{identity}"
+        build_root = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
+        build_dir = os.path.join(build_root, "fused_fp4v2", identity)
+        os.makedirs(build_dir, exist_ok=True)
+        mod = cpp_extension.load(
+            name=module_name,
+            sources=[os.path.join(src_dir, "cb_fused_fp4v2_gemm.cu")],
+            extra_include_paths=incs + [src_dir],
+            extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr",
+                               _gencode_flag(cc, accelerated=True)],
+            build_directory=build_dir, verbose=False)
+        mod = _require_symbols(
+            mod, _FUSED_FP4V2_SYMBOLS, build_dir=build_dir,
+            source="cb_fused_fp4v2_gemm.cu")
+        _fused_fp4v2 = _require_fused_identity(
+            mod, expected_name=module_name, identity=identity,
+            abi_schema=_FUSED_FP4V2_ABI_SCHEMA,
+            build_dir=build_dir, source="cb_fused_fp4v2_gemm.cu")
+    except StaleExtensionError as exc:
+        print(f"[prismaquant-cb] ERROR: incompatible fused FP4-v2 quality "
+              f"prefill extension — {exc} FP4 prefill stays on the exact "
+              f"native BF16 expand + CUTLASS bridge.",
+              file=sys.stderr, flush=True)
+        _fused_fp4v2 = None
+    except IncompleteInstallError as exc:
+        print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
+              f"FP4 prefill stays on the exact native BF16 expand + CUTLASS "
+              f"bridge.", file=sys.stderr, flush=True)
+        _fused_fp4v2 = None
+    except Exception as exc:  # noqa: BLE001 — capability probe is fail-soft
+        print(f"[prismaquant-cb] WARNING: fused FP4-v2 quality prefill "
+              f"extension unavailable ({type(exc).__name__}: {exc}); FP4 "
+              f"prefill stays on the exact native BF16 expand + CUTLASS "
+              f"bridge (expected off Blackwell or without nvcc).",
+              file=sys.stderr, flush=True)
+        _fused_fp4v2 = None
+    finally:
+        _fused_fp4v2_tried = True
+    return _fused_fp4v2
+# =========================== END P2a BLOCK =================================

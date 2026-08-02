@@ -31,6 +31,10 @@ from .bf16_grouped_lane import (dense_mm as bf16_sm120_dense_mm,
                                 require_lane as bf16_sm120_require_lane,
                                 requested as bf16_sm120_requested)
 from .expand import expand_fp4_v2_to_weight
+from .fp4v2_fused_midm_lane import (eligible as fp4v2_midm_eligible,
+                                    fused_mm as fp4v2_midm_fused_mm,
+                                    require_lane as fp4v2_midm_require_lane,
+                                    requested as fp4v2_midm_requested)
 from .native_cutlass import (native_cutlass_scaled_mm, native_fp4_quant,
                              native_fp8_quant, require_native_fp4_quant,
                              require_native_fp8_cutlass)
@@ -555,6 +559,18 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             if bf16_sm120_requested():
                 layer._cb_bf16_sm120 = bf16_sm120_require_lane(
                     f"{self.prefix} dense FP4-v2 quality prefill", device=dev)
+            # OPT-IN contract-preserving fused mid-M lane (audit §3 P2a):
+            # decode the packed CB rows inside the CUTLASS prologue instead of
+            # materializing the [N,K] BF16 transient in HBM. Resolved HERE for
+            # the same two reasons as the lane above — nothing resolves at
+            # first forward, and with the flag on an unavailable lane must fail
+            # the LOAD rather than quietly serve the expand + bridge route,
+            # which would answer a different question than the operator asked.
+            layer._cb_fp4v2_midm = None
+            if fp4v2_midm_requested():
+                layer._cb_fp4v2_midm = fp4v2_midm_require_lane(
+                    f"{self.prefix} dense FP4-v2 fused mid-M prefill",
+                    device=dev)
             if fused_mode:
                 rowwise = fused_mode in _FP4_FUSED_ROWWISE_MODES
                 static_lsq = fused_mode in _FP4_FUSED_STATIC_LSQ_MODES
@@ -947,26 +963,45 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                     layer._cb_row_offset, layer._cb_compose,
                     N, K, self.k, self.n_sub, self.type_size)
             else:
-                # Exact FP4-CB-v2 -> BF16 expansion followed by the same owned
-                # device-scheduled CUTLASS grouped kernel as MoE quality
-                # prefill. E=1 gives a dense GEMM without routing metadata or
-                # a cuBLAS/F.linear fallback. The QDQ and expanded weight are
-                # bit-identical to the established quality reference; only
-                # FP32 accumulation order may differ.
-                W = self._expand_fp4_quality_weight(layer, N, K)
-                xq2 = xq.reshape(M, K).contiguous()
-                lane = getattr(layer, "_cb_bf16_sm120", None)
-                if lane is not None:
-                    # OPT-IN sm12x-native lane: one expert, M padded up to a
-                    # tile, every tile's expert id 0. Same operands, same
-                    # single bf16 round; only the fp32 reduction order differs.
-                    y = bf16_sm120_dense_mm(lane, xq2, W)
+                # OPT-IN fused mid-M lane (P2a). At 9 <= M <= 128 ONE M-tile
+                # covers the batch, so decoding B inside the CUTLASS prologue
+                # costs no redundant per-M-tile decode and the [N,K] BF16
+                # transient never reaches HBM at all. CONTRACT-PRESERVING: the
+                # decoded weights are bit-identical to
+                # expand_fp4_v2_to_weight's and the activation is this same
+                # xq, so only the FP32 reduction order differs. Unset (the
+                # default) leaves the route below byte-for-byte unchanged.
+                midm = getattr(layer, "_cb_fp4v2_midm", None)
+                if midm is not None and fp4v2_midm_eligible(
+                        midm, layer, M=M, N=N, K=K, k_bits=self.k,
+                        n_sub=self.n_sub, type_size=self.type_size,
+                        is_v2=self.is_v2):
+                    y = fp4v2_midm_fused_mm(
+                        midm, xq.reshape(M, K).contiguous(), layer,
+                        N=N, K=K, k_bits=self.k)
                 else:
-                    expert_ends = torch.full(
-                        (1,), M, dtype=torch.int32, device=x.device)
-                    y = cb_bf16_grouped_mm(
-                        xq2, W.unsqueeze(0), expert_ends, 0)
-                del W
+                    # Exact FP4-CB-v2 -> BF16 expansion followed by the same
+                    # owned device-scheduled CUTLASS grouped kernel as MoE
+                    # quality prefill. E=1 gives a dense GEMM without routing
+                    # metadata or a cuBLAS/F.linear fallback. The QDQ and
+                    # expanded weight are bit-identical to the established
+                    # quality reference; only FP32 accumulation order may
+                    # differ.
+                    W = self._expand_fp4_quality_weight(layer, N, K)
+                    xq2 = xq.reshape(M, K).contiguous()
+                    lane = getattr(layer, "_cb_bf16_sm120", None)
+                    if lane is not None:
+                        # OPT-IN sm12x-native lane: one expert, M padded up to
+                        # a tile, every tile's expert id 0. Same operands, same
+                        # single bf16 round; only the fp32 reduction order
+                        # differs.
+                        y = bf16_sm120_dense_mm(lane, xq2, W)
+                    else:
+                        expert_ends = torch.full(
+                            (1,), M, dtype=torch.int32, device=x.device)
+                        y = cb_bf16_grouped_mm(
+                            xq2, W.unsqueeze(0), expert_ends, 0)
+                    del W
                 y = y.reshape(*x.shape[:-1], N)
             if bias is not None:
                 y = y + bias
