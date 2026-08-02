@@ -17,6 +17,7 @@ are published, while these tests run in both places the suite runs --
   serving sources arrived and the sdist-only ones did not.
 """
 
+import ast
 from pathlib import Path
 import re
 
@@ -143,3 +144,44 @@ def test_installed_wheel_carries_serving_sources_and_no_sdist_only_ones():
     assert not orig, (
         f"pristine CUTLASS diff baselines {orig} are sdist-only and must not "
         f"be installed")
+
+
+def test_suite_needs_nothing_the_wheel_does_not_declare():
+    """No test or script may write safetensors: that path imports NumPy.
+
+    ``cpu-tests`` and ``release.yml``'s ``verify`` run this suite against the
+    installed wheel, in the wheel's own dependency closure. NumPy is not in it
+    — deliberately (``gridbook/cb_digest.py``) — but it is on every developer
+    host, so a fixture built with ``safetensors.torch.save_file`` passes
+    locally and fails all four CI legs plus the release gate. That is what
+    happened, and a text-level ban is not enough: the F16 fixture writer in
+    ``test_codebook_digest.py`` documents the rule in prose and must stay
+    legal, so the ban is on the *call*, not the word.
+    """
+
+    roots = [directory
+             for directory in (Path(__file__).resolve().parent,
+                               ROOT / "scripts")
+             if directory.is_dir()]
+    assert roots, "no suite directory to scan"
+
+    banned: list[str] = []
+    for directory in roots:
+        for path in sorted(directory.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"),
+                             filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) \
+                        and (node.module or "").startswith("safetensors") \
+                        and any(a.name == "save_file" for a in node.names):
+                    banned.append(f"{path.name}:{node.lineno}: imports it")
+                elif isinstance(node, ast.Call):
+                    func = node.func
+                    name = func.attr if isinstance(func, ast.Attribute) else \
+                        getattr(func, "id", "")
+                    if name == "save_file":
+                        banned.append(f"{path.name}:{node.lineno}: calls it")
+    assert not banned, (
+        "safetensors' write path imports NumPy, which the wheel does not "
+        "depend on; serialize the fixture directly instead (see "
+        "test_codebook_digest.py::_write):\n  " + "\n  ".join(banned))

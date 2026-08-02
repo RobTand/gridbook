@@ -8,6 +8,7 @@ import inspect
 import json
 import math
 import os
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -1829,11 +1830,40 @@ _K02_W2 = "model.layers.0.feed_forward.experts.down_proj"
 _K02_MODULE = "model.layers.0.feed_forward.experts"
 
 
-def _write_k02_artifact(root, *, scales, attest=None, contract=True):
-    """Write a synthetic artifact: quant_config plus serialized F32 scalars."""
+def _write_f32_scalars(path, values: dict) -> None:
+    """Serialize ``{name: float}`` as F32 scalars, without NumPy.
+
+    ``safetensors.torch.save_file`` imports NumPy on its **write** path, and
+    NumPy is deliberately not a Gridbook dependency (``gridbook/cb_digest.py``),
+    so it is absent from the environment CI runs the suite in: the wheel's own
+    closure, installed from outside the checkout. Writing a fixture through
+    ``save_file`` therefore makes the suite need a package the package does not
+    — passing on any developer host, failing every CI leg. Emit the container
+    directly instead, as ``tests/test_codebook_digest.py`` already does for its
+    F16 sidecar. Gridbook only ever *reads* these, and the read path is
+    NumPy-free.
+    """
 
     import torch
-    from safetensors.torch import save_file
+
+    header: dict[str, object] = {}
+    payload = bytearray()
+    for name in sorted(values):
+        tensor = torch.tensor([values[name]], dtype=torch.float32)
+        start = len(payload)
+        payload.extend(bytes(tensor.view(torch.uint8).reshape(-1).tolist()))
+        header[name] = {
+            "dtype": "F32",
+            "shape": list(tensor.shape),
+            "data_offsets": [start, len(payload)],
+        }
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * (-len(encoded) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
+
+
+def _write_k02_artifact(root, *, scales, attest=None, contract=True):
+    """Write a synthetic artifact: quant_config plus serialized F32 scalars."""
 
     from gridbook import nvfp4_activation_contract as gc
 
@@ -1891,14 +1921,10 @@ def _write_k02_artifact(root, *, scales, attest=None, contract=True):
     (root / "quant_config.json").write_text(
         json.dumps(quant_config, indent=2, sort_keys=True), encoding="utf-8"
     )
-    save_file(
-        {
-            f"{target}.{gc.TENSOR_SUFFIX}": torch.tensor(
-                [value], dtype=torch.float32
-            )
-            for target, value in scales.items()
-        },
-        str(root / "model.safetensors"),
+    _write_f32_scalars(
+        root / "model.safetensors",
+        {f"{target}.{gc.TENSOR_SUFFIX}": value
+         for target, value in scales.items()},
     )
     return root
 
