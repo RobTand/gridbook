@@ -16,8 +16,8 @@
 //
 //   * the `ScaledFusion` EVT node tree (verbatim x3 before this file),
 //   * its expert-indexed `MoeScaledFusion` variant,
-//   * `AssertSmemFits` — the hard smem gate the sm90 cooperative kernel layer
-//     does not perform for itself,
+//   * `AssertSmemFits` — the hard smem gate the sm90-family kernel layers
+//     (cooperative AND pingpong) do not perform for themselves,
 //   * the tile-feasibility predicate scaffolding (`tile_sizes_where`),
 //   * the host-side shape/stride/expert_ids validation every grouped binding
 //     repeats.
@@ -108,10 +108,11 @@ struct MoeScaledFusion {
   using type = cutlass::epilogue::fusion::Sm90EVT<MulB, ScaleB, EVTA>;
 };
 
-// Hard smem gate. The sm90 cooperative kernel layer does NOT static_assert its
-// own SharedStorageSize against the arch capacity (only the sm120
-// asymmetric-DMA kernel does), so an over-budget config would compile and then
-// fail at launch. Every instantiated Gridbook config passes through this.
+// Hard smem gate. Neither sm90-family kernel layer — cooperative (the two
+// fused lanes) nor pingpong (the sm12x BF16 lane) — static_asserts its own
+// SharedStorageSize against the arch capacity; only the sm120 asymmetric-DMA
+// kernel does. An over-budget config would therefore compile and then fail at
+// launch. Every instantiated Gridbook config passes through this.
 template <class GemmKernel>
 struct AssertSmemFits {
   static_assert((int)GemmKernel::SharedStorageSize <=

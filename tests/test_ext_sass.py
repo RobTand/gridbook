@@ -129,8 +129,8 @@ def test_generic_modules_are_not_pinned_to_an_arch_conditional_target():
     The two fused modules require the conditional target for their tensor-core
     instructions, and since 2026-08-01 the grouped BF16 bridge requests it too
     — but only where it compiles its sm12x lane (cc 12.x), because the
-    sm90-family cooperative kernel layer that lane goes through compiles its
-    body only under the architecture feature macro. Which callers ask for which
+    sm90-family kernel layer that lane goes through compiles its body only
+    under the architecture feature macro. Which callers ask for which
     is asserted in ``tests/test_ext_build_identity.py``; this case pins the
     helper both of them use.
     """

@@ -97,8 +97,10 @@ initialization seen in the first `w13` reference call and removes the forbidden
 vendor/runtime fallback, but its current generic SM80-compatible
 `DefaultGemmGrouped` is **6–17% slower on warm GPU time** for these synthetic
 DSV4 shapes. The 292 ms cold reference value is one-time library setup and must
-not be multiplied by layers or requests. A `TileM=64` prototype did not improve
-the warm result. The concrete optimization opportunity is a CUTLASS 3.x
+not be multiplied by layers or requests. A `TileM=64` prototype **of this SM80
+`DefaultGemmGrouped`** did not improve the warm result (the sm12x lane below
+is a different collective, where TileM=64 does win — for a different reason:
+row-padding granularity, not tile efficiency). The concrete optimization opportunity is a CUTLASS 3.x
 SM100/SM121 grouped collective; the legacy grouped template has no SM100
 specialization. Until that work is measured end-to-end, this bridge is a
 quality/native-ownership result, not a prefill speed claim or a

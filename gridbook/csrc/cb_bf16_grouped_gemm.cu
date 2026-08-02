@@ -288,13 +288,14 @@ void cb_bf16_grouped_mm_out(torch::Tensor output,
 //
 // WHAT THE MEASUREMENTS SAID (GB10, cc 12.1; docs/BENCHMARKS.md has the
 // tables). The operator is bound by B traffic: this construction re-reads an
-// expert's B slice once per M-tile, so cost tracks the PADDED tile count, and
-// the ragged rounding of each expert's rows up to TileM is the whole tax. With
-// the padding removed (a synthetic routing whose expert counts are exact tile
-// multiples) this collective runs at 1.12-1.13x segmented cuBLAS and
-// 1.05-1.06x the SM80 lane — the SCHEDULE is not the problem. What closes most
-// of the remaining gap is halving the rounding granularity, which is why the
-// compiled rung is PINGPONG at TileM=64 rather than cooperative at 128.
+// expert's B slice once per PADDED M-tile, so cost tracks the padded tile
+// count, and the ragged rounding of each expert's rows up to TileM is the
+// whole tax. With the padding removed (a synthetic routing whose expert counts
+// are exact tile multiples) this collective runs at 1.08-1.13x segmented
+// cuBLAS and 1.05-1.24x the SM80 lane — the SCHEDULE is not the problem. What
+// closes most of the remaining gap is halving the rounding granularity, which
+// is why the compiled rung is PINGPONG at TileM=64 rather than cooperative at
+// 128.
 // ---------------------------------------------------------------------------
 namespace sm120_lane {
 
