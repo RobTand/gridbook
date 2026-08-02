@@ -8,9 +8,10 @@ reduction order (2026-08-01 performance audit §3 P2a). This file is the
 evidence for that claim, in three layers of decreasing strength:
 
 1. **DIRECT decode read-out (the primary gate).** With a one-hot ``A``
-   (``a[m, k0+m] = 1``) the GEMM degenerates to ``y[m, n] = W_decoded[n, k0+m]``
-   EXACTLY: the fp32 accumulator sums one ``1.0 * f32(w)`` term and a column of
-   zeros, and ``bf16(f32(bf16 w)) == w``. Sweeping ``k0`` over every window of
+   (``a[m, k0+m] = 1``) the GEMM degenerates to
+   ``y[m, n] = W_decoded[n, k0+m]`` EXACTLY: the fp32 accumulator sums one
+   ``1.0 * f32(w)`` term and a column of zeros, and
+   ``bf16(f32(bf16 w)) == w``. Sweeping ``k0`` over every window of
    a small problem therefore reads back the ENTIRE decoded ``[N, K]`` tile and
    compares it to ``cb_expand_v2``'s output **bit-for-bit**. Nothing here is a
    tolerance; a single wrong codeword, sub-table base, scale nibble or compose

@@ -10,7 +10,8 @@ The decoded values are **bit-identical to** ``cb_expand_v2`` and the
 activations are the same BF16 group-16 QDQ output the bridge already consumes,
 so the lane is CONTRACT-PRESERVING: only the FP32 GEMM reduction order moves.
 It is nevertheless **OPT-IN** behind ``PRISMAQUANT_CB_FP4_FUSED_MIDM=1`` until
-the served NATIVE-PARITY gate is run, per [NATIVE-PARITY](../docs/NATIVE-PARITY.md).
+the served NATIVE-PARITY gate is run, per
+[NATIVE-PARITY](../docs/NATIVE-PARITY.md).
 Nothing here runs, probes or builds anything when the flag is unset — with the
 flag off the dispatch is byte-for-byte what it was.
 
@@ -104,8 +105,8 @@ def require_lane(operation: str = "this operation", *, device=None):
             f"{operation} requested the FP4-CB fused mid-M lane ({_FLAG}=1), "
             f"but Gridbook's fused FP4-v2 quality extension "
             f"(cb_fused_fp4v2_gemm.cu) is unavailable or incomplete "
-            f"(missing {missing}; device capability {capability}). The lane is "
-            f"compiled only for compute capability 12.0/12.1"
+            f"(missing {missing}; device capability {capability}). "
+            f"The lane is compiled only for compute capability 12.0/12.1"
             + ("" if capability is None or fused_fp4v2_buildable(capability)
                else f", and this device reports "
                     f"{capability[0]}.{capability[1]}")

@@ -350,8 +350,16 @@ struct PassthroughCfg {
 // order. Proving it by TYPE IDENTITY is how this tree already proves kernel
 // equivalence (see the `MoeTile<128> == TileF` assert in cb_fused_gemm.cu).
 static_assert(
-    cute::is_same_v<typename MmaCfg<TileF>::TiledMma,
-                    typename MmaCfg<TileF>::TiledMma>);
+    cute::is_same_v<typename Cfg<TileF, kStages, 0>::Mainloop::TiledMma,
+                    typename PassthroughCfg<TileF>::Mainloop::TiledMma>,
+    "the passthrough oracle must share the fused lane's TiledMma: the atom, "
+    "the warp layout and the permutation are what fix the FP32 accumulation "
+    "order the bit-exactness gate relies on");
+static_assert(
+    cute::is_same_v<typename Cfg<TileF, kStages, 0>::Mainloop::SmemLayoutA,
+                    typename PassthroughCfg<TileF>::Mainloop::SmemLayoutA>,
+    "the passthrough oracle must share the fused lane's A staging, or the "
+    "k-block iteration the two mainloops perform is not the same one");
 static_assert(
     cute::is_same_v<typename Cfg<TileF, kStages, 0>::Epilogue,
                     typename PassthroughCfg<TileF>::Epilogue>,
@@ -475,6 +483,11 @@ torch::Tensor cb_fused_fp4v2_prefill_mm(torch::Tensor a, torch::Tensor packed,
                                         int64_t force_lut_bytes,
                                         int64_t debug_mode) {
   check_fused_inputs(a, packed, cb_flat, compose, N, K, k_bits);
+  // TESTS ONLY, and validated so a typo cannot silently return coordinates
+  // instead of weights (see the mainloop's `debug_mode`).
+  TORCH_CHECK(debug_mode >= 0 && debug_mode <= 3,
+              "debug_mode must be 0 (decode), or 1/2/3 to write the decoder's "
+              "row / column / K-tile coordinate; got ", debug_mode);
   int64_t lut_bytes = force_lut_bytes;
   if (lut_bytes < 0) {
     lut_bytes = resolve_lut_bytes(k_bits);
