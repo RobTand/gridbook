@@ -2,6 +2,104 @@
 
 ## Unreleased
 
+## 0.8.0 — 2026-08-03
+
+- **Release status note — read this before enabling anything below.** The MXFP8
+  dense lane ships **opt-in behind `GRIDBOOK_MXFP8_DENSE=1` and refuses by
+  default**, naming the flag in the refusal. Its correctness is audited and
+  recorded; its *performance* is not. The NATIVE-PARITY served timing bench
+  (`python -m gridbook.bench_mxfp8_dense`) had not been run at tag time — it
+  refuses a non-idle GPU and the reference box was occupied — so this release
+  makes no throughput claim for that lane whatsoever. The MXFP4 delegated route
+  is a different case: it is **backed**, but only through vLLM's Marlin MoE
+  backend, so it carries a *requirement* (`--moe-backend marlin`) rather than a
+  refusal. Both statements are the honest state, not a hedge.
+
+- **Delegated-native source-passthrough loading (#37).** A mixed Gridbook
+  artifact may now ship some units as CB and others as verbatim copies of the
+  source checkpoint's own quantized tensors; serving a passthrough unit means
+  handing it to the native vLLM method that already understands that source
+  format. `gridbook/source_passthrough.py` owns a versioned declaration schema
+  (`source_passthrough`, version 1) and the audited format registry.
+  **Absence of the key keeps the exact legacy all-CB meaning**, so every
+  published artifact is unaffected. Unknown schema version, unknown format id,
+  unaudited device, and a unit claimed by both the CB and passthrough
+  vocabularies are each a load-time refusal with **no env bypass**.
+
+- **The passthrough registry stores measured outcomes, not selector
+  predicates.** Each entry records a real layer built, its weights processed
+  and a forward profiled on the device — because on the very first format the
+  measurement and the predicate disagree. `mxfp4_e2m1_ue8m0_g32` (routed
+  experts) is native-confirmed via **Marlin** (`moe_wna16_marlin_gemm` /
+  `marlin_moe_wna16::Marlin<…>`, alongside `vllm::act_and_mul_kernel`,
+  `moe_align_block_size` and `topkGating`, with **zero Triton kernels** in the
+  profile and finite output). The *default* rung is not that one: vLLM's DSV4
+  MXFP4 oracle ranks `DEEPGEMM_MXFP4` ahead of Marlin and gates it on the whole
+  sm12x family (`is_device_capability_family(120)`), then dies in
+  `process_weights_after_loading` with DeepGEMM's `Unknown SF transformation`
+  (`layout.hpp:59`). A predicate would have called that a pass. Serving MXFP4
+  experts therefore **requires `--moe-backend marlin`**; `auto` is refused at
+  construction with an actionable message rather than failing later.
+
+- **`require_native_passthrough_backend` preflight.** A sibling of the
+  compressed-tensors policy keyed on the *format* rather than on a config
+  group: **Triton by MRO is refused unconditionally**, a rung measured to break
+  is named with its symptom *and* its fix, and anything outside the audited set
+  is UNKNOWN and fails. `config.py` routes declared units to the native method
+  between the CB check and the ignore test, behind device attestation and that
+  preflight — both at model load, the preflight the moment the constructor
+  returns, since the MXFP4 method runs its oracle in `__init__` and that is the
+  earliest point the backend is a fact rather than a prediction.
+
+- **MXFP8 dense W8A8 lane (#38), and the route verdict it flips.** The DeepSeek
+  body convention (E4M3 + UE8M0 per 128×128 tile) embeds *exactly* into MXFP8
+  (E4M3 + UE8M0 per 32): `128 = 4 * 32`, so `SF_mx[n,c] = S_ds[n//128, c//4]`
+  is a pure scale replication — no element byte changes, no scale arithmetic.
+  The kernel is the **stock sm120 `OpClassBlockScaledTensorOp` CollectiveBuilder
+  product** (`kind::mxf8f6f4`, SFVec 32) — no fork header, nothing vendored — and
+  SF planes are filled by scattering with offsets computed from the mainloop's
+  own CuTe layout, so the swizzle has exactly one spelling. On the strength of
+  that, `fp8_e4m3_ue8m0_block128` moves from **BLOCKED** in #37 (empty audited
+  set) to the **Gridbook-owned** route. The five measured-broken vLLM 0.24 rungs
+  are *retained* in `known_broken_backends` with their symptoms rather than
+  deleted (`DeepGemm…`, `Cutlass…`, `Triton…`, `FlashInfer…`,
+  `MarlinFP8ScaledMMLinearKernel`). New wire id `mxfp8_e4m3_e8m0_g32` serves the
+  same lane without the broadcast. Loader is the eighth digest-keyed JIT family.
+
+- **MXFP8 correctness evidence, stated as a kernel claim.** Audited
+  kernel-vs-fp32-oracle over the seven distinct DSV4-Flash body shapes from the
+  **real checkpoint**: worst rel-Frobenius **5.9e-5** at M in {1, 64, 512} (M=1
+  mostly bit-exact); embedding chain worst 1.2e-4. The numbers live in a
+  verdict-pin test, so they are asserted facts rather than prose. This is a
+  correctness result and **not** a performance result — see the status note.
+
+- **Activation UE8M0 exponent uses the exact frexp form.**
+  `ceil(log2(amax/448))` in float32 is wrong about once in 4e5 group maxima:
+  when `amax/448` rounds to exactly a power of two, `log2` lands on the integer,
+  `ceil` keeps it, the exponent comes out one too small, and the group's max
+  element **saturates at 448** — precisely what the ceil rule exists to prevent
+  (measured: 15 saturations per 6e6 maxima; 0 for frexp). Replaced with the
+  integer form the producer's encoder uses — `amax = f * 2^E`,
+  `448 = 0.875 * 2^9`, exponent `E-9 + (f > 0.875)` — zeros pinned to byte 0, so
+  both sides of the wire emit **identical scale bytes** for identical tensors.
+  Pinned by a byte-equality cross-encoder test, a boundary regression over exact
+  and near-miss power-of-two maxima, and a minimality assertion so the fix
+  cannot overshoot. The recorded parity evidence above is unaffected: every
+  comparison fed the same quantized operands to kernel and oracle, so the defect
+  cancelled identically on both sides. Weight paths were never affected.
+
+- **`cuda_ext.py` additive-block ordering restored.** The MXFP8 loader block
+  initially landed *below* the persistent-B grouped-MoE block, breaking that
+  block's file-tail invariant — the rule that keeps each lane revertible as one
+  unit and stops concurrent branches appending loaders from conflicting. Pure
+  code motion moved MXFP8 above it; the invariant test was not touched.
+
+- **`lane_select._device_capability` becomes public `device_capability()`.**
+  The lanes keep the old spelling as an alias.
+
+- CI: bump `pypa/gh-action-pypi-publish` 1.14.1 → 1.14.2 in the actions group
+  (#30). Action pins stay exact patch tags, not floating major refs.
+
 ## 0.7.0 — 2026-08-02
 
 - Release status note: the `deepseek_v4` contract below is validated by
