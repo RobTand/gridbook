@@ -255,8 +255,11 @@ def test_passthrough_linear_unit_dispatches_through_the_same_guard(monkeypatch):
     assert c.get_quant_method(_linear(), target) is method
 
 
-def test_fp8_block_passthrough_is_blocked_on_this_device(monkeypatch):
-    """The measured BLOCKED verdict must surface as a refusal, not a fallback."""
+def test_fp8_block_broken_vllm_rung_still_named_and_refused(monkeypatch):
+    """A measured-broken vLLM rung refuses BY NAME even now that the format's
+    audited route is Gridbook's own MXFP8 lane: if dispatch ever resolves one
+    of the broken classes, the operator gets the diagnosed symptom rather
+    than a generic UNKNOWN."""
     monkeypatch.setattr(config_mod, "_live_device_capability",
                         lambda *a, **k: (12, 1))
     monkeypatch.setattr(

@@ -254,15 +254,43 @@ def test_none_method_is_not_judged():
 
 
 def test_format_with_empty_audited_set_refuses_everything():
-    """A BLOCKED verdict encoded as data: no non-Triton kernel serves FP8
-    128x128 UE8M0 blocks on sm_121 in vLLM 0.24, so the format admits none."""
-    assert FORMATS[FP8_BLOCK].audited_backends == frozenset()
+    """The MECHANISM pin: an empty audited set is a BLOCKED verdict as data.
+
+    Uses a synthetic format rather than a real registry entry, so this stays
+    true whatever the registry's current verdicts are — the fp8-block entry
+    carried the empty set until Gridbook's own MXFP8 lane was audited, and the
+    verdict pin for that entry lives in
+    ``test_fp8_block_verdict_is_gridbook_owned_route`` below.
+    """
+    blocked = FORMATS[FP8_BLOCK]._replace(audited_backends=frozenset())
     method = Mxfp4MoEMethod(Mxfp4MoeBackend.MARLIN, MarlinExperts)
     with pytest.raises(DelegatedBackendError) as exc:
         require_native_passthrough_backend(
             prefix="model.layers.0.self_attn.q_proj",
-            source_format=FORMATS[FP8_BLOCK], method=method)
+            source_format=blocked, method=method)
     assert "no audited native route" in str(exc.value)
+
+
+def test_fp8_block_verdict_is_gridbook_owned_route():
+    """The VERDICT pin — this test SHOULD fail when the verdict changes.
+
+    Every vLLM 0.24 rung for UE8M0 128x128 blocks on sm_121 measured broken
+    (the known_broken_backends record each symptom), so the audited route is
+    Gridbook's own MXFP8 dense lane: the block form embeds exactly into MXFP8
+    (128 = 4 * 32, scale replication, bit-exact) and the stock sm120
+    block-scaled collective serves it.  Correctness audit 2026-08-03 on
+    sm_121: kernel-vs-fp32-oracle rel-Frobenius worst 5.9e-5 over the seven
+    distinct DSV4-Flash body shapes at M in {1, 64, 512}, M=1 bit-exact on
+    most shapes; the DeepSeek-embedding path (block scales -> broadcast ->
+    plane -> kernel) worst 1.2e-4 vs the block-dequant oracle.
+    """
+    fmt = FORMATS[FP8_BLOCK]
+    assert fmt.audited_backends == frozenset({"Mxfp8DenseLinearMethod"})
+    # The vLLM delegation outcomes stay recorded: a refusal for one of those
+    # classes must name the measured symptom, not a generic UNKNOWN.
+    assert {"DeepGemmFp8BlockScaledMMKernel", "CutlassFp8BlockScaledMMKernel",
+            "TritonFp8BlockScaledMMKernel"} <= set(fmt.known_broken_backends)
+    assert "GRIDBOOK_MXFP8_DENSE" in fmt.remedy
 
 
 def test_registry_entries_are_self_consistent():
