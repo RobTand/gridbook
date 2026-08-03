@@ -114,8 +114,14 @@ def latched_int(flag: str, *, default: int, minimum: int = 1,
     return parsed
 
 
-def _device_capability(device):
-    """``(major, minor)`` for ``device``, or ``None`` if CUDA cannot say."""
+def device_capability(device=None):
+    """``(major, minor)`` for ``device``, or ``None`` if CUDA cannot say.
+
+    Public because lane attestation is no longer the only caller: the
+    source-passthrough registry attests a device per format, and a second copy
+    of this five-line read is exactly the kind of duplication this module
+    exists to remove.
+    """
     try:
         import torch
 
@@ -125,6 +131,10 @@ def _device_capability(device):
         return int(major), int(minor)
     except Exception:  # noqa: BLE001 — reported by the caller as "unavailable"
         return None
+
+
+#: Historical spelling, kept so the three lanes below read unchanged.
+_device_capability = device_capability
 
 
 def require_lane(operation: str, *, flag: str, lane: str, source: str,

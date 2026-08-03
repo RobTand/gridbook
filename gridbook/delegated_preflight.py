@@ -56,6 +56,7 @@ __all__ = [
     "DelegatedBackendError",
     "declared_contract",
     "require_native_delegated_backend",
+    "require_native_passthrough_backend",
 ]
 
 
@@ -386,3 +387,94 @@ def require_native_delegated_backend(
                   "Audit the backend against docs/DELEGATED-NVFP4-MOE.md and "
                   "extend the table in gridbook/delegated_preflight.py, or "
                   "pin an audited backend for this group.")
+
+
+# --- source-format passthrough ----------------------------------------------
+
+
+def require_native_passthrough_backend(
+    *,
+    prefix: str,
+    source_format: Any,
+    method: Any,
+    layer: Any = None,
+) -> None:
+    """Raise unless a SOURCE-PASSTHROUGH unit resolved to its audited backend.
+
+    The sibling policy above judges a *compressed-tensors* group against a
+    declaration it reads out of the group dict.  A passthrough unit has no such
+    dict: the producer named a source format, and that format's audited route
+    is a table in ``gridbook.source_passthrough``.  So the rules are the same
+    three in spirit but keyed differently — the format supplies the contract.
+
+    ``source_format`` is a ``gridbook.source_passthrough.SourceFormat``; it is
+    taken structurally (``.id``, ``.audited_backends``, …) rather than by
+    import, so this module stays torch-free and vLLM-free and the policy can be
+    tested against stub formats.
+
+    **T — no Triton lane.** Unconditional and first, exactly as above.  A
+    passthrough unit that resolved to Triton would make the README's no-Triton
+    sentence false, whatever the format declares.
+
+    **B — a backend measured to break is named, not merely "unaudited".**
+    vLLM's MXFP4 oracle picks ``DEEPGEMM_MXFP4`` by default on the whole sm12x
+    family and that rung then raises inside DeepGEMM on sm_121.  Without this
+    rule the operator would get Gridbook's generic UNKNOWN message for a
+    failure we have already diagnosed, and would have to rediscover the fix.
+
+    **U — unaudited is not a pass.** The resolved backend must appear in the
+    format's audited set.  A format with an EMPTY audited set therefore refuses
+    every delegation, which is how a BLOCKED verdict is encoded as data rather
+    than as a comment.
+    """
+
+    if method is None:
+        return
+    fmt_id = getattr(source_format, "id", "<unknown>")
+    described = getattr(source_format, "description", "")
+    remedy = getattr(source_format, "remedy", "")
+    audited = frozenset(getattr(source_format, "audited_backends", ()) or ())
+    broken = dict(getattr(source_format, "known_broken_backends", {}) or {})
+
+    identities = _identities(method, layer)
+
+    def fail(verdict: str, fix: str) -> None:
+        raise DelegatedBackendError(
+            f"source-passthrough unit {prefix!r} ({fmt_id}): {verdict}. The "
+            f"unit stores {described}. Gridbook serves a native CUDA/CUTLASS "
+            f"operator lane and fails closed rather than serving a kernel it "
+            f"has not audited for this format on this device; there is no "
+            f"environment-variable bypass. {fix}"
+        )
+
+    # T — Triton lane.
+    triton = [identity for identity in identities if _is_triton_backed(identity)]
+    if triton:
+        fail(f"vLLM resolved it to Triton-backed {_describe(triton)}", remedy)
+
+    backends = [identity for identity in identities if identity.is_backend]
+
+    # B — a rung we have already measured to fail for this format.
+    for identity in backends:
+        key = _table_hit(identity, broken)
+        if key is not None:
+            fail(f"vLLM resolved it to {_describe([identity])}, which "
+                 f"Gridbook has measured to fail for this format: "
+                 f"{broken[key]}", remedy)
+
+    # U — audited-or-fail.
+    if not backends:
+        fail(f"Gridbook could not determine which backend "
+             f"{type(method).__module__}.{type(method).__qualname__} selected, "
+             f"so the audited native route cannot be proven to be the one that "
+             f"will run",
+             "This usually means an unaudited vLLM version. Audit it and "
+             "extend gridbook/source_passthrough.py.")
+    unaudited = [identity for identity in backends
+                 if _table_hit(identity, audited) is None]
+    if unaudited:
+        known = ", ".join(sorted(audited)) or "(none — this format has no " \
+                                             "audited native route on any device yet)"
+        fail(f"vLLM resolved it to {_describe(unaudited)}, which is not in "
+             f"Gridbook's audited set for this format. Audited: {known}",
+             remedy)

@@ -36,7 +36,17 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from .runtime_contract import load_runtime_contract
-from .delegated_preflight import require_native_delegated_backend
+from .delegated_preflight import (
+    require_native_delegated_backend,
+    require_native_passthrough_backend,
+)
+from .source_passthrough import (
+    SourceFormat as _SourceFormat,
+    build_delegated_method as _build_passthrough_method,
+    parse_declaration as _parse_passthrough_declaration,
+    require_audited_device as _require_passthrough_device,
+)
+from .lane_select import device_capability as _live_device_capability
 from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
     TENSOR_SUFFIX as _NVFP4_ACTIVATION_TENSOR_SUFFIX,
@@ -291,6 +301,10 @@ class PrismaQuantConfig(QuantizationConfig):
         # D0.2 preflight needs the *declaration*, and the declaration lives in
         # the config group, not in whatever tensors happen to be on disk.
         self._stock_group_by_target: dict[str, str] = {}
+        # Canonical unit prefix -> the SOURCE format it passes through
+        # verbatim.  Empty for every artifact published before the schema
+        # existed, which is exactly the legacy all-CB meaning.
+        self._passthrough_units: dict[str, "_SourceFormat"] = {}
 
     def _get_sidecar_source(self) -> tuple[str, str | None]:
         if self._sidecar_source is None:
@@ -557,6 +571,15 @@ class PrismaQuantConfig(QuantizationConfig):
                 stock_groups[name] = g
                 for t in g.get("targets", []):
                     self._stock_group_by_target[str(t)] = name
+        # SOURCE-format passthrough units.  Parsed after ``_cb_targets`` is
+        # populated so a unit claimed by both vocabularies is caught here
+        # rather than resolved by whichever branch of ``get_quant_method``
+        # happens to run first.
+        self._passthrough_units = _parse_passthrough_declaration(
+            cfg,
+            canonicalize=_canonical_target,
+            cb_targets=frozenset(self._cb_targets),
+        )
         self._alias_collapsed_shared_prefixes()
         self.ct_config = (self._build_ct_config(stock_groups)
                           if stock_groups else None)
@@ -619,7 +642,11 @@ class PrismaQuantConfig(QuantizationConfig):
         ct_dict = dict(self._full_config)
         ct_dict["quant_method"] = "compressed-tensors"
         ct_dict["config_groups"] = dict(stock_groups)
-        ct_dict["ignore"] = list(self.ignore) + sorted(self._cb_targets)
+        # Passthrough units join CB targets in CT's ignore: both are owned by
+        # Gridbook's own dispatch, and a stock group that also happens to name
+        # one must not be able to claim it.
+        ct_dict["ignore"] = (list(self.ignore) + sorted(self._cb_targets)
+                             + sorted(self._passthrough_units))
         ct_dict.pop("codebook_file", None)
         ct_dict.pop("provenance", None)
         # Gridbook has already attested this producer-owned container record;
@@ -828,6 +855,49 @@ class PrismaQuantConfig(QuantizationConfig):
                 return group_name, self.config_groups.get(group_name)
         return None, None
 
+    def _passthrough_format(self, prefix: str) -> "_SourceFormat | None":
+        """The declared source format for *prefix*, or ``None``.
+
+        Matched through ``_candidate_bases`` for the same reason every other
+        lookup here is: the declaration is stored in the canonical namespace
+        and the serving prefix may arrive in any of the vintages that helper
+        enumerates.
+        """
+
+        if not self._passthrough_units:
+            return None
+        for base in _candidate_bases(prefix):
+            fmt = self._passthrough_units.get(base)
+            if fmt is not None:
+                return fmt
+        return None
+
+    def _delegate_passthrough(
+        self, layer: torch.nn.Module, prefix: str, fmt: "_SourceFormat"
+    ) -> "QuantizeMethodBase | None":
+        """Hand a passthrough unit to vLLM's native method, fail-closed.
+
+        Two gates, both at model load and in this order:
+
+        1. **Device attestation.**  Which backend a format resolves to is a
+           property of the (format, device) pair — vLLM's MXFP4 oracle admits
+           the whole sm12x family for a rung that only works on part of it — so
+           an unaudited device is refused before any vLLM object is built.
+        2. **Backend preflight.**  Constructing the method is what makes the
+           resolved backend a fact rather than a prediction (the MXFP4 method
+           runs its oracle in ``__init__`` and stores the winner on
+           ``self.mxfp4_backend`` / ``self.experts_cls``), so the check happens
+           the moment the constructor returns — still model-load time, still
+           before any weights are processed.
+        """
+
+        _require_passthrough_device(
+            fmt, prefix=prefix, capability=_live_device_capability())
+        method = _build_passthrough_method(fmt, layer, prefix)
+        require_native_passthrough_backend(
+            prefix=prefix, source_format=fmt, method=method, layer=layer)
+        return method
+
     def _delegate(self, layer: torch.nn.Module, prefix: str, *,
                   moe: bool = False) -> "QuantizeMethodBase | None":
         """Hand *prefix* to the stock compressed-tensors config, fail-closed.
@@ -876,6 +946,13 @@ class PrismaQuantConfig(QuantizationConfig):
             if scheme is not None:
                 self._require_cb_device_capability(scheme, prefix)
                 return PrismaQuantCBLinearMethod(self, scheme, prefix)
+            # 1b) SOURCE-format passthrough -> vLLM's own native method for
+            #     that format, guarded by device attestation + backend
+            #     preflight. Ahead of the ignore test for the same reason CB
+            #     is: an explicit per-unit declaration outranks a pattern.
+            fmt = self._passthrough_format(prefix)
+            if fmt is not None:
+                return self._delegate_passthrough(layer, prefix, fmt)
             # 2) explicitly-ignored -> BF16 passthrough.
             if self._is_ignored(prefix):
                 return UnquantizedLinearMethod()
@@ -901,6 +978,9 @@ class PrismaQuantConfig(QuantizationConfig):
                 from .moe import PrismaQuantCBMoEMethod
                 return PrismaQuantCBMoEMethod(
                     self, layer.moe_config, scheme, prefix)
+            fmt = self._passthrough_format(prefix)
+            if fmt is not None:
+                return self._delegate_passthrough(layer, prefix, fmt)
             if self.ct_config is not None:
                 return self._delegate(layer, prefix, moe=True)
             return None
