@@ -18,12 +18,13 @@ final tile still contains only whole chunks).  The converse embedding does not
 exist — MXFP8's finer scales cannot be represented in block-128 form — so the
 containment is one-directional.
 
-Quantization rule (activations and any producer-side use): the ceil rule,
-``scale = 2 ** ceil(log2(amax / 448))`` per group, which guarantees
-``amax / scale <= 448`` and therefore never saturates E4M3.  This matches the
-UE8M0 semantics vLLM's own utilities implement; the floor-based OCP variant
-saturates up to amax/scale < 512 and would not round-trip DeepSeek's own
-tensors bit-exactly.
+Quantization rule (activations and any producer-side use): the smallest
+power-of-two scale with ``amax / scale <= 448`` per group, computed from
+``frexp`` (exact integer arithmetic; the naive ``ceil(log2(amax / 448))``
+spelling saturates on float32 rounding at power-of-two boundaries — see the
+comment in :func:`quantize_mxfp8`).  It never saturates E4M3 and matches the
+producer encoder byte-for-byte; the floor-based OCP variant saturates up to
+amax/scale < 512 and would not round-trip DeepSeek's own tensors bit-exactly.
 
 Everything here is reference-grade and torch-only: the CUDA extension owns the
 fast path, and the tests hold the two to each other.  The swizzled SF plane is
@@ -83,12 +84,25 @@ def quantize_mxfp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     xf = x.to(torch.float32)
     groups = xf.unflatten(-1, (k // SFVEC, SFVEC))
     amax = groups.abs().amax(dim=-1)
-    exp = torch.ceil(torch.log2(amax / E4M3_MAX))
-    # amax == 0 -> log2 gives -inf -> clamp lands on the minimum exponent,
-    # which is exactly the all-zero-group convention.
-    exp = torch.clamp(exp, min=float(_E8M0_MIN_EXP), max=float(_E8M0_MAX_EXP))
-    sf = (exp.to(torch.int16) + _E8M0_BIAS).to(torch.uint8)
-    scale = torch.exp2(exp)
+    # Exponent from ``frexp`` — exact integer arithmetic, NOT
+    # ``ceil(log2(amax / 448))``: the log2 spelling is wrong about once in
+    # 4e5 group maxima in float32 (when ``amax / 448`` rounds to exactly a
+    # power of two, ``log2`` lands on the integer, ``ceil`` keeps it, the
+    # exponent is one too small and the group's max saturates at 448 — the
+    # very thing the rule exists to prevent; measured 15 saturations per 6e6
+    # maxima vs 0 for this form).  ``amax = f * 2**E`` with ``f in [0.5, 1)``
+    # and ``448 = 0.875 * 2**9``, so the smallest non-clipping exponent is
+    # ``E - 9`` when ``f <= 0.875`` and ``E - 8`` otherwise.  Semantics match
+    # the producer encoder (prismaquant ``mx_formats.py``, MXFP8_UE8M0_G32)
+    # exactly, zero convention included, so the two sides emit identical
+    # scale bytes for identical tensors.
+    frac, exp0 = torch.frexp(amax)
+    exp_i = exp0 - 9 + (frac > 0.875).to(exp0.dtype)
+    exp_i = torch.where(amax > 0, exp_i,
+                        torch.full_like(exp_i, _E8M0_MIN_EXP))
+    exp_i = exp_i.clamp(_E8M0_MIN_EXP, _E8M0_MAX_EXP)
+    sf = (exp_i.to(torch.int16) + _E8M0_BIAS).to(torch.uint8)
+    scale = torch.exp2(exp_i.to(torch.float32))
     q = (groups / scale.unsqueeze(-1)).flatten(-2)
     q = q.to(torch.float8_e4m3fn)
     return q, sf

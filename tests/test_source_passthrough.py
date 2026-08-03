@@ -283,6 +283,13 @@ def test_fp8_block_verdict_is_gridbook_owned_route():
     distinct DSV4-Flash body shapes at M in {1, 64, 512}, M=1 bit-exact on
     most shapes; the DeepSeek-embedding path (block scales -> broadcast ->
     plane -> kernel) worst 1.2e-4 vs the block-dequant oracle.
+
+    Note (same date): the activation quantizer's exponent rule was moved from
+    ``ceil(log2(...))`` to the producer-matching frexp form after a measured
+    boundary defect (15 saturations / 6e6 group maxima).  The parity numbers
+    above stand unchanged as KERNEL claims: kernel and oracle consumed the
+    same quantized operands in every comparison, so the quantizer defect
+    cancelled identically on both sides.
     """
     fmt = FORMATS[FP8_BLOCK]
     assert fmt.audited_backends == frozenset({"Mxfp8DenseLinearMethod"})

@@ -20,16 +20,69 @@ from gridbook.mxfp8 import (  # noqa: E402
 )
 
 
-def test_quantize_never_saturates_under_ceil_rule():
+def _scaled_abs_max(x, sf):
+    scale = torch.exp2(sf.to(torch.int16).float() - 127.0)
+    k = x.shape[-1]
+    return float((x.to(torch.float32).unflatten(-1, (k // SFVEC, SFVEC))
+                  / scale.unsqueeze(-1)).abs().max())
+
+
+def test_quantize_never_saturates():
     torch.manual_seed(0)
     x = torch.randn(64, 256) * torch.exp2(
         torch.randint(-20, 20, (64, 1)).float())
     q, sf = quantize_mxfp8(x)
-    scale = torch.exp2(sf.to(torch.int16).float() - 127.0)
-    scaled = (x.unflatten(-1, (256 // SFVEC, SFVEC))
-              / scale.unsqueeze(-1)).abs()
-    assert float(scaled.max()) <= E4M3_MAX + 1e-6
+    # Exact bound, no slack: amax and the power-of-two division are both
+    # exact in float32, so anything above 448 is a real exponent defect.
+    assert _scaled_abs_max(x, sf) <= E4M3_MAX
     assert not q.to(torch.float32).isinf().any()
+
+
+def test_power_of_two_boundary_regression():
+    """Pins the frexp fix: ``ceil(log2(amax/448))`` computed in float32 gives
+    an exponent one too small when ``amax/448`` ROUNDS to an exact power of
+    two (measured 15 saturations per 6e6 group maxima), saturating the very
+    element the rule protects.  The frexp form must (a) never clip, and
+    (b) stay minimal — the next smaller exponent must clip whenever it is
+    admissible to ask."""
+    ks = torch.arange(-30, 31).float()
+    cases = []
+    for mult in (1.0, 1.0 + 2.0 ** -20, 1.0 - 2.0 ** -20,
+                 1.0 + 2.0 ** -23, 0.875, 1.75):
+        cases.append(E4M3_MAX * torch.exp2(ks) * mult)
+    amax = torch.cat(cases)
+    x = torch.zeros(amax.numel(), SFVEC)
+    x[:, 0] = amax
+    x[:, 1] = -amax / 2
+    q, sf = quantize_mxfp8(x)
+    assert _scaled_abs_max(x, sf) <= E4M3_MAX, \
+        "boundary amax saturated: the log2 defect is back"
+    # Minimality: halving the scale must clip (else the exponent is too big).
+    exp_i = sf.to(torch.int16).squeeze(-1) - 127
+    live = exp_i > -127
+    assert bool((amax[live] > E4M3_MAX
+                 * torch.exp2((exp_i[live] - 1).float())).all()), \
+        "exponent not minimal: group scaled down further than needed"
+
+
+def test_scale_bytes_match_producer_frexp_encoder():
+    """Byte-level cross-encoder agreement with the producer's
+    MXFP8_UE8M0_G32 rule (prismaquant mx_formats.py), restated here verbatim:
+    ``frac, exp = frexp(amax); shared = exp - 9 + (frac > 0.875)``, zeros
+    pinned to the bottom of the range.  Identical tensors must yield
+    identical scale bytes on both sides of the wire."""
+    torch.manual_seed(4)
+    x = torch.randn(257, 8 * SFVEC) * torch.exp2(
+        torch.randint(-40, 40, (257, 1)).float())
+    x[0] = 0.0
+    x[1, :SFVEC] = 0.0
+    _, sf = quantize_mxfp8(x)
+    amax = x.abs().unflatten(-1, (8, SFVEC)).amax(dim=-1).to(torch.float32)
+    frac, exp = torch.frexp(amax)
+    shared = exp - 9 + (frac > 0.875).to(exp.dtype)
+    shared = torch.where(amax > 0, shared, torch.full_like(shared, -127))
+    expected = (shared.clamp(-127, 127).to(torch.int16) + 127).to(torch.uint8)
+    assert torch.equal(sf, expected)
 
 
 def test_quantize_round_trip_error_is_e4m3_grade():
