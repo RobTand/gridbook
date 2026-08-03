@@ -1660,6 +1660,149 @@ def _load_fused_fp4v2_ext_locked():
         _fused_fp4v2_tried = True
     return _fused_fp4v2
 # =========================== END P2a BLOCK ========================================
+# ===========================================================================
+# BEGIN ADDITIVE BLOCK — MXFP8 dense block-scaled loader (task: MXFP8 lane;
+# serves producer MXFP8 and the DeepSeek fp8-ue8m0-block128 embedding).
+# Self-contained: adds module-level globals, constants and three functions,
+# and modifies nothing above.
+# ===========================================================================
+_mxfp8_dense = None
+_mxfp8_dense_tried = False
+_mxfp8_dense_lock = threading.Lock()
+
+# One translation unit, no Gridbook fork header: the mainloop is the STOCK
+# sm120 block-scaled CollectiveBuilder product (kind::mxf8f6f4, SFVec 32).
+# CUTLASS itself IS an input, hashed through the identity sentinels.
+_MXFP8_DENSE_BUILD_INPUTS = ("mxfp8_dense_gemm.cu",)
+# Starts at 1: new module, new identity payload.
+_MXFP8_DENSE_ABI_SCHEMA = 1
+
+# Strict symbol contract (see the persistent-B note: the digest keys the
+# module, so a missing binding is a broken build rather than an older one).
+_MXFP8_DENSE_SYMBOLS = (
+    "mxfp8_dense_mm",
+    "mxfp8_dense_mm_out",
+    "mxfp8_sf_offsets",
+    "mxfp8_sf_plane_numel",
+)
+# The block-scaled MMA is an arch-'a' instruction on exactly this pair.
+_MXFP8_DENSE_CAPABILITIES = ((12, 0), (12, 1))
+
+
+def mxfp8_dense_buildable(capability) -> bool:
+    """Whether the MXFP8 dense block-scaled kernel compiles for ``capability``."""
+    return tuple(capability) in _MXFP8_DENSE_CAPABILITIES
+
+
+def _mxfp8_dense_build_identity(torch, cpp_extension, *, src_dir: str,
+                                cutlass_include: str, util_include: str,
+                                capability: tuple[int, int]):
+    """``(digest, payload)`` for the MXFP8 dense module's binary ABI."""
+    return _fused_build_identity(
+        torch, cpp_extension, src_dir=src_dir,
+        cutlass_include=cutlass_include, util_include=util_include,
+        capability=capability,
+        build_inputs=_MXFP8_DENSE_BUILD_INPUTS,
+        bindings=(("mxfp8 dense", _MXFP8_DENSE_SYMBOLS),),
+        abi_schema=_MXFP8_DENSE_ABI_SCHEMA,
+        accelerated=True)
+
+
+def get_mxfp8_dense_ext():
+    """The MXFP8 dense W8A8 block-scaled extension (mxfp8_dense_gemm.cu), or
+    None.
+
+    Serves two wire spellings of one on-device format: producer-emitted MXFP8
+    (``mxfp8_e4m3_e8m0_g32``) and DeepSeek block-128 FP8
+    (``fp8_e4m3_ue8m0_block128``), the latter embedded exactly by scale
+    replication at load (gridbook/mxfp8.py).  Fail-soft here, fail-closed at
+    the lane: ``mxfp8_dense_lane`` attests symbols, device and built-for
+    capability via ``lane_select.require_lane`` before any unit is served.
+    """
+    if _mxfp8_dense_tried:
+        return _mxfp8_dense
+    with _mxfp8_dense_lock:
+        if _mxfp8_dense_tried:
+            return _mxfp8_dense
+        return _load_mxfp8_dense_ext_locked()
+
+
+def _load_mxfp8_dense_ext_locked():
+    """Build and publish the MXFP8 dense module with ``_mxfp8_dense_lock`` held."""
+    global _mxfp8_dense, _mxfp8_dense_tried
+    build_dir = "<unresolved>"
+    try:
+        import torch  # noqa: F401  (must import before cpp_extension)
+        from torch.utils import cpp_extension
+
+        # Arch precheck FIRST: the block-scaled MMA exists only on
+        # sm_120a/sm_121a, so any other capability is a doomed multi-minute
+        # nvcc run (same early rejection every fused loader has).
+        cc = _target_capability(
+            "the MXFP8 dense block-scaled extension (mxfp8_dense_gemm.cu)")
+        if not mxfp8_dense_buildable(cc):
+            raise RuntimeError(
+                f"the MXFP8 dense block-scaled kernel is compiled only for "
+                f"compute capability 12.0/12.1, got {cc[0]}.{cc[1]}")
+        cut_inc = _find_cutlass_include()
+        incs = [cut_inc]
+        util_inc = os.path.join(os.path.dirname(cut_inc), "tools", "util",
+                                "include")
+        if os.path.isdir(util_inc):
+            incs.append(util_inc)
+        src_dir = _require_csrc(*_MXFP8_DENSE_BUILD_INPUTS)
+        identity, _identity_payload = _mxfp8_dense_build_identity(
+            torch, cpp_extension, src_dir=src_dir,
+            cutlass_include=cut_inc, util_include=util_inc, capability=cc)
+        module_name = f"pq_mxfp8_dense_{identity}"
+        build_root = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
+        build_dir = os.path.join(build_root, "mxfp8_dense", identity)
+        os.makedirs(build_dir, exist_ok=True)
+        mod = cpp_extension.load(
+            name=module_name,
+            sources=[os.path.join(src_dir, "mxfp8_dense_gemm.cu")],
+            extra_include_paths=incs + [src_dir],
+            extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr",
+                               _gencode_flag(cc, accelerated=True)],
+            build_directory=build_dir, verbose=False)
+        mod = _require_symbols(
+            mod, _MXFP8_DENSE_SYMBOLS, build_dir=build_dir,
+            source="mxfp8_dense_gemm.cu")
+        _mxfp8_dense = _require_fused_identity(
+            mod, expected_name=module_name, identity=identity,
+            abi_schema=_MXFP8_DENSE_ABI_SCHEMA,
+            build_dir=build_dir, source="mxfp8_dense_gemm.cu",
+            capability=cc)
+    except StaleExtensionError as exc:
+        print(f"[prismaquant-cb] ERROR: incompatible MXFP8 dense extension — "
+              f"{exc} MXFP8/DeepSeek-FP8 passthrough units stay refused "
+              f"(fail-closed).", file=sys.stderr, flush=True)
+        _mxfp8_dense = None
+    except IncompleteInstallError as exc:
+        print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
+              f"MXFP8/DeepSeek-FP8 passthrough units stay refused "
+              f"(fail-closed).", file=sys.stderr, flush=True)
+        _mxfp8_dense = None
+    except Exception as exc:  # noqa: BLE001 — capability probe is fail-soft
+        print(f"[prismaquant-cb] WARNING: MXFP8 dense extension unavailable "
+              f"({type(exc).__name__}: {exc}); MXFP8/DeepSeek-FP8 passthrough "
+              f"units will refuse at load (expected off cc 12.0/12.1 and "
+              f"without nvcc). To enable the native path: {_NVCC_HINT}.",
+              file=sys.stderr, flush=True)
+        _mxfp8_dense = None
+    finally:
+        _mxfp8_dense_tried = True
+    return _mxfp8_dense
+
+
+# Residency warm-up registration, by name, from inside the block (see the
+# persistent-B block: an arm that builds this module and one that does not are
+# not extension-residency-matched).
+_PRELOAD_FAMILIES.append(("mxfp8_dense", "get_mxfp8_dense_ext"))
+# ===========================================================================
+# END ADDITIVE BLOCK — MXFP8 dense block-scaled loader
+# ===========================================================================
 # BEGIN ADDITIVE BLOCK — persistent-B grouped MoE loader (ROADMAP K1.1, audit
 # §3 P2b).  Self-contained: it adds module-level globals, constants and three
 # functions, and modifies nothing above.

@@ -163,17 +163,17 @@ _FP8_BLOCK_LINEAR = SourceFormat(
         "F8_E8M0 (UE8M0) exponent scale per 128x128 block"
     ),
     audited_capabilities=((12, 1),),
-    # DELIBERATELY EMPTY.  Every rung in vLLM 0.24's block-scaled FP8 linear
-    # ladder was measured to fail on sm_121 for UE8M0 scales:
-    #   * deep_gemm -> 'Unknown SF transformation' (layout.hpp:59)
-    #   * cutlass   -> torch.ops._C.cutlass_scaled_mm 'dispatch_scaled_mm'
-    #                  (scaled_mm_helper.hpp:17)
-    #   * triton    -> KeyError 'float8_e8m0fnu' (triton 3.6.0 has no such
-    #                  dtype), and would be a doctrine refusal regardless.
-    # An empty audited set means every delegation of this format refuses, which
-    # is the honest encoding of a BLOCKED verdict.  Serving this body as
-    # Gridbook FP8-CB is unaffected: that is not a passthrough unit.
-    audited_backends=frozenset(),
+    # The route is GRIDBOOK-OWNED: every rung in vLLM 0.24's block-scaled FP8
+    # linear ladder was measured to fail on sm_121 for UE8M0 scales (the
+    # known_broken_backends below record each symptom), so Gridbook serves the
+    # format itself by embedding it into MXFP8 — 128 = 4 * 32, one scale byte
+    # replicated per chunk, bit-exact by construction — and running the stock
+    # sm120 block-scaled collective (gridbook/mxfp8_dense_lane.py; the
+    # embedding proof is in gridbook/mxfp8.py).  Correctness-audited
+    # kernel-vs-oracle over the DSV4 body shapes on sm_121; NATIVE-PARITY
+    # *served* evidence pending, so the lane is OPT-IN
+    # (GRIDBOOK_MXFP8_DENSE=1) and the factory refuses without it.
+    audited_backends=frozenset({"Mxfp8DenseLinearMethod"}),
     known_broken_backends={
         "DeepGemmFp8BlockScaledMMKernel": (
             "DeepGEMM's UE8M0 scale-layout transform rejects sm_121 "
@@ -200,10 +200,32 @@ _FP8_BLOCK_LINEAR = SourceFormat(
     quantizes_activations=True,
     remedy=(
         "No native block-scaled FP8 kernel serves UE8M0 scales on sm_121 in "
-        "vLLM 0.24. Export this unit as Gridbook FP8-CB instead of declaring "
-        "it passthrough, or serve it on an audited device."
+        "vLLM 0.24; Gridbook's own MXFP8 lane does. Set "
+        "GRIDBOOK_MXFP8_DENSE=1 to opt in (correctness-audited; serve-parity "
+        "bench pending), export the unit as Gridbook FP8-CB, or serve it on "
+        "an audited device."
     ),
-    method_factory="gridbook.source_passthrough:_build_vllm_fp8_block_linear_method",
+    method_factory="gridbook.source_passthrough:_build_gridbook_mxfp8_block128_method",
+)
+
+_MXFP8_LINEAR = SourceFormat(
+    id="mxfp8_e4m3_e8m0_g32",
+    unit_kind="linear",
+    description=(
+        "MXFP8 linear weights: F8_E4M3 values with one F8_E8M0 (UE8M0) "
+        "exponent scale per 32 contiguous K elements, scales stored row-major"
+    ),
+    audited_capabilities=((12, 1),),
+    # Same Gridbook-owned route as fp8_e4m3_ue8m0_block128, minus the
+    # load-time scale broadcast: the wire already stores per-32 scales.
+    audited_backends=frozenset({"Mxfp8DenseLinearMethod"}),
+    known_broken_backends={},
+    quantizes_activations=True,
+    remedy=(
+        "Set GRIDBOOK_MXFP8_DENSE=1 to opt in to Gridbook's MXFP8 dense lane "
+        "(correctness-audited; serve-parity bench pending)."
+    ),
+    method_factory="gridbook.source_passthrough:_build_gridbook_mxfp8_direct_method",
 )
 
 #: format id -> audited route.  A producer id absent from this mapping is a
@@ -211,6 +233,7 @@ _FP8_BLOCK_LINEAR = SourceFormat(
 FORMATS: dict[str, SourceFormat] = {
     _MXFP4_EXPERTS.id: _MXFP4_EXPERTS,
     _FP8_BLOCK_LINEAR.id: _FP8_BLOCK_LINEAR,
+    _MXFP8_LINEAR.id: _MXFP8_LINEAR,
 }
 
 
@@ -394,27 +417,53 @@ def _build_vllm_mxfp4_moe_method(layer: Any, prefix: str) -> Any:
     return Mxfp4MoEMethod(layer.moe_config)
 
 
-def _build_vllm_fp8_block_linear_method(layer: Any, prefix: str) -> Any:
-    """Unreachable today: the FP8-block format has an empty audited set.
+def _require_mxfp8_opt_in(fmt_id: str, prefix: str) -> None:
+    """The OPT-IN gate for the Gridbook-owned MXFP8 dense lane.
 
-    Kept so the registry entry is complete and the refusal comes from the
-    audited-backend policy (which can name the measured symptom) rather than
-    from a missing factory (which could not).
+    Correctness parity (kernel vs fp32 oracle over the real body shapes) is
+    audited; NATIVE-PARITY *served* evidence is pending, and Gridbook does not
+    default-enable a lane on correctness evidence alone.  With the flag unset
+    the unit refuses at load, with the flag named — the same fail-closed
+    shape as every other lane, just one rung earlier in its promotion life.
     """
 
-    from vllm.model_executor.layers.quantization.fp8 import (
-        Fp8Config, Fp8LinearMethod,
-    )
+    from .mxfp8_dense_lane import MXFP8_DENSE_FLAG, mxfp8_dense_enabled
 
-    return Fp8LinearMethod(Fp8Config(is_checkpoint_fp8_serialized=True,
-                                     weight_block_size=[128, 128]))
+    if not mxfp8_dense_enabled():
+        raise SourcePassthroughError(
+            f"source-passthrough unit {prefix!r} declares {fmt_id!r}, served "
+            f"by Gridbook's OPT-IN MXFP8 dense lane, and {MXFP8_DENSE_FLAG} "
+            f"is not set. The lane is correctness-audited on sm_121 but its "
+            f"serve-parity bench is pending, so it does not enable itself. "
+            f"Set {MXFP8_DENSE_FLAG}=1 to serve this unit."
+        )
+
+
+def _build_gridbook_mxfp8_block128_method(layer: Any, prefix: str) -> Any:
+    """Gridbook's MXFP8 dense lane reading the DeepSeek block-128 wire."""
+
+    _require_mxfp8_opt_in(_FP8_BLOCK_LINEAR.id, prefix)
+    from .mxfp8_dense_lane import WIRE_FP8_BLOCK128, build_mxfp8_dense_method
+
+    return build_mxfp8_dense_method(WIRE_FP8_BLOCK128)
+
+
+def _build_gridbook_mxfp8_direct_method(layer: Any, prefix: str) -> Any:
+    """Gridbook's MXFP8 dense lane reading the native per-32 wire."""
+
+    _require_mxfp8_opt_in(_MXFP8_LINEAR.id, prefix)
+    from .mxfp8_dense_lane import WIRE_MXFP8_G32, build_mxfp8_dense_method
+
+    return build_mxfp8_dense_method(WIRE_MXFP8_G32)
 
 
 _FACTORIES: dict[str, Callable[[Any, str], Any]] = {
     "gridbook.source_passthrough:_build_vllm_mxfp4_moe_method":
         _build_vllm_mxfp4_moe_method,
-    "gridbook.source_passthrough:_build_vllm_fp8_block_linear_method":
-        _build_vllm_fp8_block_linear_method,
+    "gridbook.source_passthrough:_build_gridbook_mxfp8_block128_method":
+        _build_gridbook_mxfp8_block128_method,
+    "gridbook.source_passthrough:_build_gridbook_mxfp8_direct_method":
+        _build_gridbook_mxfp8_direct_method,
 }
 
 
