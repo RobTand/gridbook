@@ -53,6 +53,11 @@ from .nvfp4_activation_contract import (
     parse_contract as _parse_nvfp4_activation_contract,
     validate_payload as _validate_nvfp4_activation_payload,
 )
+from .per_expert_format import (
+    LayerFormatGroups as _LayerFormatGroups,
+    layer_id_for_prefix as _per_expert_layer_id_for_prefix,
+    parse_declaration as _parse_per_expert_format_groups,
+)
 try:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
 except Exception:  # pragma: no cover - older vLLM
@@ -305,6 +310,13 @@ class PrismaQuantConfig(QuantizationConfig):
         # verbatim.  Empty for every artifact published before the schema
         # existed, which is exactly the legacy all-CB meaning.
         self._passthrough_units: dict[str, "_SourceFormat"] = {}
+        # Layer-id -> the producer's v1 family-specific expert partitions.
+        # Empty is the permanent legacy path: no different method, buffer,
+        # loader wrapper, or dispatch branch is installed for old artifacts.
+        self._per_expert_format_groups: dict[str, "_LayerFormatGroups"] = {}
+        # Producer-physical declaration prefix -> current serving namespace.
+        # Values follow vLLM's mapper; keys remain checkpoint wire identities.
+        self._per_expert_serving_prefixes: dict[str, str] = {}
 
     def _get_sidecar_source(self) -> tuple[str, str | None]:
         if self._sidecar_source is None:
@@ -580,6 +592,18 @@ class PrismaQuantConfig(QuantizationConfig):
             canonicalize=_canonical_target,
             cb_targets=frozenset(self._cb_targets),
         )
+        self._per_expert_format_groups = _parse_per_expert_format_groups(
+            cfg,
+            runtime_contract=_RUNTIME_CONTRACT,
+            cb_schemes=self.target_scheme,
+            canonicalize=_canonical_target,
+        )
+        self._per_expert_serving_prefixes = {
+            group.tensor_prefix: _canonical_target(group.tensor_prefix)
+            for layer_groups in self._per_expert_format_groups.values()
+            for family in ("w13", "w2")
+            for group in layer_groups.groups(family)
+        }
         self._alias_collapsed_shared_prefixes()
         self.ct_config = (self._build_ct_config(stock_groups)
                           if stock_groups else None)
@@ -652,6 +676,7 @@ class PrismaQuantConfig(QuantizationConfig):
         # Gridbook has already attested this producer-owned container record;
         # compressed-tensors does not define the field in its own schema.
         ct_dict.pop("execution_contracts", None)
+        ct_dict.pop("per_expert_format_groups", None)
         raw_fmt = str(self._full_config.get("format", ""))
         if raw_fmt in ("", "nvfp4_cb", "fp8_cb", "cb", "mixed-precision"):
             ct_dict["format"] = "mixed-precision"
@@ -972,6 +997,19 @@ class PrismaQuantConfig(QuantizationConfig):
         # FusedMoE expert stacks (RoutedExperts): a CB expert group -> our MoE
         # method; else delegate to the stock CT MoE path.
         if RoutedExperts is not None and isinstance(layer, RoutedExperts):
+            mixed_groups = self._mixed_moe_groups_for_prefix(prefix)
+            if mixed_groups is not None:
+                if int(layer.moe_config.num_experts) != mixed_groups.num_experts:
+                    raise ValueError(
+                        f"MoE stack {prefix} has "
+                        f"num_experts={layer.moe_config.num_experts}, but "
+                        "per_expert_format_groups declares a partition of "
+                        f"{mixed_groups.num_experts} experts"
+                    )
+                from .moe_mixed import PrismaQuantMixedMoEMethod
+                return PrismaQuantMixedMoEMethod(
+                    self, layer.moe_config, mixed_groups, prefix
+                )
             scheme = self._moe_scheme_for_prefix(prefix)
             if scheme is not None:
                 self._require_cb_device_capability(scheme, prefix)
@@ -984,6 +1022,38 @@ class PrismaQuantConfig(QuantizationConfig):
             if self.ct_config is not None:
                 return self._delegate(layer, prefix, moe=True)
             return None
+        return None
+
+    def _mixed_moe_groups_for_prefix(
+        self, prefix: str
+    ) -> "_LayerFormatGroups | None":
+        """Resolve v1 by layer id *and* exact expert-unit namespace."""
+
+        layer_id = _per_expert_layer_id_for_prefix(prefix)
+        if layer_id is None:
+            return None
+        groups = self._per_expert_format_groups.get(layer_id)
+        if groups is None:
+            return None
+        bases = _candidate_bases(prefix)
+        matched = []
+        for family in ("w13", "w2"):
+            for group in groups.groups(family):
+                serving = self._per_expert_serving_prefixes[
+                    group.tensor_prefix
+                ]
+                variants = _candidate_bases(serving)
+                matched.append(any(
+                    variant == base or variant.startswith(base.rstrip(".") + ".")
+                    for variant in variants for base in bases
+                ))
+        if all(matched):
+            return groups
+        if any(matched):
+            raise ValueError(
+                f"MoE stack {prefix}: per_expert_format_groups layer "
+                f"{layer_id} mixes tensor prefixes from different expert units"
+            )
         return None
 
     def _moe_scheme_for_prefix(self, prefix: str) -> dict | None:
@@ -1084,6 +1154,12 @@ class PrismaQuantConfig(QuantizationConfig):
         )
         self._cb_targets = set(
             hf_to_vllm_mapper.apply_list(sorted(self._cb_targets)))
+        if self._per_expert_serving_prefixes:
+            physical = list(self._per_expert_serving_prefixes)
+            served = hf_to_vllm_mapper.apply_list([
+                self._per_expert_serving_prefixes[name] for name in physical
+            ])
+            self._per_expert_serving_prefixes = dict(zip(physical, served))
         # The delegated-group index is matched against serving prefixes exactly
         # like the CT config's own targets, so it moves into the mapper
         # namespace with them. Regex entries are left alone for the same reason

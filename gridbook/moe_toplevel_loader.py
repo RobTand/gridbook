@@ -102,6 +102,7 @@ prior behaviour.
 """
 from __future__ import annotations
 
+import re
 import torch
 
 from .cb_fill_guard import mark_filled
@@ -131,6 +132,26 @@ _CB_EXPERT_SUFFIX_TO_LEAF: dict[str, str] = {
     ".experts.down_proj.input_global_scale": "w2_input_global_scale",
 }
 
+_SPLIT_CB_EXPERT_RE = re.compile(
+    r"^(?P<parent>.*[.]experts)[.]"
+    r"(?P<projection>gate_up_proj|down_proj)[.]"
+    r"(?P<group>format_group_[a-z0-9_]+)[.]"
+    r"(?P<plane>cb_qweight|weight_scale|input_global_scale)$"
+)
+
+
+def _split_cb_expert_leaf(name: str) -> tuple[str, str] | None:
+    """Return ``(expert parent, registered leaf)`` for a v1 sub-stack."""
+
+    match = _SPLIT_CB_EXPERT_RE.match(name)
+    if match is None:
+        return None
+    family = "w13" if match.group("projection") == "gate_up_proj" else "w2"
+    plane = match.group("plane")
+    leaf = (f"{family}_input_global_scale" if plane == "input_global_scale"
+            else f"{family}_{match.group('group')}_{plane}")
+    return match.group("parent"), leaf
+
 
 def resolve_cb_expert_param(name: str,
                             param_names) -> str | None:
@@ -151,6 +172,21 @@ def resolve_cb_expert_param(name: str,
     original loader). Raises on an ambiguous (>1) match — that would mean the
     layer structure is not what we assume, and a silent wrong copy is worse.
     """
+    split = _split_cb_expert_leaf(name)
+    if split is not None:
+        parent, leaf = split
+        want_prefix = parent + "."
+        want_suffix = "." + leaf
+        matches = [key for key in param_names
+                   if key.startswith(want_prefix) and key.endswith(want_suffix)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(
+                f"prismaquant split CB expert {name!r}: ambiguous target "
+                f"params {matches}"
+            )
+        return None
     for suffix, leaf in _CB_EXPERT_SUFFIX_TO_LEAF.items():
         if not name.endswith(suffix):
             continue
@@ -173,10 +209,74 @@ def resolve_cb_expert_param(name: str,
 # params-aware resolver above. Kept for the unit tests that assert the
 # suffix/exclusion logic in isolation.
 def map_cb_expert_name(name: str) -> str | None:
+    split = _split_cb_expert_leaf(name)
+    if split is not None:
+        parent, leaf = split
+        return parent + "." + leaf
     for suffix, leaf in _CB_EXPERT_SUFFIX_TO_LEAF.items():
         if name.endswith(suffix):
             return name[: -len(suffix)] + ".experts." + leaf
     return None
+
+
+_SOURCE_SPLIT_RE = re.compile(
+    r"(?:^|[.]experts[.])(?P<expert>\d+)[.]"
+    r"(?P<leaf>w1|w3|w2|gate_proj|up_proj|down_proj)[.]"
+    r"(?P<plane>weight|scale)$"
+)
+
+
+def load_source_split_expert(name: str, weight: torch.Tensor,
+                             params_dict) -> str | None:
+    """Load one producer-verbatim MXFP4 slice into a scoped native subgroup.
+
+    Parameters owned by the mixed method carry their ordered global expert-id
+    tuple.  That is enough for top-level architecture loaders to perform the
+    same global->local and gate/up shard mapping as the instance-level hook,
+    without reading quant config or hard-coding an architecture.
+    """
+
+    match = _SOURCE_SPLIT_RE.search(name)
+    if match is None:
+        return None
+    expert_id = int(match.group("expert"))
+    leaf, plane = match.group("leaf"), match.group("plane")
+    family = "w13" if leaf in ("w1", "w3", "gate_proj", "up_proj") else "w2"
+    param_leaf = f"{family}_{'weight_scale' if plane == 'scale' else 'weight'}"
+    candidates = []
+    for param_name, param in params_dict.items():
+        expert_ids = getattr(param, "_gridbook_source_expert_ids", None)
+        if (expert_ids is not None and expert_id in expert_ids
+                and param_name.endswith("." + param_leaf)):
+            candidates.append((param_name, param, tuple(expert_ids)))
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise ValueError(
+            f"source split expert {name!r}: ambiguous delegated params "
+            f"{[item[0] for item in candidates]}"
+        )
+    param_name, param, expert_ids = candidates[0]
+    local = expert_ids.index(expert_id)
+    if family == "w13":
+        shard = 0 if leaf in ("w1", "gate_proj") else 1
+        rows = param.shape[1] // 2
+        destination = param.data[local, shard * rows:(shard + 1) * rows]
+    else:
+        destination = param.data[local]
+    if tuple(destination.shape) != tuple(weight.shape):
+        raise ValueError(
+            f"source split expert {name!r} -> {param_name!r}: checkpoint "
+            f"shape {tuple(weight.shape)} != delegated slice "
+            f"{tuple(destination.shape)}"
+        )
+    incoming = (
+        weight.contiguous().view(destination.dtype)
+        if weight.element_size() == destination.element_size()
+        else weight.to(destination.dtype)
+    )
+    destination.copy_(incoming)
+    return param_name
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +533,12 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                 if res_name == "__skip__":
                     yield name, w
                     continue
+                source_mapped = load_source_split_expert(
+                    res_name, w, params_dict
+                )
+                if source_mapped is not None:
+                    loaded.add(source_mapped)
+                    continue
                 mapped = resolve_cb_expert_param(res_name, param_names)
                 if mapped is not None:
                     param = params_dict[mapped]
@@ -442,7 +548,17 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                             f"checkpoint shape {tuple(w.shape)} != param "
                             f"shape {tuple(param.shape)} — stacked "
                             "(E, out, bytes) contract violated")
-                    param.data.copy_(w.to(param.dtype))
+                    incoming = w.to(param.dtype)
+                    if mapped.endswith("_input_global_scale") \
+                            and not torch.isnan(param.data).all():
+                        if not torch.equal(param.data, incoming.reshape_as(param)):
+                            raise ValueError(
+                                f"prismaquant CB expert '{name}' -> "
+                                f"'{mapped}': per-layer input_global_scale "
+                                "differs across format subgroups"
+                            )
+                    else:
+                        param.data.copy_(incoming)
                     # fill path 2 of 2 (top-level): stamp the sentinel that
                     # process_weights_after_loading checks (cb_fill_guard).
                     if mapped.endswith("cb_qweight"):

@@ -21,6 +21,7 @@ from gridbook.moe_toplevel_loader import (
     _build_reverse_fusion,
     _spec_layer_rename,
     install_toplevel_cb_expert_loader,
+    load_source_split_expert,
     map_cb_expert_name,
     resolve_shared_cb_target,
 )
@@ -39,6 +40,34 @@ def test_map_cb_expert_name_positive():
     # prefix-agnostic (pure suffix rewrite): works with or without model. prefix
     assert map_cb_expert_name("layers.7.mlp.experts.down_proj.cb_qweight") == \
         "layers.7.mlp.experts.w2_cb_qweight"
+
+
+def test_map_split_cb_expert_names_positive():
+    P = "model.layers.7.mlp.experts."
+    assert map_cb_expert_name(
+        P + "gate_up_proj.format_group_nvfp4_cb_k16.cb_qweight"
+    ) == P + "w13_format_group_nvfp4_cb_k16_cb_qweight"
+    assert map_cb_expert_name(
+        P + "down_proj.format_group_fp8_cb_k28.weight_scale"
+    ) == P + "w2_format_group_fp8_cb_k28_weight_scale"
+    assert map_cb_expert_name(
+        P + "down_proj.format_group_nvfp4_cb_k16.input_global_scale"
+    ) == P + "w2_input_global_scale"
+
+
+def test_load_source_split_expert_is_byte_verbatim_and_group_local():
+    name = "model.layers.7.mlp.experts._gridbook_mxfp4_subgroup.w13_weight"
+    param = torch.nn.Parameter(
+        torch.zeros(2, 8, 3, dtype=torch.uint8), requires_grad=False
+    )
+    param._gridbook_source_expert_ids = (2, 5)
+    source = torch.full((4, 3), -1, dtype=torch.int8)
+    mapped = load_source_split_expert(
+        "model.layers.7.mlp.experts.5.w3.weight", source, {name: param}
+    )
+    assert mapped == name
+    assert torch.all(param[1, :4] == 0)
+    assert torch.all(param[1, 4:] == 255)
 
 
 def test_map_cb_expert_name_excludes_non_experts():
