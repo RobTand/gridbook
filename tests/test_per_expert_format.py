@@ -83,6 +83,65 @@ def _mixed_config(formats, *, independent_w2=False, w2_formats=None):
 
 
 
+
+def _assert_within_ulps(actual, witness, *, ulps, what):
+    """Bounded-difference assertion, in ULPs of the witness's own magnitude.
+
+    Deliberately not ``allclose``: the bound is stated in units of float64
+    resolution against the measured scale, so the number in the failure message
+    means something and cannot quietly absorb a real error.
+    """
+    scale = witness.abs().max().item()
+    allowed = ulps * torch.finfo(witness.dtype).eps * scale
+    worst = (actual - witness).abs().max().item()
+    assert worst <= allowed, (
+        f"{what}: worst |difference| {worst:.3e} exceeds {ulps} ULP "
+        f"({allowed:.3e}) at scale {scale:.3e}"
+    )
+
+
+def _independent_witness(x, router, ids, declaration, weights):
+    """Sum of one-expert uniform layers, computed WITHOUT the code under test.
+
+    This shares nothing with ``dispatch_family_stages``: it walks routed pairs
+    in Python and multiplies with ``@`` rather than ``torch.bmm``.  That is the
+    point.  The primary oracle compares two routes through the dispatcher, so a
+    defect living inside the dispatcher could in principle satisfy both sides;
+    this witness cannot be fooled that way, because it never calls it.
+
+    The price of that independence is that exact equality is unavailable, for
+    two compounding reasons, both benign and both measured rather than assumed:
+
+      * ``@`` and ``torch.bmm`` are different kernels and reduce in different
+        orders; and
+      * summing per-expert layers reassociates the final per-token combine,
+        because a token's pairs are interleaved across groups in pair order but
+        consecutive here.
+
+    Measured worst case across the three oracle cases is 1.06 ULP of float64,
+    so the caller's 2 ULP bound holds with headroom while staying far too tight
+    to hide a routing, index-map or launch defect -- each of which moves the
+    result by a large multiple of the operand scale, not by a last bit.
+    """
+    tokens, topk = ids.shape
+    hidden = x.shape[1]
+    witness = torch.zeros(tokens, hidden, dtype=torch.float64)
+    for token in range(tokens):
+        for slot in range(topk):
+            expert = int(ids[token, slot])
+            operands = x[token:token + 1]
+            for family in FAMILIES_UNDER_TEST:
+                group_index, position = declaration.index_maps[family][expert]
+                group = declaration.groups(family)[group_index]
+                operands = operands @ weights[
+                    (family, group.tensor_prefix)
+                ][position]
+                if family == "w13":
+                    operands = torch.tanh(operands)
+            witness[token] += router[token, slot] * operands[0]
+    return witness
+
+
 def _uniform_reference(x, router, ids, declaration, weights, activate):
     """Run the SAME layer as one uniform single-format stack, same routing.
 
@@ -202,6 +261,24 @@ def _oracle_case(formats, *, independent_w2=False, w2_formats=None):
         mutated[0, 0], torch.tensor(float("inf"), dtype=mutated.dtype)
     )
     assert not torch.equal(actual, mutated)
+
+    # SECONDARY, and independent: the primary compares two routes through
+    # dispatch_family_stages, so a defect inside the dispatcher could satisfy
+    # both of its sides.  This witness never calls it.  Independence costs
+    # exactness -- see _independent_witness -- so it is bounded at 2 ULP rather
+    # than asserted equal.
+    witness = _independent_witness(x, router, ids, declaration, weights)
+    _assert_within_ulps(
+        actual, witness, ulps=2, what="mixed layer vs independent witness"
+    )
+    # The bound must not be vacuous: a perturbation of the size a real routing
+    # or index-map defect produces has to break it.
+    broken = witness.clone()
+    broken[0, 0] += 1e-6 * max(witness.abs().max().item(), 1.0)
+    with pytest.raises(AssertionError):
+        _assert_within_ulps(
+            actual, broken, ulps=2, what="deliberately perturbed witness"
+        )
     # One family launch per nonempty format subgroup; no mixed-format launch.
     assert {(family, fmt) for family, fmt, _rows in calls} == {
         (family, group.format_wire_id)
