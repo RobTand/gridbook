@@ -1,0 +1,17 @@
+# Build a serving image whose installed Gridbook tree is tied to an immutable
+# release ref. pip's direct-VCS install writes the resolved commit and requested
+# ref to gridbook's PEP 610 direct_url.json provenance record.
+ARG BASE_IMAGE=gridbook:local
+FROM ${BASE_IMAGE}
+
+ARG GRIDBOOK_REF=v0.8.1
+
+USER root
+RUN test -n "${GRIDBOOK_REF}" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
+       "gridbook @ git+https://github.com/RobTand/gridbook.git@${GRIDBOOK_REF}" \
+    && GRIDBOOK_REF="${GRIDBOOK_REF}" python3 -c \
+       'import json, os; from importlib.metadata import distribution; p = json.loads(distribution("gridbook").read_text("direct_url.json")); assert p["vcs_info"]["requested_revision"] == os.environ["GRIDBOOK_REF"]; assert len(p["vcs_info"]["commit_id"]) == 40; print("gridbook provenance:", p)' \
+    && rm -rf /var/lib/apt/lists/* /root/.cache/pip
