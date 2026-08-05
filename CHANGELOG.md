@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.8.1 — 2026-08-05
+
+- **Per-expert split-format MoE stacks (#40).** Gridbook now accepts the
+  producer-owned `per_expert_format_groups` v1 declaration and serves one MoE
+  layer whose `w13` and `w2` families are independently partitioned across CB
+  formats and native MXFP4 passthrough groups. The loader validates complete,
+  non-overlapping expert partitions and exact wire-id/scheme agreement, builds
+  family-specific expert index maps, and refuses unknown or inconsistent
+  declarations. Artifacts without the declaration retain the legacy uniform
+  path and identical bytes.
+
+- **Split-stack correctness follow-ups (#40, #41).** The primary mixed-vs-
+  uniform oracle is now exact by construction: both sides use the same
+  `dispatch_family_stages` and `torch.bmm` primitives in the same order, so its
+  bit-equality claim no longer depends on BLAS reduction differences across
+  torch versions; the byte-identity check also no longer needs undeclared
+  NumPy. PR #41 adds a genuinely independent, explicit expert-loop witness
+  which does not call the dispatcher, accepts at most 2 float64 ULP, and proves
+  that both the exact assertion and tolerance bound reject deliberate
+  perturbations.
+
 ## 0.8.0 — 2026-08-03
 
 - **Release status note — read this before enabling anything below.** The MXFP8

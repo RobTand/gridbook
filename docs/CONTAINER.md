@@ -90,6 +90,36 @@ curl http://localhost:8000/v1/completions \
 Everything after the image name is passed straight to `vllm serve`, so every
 upstream vLLM flag works unchanged.
 
+### Provision a release-pinned image before the first serve
+
+Do not make the first production `docker run` clone or install Gridbook on its
+startup path. Build a small derived image once, from the already-provisioned
+serving image, using [`docker/Dockerfile.gridbook-pinned`](../docker/Dockerfile.gridbook-pinned):
+
+```bash
+docker build \
+  -f docker/Dockerfile.gridbook-pinned \
+  --build-arg BASE_IMAGE=gridbook:local \
+  --build-arg GRIDBOOK_REF=v0.8.1 \
+  -t gridbook:v0.8.1-pinned .
+```
+
+`GRIDBOOK_REF` is parameterized so the same recipe works for a release tag or,
+during a pre-tag rehearsal, the exact release commit SHA. For a release image,
+use the immutable `v0.8.1` tag. The direct-VCS requirement causes pip to write
+the requested ref and resolved 40-character commit to the installed
+distribution's PEP 610 `direct_url.json`; the Docker build reads that record
+back and fails if the requested revision or resolved commit is absent. This is
+the attestation-clean path: provisioning happens in an auditable image layer,
+not as an unrecorded mutation when the server starts.
+
+Then serve from the derived image with the same arguments shown above. On the
+0.6B smoke, the one-time image build took **383 s**, while an actual serve start
+from that completed image took **18 s**. The distinction is operationally
+important: budget the 383-second provision once before traffic, so the first
+serve sees the 18-second startup rather than paying installation and build work
+on its critical path.
+
 ---
 
 ## What the image contains
