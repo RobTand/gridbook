@@ -78,7 +78,21 @@ hipcc --offload-arch=gfx1201 amd/gemm_wmma_hip.cpp -o /tmp/gemm_wmma && /tmp/gem
   # For M4 perf tuning: profile with rocprofiler-sdk, iterate on LDS/vectorized decode per BENCH.md diagnosis.
   ```
 
+## 2026-08-06 — M4 — Optimized plain vs fused (roofline) — DONE (honest fail, optimized)
+
+- **Goal per OPERATOR M4:** Get plain FP8 to >50% roofline, then re-run ratio table on optimized fused (LDS-staged vectorized bit extraction, cb resident in LDS, pipelined K-loop treatment). Deliver ratio table on optimized kernels (pass or attested-fail).
+- **Plain optimization:** `amd/gemm_opt_hip.cpp` adds `plain_direct16` (WMMA 16x16x16 direct global `load_matrix_sync`/`mma_sync`/`store_matrix_sync`, no LDS, no masking, grid (N+15)/16 x (M+15)/16, block 32) and `plain_direct32` (16x16x32). Both compile on gfx1201 via `enable_gfx12`. Bench vs M3 LDS plain (1.0ms, 17GB/s) now: `M16 N4096 K4096` plain_direct16 0.032–0.044ms 384–523 GB/s 12–16 TFLOPs (62–84% of ~620 GB/s roofline), plain_direct32 0.034–0.035ms 486–492 GB/s 15 TFLOPs. M128 plain_direct32 0.167–0.184ms 23–25 TFLOPs (compute-bound, 115 GB/s). Target >50% BW met (previously 2%). Command: `hipcc --offload-arch=gfx1201 amd/gemm_opt_hip.cpp -o /tmp/gemm_opt && /tmp/gemm_opt` — verbatim output captured to `amd/BENCH_M4.md`.
+- **Fused optimization:** Three variants in same file:
+  - `fused_naive` — M3 baseline per-element LDS (2.73ms at M16, ratio 0.016).
+  - `fused_vec` — per-codeword (32 workers per 16x16 tile, one codeword→8 FP8 values, 8-byte window per codeword instead of per element, generic k handling) — 0.86–1.15ms, 3.2× faster than naive but still 20× slower than plain.
+  - `fused_k32_fast` — specialized for k=32 (byte-aligned 4B/code, bit_shift 0): `*(uint32_t*)(qw+gn*rbytes+sb*128+vec*4)`, cb in LDS `s_cb[2048]` loaded once per block via 64-bit vector loads, expand via 4 byte extracts + LDS gather (`c0/c1/c2/c3` + `s_cb[c*2 + sub*512]`), A direct global. 0.087–0.11ms at M16, ratio 0.30–0.50, ~31× faster than naive (2.73→0.087) but still 2–3× slower than plain. Correctness: k32_fast bit-exact vs CPU ref (max_abs 0, PASS per `/tmp/m4_opt_correct` probe).
+- **Isolated decode probe:** Row-coop decode with LDS qw + LDS cb + vectorized 64-bit loads + per-codeword expand: 0.0305ms for N=4096 K4096 k32 (8 MB packed →16 MB decoded), 274 GB/s packed (vs elem 0.66ms 12GB/s, vec 0.176ms 47GB/s, k32_fast 0.087ms 95GB/s). Shows decode alone already slower than plain's memory saving (8 MB saving at 517 GB/s =0.015ms, decode 0.030ms > saving). Even sequential decode+GEMM 0.062ms > plain 0.032ms.
+- **Full sweep (optimized ratio table, best fused per shape: k32→k32_fast, else vec):** All 8 cells FAIL. Example `M16 N4096 K4096 k32` plain 0.033ms vs fused 0.098ms ratio 0.30–0.33 (need ≥1.0). `M128 N4096 K4096 k32` plain 0.236ms 18 TF vs fused 1.32ms 3.2 TF ratio 0.17–0.18 (need ≥0.97). `k36/k40` generic even worse ratio 0.038–0.045 (1.0ms fused vs 0.038ms plain). Table in `amd/BENCH_M4.md`.
+- **Diagnosis (honest, timer + isolated probe evidence):** Decode not hidden even after LDS vectorization and cb caching. Plain is now roofline, so ratio is meaningfully testable. Fused's B path still does per-K-tile LDS fill + 2× `__syncthreads` per 16-wide iteration (512 syncs for K=4096) vs plain's zero sync. Qw loads are scattered across rows (stride 2048) vs plain's coalesced WMMA matrix load, and each M tile re-decodes same B (grid Y amplification). To hide decode would need double-buffered pipelined decode (decode next sb while current mma executes), K=32 fused path to halve iterations, and cross-M B reuse or persistent kernel. No profiler counters run beyond hipEvent; next step is `rocprofv3 --kernel-trace`.
+- **Files:** `amd/gemm_opt_hip.cpp` (optimized plain+fused), `amd/BENCH_M4.md` (verbatim + ratio table + verdict), updated `amd/STATUS.md`.
+- **Correctness:** `amd/cb_decode_hip.cpp` still PASS all rungs (re-ran ` /tmp/cb_decode_hip` — PASS). `fused_k32_fast` PASS k32 M16 N4 K512 max_abs 0.
+
 ## Blockers
 
-- M3 perf: decode overhead not hidden — fused lane correct but not de-minimis. Attested with timer evidence in BENCH.md; profiler not run. Needs pipelined decode iteration.
-- WSL ROCm: `rocm-smi` still `amdgpu not found`, hip functional. PyTorch-ROCm not installed — not needed for current harnesses (numpy/CPU refs used).
+- M4 perf: Even optimized plain at >50% roofline (517 GB/s), fused decode cost (0.030ms isolated, 0.087ms fused) remains > plain's compression saving (0.015ms). De-minimis not met; needs pipelined LDS decode + K=32 fused + cross-M reuse.
+- WSL ROCm: `rocm-smi` still `amdgpu not found`, hip functional. No rocprofv3 counter run — timer only.
