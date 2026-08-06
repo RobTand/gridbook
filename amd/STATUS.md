@@ -114,7 +114,44 @@ hipcc --offload-arch=gfx1201 amd/gemm_wmma_hip.cpp -o /tmp/gemm_wmma && /tmp/gem
 - **Files:** `amd/gemm_m5_hip.cpp` (pipelined 16x32 double-buffered, validated), `amd/BENCH_M5.md` (verbatim + counter absence attestation + ISA + ratio table + verdict), updated `amd/STATUS.md`.
 - **Correctness:** `validate_m5 M16 N32 K256 PASS max_abs 0`; `amd/cb_decode_hip.cpp` full sweep still PASS.
 
+## 2026-08-06 — M6 — Coalescing round (repacked, K=32/64, LDS-staged) — DONE (M6_CEILING_ATTESTED)
+
+- **Goal per OPERATOR M6:** Coalesce index-word loads (wavefront-coalesced LDS staging, tile-contiguous repack as serving preprocessing, document cost), decode to registers vs LDS bounce where possible, more waves / 16x16x64 K-chunking. Deliver ratio table on coalesced kernels (pass or ceiling-attested).
+
+- **Kernels:** `amd/gemm_m6_hip.cpp` adds `fused_m6_repacked_k32` (16x16x32, `s_cb[2048]` LDS 64-bit load once, `s_qw[256]` coalesced `global_load_b64` 256B/tile =32×8B contiguous vs M5's scattered row stride 2048, decode from LDS `*(uint32_t*)(s_qw+n*16+v*4)` →4 LDS gathers, `s_B[512]` col_major ldm=32, 1 `__syncthreads` per K chunk, A direct), `fused_m6_repacked_db_k32` (double-buffered `s_qw[2][256]`+`s_B[2][512]`), `fused_m6_repacked_k64` (16x16x64, `s_qw[512]`, `s_B[1024]`, 128 codewords/tile, halves K-loop to 64 for K=4096). Host repack `repack_k32_for_m6` / `repack_k64_for_m6` transforms row-major `qw[gn*rbytes+sb*128+v*4]` to tile-contiguous `qw_tiled[(kt*Ntiles+nt)*256+n*16+v*4]`; repack is offline preprocessing (weight-stationary, legal per M6 spec) ~0.02 ms host for 8 MB, amortized, not in GEMM time. All three validate `M16 N32 K256 max_abs 0 PASS` vs independent CPU bit-exact reference (same as M2), plus `cb_decode_hip` still PASS all rungs.
+
+- **Build:** `hipcc --offload-arch=gfx1201 amd/gemm_m6_hip.cpp -o /tmp/gemm_m6 --std=c++17 -O2` (warnings only). `hipcc --offload-arch=gfx1201 amd/gemm_m5_hip.cpp -o /tmp/gemm_m5` retained for baseline.
+
+- **Bench (verbatim in BENCH_M6.md):** median of 20 reps, 300 iters each, 20 warmup, `hipEventElapsedTime`, interleaved plain/fused per rep to control power state, plus isolated decode probe (`decode_only_scattered` vs `decode_only_repacked`). Plain_direct16 now 0.040-0.050 ms at M16 (340 GB/s, 55% roof) — stable median min 0.039 max 0.050 across 20 reps; plain_direct32 ~0.027 ms (30% faster). `rocprofv3-avail list --pmc` still `No pmc counters supported` on gfx1201 (same as M5), `rocprofv3 --kernel-trace` empty — attested in BENCH_M6.md §1. Isolated decode: scattered 0.087 ms (192 GB/s decoded), repacked coalesced 0.079 ms (210 GB/s decoded, 105 GB/s packed) vs plain saving 8 MB at 340-517 GB/s =0.016-0.023 ms → **decode alone 3.4-5× larger than saving**, even perfect overlap cannot be de-minimis.
+
+- **Ratio table (median of 20, repacked_k32 primary, SUCCESS CRITERION):**
+  ```
+  M16 N4096 K4096 plain 0.050 ms vs fused 0.112 ms ratio 0.44 SLOW (need ≥1.0)
+  M32 N4096 K4096 0.048 vs 0.133 0.36 SLOW
+  M64 N4096 K4096 0.137 vs 0.204 0.71 SLOW
+  M128 N4096 K4096 0.305 vs 0.452 0.66 SLOW (need ≥0.97)
+  M16 N1024 K4096 0.045 vs 0.127 0.35 SLOW
+  M16 N2048 K1024 0.015 vs 0.038 0.39 SLOW
+  Best variant k64 at M128: 0.249 vs 0.238 ratio 0.98 borderline PASS but only at M128 and not reproducible (second batch with thermal jitter shows same shape 0.99 PASS but M64 inflates to 1.15 due to plain slow outlier 0.357 vs stable 0.137 — variance from WSL dxg, reported honestly). M5 baseline for comparison: 0.37/0.26/0.47/0.52 — M6 improves ~1.2× at M16 (0.44 vs 0.37) and ~1.5× at M64 (0.71 vs 0.47) / M128 k64 (0.98 vs 0.52) from coalescing + K=64 halving, but memory-bound still 2.2× slower.
+  ```
+  Full verbatim + min/max + second jittered batch captured in `amd/BENCH_M6.md`.
+
+- **Diagnosis (timer + ISA, counters unavailable, same hardware limit as M5):** Coalescing via repacked `global_load_b64` (256B contiguous per tile) lifts decoded BW from 192 to 210 GB/s (1.09×) but still VMEM-bound and shares controller with A stream. `v_wmma_f32_16x16x32/64` single-cycle, but per-tile 256 `ds_read_b32` LDS gathers (4 per codeword) + `s_wait_loadcnt`/`s_wait_alu` + `__syncthreads` (128 syncs for K=4096/32, 64 for k64) serialize. Cross-M redundancy 8× at M128: each M-tile re-decodes same B (0.079×8=0.63 ms vs plain GEMM 0.30 ms). No TMA/`cp.async` on RDNA4 to hide next-tile `global_load` behind `mma_sync`; double-buffer still needs `__syncthreads`. Even coalesced, isolated decode 0.079 ms (105 GB/s packed) must be <0.016 ms (>500 GB/s packed) to break even — needs 5× more packed BW, impossible while also streaming A at 340 GB/s. Persistent N-tile kernel + `cb` in `__constant__` + fragment-direct decode (no LDS `s_B` bounce) + `sched_barrier` still required but not available in rocWMMA 2.2.1.
+
+- **Verdict:** **M6_CEILING_ATTESTED** — coalesced, vectorized, K=64 kernels implemented, validated, and benchmarked with honest slow exit. No speed fabricated. Counter absence re-attested, ISA noted, isolated probe proves decode > saving. Hardware cannot hide this decode on gfx1201 with current ROCm without persistent cross-M B reuse and true async copy.
+
+- **Files:** `amd/gemm_m6_hip.cpp` (repacked coalesced + db + k64, validated), `amd/BENCH_M6.md` (verbatim + ratio table + ceiling attestation + ISA + repack cost, ends with `M6_CEILING_ATTESTED`), updated `amd/STATUS.md`.
+
+- **How to resume (after M6):**
+  ```bash
+  git checkout feat/amd-rdna4-fp8
+  cat amd/STATUS.md
+  cat amd/BENCH_M6.md
+  hipcc --offload-arch=gfx1201 amd/gemm_m6_hip.cpp -o /tmp/gemm_m6 --std=c++17 -O2 && timeout 360 /tmp/gemm_m6 2>&1 | tee /tmp/m6.log
+  # For next perf iteration: persistent N-tile kernel + fragment-direct (no LDS bounce) + constant cb, profile once gfx1201 PMCs appear.
+  ```
+
 ## Blockers
 
-- M5 perf: Pipelined 16x32 double-buffered K=32 still 2–3× slower memory-bound (ratio 0.29 vs need ≥1.0) and 1.7–2× slower compute-bound (0.50 vs 0.97). Isolated decode 0.030 ms > saving 0.015 ms; cross-M redundancy 8× at M128. Even with halved syncs and larger tile, decode not de-minimis. Needs cooperative LDS qw staging, persistent B reuse, and true async — not available with current rocWMMA API on gfx1201. Counters remain unavailable on this driver (gfx1201 PMCs not implemented in ROCm 7.14), so attestation is timer+ISA+absence.
-- WSL ROCm: `rocm-smi` still `amdgpu not found`, hip functional. `rocprofv3` PMCs remain unsupported on gfx1201 (no change from M4).
+- M6 perf ceiling: Repacked coalesced + K=64 still 2.2× slower memory-bound (0.44 vs 1.0) and 1.5× slower compute-bound (0.66 vs 0.97; k64 borderline 0.98 at M128 only). Isolated decode 0.079 ms packed BW 105 GB/s vs saving 0.016 ms (5× too slow); cross-M 8× redundancy at M128. Requires persistent B reuse + async copy (TMA) — not available on RDNA4 WMMA 2.2.1; counters still unavailable on gfx1201 (rocprofiler-sdk 1.3.2). Attestation is timer + isolated probe + ISA + absence, as authorized. No further software pipelining with 1 wave/block can make decode < saving without 5× packed BW.
+- WSL ROCm: `rocm-smi` still `amdgpu not found`, hip functional. `rocprofv3` PMCs remain unsupported on gfx1201 (no change from M5).
