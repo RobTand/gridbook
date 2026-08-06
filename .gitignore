@@ -4,3 +4,10 @@ __pycache__/
 build/
 dist/
 .claude/
+
+# HIP/ROCm build artifacts (amd lane)
+*-hip-amdgcn-amd-amdhsa-gfx*
+*-host-x86_64-unknown-linux-gnu.*
+*.hipi
+*.bc
+*.bc.tmp
