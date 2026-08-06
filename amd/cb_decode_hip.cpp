@@ -724,7 +724,7 @@ void bench_one(int M,int N,int K,int k_bits,int n_sub,int iters=300){
     float* scale = new float[N]; for(int i=0;i<N;i++) scale[i]=1.0f;
     hip_fp8_e4m3* Ahost = new hip_fp8_e4m3[M*K]; for(int i=0;i<M*K;i++){ rng_state = rng_state*1103515245 + 12345; float v=((rng_state>>16)%9-4)*0.5f; Ahost[i]=hip_fp8_e4m3(v); }
     hip_fp8_e4m3* Whost = new hip_fp8_e4m3[N*K]; for(int i=0;i<N*K;i++){ rng_state = rng_state*1103515245 + 12345; float v=((rng_state>>16)%9-4)*0.5f; Whost[i]=hip_fp8_e4m3(v); }
-    hip_fp8_e4m3 *dA,*dW,*dC; uint8_t *d_qw,*d_cb; int32_t *d_off; float *d_scale,*dCfused;
+    hip_fp8_e4m3 *dA,*dW; float *dC; uint8_t *d_qw,*d_cb; int32_t *d_off; float *d_scale,*dCfused;
     hipMalloc(&dA,M*K*sizeof(hip_fp8_e4m3));
     hipMalloc(&dW,N*K*sizeof(hip_fp8_e4m3));
     hipMalloc(&dC,M*N*sizeof(float));

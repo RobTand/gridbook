@@ -115,7 +115,7 @@ double bench_kernel(int M,int N,int K,int k_bits,int n_sub, int iters=500){
     // For bench we just generate random W bytes (perf same, not correctness)
     std::vector<hip_fp8_e4m3> W(N*K); for(auto &x:W){ float v=(rng()%9-4)*0.5f; x=hip_fp8_e4m3(v); }
 
-    hip_fp8_e4m3 *dA,*dW,*dC; uint8_t *d_qw,*d_cb; int32_t *d_off; float *d_scale,*dCfused;
+    hip_fp8_e4m3 *dA,*dW; float *dC; uint8_t *d_qw,*d_cb; int32_t *d_off; float *d_scale,*dCfused;
     hipMalloc(&dA,M*K*sizeof(hip_fp8_e4m3));
     hipMalloc(&dW,N*K*sizeof(hip_fp8_e4m3));
     hipMalloc(&dC,M*N*sizeof(float));
