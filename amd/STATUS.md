@@ -174,3 +174,49 @@ hipcc --offload-arch=gfx1201 amd/gemm_wmma_hip.cpp -o /tmp/gemm_wmma && /tmp/gem
 
 - M6 perf ceiling (verified): Even gate-compliant one-alloc alternating plain_min vs fused_min, best ratio 0.84 at M64, worst 0.34-0.52 memory-bound, 0.74 compute-bound. Repacked coalesced 256B/tile + LDS cb + 2 barriers/tile still 1.2-2.9× slower. Isolated decode 0.085 ms (98 GB/s packed) vs saving 0.015 ms at 525 GB/s =5.6× too slow; cross-M 8× redundancy at M128. Requires persistent B reuse + async copy — not available on RDNA4 WMMA 2.2.1; counters unavailable. Host repack 0.14 ms once per weight, amortized negligible, does not change verdict. Attestation is timer+ISA+isolated probe+absence as authorized. No further SW pipelining with 1 wave/block can reach bar without 5× packed BW. **M6_CEILING_ATTESTED**
 - WSL ROCm: `rocm-smi` still `amdgpu not found`, hip functional. `rocprofv3` PMCs remain unsupported on gfx1201 (no change from M5).
+
+## 2026-08-06 — M7 — Persistent-B + Fragment-Direct (both implemented, measured) — DONE (M7_CEILING_DEMONSTRATED)
+
+- **Goal per OPERATOR M7:** Implement the two optimizations only argued in M6: M7.1 persistent-B tile reuse (one CTA owns N-tile, decode once per K chunk, reuse across Mt) and M7.2 fragment-direct decode (no LDS bounce, empirically probed mapping). Both have precedent in this repo: `csrc/cb_moe_persistent_b.cu` (persistent-B, TN*TK tiles, K-major XOR swizzle, 2 CTAs/SM budget) and `csrc/cb_gemv_v2.cu` (whole packed row staged in one coalesced burst, full sub-codebook staged to smem once per block).
+- **Kernels:** `amd/gemm_m7_hip.cpp` adds `fused_persistent_k32` (M7.1, 16x32, grid Ntiles=256, s_cb 2048B 64-bit once, s_qw 256B coalesced, s_B 512B, decodes 64 codewords/tile once per K chunk, load fb once, loop Mt 1..8 mma with same fb, acc[Mt] fragments, 128 decodes for K=4096 vs 1024 for M128 M6) and `fused_persistent_frag_direct_k16` (M7.2, 16x16, s_cb+s_qw LDS, per-lane fb register fill via probed mapping n=lane%16, k=(lane/16)*8+i, 8 elements/lane, no s_B, fb reused across Mt). Both validate bit-exact: M16 N32 K256 PASS max_abs 0, M64 N32 K256 PASS, same CPU reference as M2 (LSB-first window, product split). M6 `fused_m6_repacked_k32` retained for comparison.
+- **Fragment probe (empirical, not assumed):** `/tmp/probe_frag.cpp` on gfx1201: B 16x16 col_major fb num_elements 8, lane0:0 16 32 48 64 80 96 112 col0 rows0..7, lane16 duplicate rows8..15; for B 16x32 fb 16 elements showed rows0..15 only (lane16 duplicate), so M7.2 uses 16x16 mapping n=lane%16 k=(lane/16)*8+i, manual fill mismatch 0 confirms correct. ISA via llvm-objdump shows global_load_b64 + ds_read + v_wmma_f32_16x16x32_fp8_fp8 + s_barrier/s_wait.
+- **Build:** `hipcc --offload-arch=gfx1201 amd/gemm_m7_hip.cpp -o /tmp/gemm_m7 --std=c++17 -O2` (warnings only); `hipcc --offload-arch=gfx1201 amd/bench_verify_m7.cpp -o /tmp/bench_verify_m7 --std=c++17 -O2` (one-alloc gate harness, alternates plain/m6/persistent/frag).
+- **Bench (verification gate: one alloc set, alternating, 20 reps, 300 iters, 20 warmup, hipEvent, min+med vs plain_min):** verbatim in `amd/BENCH_M7.md` section 3 and `/tmp/bench_m7_verify.log`. Repack costed: k32 8MB median 0.151ms 55GB/s host, k16 0.405ms 20GB/s, once per weight amortized ~0. Host repack legal, fused reads only qw_tiled.
+
+- **Ratio table (gate-compliant vs plain_min, plain 538GB/s at M16, 230GB/s at M64, 140GB/s at M128):**
+  ```
+  Small M (memory-bound, need >=1.0, M16):
+   M16 N4096 K4096  plain 0.03179 | m6 0.06094 ratio 0.52 | pers 0.07999 ratio 0.39 | frag 0.13065 ratio 0.24 SLOW
+   M16 N1024 K4096  plain 0.01892 | m6 0.05340 ratio 0.35 | pers 0.07151 ratio 0.26 | frag 0.11712 ratio 0.16 SLOW
+   M16 N2048 K1024  plain 0.00642 | m6 0.01699 ratio 0.37 | pers 0.02177 ratio 0.29 | frag 0.03317 ratio 0.19 SLOW
+  Large M (compute-bound, need >=0.97):
+   M32 N4096 K4096  plain 0.03263 | m6 0.06664 ratio 0.48 | pers 0.09811 ratio 0.33 | frag 0.16261 ratio 0.20 SLOW
+   M64 N4096 K4096  plain 0.07835 | m6 0.09277 ratio 0.84 | pers 0.13624 ratio 0.57 | frag 0.24042 ratio 0.32 SLOW
+   M128 N4096 K4096 plain 0.13817 | m6 0.18815 ratio 0.73 | pers 0.21403 ratio 0.64 | frag 0.38643 ratio 0.35 SLOW
+  ```
+  Persistence is 1.3x slower than M6 at M16 (no reuse, Mt=1, extra loop overhead) and 1.14x slower at M128 (0.214 vs 0.188) despite 8x fewer decodes (128 vs 1024). Fragment-direct is 1.6-1.8x slower than persistent LDS (0.130 vs 0.079, 0.386 vs 0.214). Best remains M6 at M64 ratio 0.84 (still <0.97). No shape reaches bar even on fused_min vs plain_min.
+
+- **Two regimes separately (M7 addendum):**
+  - Large M (M64/M128): persistence arithmetically flips inequality (0.085/8=0.011 <0.015 saving), but measured persistent still 0.214>0.138 (1.54x slower) due to grid parallelism loss (2048 blocks plain/M6 vs 256 blocks persistent) and 8 acc VGPR pressure (9 fragments/wave, ~72 floats) + extra barriers. To hide decode would need 8-wave cooperative persistent (one warp per Mt, shared s_B, cooperative decode) + sched_barrier pipelining — not implemented in rocWMMA 1-wave model.
+  - Small M (M16 batch-1): persistence cannot help (Mt=1, no amortization). Lever should be MLP/occupancy (more waves, outstanding loads, whole-row burst as in cb_gemv_v2). M6 already has coalesced 256B burst, but decode still 5.5x > saving. Adding wave via frag-direct increases register pressure and per-lane gathers (4 ds_read per codeword) without async, so even slower (0.24 vs 0.52). Need hardware TMA/cp.async to hide next tile's global_load behind mma — not available on RDNA4 WMMA 2.2.1 (all global_load synchronous s_wait_loadcnt + s_barrier).
+
+- **Diagnosis (timer+ISA+isolated probe+fragment probe, counters unavailable):** Decode remains VMEM+VALU bound (4 LDS cb gathers per codeword, 64 codewords/tile=256 gathers, 2 barriers/tile). Persistent saves decodes but loses parallelism 8x and increases VGPR; fragment-direct saves one LDS bounce/barrier but same gathers + register live range, slower. Even optimal persistent effective decode 0.011ms < saving, but measured 0.214>0.138 shows other bound (occupancy/barriers). Isolated decode 0.085ms >0.015ms saving 5.5x, and at 538GB/s plain, need >550GB/s packed (<0.015ms) to break even — current 98GB/s (repacked) 5.6x too slow. No async copy on gfx1201 with current ROCm. Counters still `No pmc counters supported` (re-attested).
+
+- **Files:** `amd/gemm_m7_hip.cpp` (persistent LDS + frag-direct, validated), `amd/bench_verify_m7.cpp` (gate harness, one alloc, alternating, min/med), `amd/BENCH_M7.md` (verbatim + ratio + ceiling, ends with `M7_CEILING_DEMONSTRATED`), updated `amd/STATUS.md`.
+
+- **Verdict:** **M7_CEILING_DEMONSTRATED** — both optimizations implemented, validated bit-exact, and measured with gate-compliant evidence (one alloc alternating min/median vs plain_min, repack costed, fragment mapping probed, ISA, isolated decode, counter absence re-attested). De-minimis not met in either regime; residual gap explained by occupancy/barrier/VGPR and lack of async copy on gfx1201. No speed fabricated.
+
+- **How to resume (after M7):**
+  ```bash
+  git checkout feat/amd-rdna4-fp8
+  cat amd/STATUS.md
+  cat amd/BENCH_M7.md
+  hipcc --offload-arch=gfx1201 amd/gemm_m7_hip.cpp -o /tmp/gemm_m7 --std=c++17 -O2 && timeout 60 /tmp/gemm_m7 2>&1 | tee /tmp/m7.log
+  hipcc --offload-arch=gfx1201 amd/bench_verify_m7.cpp -o /tmp/bench_verify_m7 --std=c++17 -O2 && timeout 360 /tmp/bench_verify_m7 2>&1 | tee /tmp/bench_m7_verify.log
+  # For next iteration: 8-wave cooperative persistent (one warp/M-tile), sched_barrier pipelining, or wait for gfx12 PMCs/TMA.
+  ```
+
+## Blockers
+
+- M7 perf ceiling (demonstrated): Even with both required optimizations implemented and measured gate-compliantly, best ratio remains 0.84 at M64 (m6) /0.64 persistent at M128, 0.52/0.39/0.24 at M16. Persistent amortizes 8x (128 vs 1024 decodes) arithmetically 0.011<0.015 but loses 8x block parallelism (2048->256 blocks) and VGPR (8 acc), so 0.214>0.138. Fragment-direct (no LDS B) map probed n=lane%16 k=(lane/16)*8+i correct, but 1.6x slower than LDS due to gather VALU and register pressure. Isolated decode 0.085ms >0.015ms saving 5.5x, need >550GB/s packed. No async copy on gfx1201 WMMA 2.2.1. **M7_CEILING_DEMONSTRATED**
+- WSL ROCm: `rocm-smi` still `amdgpu not found`, hip functional. `rocprofv3` PMCs remain unsupported on gfx1201 (no change from M5).
