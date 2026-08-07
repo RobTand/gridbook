@@ -151,7 +151,26 @@ hipcc --offload-arch=gfx1201 amd/gemm_wmma_hip.cpp -o /tmp/gemm_wmma && /tmp/gem
   # For next perf iteration: persistent N-tile kernel + fragment-direct (no LDS bounce) + constant cb, profile once gfx1201 PMCs appear.
   ```
 
+## 2026-08-06 — M6 verification gate — DONE (M6_CEILING_ATTESTED verified)
+
+- **Gate per SPEC §M6 VERIFICATION GATE:** One clean process, one allocation set, alternating plain and fused, >=20 reps each, report BOTH min and median for BOTH kernels, compare fused vs plain AT ITS BEST (min, cache-warm), explain 5x baseline discrepancy, cost repack, then write M6_BAR_MET_VERIFIED or M6_CEILING_ATTESTED.
+- **Harness:** `amd/bench_verify_m6.cpp` — hipcc --offload-arch=gfx1201, one alloc set per shape (dA+dB 16.7MB + dqw_tiled 8MB + dcb 2KB + dC, <40MB <64MB Infinity Cache), 20 warmup, 20 reps alternating plain_direct16 then fused_m6_repacked_k32 (300 iters each, hipEvent), reports min/med/max for both. Also repack microbench (50 reps, volatile sink, median 0.143 ms for 8 MB, 58 GB/s host, once per weight, amortized).
+- **Repack costed:** 8 MB moved (N*rbytes=8388608 source packed -> same 8388608 dest tiled, contiguous permutation), median 0.1435 ms min 0.142 ms max 0.183 ms host BW 58 GB/s, once per weight stationary preprocessing (legal per spec), amortized over 1000 tokens adds 0.00014 ms per GEMM, negligible. Fused kernel reads only `qw_tiled`. Verbose log in `amd/BENCH_M6.md` §8.4 and `/tmp/verify.log`.
+- **Discrepancy explained (with evidence):** M4 isolated plain min 0.032-0.044 ms / 525 GB/s (84% of 620 GB/s roof) is roofline; M6 suite median 0.05-0.09 ms max 0.54 ms (13x) was thermal throttling + per-rep hipMalloc/hipFree churn (20x alloc/free per shape, no cooldown) on WSL dxg. Verification one-alloc shows plain min 0.03255 ms med 0.03420 max 0.04416 (1.35x) — early reps cool, later hot. Infinity Cache 64 MB > total resident 25-40 MB, so B fully cacheable; measured 525 GB/s is VRAM not cache (cache would be >2 TB/s), throttling reduces clock uniformly. Written in BENCH_M6.md §8.3.
+- **Verified ratio table (vs plain_min, gate-compliant):**
+  ```
+  M16 N4096 K4096 plain_min 0.03255 med 0.03420 | fused_min 0.06210 med 0.07426 ratio min/min 0.52 FAIL (need >=1.0) BW 525 GB/s vs 140 eff
+  M32 N4096 K4096 0.03341 vs 0.06853 ratio 0.48 FAIL
+  M64 N4096 K4096 0.07962 vs 0.09450 ratio 0.84 FAIL (best, still <0.97)
+  M128 N4096 K4096 0.14352 vs 0.19305 ratio 0.74 FAIL (need >=0.97)
+  M16 N1024 K4096 0.02018 vs 0.05769 ratio 0.34 FAIL
+  M16 N2048 K1024 0.00737 vs 0.01840 ratio 0.40 FAIL
+  ```
+  No shape reaches bar even on fused_min vs plain_min (harshest). Full per-rep logs in BENCH_M6.md §8.4.
+- **Verdict:** **M6_CEILING_ATTESTED** (verified) — gate satisfied, honest ceiling attested with timer+ISA+isolated probe (rocprofv3 PMCs still `No pmc counters supported` on gfx1201, re-attested). Repack does not hide decode (isolated decode 0.085 ms > saving 0.015 ms at 525 GB/s); persistent cross-M B reuse + async copy (TMA) still required but unavailable in rocWMMA 2.2.1 on RDNA4.
+- **Files:** `amd/bench_verify_m6.cpp` (verification harness), `amd/BENCH_M6.md` §8 (verbatim + table + explanation + ceiling), updated `amd/STATUS.md`. Build: `hipcc --offload-arch=gfx1201 amd/bench_verify_m6.cpp -o /tmp/bench_verify_m6 --std=c++17 -O2 && /tmp/bench_verify_m6`.
+
 ## Blockers
 
-- M6 perf ceiling: Repacked coalesced + K=64 still 2.2× slower memory-bound (0.44 vs 1.0) and 1.5× slower compute-bound (0.66 vs 0.97; k64 borderline 0.98 at M128 only). Isolated decode 0.079 ms packed BW 105 GB/s vs saving 0.016 ms (5× too slow); cross-M 8× redundancy at M128. Requires persistent B reuse + async copy (TMA) — not available on RDNA4 WMMA 2.2.1; counters still unavailable on gfx1201 (rocprofiler-sdk 1.3.2). Attestation is timer + isolated probe + ISA + absence, as authorized. No further software pipelining with 1 wave/block can make decode < saving without 5× packed BW.
+- M6 perf ceiling (verified): Even gate-compliant one-alloc alternating plain_min vs fused_min, best ratio 0.84 at M64, worst 0.34-0.52 memory-bound, 0.74 compute-bound. Repacked coalesced 256B/tile + LDS cb + 2 barriers/tile still 1.2-2.9× slower. Isolated decode 0.085 ms (98 GB/s packed) vs saving 0.015 ms at 525 GB/s =5.6× too slow; cross-M 8× redundancy at M128. Requires persistent B reuse + async copy — not available on RDNA4 WMMA 2.2.1; counters unavailable. Host repack 0.14 ms once per weight, amortized negligible, does not change verdict. Attestation is timer+ISA+isolated probe+absence as authorized. No further SW pipelining with 1 wave/block can reach bar without 5× packed BW. **M6_CEILING_ATTESTED**
 - WSL ROCm: `rocm-smi` still `amdgpu not found`, hip functional. `rocprofv3` PMCs remain unsupported on gfx1201 (no change from M5).
