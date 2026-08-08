@@ -307,7 +307,13 @@ that logic for no extra signal. One mechanical fact drives
 Every optional monorepo dependency in `test_cb_kernels.py` is now guarded, so
 the installed-wheel matrix collects every test module. Current CI runs the
 suite on Python 3.10–3.13 from outside the checkout, with one pytest process per
-file.
+file. Three tests also exercise validation entry points that intentionally ship
+only in the sdist. `run_cpu_tests.sh` exports `GRIDBOOK_SOURCE_ROOT`, resolved
+from its own checkout location, so those utilities remain available after the
+tests are staged and the same command works outside GitHub (where the ambient
+`GITHUB_WORKSPACE` variable does not exist). The source root is a file locator;
+it is never added to `PYTHONPATH`, so imports still resolve from the installed
+wheel.
 
 ### `release.yml` — tag pushes matching `v*` only
 

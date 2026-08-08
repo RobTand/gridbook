@@ -18,8 +18,10 @@ are published, while these tests run in both places the suite runs --
 """
 
 import ast
+import os
 from pathlib import Path
 import re
+import subprocess
 
 import gridbook
 import pytest
@@ -117,6 +119,43 @@ def test_sdist_only_split_is_declared_in_all_three_places():
     declared = re.search(r"SDIST_ONLY_GLOBS = \[(.*?)\]", gate, flags=re.S)
     assert declared is not None, "check_dist.py has no SDIST_ONLY_GLOBS list"
     assert declared.group(1).count("f\"{PKG}/") == len(SDIST_ONLY_GLOBS)
+
+
+def test_cpu_gate_locates_source_utilities_without_ci_environment(tmp_path):
+    """The local installed-wheel gate must not rely on GITHUB_WORKSPACE.
+
+    The real gate invokes one pytest process per staged test file. A tiny fake
+    interpreter is enough to attest that its child processes receive the
+    source-root locator while the gate itself runs away from the checkout.
+    """
+    if not _source_checkout():
+        pytest.skip("the release harness is not shipped in the wheel")
+
+    staged = tmp_path / "gbtests"
+    staged.mkdir()
+    (staged / "test_probe.py").write_text("# gate probe\n", encoding="utf-8")
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'test -f "${GRIDBOOK_SOURCE_ROOT}/scripts/'
+        'validate_fused_nvfp4_three_arm.py"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    environment = os.environ.copy()
+    environment.pop("GITHUB_WORKSPACE", None)
+    environment.pop("GRIDBOOK_SOURCE_ROOT", None)
+    environment["PYTHON_BIN"] = str(fake_python)
+    completed = subprocess.run(
+        ["bash", str(ROOT / ".github/scripts/run_cpu_tests.sh"), str(staged)],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "CPU test suite OK" in completed.stdout
 
 
 def test_installed_wheel_carries_serving_sources_and_no_sdist_only_ones():

@@ -4,6 +4,11 @@
 
 ## 0.8.2 — 2026-08-08
 
+- The installed-wheel CPU release gate now locates sdist-only validation
+  utilities explicitly instead of depending on GitHub's ambient
+  `GITHUB_WORKSPACE`. The schema-v6 three-arm validation entry point is also
+  included in the sdist and covered by the distribution-content gate.
+
 - Source-format metadata groups are now kept out of compressed-tensors config
   parsing. Gridbook already owns these groups through the versioned
   `source_passthrough` declaration; handing their producer-only fields to
