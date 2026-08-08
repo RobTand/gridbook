@@ -170,8 +170,9 @@ _FP8_BLOCK_LINEAR = SourceFormat(
     # replicated per chunk, bit-exact by construction — and running the stock
     # sm120 block-scaled collective (gridbook/mxfp8_dense_lane.py; the
     # embedding proof is in gridbook/mxfp8.py).  Correctness-audited
-    # kernel-vs-oracle over the DSV4 body shapes on sm_121; NATIVE-PARITY
-    # *served* evidence pending, so the lane is OPT-IN
+    # kernel-vs-oracle over the ordinary DSV4 body shapes and its grouped
+    # wo_a projection on sm_121; NATIVE-PARITY *served* evidence pending, so
+    # the lane is OPT-IN
     # (GRIDBOOK_MXFP8_DENSE=1) and the factory refuses without it.
     audited_backends=frozenset({"Mxfp8DenseLinearMethod"}),
     known_broken_backends={

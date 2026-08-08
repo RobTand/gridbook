@@ -199,13 +199,20 @@ Gridbook.
   `e_score_correction_bias`, `compressor.ape`, `attn.attn_sink`, and all norms.
   vLLM builds these as raw parameters or with `quant_config=None`, so
   `get_quant_method` is never called for them.
-- **Must not be quantized.** `ffn.gate`, both `compressor.fused_wkv_wgate`
-  modules, `indexer.weights_proj`, `lm_head` and `embed_tokens` have no quant
-  config at all. Separately, `attn.wo_a` *is* created and post-processed through
-  the quant-method contract but its forward **bypasses `apply()`** — the grouped
-  output projection reads `.weight`/`.weight_scale_inv` directly — so a CB
-  layout there would serve wrong results silently rather than failing. It stays
-  on its source layout.
+- **Must not be CB-encoded.** `ffn.gate`, both
+  `compressor.fused_wkv_wgate` modules, `indexer.weights_proj`, `lm_head` and
+  `embed_tokens` have no quant config at all. `attn.wo_a` does have a quant
+  config, but it remains source block-FP8 rather than CB: vLLM 0.24's grouped
+  output projection bypasses `apply()` and reads `.weight` /
+  `.weight_scale_inv` for DeepGEMM directly. On sm_121 that DeepGEMM scale
+  transform is unsupported, and Gridbook has already converted the source
+  scales into its own MXFP8 CuTe planes. Gridbook therefore installs a narrow,
+  ABI-guarded DSV4 adapter only on marked `wo_a` modules: native inverse RoPE,
+  the Gridbook-owned grouped MXFP8 method, then `wo_b`. Every unmarked stock
+  DSV4 layer continues through vLLM's original `_o_proj` method unchanged.
+  Exact artifact geometry `(G=8, N=1024, K=4096)` is correctness-audited on
+  GB10 (M=1 bit-exact; M=64 relative Frobenius error 4.77e-5); end-to-end
+  served parity remains a release gate.
 - **Fail-closed.** Outside `mtp.*`, vLLM's DSV4 loader looks parameters up
   unguarded, so any tensor the artifact emits with no matching parameter is a
   hard load failure rather than a silent skip. On the Gridbook side the usual

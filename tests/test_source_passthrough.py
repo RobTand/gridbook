@@ -287,9 +287,11 @@ def test_fp8_block_verdict_is_gridbook_owned_route():
     (128 = 4 * 32, scale replication, bit-exact) and the stock sm120
     block-scaled collective serves it.  Correctness audit 2026-08-03 on
     sm_121: kernel-vs-fp32-oracle rel-Frobenius worst 5.9e-5 over the seven
-    distinct DSV4-Flash body shapes at M in {1, 64, 512}, M=1 bit-exact on
-    most shapes; the DeepSeek-embedding path (block scales -> broadcast ->
-    plane -> kernel) worst 1.2e-4 vs the block-dequant oracle.
+    distinct ordinary DSV4-Flash body shapes at M in {1, 64, 512}, M=1
+    bit-exact on most shapes; the DeepSeek-embedding path (block scales ->
+    broadcast -> plane -> kernel) worst 1.2e-4 vs the block-dequant oracle.
+    The grouped wo_a artifact geometry (G=8, N=1024, K=4096) is separately
+    checked at M=1 (bit-exact) and M=64 (relative Frobenius 4.77e-5).
 
     Note (same date): the activation quantizer's exponent rule was moved from
     ``ceil(log2(...))`` to the producer-matching frexp form after a measured

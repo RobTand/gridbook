@@ -180,15 +180,99 @@ def build_mxfp8_dense_method(wire_id: str):
             else:
                 sf_rm = layer.weight_scale.data
                 del layer.weight_scale
-            offs = _OFFSETS.get(ext, n, k, is_b=True, device=device)
-            plane = fill_sf_plane(sf_rm.to(device), offs,
-                                  int(ext.mxfp8_sf_plane_numel(n, k)))
-            layer.register_buffer("weight_sf_plane", plane, persistent=False)
+            is_bmm = bool(getattr(layer, "is_bmm", False))
+            if is_bmm:
+                groups = int(getattr(layer, "bmm_batch_size", 0))
+                if groups <= 0 or n % groups != 0:
+                    raise ValueError(
+                        f"MXFP8 BMM needs a positive batch size dividing N; "
+                        f"got batch={groups}, N={n}")
+                rows = n // groups
+                if int(getattr(layer, "tp_size", 1)) != 1:
+                    raise ValueError("MXFP8 BMM is audited only for TP=1")
+                if (self._wire == WIRE_FP8_BLOCK128 and
+                        (rows % DS_BLOCK != 0 or k % DS_BLOCK != 0)):
+                    raise ValueError(
+                        "block128 MXFP8 BMM needs per-group N and K divisible "
+                        f"by {DS_BLOCK}; got N={rows}, K={k}")
+                sf_groups = sf_rm.reshape(groups, rows, k // SFVEC).to(device)
+                offs = _OFFSETS.get(
+                    ext, rows, k, is_b=True, device=device)
+                plane_numel = int(ext.mxfp8_sf_plane_numel(rows, k))
+                planes = torch.stack([
+                    fill_sf_plane(sf_groups[group], offs, plane_numel)
+                    for group in range(groups)
+                ])
+                layer.register_buffer(
+                    "weight_sf_planes", planes, persistent=False)
+                from .dsv4_woa import (
+                    DSV4_MXFP8_BMM_ABI,
+                    DSV4_MXFP8_BMM_ATTR,
+                    install_dsv4_woa_adapter,
+                )
+                setattr(layer, DSV4_MXFP8_BMM_ATTR, DSV4_MXFP8_BMM_ABI)
+                install_dsv4_woa_adapter()
+            else:
+                offs = _OFFSETS.get(ext, n, k, is_b=True, device=device)
+                plane = fill_sf_plane(
+                    sf_rm.to(device), offs,
+                    int(ext.mxfp8_sf_plane_numel(n, k)))
+                layer.register_buffer(
+                    "weight_sf_plane", plane, persistent=False)
             layer.weight.data = w.contiguous()
 
         def apply(self, layer, x: torch.Tensor,
                   bias: Optional[torch.Tensor] = None) -> torch.Tensor:
             ext = _require_lane_ext(x.device)
+            if bool(getattr(layer, "is_bmm", False)):
+                groups = int(getattr(layer, "bmm_batch_size", 0))
+                if x.ndim < 3 or int(x.shape[-2]) != groups:
+                    raise ValueError(
+                        f"MXFP8 BMM expected [..., {groups}, K], got "
+                        f"{tuple(x.shape)}")
+                k = int(layer.weight.shape[1])
+                if int(x.shape[-1]) != k:
+                    raise ValueError(
+                        f"MXFP8 BMM input K={x.shape[-1]} does not match "
+                        f"weight K={k}")
+                n = int(layer.weight.shape[0])
+                if groups <= 0 or n % groups != 0:
+                    raise ValueError(
+                        f"MXFP8 BMM has invalid batch={groups}, N={n}")
+                rows = n // groups
+                outer = tuple(x.shape[:-2])
+                x3 = x.reshape(-1, groups, k)
+                if x3.dtype != torch.bfloat16:
+                    x3 = x3.to(torch.bfloat16)
+                a_q, a_sf = quantize_mxfp8(x3)
+                m = int(x3.shape[0])
+                offs = _OFFSETS.get(
+                    ext, m, k, is_b=False, device=x.device)
+                plane_numel = int(ext.mxfp8_sf_plane_numel(m, k))
+                weights = layer.weight.view(groups, rows, k)
+                weight_planes = getattr(layer, "weight_sf_planes", None)
+                if weight_planes is None or int(weight_planes.shape[0]) != groups:
+                    raise RuntimeError(
+                        "MXFP8 BMM weight scale planes were not finalized")
+                outputs = []
+                for group in range(groups):
+                    a_plane = fill_sf_plane(
+                        a_sf[:, group, :], offs, plane_numel)
+                    # A size-one leading dimension makes PyTorch treat the
+                    # group slice as contiguous even though its row stride is
+                    # still ``groups * K``. The native ABI requires the exact
+                    # compact ``(K, 1)`` stride at decode M=1, so ``contiguous``
+                    # is insufficient here; clone materializes that layout.
+                    a_group = a_q[:, group, :].clone(
+                        memory_format=torch.contiguous_format)
+                    y = ext.mxfp8_dense_mm(
+                        a_group, a_plane,
+                        weights[group], weight_planes[group])
+                    outputs.append(y)
+                result = torch.stack(outputs, dim=1)
+                if bias is not None:
+                    result = result + bias.view(groups, rows)
+                return result.reshape(*outer, groups, rows)
             orig_shape = x.shape
             x2 = x.reshape(-1, orig_shape[-1])
             if x2.dtype != torch.bfloat16:

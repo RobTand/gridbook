@@ -319,11 +319,14 @@ resident weight copy, decoder, or matmul merely to create another route.
     it invents no support vLLM lacks.
   - **Not every DSV4 Linear is CB-eligible.** `ffn.gate`, both
     `compressor.fused_wkv_wgate`s, `indexer.weights_proj`, `lm_head` and
-    `embed_tokens` are built with no quant config, and `attn.wo_a` is created
-    and post-processed through the quant contract but **applied outside it**
-    (`nvidia/ops/o_proj.py` reads `.weight`/`.weight_scale_inv` directly), so a
-    CB layout there would serve silently wrong results. All of these are
-    documented as must-not-quantize in [`docs/PLUGIN.md`](docs/PLUGIN.md).
+    `embed_tokens` are built with no quant config. `attn.wo_a` is created and
+    post-processed through the quant contract but **applied outside it**
+    (`nvidia/ops/o_proj.py` reads `.weight`/`.weight_scale_inv` directly), so
+    it is not CB-eligible. Its source block-FP8 form is nevertheless served on
+    sm_121 by Gridbook's ABI-guarded DSV4 adapter, which preserves vLLM's
+    inverse-RoPE and head-group ordering while routing the BMM through the
+    owning MXFP8 method. The distinction and hardware evidence are documented
+    in [`docs/PLUGIN.md`](docs/PLUGIN.md).
 
   Remaining before a real artifact loads is not contract work — see the
   DSV4-Flash study's release gate (items 4-5: production calibration of the

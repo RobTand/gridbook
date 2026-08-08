@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- DeepSeek-V4's grouped `attn.wo_a` source block-FP8 projection now runs
+  through Gridbook's MXFP8 dense lane instead of vLLM's unconditional
+  DeepGEMM `fp8_einsum` path. vLLM 0.24 reads `.weight_scale_inv` directly
+  for this projection, but Gridbook has already converted that tensor into
+  its audited CuTe scale plane; an ABI-guarded adapter therefore performs
+  vLLM's native inverse RoPE, groups heads in the original order, calls the
+  owning Gridbook BMM method, and then calls `wo_b`. Stock DSV4 layers remain
+  byte-for-byte on vLLM's original path. The grouped kernel is independently
+  checked on GB10 at the artifact's exact `(G=8, N=1024, K=4096)` geometry:
+  decode M=1 is bit-exact to the dequantized oracle and M=64 has relative
+  Frobenius error 4.77e-5. This is correctness evidence; full served parity is
+  still a release gate.
+
 - Semantically heterogeneous dense fusions now preserve per-Linear ownership.
   When vLLM merges checkpoint siblings such as gate/up or DeepSeek-V4's
   `wq_a`/`wkv`, Gridbook gives every role its existing native method and
