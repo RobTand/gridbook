@@ -579,6 +579,19 @@ class PrismaQuantConfig(QuantizationConfig):
                 for t in g["targets"]:
                     self.target_scheme[t] = g["scheme"]
                     self._cb_targets.add(t)
+            elif (str(g.get("format", "")).strip().lower()
+                  == "source-passthrough"
+                  or (isinstance(g.get("weights"), dict)
+                      and bool(g["weights"].get("source_passthrough")))):
+                # Producer metadata for source-format units is not compressed-
+                # tensors vocabulary.  Gridbook owns their dispatch through
+                # the versioned ``source_passthrough`` declaration below, and
+                # _build_ct_config adds those units to CT's ignore list.  In
+                # particular, fields such as ``element_dtype`` and
+                # ``source_passthrough`` are intentionally rejected by CT's
+                # Pydantic schema and must not be reinterpreted as a stock
+                # quantization group.
+                continue
             else:                                    # stock CT vocabulary
                 stock_groups[name] = g
                 for t in g.get("targets", []):

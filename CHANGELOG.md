@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Source-format metadata groups are now kept out of compressed-tensors config
+  parsing. Gridbook already owns these groups through the versioned
+  `source_passthrough` declaration; handing their producer-only fields to
+  compressed-tensors caused strict schema validation to reject mixed DeepSeek
+  artifacts before model construction.
+
+- Gridbook-native terminal lane methods now count as their own backend in the
+  audited passthrough preflight. This lets the opt-in MXFP8 dense method satisfy
+  the same fail-closed identity check its registry entry declares, while vLLM
+  dispatching wrappers still require an inspected nested backend.
+
 ## 0.8.1 — 2026-08-05
 
 - **Per-expert split-format MoE stacks (#40).** Gridbook now accepts the

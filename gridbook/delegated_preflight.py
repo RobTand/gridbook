@@ -210,6 +210,13 @@ def _identities(method: Any, layer: Any = None) -> list[_Identity]:
         found.append(identity)
 
     add(_identity("resolved method", method, is_backend=False))
+    # Gridbook-native lane methods are terminal kernel selections, not vLLM
+    # dispatching wrappers.  They therefore have no backend-holder attribute:
+    # the method itself is the backend audited in source_passthrough.FORMATS.
+    # vLLM wrappers remain non-terminal and continue through the structural
+    # attribute inspection below.
+    if type(method).__module__.split(".")[0] == "gridbook":
+        add(_identity("Gridbook native lane", method, is_backend=True))
     for source, holder in (("method", method), ("layer scheme",
                                                 getattr(layer, "scheme", None))):
         if holder is None:
