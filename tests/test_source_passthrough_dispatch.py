@@ -174,6 +174,46 @@ def test_passthrough_units_are_hidden_from_delegated_compressed_tensors():
     assert CB_TARGET in c.ct_config.ignore
 
 
+def test_passthrough_metadata_groups_are_not_parsed_as_compressed_tensors():
+    """Producer source-wire metadata and real CT groups can coexist.
+
+    ``element_dtype`` and ``source_passthrough`` deliberately are not part of
+    compressed-tensors' QuantizationArgs schema.  The metadata group describes
+    bytes Gridbook owns; only the ordinary FP8 group should reach CT.
+    """
+    source_group = {
+        "format": "source-passthrough",
+        "source_format": "MXFP4_SOURCE",
+        "source_passthrough_id": MXFP4,
+        "weights": {
+            "num_bits": 4, "type": "float", "strategy": "group",
+            "group_size": 32, "symmetric": True, "dynamic": False,
+            "element_dtype": "fp4_e2m1", "scale_dtype": "uint8_e8m0",
+            "source_passthrough": True,
+        },
+        "input_activations": None,
+        "targets": ["re:^model[.]layers[.]7[.]mlp[.]experts"],
+    }
+    stock_group = {
+        "format": "float-quantized",
+        "weights": {"num_bits": 8, "type": "float", "strategy": "channel",
+                    "symmetric": True, "dynamic": False},
+        "input_activations": {"num_bits": 8, "type": "float",
+                              "strategy": "token", "symmetric": True,
+                              "dynamic": True},
+        "targets": ["re:.*self_attn.*_proj$"],
+    }
+    c = PrismaQuantConfig.from_config(_artifact(
+        {"version": 1, "units": {PT_EXPERTS: MXFP4}},
+        extra_groups={"group_source": source_group,
+                      "group_fp8": stock_group},
+    ))
+    c._ensure_resolved()
+    assert c.ct_config is not None
+    assert "group_source" not in c._stock_group_by_target.values()
+    assert "group_fp8" in c._stock_group_by_target.values()
+
+
 # --- the dispatch branch -----------------------------------------------------
 
 
@@ -188,6 +228,23 @@ def test_cb_units_are_unaffected_by_a_passthrough_declaration(native_marlin):
         {"version": 1, "units": {PT_EXPERTS: MXFP4}}))
     assert isinstance(c.get_quant_method(_linear(), CB_TARGET),
                       PrismaQuantCBLinearMethod)
+
+
+def test_one_moe_stack_cannot_be_both_source_mxfp4_and_cb(native_marlin):
+    """Separate modules in one decoder layer may differ; one stack may not."""
+
+    overlapping_cb = {
+        "format": "FP8_CB_K44",
+        "targets": [PT_EXPERTS + ".gate_up_proj"],
+        "scheme": dict(_CB_SCHEME),
+    }
+    c = PrismaQuantConfig.from_config(_artifact(
+        {"version": 1, "units": {PT_EXPERTS: MXFP4}},
+        extra_groups={"overlapping_cb": overlapping_cb},
+    ))
+    with pytest.raises(SourcePassthroughError,
+                       match="cannot own the same routed-expert stack"):
+        c.get_quant_method(_experts(), PT_EXPERTS)
 
 
 def test_undeclared_moe_unit_is_not_passed_through(native_marlin):

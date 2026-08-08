@@ -23,6 +23,24 @@ set -uo pipefail
 
 TESTS="${1:?usage: run_cpu_tests.sh <tests-dir>}"
 
+# Some CPU tests exercise repository-only validation utilities under scripts/.
+# The tests themselves are copied away from the checkout so local gridbook/
+# cannot shadow the installed wheel, and the utilities deliberately remain out
+# of that runtime wheel. GitHub happens to provide GITHUB_WORKSPACE, but the
+# release gate is also a documented local command and must not depend on that
+# ambient CI variable. Resolve the canonical source root from this script and
+# export it only as a data-file locator; it is never added to PYTHONPATH.
+if [ -z "${GRIDBOOK_SOURCE_ROOT:-}" ]; then
+  GATE_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  GRIDBOOK_SOURCE_ROOT="$(CDPATH= cd -- "${GATE_DIR}/../.." && pwd)"
+fi
+export GRIDBOOK_SOURCE_ROOT
+
+if [ ! -f "${GRIDBOOK_SOURCE_ROOT}/gridbook/__init__.py" ]; then
+  echo "GRIDBOOK_SOURCE_ROOT is not a Gridbook source tree: ${GRIDBOOK_SOURCE_ROOT}" >&2
+  exit 2
+fi
+
 # Every optional monorepo/GPU dependency is guarded with importorskip/skip, so
 # every test module can be collected in the released-package environment.
 EXCLUDE=()

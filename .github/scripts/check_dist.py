@@ -48,6 +48,8 @@ Checks
    ``License-Expression`` is backed by an actual license file.  ``twine check``
    passes on a wheel that fails all three -- it checks that the metadata
    renders, not that it is the right metadata.
+7. The repository-only validation entry points exercised by the CPU suite are
+   present in the sdist and remain absent from the runtime wheel.
 """
 from __future__ import annotations
 
@@ -146,6 +148,18 @@ NATIVE_SUFFIXES = (".cu", ".cuh", ".hpp", ".h")
 SDIST_ONLY_GLOBS = [
     f"{PKG}/csrc/tools/*",
     f"{PKG}/csrc/cutlass_fork/*_orig.hpp",
+]
+
+# These validation entry points are source utilities rather than importable
+# runtime modules, so they belong in the auditable sdist and not the wheel.
+# Their CPU tests are still part of the installed-wheel gate: run_cpu_tests.sh
+# locates them through GRIDBOOK_SOURCE_ROOT without putting the checkout on
+# PYTHONPATH. Keep this literal floor so a newly added harness cannot ship a
+# test in the sdist while silently omitting the utility that test exercises.
+SDIST_REQUIRED_UTILITIES = [
+    "scripts/prepare_lfm_fused_validation.py",
+    "scripts/validate_fused_nvfp4_ab.py",
+    "scripts/validate_fused_nvfp4_three_arm.py",
 ]
 
 _errors: list[str] = []
@@ -268,6 +282,24 @@ def check_checkout_layout(root: pathlib.Path) -> None:
     err(f"checkout: stale repo-root csrc/ holds {len(files)} native source(s) "
         f"(e.g. {files[0].relative_to(root)}). The canonical and only runtime "
         f"location is {PKG}/csrc/. Remove the root copy: `git rm -r csrc`.")
+
+
+def check_validation_utilities(wheel: pathlib.Path, sdist: pathlib.Path) -> None:
+    """Gate the intentional sdist-only validation-script split."""
+    wheel_present = set(wheel_members(wheel))
+    sdist_present = set(sdist_members(sdist))
+    missing = sorted(set(SDIST_REQUIRED_UTILITIES) - sdist_present)
+    if missing:
+        err(f"sdist: validation utilities missing: {missing}")
+    else:
+        ok(f"sdist: all {len(SDIST_REQUIRED_UTILITIES)} validation utilities "
+           "present")
+
+    leaked = sorted(set(SDIST_REQUIRED_UTILITIES) & wheel_present)
+    if leaked:
+        err(f"wheel: source-only validation utilities leaked in: {leaked}")
+    else:
+        ok("wheel: source-only validation utilities remain excluded")
 
 
 def check_publishable(wheel: pathlib.Path) -> None:
@@ -404,6 +436,7 @@ def main() -> int:
     check_artifact("wheel", wheel_members(wheel), expected - sdist_only,
                    excluded=sdist_only)
     check_artifact("sdist", sdist_members(sdist), expected)
+    check_validation_utilities(wheel, sdist)
 
     md = wheel_metadata(wheel)
     for field in ("Name", "Version", "Requires-Python"):

@@ -86,6 +86,13 @@ class OpaqueMethod:
 OpaqueMethod.__module__ = "vllm.model_executor.layers.quantization.mxfp4"
 
 
+class Mxfp8DenseLinearMethod:
+    """Gridbook's terminal dense lane has no nested backend holder."""
+
+
+Mxfp8DenseLinearMethod.__module__ = "gridbook.mxfp8_dense_lane"
+
+
 def _declaration(units, version=1):
     return {SCHEMA_KEY: {"version": version, "units": units}}
 
@@ -298,6 +305,14 @@ def test_fp8_block_verdict_is_gridbook_owned_route():
     assert {"DeepGemmFp8BlockScaledMMKernel", "CutlassFp8BlockScaledMMKernel",
             "TritonFp8BlockScaledMMKernel"} <= set(fmt.known_broken_backends)
     assert "GRIDBOOK_MXFP8_DENSE" in fmt.remedy
+
+
+def test_gridbook_native_method_is_itself_the_audited_backend():
+    require_native_passthrough_backend(
+        prefix="model.layers.0.self_attn.q_proj",
+        source_format=FORMATS[FP8_BLOCK],
+        method=Mxfp8DenseLinearMethod(),
+    )
 
 
 def test_registry_entries_are_self_consistent():

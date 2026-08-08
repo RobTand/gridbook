@@ -285,10 +285,20 @@ MoE `experts.gate_up_proj` / `experts.down_proj`): the expert axis stays explici
 | `<q>.cb_qweight` | `uint8` `(E, out, (in/256)*type_size)` — expert `e` is `cb_qweight[e]`, laid out exactly as the 2-D case |
 | `<q>.weight_scale` | `fp32` `(E, out)` — fp8 only |
 
-All experts of one stack **MUST** share one format and one codebook. Producers
-enforce serving-unit uniformity: fused siblings (q/k/v, gate/up) and packed MoE
-experts within a layer are one format; experts **MAY** differ across layers but
-**MUST** be uniform within a layer.
+Legacy packed-MoE stacks without a `per_expert_format_groups` declaration
+**MUST** share one format and one codebook; the versioned split-stack schema is
+the explicit partitioned exception. Dense siblings which vLLM presents as one
+merged output (q/k/v, gate/up, and architecture-specific merges) remain
+independent Linears and **MAY use different Gridbook or declared source-native
+formats**. The runtime loads each role through its own method and concatenates
+the output in vLLM's declared shard order when their representation or physical
+activation metadata differs. A compatible same-representation merge MAY keep
+one method, but only after contracted role scalars are proven equal. A producer
+MUST preserve the individual role tensors and metadata; it MUST NOT coerce
+their allocation to a single format or scalar merely because vLLM constructs
+one `MergedColumnParallelLinear`. A runtime without a loader wired for private
+role carriers MUST reject the model as an unsupported loader integration; it
+MUST NOT describe the independent formats themselves as invalid.
 
 **Codebook sidecar.** Codebooks are shipped **once per `(ref, format)`**, never
 per tensor, in a sidecar file `cb_codebooks.pqcb`. The `.pqcb` file **IS a

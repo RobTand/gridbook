@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+- Semantically heterogeneous dense fusions now preserve per-Linear ownership.
+  When vLLM merges checkpoint siblings such as gate/up or DeepSeek-V4's
+  `wq_a`/`wkv`, Gridbook gives every role its existing native method and
+  concatenates the results in vLLM shard order; it does not force one format,
+  requantize a persistent common weight, or fall back to an upstream kernel.
+  Matching format declarations also take this path when physical activation
+  scalars differ per role; genuinely compatible roles retain vLLM's merged
+  single-method path. The versioned, construction-scoped top-level loader
+  stages every composite role plane and commits a fused module only after the
+  complete transaction validates. An unwired model class fails at construction
+  instead of making independently encoded roles appear invalid.
+  Source MXFP4 and CB metadata are now explicitly rejected only when they
+  claim the same routed-expert stack; separate routed, shared-expert, and
+  attention modules may still use different formats within one decoder layer.
+
+- DeepSeek-V4 source-passthrough lookup now bridges vLLM's `attn`/`ffn` and
+  `w1`/`w3`/`w2` spellings to the producer declaration's
+  `self_attn`/`mlp` and gate/up/down spellings. This covers both mixed fused
+  projections and ordinary source-native body Linears/MoE stacks. The native
+  block-FP8 merged path now declares its 128x128 scale block so vLLM places
+  homogeneous source role scales at the correct offsets.
+
+## 0.8.2 — 2026-08-08
+
+- The installed-wheel CPU release gate now locates sdist-only validation
+  utilities explicitly instead of depending on GitHub's ambient
+  `GITHUB_WORKSPACE`. The schema-v6 three-arm validation entry point is also
+  included in the sdist and covered by the distribution-content gate.
+
+- Source-format metadata groups are now kept out of compressed-tensors config
+  parsing. Gridbook already owns these groups through the versioned
+  `source_passthrough` declaration; handing their producer-only fields to
+  compressed-tensors caused strict schema validation to reject mixed DeepSeek
+  artifacts before model construction.
+
+- Gridbook-native terminal lane methods now count as their own backend in the
+  audited passthrough preflight. This lets the opt-in MXFP8 dense method satisfy
+  the same fail-closed identity check its registry entry declares, while vLLM
+  dispatching wrappers still require an inspected nested backend.
+
 ## 0.8.1 — 2026-08-05
 
 - **Per-expert split-format MoE stacks (#40).** Gridbook now accepts the

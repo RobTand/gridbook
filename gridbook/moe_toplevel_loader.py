@@ -102,6 +102,8 @@ prior behaviour.
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
+from functools import wraps
 import re
 import torch
 
@@ -111,6 +113,20 @@ from .cb_fill_guard import mark_filled
 # for the serve-time fill assertion (cb_fill_guard), which prints them so an
 # unwired arch's error says exactly which list it is missing from.
 _INSTALLED_MODULE_PATHS: set[str] = set()
+
+# Versioned capability stamp carried by the effective ``load_weights`` method.
+# Its paired __init__ gate verifies ``type(self)`` and authorizes config-side
+# composite dispatch only while that exact instance constructs its layers.
+MIXED_FUSED_LOADER_ABI = 1
+_ACTIVE_MIXED_FUSED_LOADER_ABI: ContextVar[int | None] = ContextVar(
+    "gridbook_active_mixed_fused_loader_abi", default=None
+)
+
+
+def mixed_fused_loader_active() -> bool:
+    """Whether the model currently constructing has the loader ABI."""
+
+    return _ACTIVE_MIXED_FUSED_LOADER_ABI.get() == MIXED_FUSED_LOADER_ABI
 
 
 def installed_module_paths() -> set[str]:
@@ -220,7 +236,7 @@ def map_cb_expert_name(name: str) -> str | None:
 
 
 _SOURCE_SPLIT_RE = re.compile(
-    r"(?:^|[.]experts[.])(?P<expert>\d+)[.]"
+    r"^(?P<parent>(?:.*[.])?experts)[.](?P<expert>\d+)[.]"
     r"(?P<leaf>w1|w3|w2|gate_proj|up_proj|down_proj)[.]"
     r"(?P<plane>weight|scale)$"
 )
@@ -231,15 +247,16 @@ def load_source_split_expert(name: str, weight: torch.Tensor,
     """Load one producer-verbatim MXFP4 slice into a scoped native subgroup.
 
     Parameters owned by the mixed method carry their ordered global expert-id
-    tuple.  That is enough for top-level architecture loaders to perform the
-    same global->local and gate/up shard mapping as the instance-level hook,
-    without reading quant config or hard-coding an architecture.
+    tuple. The mapped ``...experts`` parent anchors the exact decoder layer,
+    then that tuple supplies global->local and gate/up shard mapping. Both are
+    required: many layers legitimately contain the same expert id and leaf.
     """
 
     match = _SOURCE_SPLIT_RE.search(name)
     if match is None:
         return None
     expert_id = int(match.group("expert"))
+    parent = match.group("parent")
     leaf, plane = match.group("leaf"), match.group("plane")
     family = "w13" if leaf in ("w1", "w3", "gate_proj", "up_proj") else "w2"
     param_leaf = f"{family}_{'weight_scale' if plane == 'scale' else 'weight'}"
@@ -247,6 +264,7 @@ def load_source_split_expert(name: str, weight: torch.Tensor,
     for param_name, param in params_dict.items():
         expert_ids = getattr(param, "_gridbook_source_expert_ids", None)
         if (expert_ids is not None and expert_id in expert_ids
+                and param_name.startswith(parent + ".")
                 and param_name.endswith("." + param_leaf)):
             candidates.append((param_name, param, tuple(expert_ids)))
     if not candidates:
@@ -287,6 +305,165 @@ def load_source_split_expert(name: str, weight: torch.Tensor,
 _CB_QWEIGHT_SUFFIX = ".cb_qweight"
 _WEIGHT_SCALE_SUFFIX = ".weight_scale"
 _INPUT_GLOBAL_SCALE_SUFFIX = ".input_global_scale"
+
+# Independently encoded dense fusions register one private carrier per
+# checkpoint sibling (``mixed_linear.py``).  The architecture's ordinary loader
+# cannot name those nested parameters, so this wrapper routes their planes by
+# metadata.  Keep the strings local: this module deliberately remains
+# torch-only and must not import the vLLM-bound mixed method just to inspect a
+# parameter.
+_MIXED_GROUP_ATTR = "_gridbook_mixed_fused_group"
+_MIXED_SOURCE_ATTR = "_gridbook_mixed_fused_source"
+_MIXED_PLANE_ATTR = "_gridbook_mixed_fused_plane"
+_MIXED_FILLED_ATTR = "_gridbook_mixed_fused_filled"
+
+
+def _mixed_plane_candidates(name: str) -> tuple[str, tuple[str, ...]] | None:
+    """Split a mapped checkpoint name into role prefix + possible planes.
+
+    DeepSeek's real mapper rewrites source ``.scale`` to
+    ``.weight_scale_inv``.  Keeping ``.scale`` as an accepted wire spelling
+    makes the transaction resolver robust to loaders that call the wrapper
+    before applying that final regex (and keeps the CPU model stub faithful).
+    It is still resolved only against explicitly registered carrier metadata.
+    """
+
+    for suffix in (".input_global_scale", ".weight_scale_inv",
+                   ".weight_scale", ".cb_qweight", ".weight"):
+        if name.endswith(suffix):
+            return name[:-len(suffix)], (suffix[1:],)
+    if name.endswith(".scale"):
+        return name[:-len(".scale")], ("weight_scale_inv", "weight_scale")
+    return None
+
+
+class _MixedFusedTransactions:
+    """Stage and atomically commit every plane of one fused module.
+
+    A fused role may need differently-shaped packed bytes and scale metadata
+    from its sibling.  Copying a tensor as soon as it appears leaves a
+    half-populated module if another plane is absent or malformed.  This router
+    retains the streaming tensor references until *all* registered planes of a
+    fused module are present, validates every destination first, then performs
+    the copies as one load transaction.  ``finish`` and the mixed method's
+    independent post-load fill gate both reject an incomplete stream.
+    """
+
+    def __init__(self, params_dict) -> None:
+        self._params = params_dict
+        self._routes: dict[tuple[str, str], str] = {}
+        self._expected: dict[str, set[str]] = {}
+        for param_name, param in params_dict.items():
+            group = getattr(param, _MIXED_GROUP_ATTR, None)
+            source = getattr(param, _MIXED_SOURCE_ATTR, None)
+            plane = getattr(param, _MIXED_PLANE_ATTR, None)
+            if group is None and source is None and plane is None:
+                continue
+            if not all(isinstance(value, str) and value
+                       for value in (group, source, plane)):
+                raise ValueError(
+                    f"mixed fused parameter {param_name!r} has incomplete "
+                    "routing metadata")
+            route = (source, plane)
+            previous = self._routes.setdefault(route, param_name)
+            if previous != param_name:
+                raise ValueError(
+                    f"mixed fused route {route!r} is ambiguous between "
+                    f"{previous!r} and {param_name!r}")
+            self._expected.setdefault(group, set()).add(param_name)
+        self._pending: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
+        self._committed: set[str] = set()
+
+    def stage(self, name: str, weight: torch.Tensor
+              ) -> tuple[str, ...] | None:
+        """Stage one plane; return committed params, ``()`` or ``None``.
+
+        ``None`` means the tensor is not owned by a mixed fused carrier and the
+        caller must delegate it.  An empty tuple means it was consumed but its
+        module transaction is still waiting for other planes.
+        """
+
+        split = _mixed_plane_candidates(name)
+        if split is None:
+            return None
+        source, planes = split
+        matches = [self._routes[(source, plane)] for plane in planes
+                   if (source, plane) in self._routes]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise ValueError(
+                f"mixed fused tensor {name!r} matches multiple carrier "
+                f"parameters {matches}")
+        param_name = matches[0]
+        param = self._params[param_name]
+        group = getattr(param, _MIXED_GROUP_ATTR)
+        if group in self._committed:
+            raise ValueError(
+                f"mixed fused tensor {name!r} arrived after module {group!r} "
+                "was already committed")
+        pending = self._pending.setdefault(group, {})
+        if param_name in pending:
+            raise ValueError(
+                f"mixed fused parameter {param_name!r} received duplicate "
+                f"checkpoint planes {pending[param_name][0]!r} and {name!r}")
+        if tuple(param.shape) != tuple(weight.shape):
+            raise ValueError(
+                f"mixed fused tensor {name!r} -> {param_name!r}: checkpoint "
+                f"shape {tuple(weight.shape)} != parameter shape "
+                f"{tuple(param.shape)}")
+        pending[param_name] = (name, weight)
+
+        expected = self._expected[group]
+        if set(pending) != expected:
+            return ()
+
+        # Prepare and validate every source before mutating any destination.
+        prepared: dict[str, torch.Tensor] = {}
+        for target in sorted(expected):
+            destination = self._params[target]
+            incoming = pending[target][1]
+            if incoming.dtype == destination.dtype:
+                converted = incoming
+            elif ({incoming.dtype, destination.dtype}
+                  == {torch.float8_e8m0fnu, torch.uint8}):
+                # vLLM stores some native MX scale parameters as uint8 while
+                # safetensors names their wire dtype F8_E8M0.  Those are the
+                # same exponent bytes and must be reinterpreted, not converted.
+                converted = incoming.contiguous().view(destination.dtype)
+            else:
+                raise ValueError(
+                    f"mixed fused tensor {pending[target][0]!r} -> "
+                    f"{target!r}: checkpoint dtype {incoming.dtype} != "
+                    f"parameter dtype {destination.dtype}; only the audited "
+                    "F8_E8M0/uint8 raw-scale spelling may be reinterpreted"
+                )
+            if tuple(converted.shape) != tuple(destination.shape):
+                raise ValueError(
+                    f"mixed fused tensor {pending[target][0]!r} changed shape "
+                    f"during dtype preparation: {tuple(converted.shape)} != "
+                    f"{tuple(destination.shape)}")
+            prepared[target] = converted
+        for target in sorted(expected):
+            destination = self._params[target]
+            destination.data.copy_(prepared[target])
+            setattr(destination, _MIXED_FILLED_ATTR, True)
+        self._committed.add(group)
+        del self._pending[group]
+        return tuple(sorted(expected))
+
+    def finish(self) -> None:
+        missing_groups = sorted(set(self._expected) - self._committed)
+        if not missing_groups:
+            return
+        detail = []
+        for group in missing_groups:
+            present = set(self._pending.get(group, {}))
+            missing = sorted(self._expected[group] - present)
+            detail.append(f"{group}: missing {missing}")
+        raise RuntimeError(
+            "incomplete mixed fused checkpoint transactions; " +
+            "; ".join(detail))
 
 # Standard vLLM fusions, as a fallback when the model class exposes no
 # packed_modules_mapping (only the leaves we route matter here).
@@ -479,6 +656,45 @@ def _compose_renames(*renames):
     return rename
 
 
+def _install_mixed_fused_construction_gate(model_cls: type) -> None:
+    """Authorize composite dispatch only while this exact instance builds.
+
+    The effective loader is checked through ``type(self)`` on every
+    construction. Thus a subclass that simply inherits the wrapped loader and
+    initializer remains authorized, while a subclass that overrides
+    ``load_weights`` without installing Gridbook's wrapper is rejected before
+    any nested carrier can be registered. ContextVar tokens make nested model
+    construction and concurrent target/draft builds restore their prior state.
+    """
+
+    orig_init = model_cls.__init__
+    if (getattr(orig_init, "_gridbook_mixed_fused_init_abi", None)
+            == MIXED_FUSED_LOADER_ABI):
+        return
+
+    @wraps(orig_init)
+    def init(self, *args, **kwargs):  # noqa: ANN001, ANN202
+        effective_loader = getattr(type(self), "load_weights", None)
+        loader_abi = getattr(
+            effective_loader, "_gridbook_mixed_fused_loader_abi", None)
+        if loader_abi != MIXED_FUSED_LOADER_ABI:
+            raise RuntimeError(
+                f"{type(self).__module__}.{type(self).__name__} inherits a "
+                "Gridbook mixed-fused construction gate but its effective "
+                f"load_weights method has ABI {loader_abi!r}, expected "
+                f"{MIXED_FUSED_LOADER_ABI}; install the top-level loader "
+                "wrapper on this overriding class"
+            )
+        token = _ACTIVE_MIXED_FUSED_LOADER_ABI.set(loader_abi)
+        try:
+            return orig_init(self, *args, **kwargs)
+        finally:
+            _ACTIVE_MIXED_FUSED_LOADER_ABI.reset(token)
+
+    init._gridbook_mixed_fused_init_abi = MIXED_FUSED_LOADER_ABI
+    model_cls.__init__ = init
+
+
 def install_toplevel_cb_expert_loader(model_cls: type) -> None:
     """Idempotently wrap ``model_cls.load_weights`` so stacked-CB expert tensors
     load directly into the registered FusedMoE params, and everything else
@@ -493,11 +709,13 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
     # ForConditionalGeneration hierarchy). If the class merely INHERITS an
     # already-wrapped function there is nothing to do.
     if model_cls.__dict__.get("_pq_cb_wrapped", False):
+        _install_mixed_fused_construction_gate(model_cls)
         _INSTALLED_MODULE_PATHS.add(getattr(model_cls, "__module__", "?"))
         return
     orig_load_weights = model_cls.load_weights
     if getattr(orig_load_weights, "_pq_cb_wrapper", False):
         model_cls._pq_cb_wrapped = True
+        _install_mixed_fused_construction_gate(model_cls)
         _INSTALLED_MODULE_PATHS.add(getattr(model_cls, "__module__", "?"))
         return
 
@@ -518,13 +736,14 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
         # apply it FIRST so our anchors match the registered param names.
         rename = _compose_renames(_hf_mapper_rename(self),
                                   _spec_layer_rename(self))
+        mixed_transactions = _MixedFusedTransactions(params_dict)
         loaded: set[str] = set()
         def _passthrough():
-            # A generator (not a materialized list): only one checkpoint tensor
-            # is live at a time, preserving the streaming/mmap semantics the
-            # original loader relies on for a 100 GB+ model. CB expert tensors
-            # are copied inline as a side effect and recorded in ``loaded``;
-            # every other tensor is yielded on to the original loader.
+            # A generator (not a materialized list) preserves the original
+            # streaming/mmap path. Ordinary tensors remain one-at-a-time. A
+            # composite fused module retains only its bounded set of role
+            # planes until the complete module validates and commits; CB expert
+            # tensors are copied inline. Every other tensor is yielded onward.
             for name, w in weights:
                 # Resolve against the served param naming (spec-layer rename or
                 # identity). A ``"__skip__"`` — the spec drafter reusing the main
@@ -532,6 +751,10 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                 res_name = rename(name) if rename is not None else name
                 if res_name == "__skip__":
                     yield name, w
+                    continue
+                mixed_mapped = mixed_transactions.stage(res_name, w)
+                if mixed_mapped is not None:
+                    loaded.update(mixed_mapped)
                     continue
                 source_mapped = load_source_split_expert(
                     res_name, w, params_dict
@@ -588,11 +811,14 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
         # return None (HYV3MTP's drafter loader) — tolerate both; our own
         # `loaded` set still reports the tensors WE placed.
         ret = orig_load_weights(self, _passthrough())
+        mixed_transactions.finish()
         if ret:
             loaded |= set(ret)
         return loaded
 
     load_weights._pq_cb_wrapper = True
+    load_weights._gridbook_mixed_fused_loader_abi = MIXED_FUSED_LOADER_ABI
     model_cls.load_weights = load_weights
     model_cls._pq_cb_wrapped = True
+    _install_mixed_fused_construction_gate(model_cls)
     _INSTALLED_MODULE_PATHS.add(getattr(model_cls, "__module__", "?"))

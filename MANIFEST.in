@@ -14,6 +14,7 @@ graft docs
 recursive-include tests *.py
 include scripts/prepare_lfm_fused_validation.py
 include scripts/validate_fused_nvfp4_ab.py
+include scripts/validate_fused_nvfp4_three_arm.py
 
 # Developer tools that live inside the package directory but are NOT package
 # data: standalone main() binaries (gridbook/csrc/tools/) that nothing loads at

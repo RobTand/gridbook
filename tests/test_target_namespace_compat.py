@@ -424,16 +424,18 @@ def test_no_scheme_when_nothing_matches():
         unfused_fallback=True) == []
 
 
-def test_mixed_fused_formats_still_raise():
-    """The export union-find guarantee is load-bearing; the guard that catches
-    a violation must survive the namespace refactor."""
+def test_mixed_fused_formats_resolve_as_ordered_role_owners():
+    """A merged vLLM module is not a single-format allocation unit."""
     cfg = _gdn_cfg()
     other = dict(_SCHEME)
     other["k"] = 28
     other["type_size"] = 112
     cfg.target_scheme["language_model." + _GDN_BASE + "in_proj_z"] = other
-    with pytest.raises(ValueError, match="mixed CB decode"):
-        cfg._scheme_for_prefix(_GDN_SERVE)
+    assert cfg._scheme_for_prefix(_GDN_SERVE) is None
+    owners = cfg.fused_role_owners(_GDN_SERVE)
+    assert [owner.target for owner in owners] == [
+        "language_model." + _GDN_BASE + role for role in _GDN_ROLES]
+    assert [owner.payload["k"] for owner in owners] == [_SCHEME["k"], 28]
 
 
 # ---------------------------------------------------------------------------
