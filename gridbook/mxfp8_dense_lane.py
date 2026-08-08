@@ -147,6 +147,10 @@ def build_mxfp8_dense_method(wire_id: str):
                 input_dim=1, output_dim=0, weight_loader=weight_loader)
             layer.register_parameter("weight", weight)
             if self._wire == WIRE_FP8_BLOCK128:
+                # MergedColumnParallelLinear needs this block shape to place
+                # each physical role's scale shard at the correct output-row
+                # offset on the homogeneous native fast path.
+                layer.weight_block_size = [DS_BLOCK, DS_BLOCK]
                 scale = BlockQuantScaleParameter(
                     data=torch.empty(
                         (out_size + DS_BLOCK - 1) // DS_BLOCK,
@@ -157,6 +161,7 @@ def build_mxfp8_dense_method(wire_id: str):
                 # name; bytes are copied verbatim by the producer.
                 layer.register_parameter("weight_scale_inv", scale)
             else:
+                layer.weight_block_size = None
                 scale = GroupQuantScaleParameter(
                     data=torch.empty(out_size, in_size // SFVEC,
                                      dtype=torch.float8_e8m0fnu),

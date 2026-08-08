@@ -158,9 +158,28 @@ Gridbook.
   Mixtral `w1`/`w2`/`w3` convention while vLLM's merged leaf is `gate_up_proj`.
   The class publishes **no** `packed_modules_mapping`, so Gridbook's fused
   fallback tables supply the merge.
+- **Independently owned dense fusions.** A fused output is not a single-format
+  or single-metadata allocation unit. When source siblings have different
+  CB/source encodings—or matching schemes but different physical activation
+  scalars—Gridbook constructs private role carriers, runs each role's existing
+  method unchanged, and concatenates results in `stacked_params_mapping` order.
+  The top-level loader validates all packed/scalar planes before committing the
+  composite. Truly compatible same-scheme/same-scalar CB roles and same-wire
+  source roles retain vLLM's existing merged method. Composite dispatch is
+  authorized only while a model class with mixed-fused loader ABI 1 is being
+  constructed; an unwrapped class fails with that loader gap named. The ABI is
+  scoped with a task-local construction gate, so target-model authority cannot
+  leak into an MTP/draft constructor. No persistent common weight or
+  cross-format requantization is created. The 2026-08-08 DSV4 artifact audit
+  covers all 86 dense merges: 13 differ by format and 54 by contracted scalar
+  (67 composite); 19 are physically compatible and retain the merged fast path.
 - **Namespace.** The checkpoint has no `model.` component (keys start at
-  `layers.N.`); the class re-attaches it in its own `hf_to_vllm_mapper`. Both
-  the expert loader and config-side target resolution handle either spelling.
+  `layers.N.`); the class re-attaches it in its own `hf_to_vllm_mapper`.
+  Source-passthrough declarations use the producer/Transformers live spelling
+  (`self_attn`/`mlp`, gate/up/down), while this vLLM class constructs
+  `attn`/`ffn` and loads `w1`/`w3`/`w2`; config resolution bridges those exact
+  structural aliases. Both the expert loader and config-side target resolution
+  handle either outer namespace spelling.
 - **Passthrough, not served: MTP and DSpark.** The artifact preserves
   `mtp.*` (4,705 tensors across the three DSpark stages `mtp.0/1/2`) verbatim.
   `DeepseekV4ForCausalLM.load_weights` builds

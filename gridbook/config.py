@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,7 @@ from .delegated_preflight import (
     require_native_passthrough_backend,
 )
 from .source_passthrough import (
+    SourcePassthroughError,
     SourceFormat as _SourceFormat,
     build_delegated_method as _build_passthrough_method,
     parse_declaration as _parse_passthrough_declaration,
@@ -123,6 +125,52 @@ _ALTERNATE_SHARD_SPELLINGS = {
     "up_proj": (["w3"],),
     "down_proj": (["w2"],),
 }
+
+
+@dataclass(frozen=True)
+class _FusedRoleOwner:
+    """One physical source role of a vLLM ``MergedColumnParallelLinear``.
+
+    ``target`` is kept in the serving/checkpoint shard spelling (rather than
+    the fused module spelling) so the mixed loader can route the corresponding
+    tensor planes without guessing.  ``kind`` is either ``"cb"`` or
+    ``"source"``; ``payload`` is the existing scheme / ``SourceFormat`` object
+    consumed by that lane's ordinary linear method.
+    """
+
+    target: str
+    kind: str
+    payload: Any
+
+
+def _source_passthrough_aliases(name: str) -> tuple[str, ...]:
+    """Additional live-module spellings for a source-passthrough unit.
+
+    DeepSeek-V4 has two live namespaces: Transformers exposes
+    ``self_attn``/``mlp`` and gate/up/down shared-expert leaves, while vLLM
+    0.24 constructs ``attn``/``ffn`` and consumes the checkpoint's
+    ``w1``/``w3``/``w2`` leaves.  The producer declaration is intentionally in
+    the former (the profile's live namespace), so serving must try that exact
+    structural alias after the vLLM spelling.  An alias only wins when it is an
+    explicitly declared unit; it cannot claim an unrelated model by pattern.
+    """
+
+    aliases: list[str] = []
+    if ".attn." in name:
+        aliases.append(name.replace(".attn.", ".self_attn.", 1))
+    if ".ffn." in name:
+        live = name.replace(".ffn.", ".mlp.", 1)
+        replacements = {
+            ".shared_experts.w1": ".shared_experts.gate_proj",
+            ".shared_experts.w3": ".shared_experts.up_proj",
+            ".shared_experts.w2": ".shared_experts.down_proj",
+        }
+        for source, target in replacements.items():
+            if source in live:
+                live = live.replace(source, target, 1)
+                break
+        aliases.append(live)
+    return tuple(dict.fromkeys(aliases))
 
 
 def _initialized_tensor_parallel_world_size() -> int | None:
@@ -352,6 +400,57 @@ class PrismaQuantConfig(QuantizationConfig):
                 f"the live vLLM worker reports TP={world_size}"
             )
         self._tp_world_size = world_size
+
+    def _has_mixed_fused_loader(self) -> bool:
+        """Whether the class constructing this layer has Gridbook's loader ABI.
+
+        A composite method owns nested per-role parameters which ordinary
+        ``AutoWeightsLoader`` lookup cannot name.  The top-level Gridbook
+        wrapper is therefore a hard ownership precondition, not merely an MoE
+        optimization. The installer sets a thread/task-local context only
+        around the exact model instance's ``__init__``, after verifying its
+        effective ``load_weights`` method. This is intentionally not derived
+        from vLLM's global model_config: speculative draft construction keeps
+        the target config current and would otherwise inherit target authority.
+        """
+
+        try:
+            from .moe_toplevel_loader import mixed_fused_loader_active
+            return mixed_fused_loader_active()
+        except Exception:  # noqa: BLE001 — absence means loader unavailable
+            return False
+
+    def _fused_owners_share_single_method(
+        self, owners: list[_FusedRoleOwner]
+    ) -> bool:
+        """Whether the legacy merged method preserves every role contract."""
+
+        kinds = {owner.kind for owner in owners}
+        if kinds == {"source"}:
+            return all(owner.payload.id == owners[0].payload.id
+                       for owner in owners[1:])
+        if kinds != {"cb"}:
+            return False
+        # Codebook refs may differ by role: PrismaQuantCBLinearMethod already
+        # concatenates those tables and row offsets. These fields instead
+        # describe the physical packed representation / activation ABI shared
+        # by the one resident parameter set.
+        keys = ("grid", "mode", "k", "n_sub", "type_size", "group_size",
+                "vec_dim", "scale_coding", "activation_contract")
+        first = owners[0].payload
+        if any(any(owner.payload.get(key) != first.get(key) for key in keys)
+               for owner in owners[1:]):
+            return False
+        if first.get("activation_contract") is None:
+            return True
+        # Matching scheme dictionaries do not prove matching physical static
+        # scalars. The legacy fused method owns one activation contract and
+        # intentionally rejects non-identical role scalars, so decide that
+        # before selecting it rather than failing late in post-load finalize.
+        scales = self.activation_scales_for_targets(
+            [owner.target for owner in owners])
+        return bool(scales) and all(scale == scales[0]
+                                    for scale in scales[1:])
 
     @staticmethod
     def _require_cb_device_capability(scheme: dict, prefix: str) -> None:
@@ -840,6 +939,18 @@ class PrismaQuantConfig(QuantizationConfig):
         for base in _candidate_bases(prefix):
             if base in self.target_scheme:
                 return self.target_scheme[base]
+        owners = self.fused_role_owners(prefix)
+        if owners:
+            # A heterogeneous fused module has no truthful single scheme.
+            # ``get_quant_method`` consumes the complete owner list before it
+            # reaches this helper and installs the composite method.  Returning
+            # None here keeps config/introspection callers from mistaking the
+            # first role's format for the whole merged module.
+            if any(owner.kind != "cb" for owner in owners):
+                return None
+            if not self._fused_owners_share_single_method(owners):
+                return None
+            return owners[0].payload
         schemes = [self.target_scheme[k]
                    for k in self.shard_target_keys(prefix)]
         if not schemes:
@@ -849,10 +960,99 @@ class PrismaQuantConfig(QuantizationConfig):
         sig = {kk: schemes[0].get(kk) for kk in fmt_keys}
         for s in schemes[1:]:
             if {kk: s.get(kk) for kk in fmt_keys} != sig:
-                raise ValueError(
-                    f"fused module {prefix} maps to mixed CB decode "
-                    "formats — export union-find should prevent this")
+                return None
         return schemes[0]
+
+    def fused_role_owners(self, prefix: str) -> list[_FusedRoleOwner]:
+        """Complete ordered owners for a fused Linear, or ``[]``.
+
+        vLLM exposes one module for q/k/v-, gate/up-, and architecture-specific
+        merges, but each source sibling remains a distinct checkpoint tensor.
+        Gridbook formats are per-Linear decisions, so the siblings may use
+        different CB rungs or mix CB with a declared source-native lane.  This
+        resolver preserves the order published by ``packed_modules_mapping``
+        (falling back to Gridbook's audited table) and only returns a spelling
+        when *every* role has an explicit owner. Partial ownership is rejected
+        separately rather than letting the first role claim the whole merge.
+        """
+
+        pmm = getattr(self, "packed_modules_mapping", {}) or {}
+        for base in _candidate_bases(prefix):
+            leaf = base.rsplit(".", 1)[-1]
+            primary = pmm.get(leaf) or _FUSED_FALLBACK.get(leaf)
+            spellings = [primary] if primary is not None else []
+            spellings.extend(_ALTERNATE_SHARD_SPELLINGS.get(leaf, ()))
+            if not spellings:
+                continue
+            stem = base[: -len(leaf)]
+            for shard_leaves in spellings:
+                if not isinstance(shard_leaves, (list, tuple)) \
+                        or len(shard_leaves) < 2:
+                    continue
+                owners: list[_FusedRoleOwner] = []
+                for shard_leaf in shard_leaves:
+                    target = stem + shard_leaf
+                    scheme = self.target_scheme.get(target)
+                    source_format = self._passthrough_format(target)
+                    if scheme is not None and source_format is not None:
+                        raise ValueError(
+                            f"fused role {target!r} is claimed by both CB and "
+                            "source-passthrough dispatch")
+                    if scheme is not None:
+                        owners.append(_FusedRoleOwner(target, "cb", scheme))
+                    elif source_format is not None:
+                        owners.append(_FusedRoleOwner(
+                            target, "source", source_format))
+                    else:
+                        break
+                if len(owners) == len(shard_leaves):
+                    return owners
+        return []
+
+    def incomplete_fused_roles(self, prefix: str) -> list[str]:
+        """Missing role targets when a known fusion is only partly owned.
+
+        A single CB hit used to fall through ``_scheme_for_prefix`` and claim
+        the whole merged module, leaving its unrepresented sibling to be
+        interpreted through the first role's format. Complete alternate
+        spellings (notably DeepSeek w1/w3 after gate/up misses) still win; only
+        after every spelling has been checked do we report the best partial
+        match. An exact fused CB/source declaration is a deliberate whole-
+        module representation and therefore not partial.
+        """
+
+        for base in _candidate_bases(prefix):
+            if (base in self.target_scheme
+                    or self._passthrough_format(base) is not None):
+                return []
+        pmm = getattr(self, "packed_modules_mapping", {}) or {}
+        best_owned = -1
+        best_missing: list[str] = []
+        for base in _candidate_bases(prefix):
+            leaf = base.rsplit(".", 1)[-1]
+            primary = pmm.get(leaf) or _FUSED_FALLBACK.get(leaf)
+            spellings = [primary] if primary is not None else []
+            spellings.extend(_ALTERNATE_SHARD_SPELLINGS.get(leaf, ()))
+            stem = base[: -len(leaf)]
+            for shard_leaves in spellings:
+                if not isinstance(shard_leaves, (list, tuple)) \
+                        or len(shard_leaves) < 2:
+                    continue
+                owned = []
+                missing = []
+                for shard_leaf in shard_leaves:
+                    target = stem + shard_leaf
+                    if (target in self.target_scheme
+                            or self._passthrough_format(target) is not None):
+                        owned.append(target)
+                    else:
+                        missing.append(target)
+                if not missing:
+                    return []
+                if owned and len(owned) > best_owned:
+                    best_owned = len(owned)
+                    best_missing = missing
+        return best_missing
 
     def _stock_group_for_prefix(
         self, layer: torch.nn.Module, prefix: str, *, moe: bool = False
@@ -905,9 +1105,10 @@ class PrismaQuantConfig(QuantizationConfig):
         if not self._passthrough_units:
             return None
         for base in _candidate_bases(prefix):
-            fmt = self._passthrough_units.get(base)
-            if fmt is not None:
-                return fmt
+            for candidate in (base, *_source_passthrough_aliases(base)):
+                fmt = self._passthrough_units.get(candidate)
+                if fmt is not None:
+                    return fmt
         return None
 
     def _delegate_passthrough(
@@ -973,8 +1174,58 @@ class PrismaQuantConfig(QuantizationConfig):
                 self, "packed_modules_mapping", {}) or {}
 
         if isinstance(layer, LinearBase):
-            # 1) CB target (has a "scheme") — ours (precise, fused-aware; ahead
-            #    of the ignore test).
+            # 1) A complete vLLM fusion is resolved role-by-role before the
+            #    single-scheme path. The legacy merged method remains truthful
+            #    when physical representation and activation metadata match.
+            #    Otherwise a loader-ABI-gated composite preserves each role's
+            #    method and concatenates only the outputs.
+            owners = self.fused_role_owners(prefix)
+            if owners:
+                if self._fused_owners_share_single_method(owners):
+                    if owners[0].kind == "cb":
+                        scheme = owners[0].payload
+                        self._require_cb_device_capability(scheme, prefix)
+                        return PrismaQuantCBLinearMethod(self, scheme, prefix)
+                    return self._delegate_passthrough(
+                        layer, prefix, owners[0].payload)
+
+                if not self._has_mixed_fused_loader():
+                    roles = ", ".join(
+                        f"{owner.target} ({owner.kind})" for owner in owners)
+                    raise RuntimeError(
+                        f"fused module {prefix!r} has independently encoded "
+                        f"roles [{roles}], but the selected model class's "
+                        "effective load_weights method does not expose "
+                        "Gridbook mixed-fused loader ABI 1; add and audit the "
+                        "top-level loader wrapper for that exact class before "
+                        "serving this valid mixed-format fusion"
+                    )
+
+                from .mixed_linear import MixedFusedLinearMethod
+                role_methods = []
+                for owner in owners:
+                    if owner.kind == "cb":
+                        self._require_cb_device_capability(
+                            owner.payload, owner.target)
+                        method = PrismaQuantCBLinearMethod(
+                            self, owner.payload, owner.target)
+                    else:
+                        method = self._delegate_passthrough(
+                            layer, owner.target, owner.payload)
+                    role_methods.append((owner.target, method))
+                return MixedFusedLinearMethod(prefix, role_methods)
+
+            missing_roles = self.incomplete_fused_roles(prefix)
+            if missing_roles:
+                raise RuntimeError(
+                    f"fused module {prefix!r} has only partial explicit role "
+                    f"ownership; missing {missing_roles}. Every physical role "
+                    "must declare a supported CB or source-native owner before "
+                    "the merged module can be constructed"
+                )
+
+            # 1b) Ordinary CB target (has a "scheme") — ours (precise and
+            #     ahead of the ignore test).
             scheme = self._scheme_for_prefix(prefix)
             if os.environ.get("PRISMAQUANT_DEBUG_PREFIXES") == "1":
                 import sys
@@ -984,7 +1235,7 @@ class PrismaQuantConfig(QuantizationConfig):
             if scheme is not None:
                 self._require_cb_device_capability(scheme, prefix)
                 return PrismaQuantCBLinearMethod(self, scheme, prefix)
-            # 1b) SOURCE-format passthrough -> vLLM's own native method for
+            # 1c) SOURCE-format passthrough -> vLLM's own native method for
             #     that format, guarded by device attestation + backend
             #     preflight. Ahead of the ignore test for the same reason CB
             #     is: an explicit per-unit declaration outranks a pattern.
@@ -1011,6 +1262,24 @@ class PrismaQuantConfig(QuantizationConfig):
         # method; else delegate to the stock CT MoE path.
         if RoutedExperts is not None and isinstance(layer, RoutedExperts):
             mixed_groups = self._mixed_moe_groups_for_prefix(prefix)
+            scheme = self._moe_scheme_for_prefix(prefix)
+            fmt = self._passthrough_format(prefix)
+            # Unlike dense siblings whose outputs vLLM merely concatenates,
+            # one RoutedExperts object owns a single physical expert stack.
+            # A source-native parent and CB children would make two methods
+            # claim the same resident weights.  Refuse that overlap before
+            # dispatch order can silently pick one representation.
+            if fmt is not None and (mixed_groups is not None
+                                    or scheme is not None):
+                cb_kind = ("per-expert CB groups" if mixed_groups is not None
+                           else "a CB expert group")
+                raise SourcePassthroughError(
+                    f"MoE stack {prefix!r} is declared both as source-native "
+                    f"{fmt.id!r} and as {cb_kind}; NVFP4-CB/FP8-CB and "
+                    "source MXFP4 may coexist in separate modules of one "
+                    "decoder layer, but cannot own the same routed-expert "
+                    "stack"
+                )
             if mixed_groups is not None:
                 if int(layer.moe_config.num_experts) != mixed_groups.num_experts:
                     raise ValueError(
@@ -1023,13 +1292,11 @@ class PrismaQuantConfig(QuantizationConfig):
                 return PrismaQuantMixedMoEMethod(
                     self, layer.moe_config, mixed_groups, prefix
                 )
-            scheme = self._moe_scheme_for_prefix(prefix)
             if scheme is not None:
                 self._require_cb_device_capability(scheme, prefix)
                 from .moe import PrismaQuantCBMoEMethod
                 return PrismaQuantCBMoEMethod(
                     self, layer.moe_config, scheme, prefix)
-            fmt = self._passthrough_format(prefix)
             if fmt is not None:
                 return self._delegate_passthrough(layer, prefix, fmt)
             if self.ct_config is not None:

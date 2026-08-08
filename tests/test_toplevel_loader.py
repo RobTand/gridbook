@@ -70,6 +70,27 @@ def test_load_source_split_expert_is_byte_verbatim_and_group_local():
     assert torch.all(param[1, 4:] == 255)
 
 
+def test_load_source_split_expert_is_anchored_to_exact_layer_parent():
+    params = {}
+    for layer in (7, 19):
+        name = (f"model.layers.{layer}.ffn.experts.routed_experts."
+                "_gridbook_mxfp4_subgroup.w13_weight")
+        param = torch.nn.Parameter(
+            torch.zeros(1, 8, 3, dtype=torch.uint8), requires_grad=False
+        )
+        param._gridbook_source_expert_ids = (5,)
+        params[name] = param
+    source = torch.full((4, 3), -1, dtype=torch.int8)
+    mapped = load_source_split_expert(
+        "model.layers.19.ffn.experts.5.w1.weight", source, params
+    )
+    assert mapped.startswith("model.layers.19.ffn.experts.")
+    assert torch.all(params[mapped][0, :4] == 255)
+    other = next(param for name, param in params.items()
+                 if name.startswith("model.layers.7."))
+    assert torch.count_nonzero(other) == 0
+
+
 def test_map_cb_expert_name_excludes_non_experts():
     # The .experts. anchor (not just the leaf name) excludes shared_mlp / dense
     # MLP / router / attention — those must reach the ORIGINAL loader.

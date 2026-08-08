@@ -230,6 +230,23 @@ def test_cb_units_are_unaffected_by_a_passthrough_declaration(native_marlin):
                       PrismaQuantCBLinearMethod)
 
 
+def test_one_moe_stack_cannot_be_both_source_mxfp4_and_cb(native_marlin):
+    """Separate modules in one decoder layer may differ; one stack may not."""
+
+    overlapping_cb = {
+        "format": "FP8_CB_K44",
+        "targets": [PT_EXPERTS + ".gate_up_proj"],
+        "scheme": dict(_CB_SCHEME),
+    }
+    c = PrismaQuantConfig.from_config(_artifact(
+        {"version": 1, "units": {PT_EXPERTS: MXFP4}},
+        extra_groups={"overlapping_cb": overlapping_cb},
+    ))
+    with pytest.raises(SourcePassthroughError,
+                       match="cannot own the same routed-expert stack"):
+        c.get_quant_method(_experts(), PT_EXPERTS)
+
+
 def test_undeclared_moe_unit_is_not_passed_through(native_marlin):
     c = PrismaQuantConfig.from_config(_artifact(
         {"version": 1, "units": {PT_EXPERTS: MXFP4}}))

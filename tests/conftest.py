@@ -71,6 +71,7 @@ def _fresh_env_latches():
 _VLLM_BOUND_GRIDBOOK_MODULES = {
     "gridbook.config",
     "gridbook.linear",
+    "gridbook.mixed_linear",
     "gridbook.moe",
 }
 
