@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.2 — 2026-08-08
+
 - Source-format metadata groups are now kept out of compressed-tensors config
   parsing. Gridbook already owns these groups through the versioned
   `source_passthrough` declaration; handing their producer-only fields to
