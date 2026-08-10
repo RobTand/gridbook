@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.8.2 — 2026-08-09
+
+DeepSeek-V4-Flash serving enablement. Every entry below is additive or
+fail-closed: an artifact that does not carry the new declarations keeps its
+existing load path and identical bytes. The DSV4-Flash serving images were built
+from `72d6650`; the two commits between it and this tag change prose only
+(this changelog, module and test docstrings, and the CITATION date), so there is
+no functional delta between what was served and what is tagged. The
+served-parity gate named below is still open at tag time.
 
 - DeepSeek-V4's grouped `attn.wo_a` source block-FP8 projection now runs
   through Gridbook's MXFP8 dense lane instead of vLLM's unconditional
@@ -38,8 +46,6 @@
   projections and ordinary source-native body Linears/MoE stacks. The native
   block-FP8 merged path now declares its 128x128 scale block so vLLM places
   homogeneous source role scales at the correct offsets.
-
-## 0.8.2 — 2026-08-08
 
 - The installed-wheel CPU release gate now locates sdist-only validation
   utilities explicitly instead of depending on GitHub's ambient
