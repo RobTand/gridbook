@@ -1,11 +1,12 @@
 """DeepSeek-V4 ``wo_a`` adapter for Gridbook-owned BMM linears.
 
-vLLM 0.24's NVIDIA DSV4 attention does not call ``self.wo_a``.  Its
-specialized output projection reads ``wo_a.weight`` and
-``wo_a.weight_scale_inv`` directly and feeds both to DeepGEMM ``fp8_einsum``.
-That is valid for vLLM's stock block-FP8 method, but not for Gridbook's
-``Mxfp8DenseLinearMethod``: after load, the latter owns a CuTe MXFP8 scale
-plane and deliberately removes the checkpoint-scale parameter.
+The qualified eugr Spark vLLM baseline
+(``0.26.1rc1.dev515+g653ebb52d.d20260808``) does not call ``self.wo_a`` from
+NVIDIA DSV4 attention.  Its specialized output projection reads
+``wo_a.weight`` and its scale parameter directly and feeds both to DeepGEMM
+``fp8_einsum``.  That is valid for vLLM's stock block-FP8 method, but not for
+Gridbook's ``Mxfp8DenseLinearMethod``: after load, the latter owns a CuTe MXFP8
+scale plane and deliberately removes the checkpoint-scale parameter.
 
 This module installs one narrowly guarded class wrapper.  It activates only
 when the ``wo_a`` module carries :data:`DSV4_MXFP8_BMM_ATTR`; every other DSV4

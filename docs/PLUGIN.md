@@ -142,10 +142,13 @@ per-platform vLLM package is a submodule rather than the package itself.
 
 #### DeepSeek-V4 (`deepseek_v4`)
 
-Established against **vLLM 0.24.0** and the released DSV4-Flash config
-(43 layers, all MoE, 256 routed experts + 1 shared, top-6, MLA with
-`q_lora_rank`/`o_lora_rank` 1024 and `o_groups` 8). Single GPU, `tp=1`, and on
-GB10 the class selects a FlashInfer SM120 MLA backend that **requires
+Established against immutable eugr Spark image
+`eugr/spark-vllm@sha256:7bf752a9fa225b528b27c6a1118cb1727cddd7c383096d83281010c4f8b407bc`
+(vLLM `0.26.1rc1.dev515+g653ebb52d.d20260808`, torch `2.11.0+cu130`) and the
+released DSV4-Flash config (43 layers, all MoE, 256 routed experts + 1 shared,
+top-6, MLA with `q_lora_rank`/`o_lora_rank` 1024 and `o_groups` 8). Single GPU,
+`tp=1`, and on GB10 the class selects a FlashInfer SM120 MLA backend that
+**requires
 `--kv-cache-dtype fp8`** — `auto` aborts model construction, independently of
 Gridbook.
 
@@ -202,17 +205,19 @@ Gridbook.
 - **Must not be CB-encoded.** `ffn.gate`, both
   `compressor.fused_wkv_wgate` modules, `indexer.weights_proj`, `lm_head` and
   `embed_tokens` have no quant config at all. `attn.wo_a` does have a quant
-  config, but it remains source block-FP8 rather than CB: vLLM 0.24's grouped
-  output projection bypasses `apply()` and reads `.weight` /
-  `.weight_scale_inv` for DeepGEMM directly. On sm_121 that DeepGEMM scale
-  transform is unsupported, and Gridbook has already converted the source
-  scales into its own MXFP8 CuTe planes. Gridbook therefore installs a narrow,
-  ABI-guarded DSV4 adapter only on marked `wo_a` modules: native inverse RoPE,
-  the Gridbook-owned grouped MXFP8 method, then `wo_b`. Every unmarked stock
-  DSV4 layer continues through vLLM's original `_o_proj` method unchanged.
-  Exact artifact geometry `(G=8, N=1024, K=4096)` is correctness-audited on
-  GB10 (M=1 bit-exact; M=64 relative Frobenius error 4.77e-5); end-to-end
-  served parity remains a release gate.
+  config, but it remains source block-FP8 rather than CB: the qualified eugr
+  vLLM baseline's grouped output projection bypasses `apply()` and reads
+  `.weight` plus its scale parameter for DeepGEMM directly. On sm_121 that
+  DeepGEMM scale transform is unsupported, and Gridbook has already converted
+  the source scales into its own MXFP8 CuTe planes. Gridbook therefore installs
+  a narrow, ABI-guarded DSV4 adapter only on marked `wo_a` modules: native
+  inverse RoPE, the Gridbook-owned grouped MXFP8 method, then `wo_b`. Every
+  unmarked stock DSV4 layer continues through vLLM's original `_o_proj` method
+  unchanged. Exact artifact geometry `(G=8, N=1024, K=4096)` is
+  correctness-audited on GB10: M=1 max-abs 0.03125, relative Frobenius
+  1.2460984e-5; M=64 max-abs 0.25, relative Frobenius 4.4897934e-5. Both meet
+  the numeric contract of relative Frobenius at most 1e-4; neither is a
+  bit-exactness claim. End-to-end served parity remains a release gate.
 - **Fail-closed.** Outside `mtp.*`, vLLM's DSV4 loader looks parameters up
   unguarded, so any tensor the artifact emits with no matching parameter is a
   hard load failure rather than a silent skip. On the Gridbook side the usual
@@ -367,7 +372,7 @@ tooling and model cards — see the README's naming section.)
 | `PRISMAQUANT_CB_FP4_FUSED_MIDM` | off | `1` routes **dense FP4-CB v2 quality prefill at 9 ≤ M ≤ 128** to the fused decode-in-prologue lane (`csrc/cb_fused_fp4v2_gemm.cu`) instead of `expand_fp4_v2_to_weight` + the owned CUTLASS bridge. CONTRACT-PRESERVING: the decoded weights are bit-identical to `cb_expand_v2` and the activation is the same group-16 QDQ output, so only the FP32 GEMM reduction order changes. Compiled only for cc 12.0/12.1; resolved at model load and **fails the load** if unavailable rather than silently serving the bridge. Since 2026-08-02 the load-time gate is per LAYER, not merely "is the extension present": an uncompiled rung, `K % 256 ≠ 0`, `N % 8 ≠ 0`, a non-v2/non-product format, or a fused module whose roles use different interned codebooks all **fail the load** with the reason named — those are properties of the layer, so with the flag on they would otherwise have served the bridge for every request while the load reported success. The **M band is the one call-time fall-through** and is deliberate: `9 ≤ M ≤ 128` is a property of the REQUEST (and `M ≤ 128` is a HARD gate the kernel itself enforces, since decode-in-prologue re-decodes B per M-tile), so out-of-band shapes take today's exact path unchanged — that is what makes this a mid-M lane. Measured 1.06–4.37× the bridge at M ∈ {9,16,32,64,128}, bit-checked against a same-config oracle; served protocol NOT run. **Outranked by `PRISMAQUANT_CB_FUSED_FP4`** and above `PRISMAQUANT_CB_BF16_SM120` in the dense chain; still attested at load when overridden (see [Lane precedence](#lane-precedence--which-flag-wins-when-several-are-set)). Unknown spellings and mid-process changes raise. See [KERNELS](KERNELS.md#fp4-cb-v2-fused-mid-m-opt-in-prismaquant_cb_fp4_fused_midm) and the [benchmark table](BENCHMARKS.md#2026-08-02-fp4-cb-v2-fused-mid-m-lane-microbenchmark-proposal-data). |
 | `PRISMAQUANT_CB_MOE_PERSISTENT_B` | off | `1` routes the **FP4-CB MoE quality prefill** above the `M<=16` GEMV band to the persistent-B decode-in-mainloop kernel (`csrc/cb_moe_persistent_b.cu`, ROADMAP K1.1) instead of expand + grouped bridge. A CTA owns one (expert, N-tile), decodes that weight tile from packed CB bytes into shared memory ONCE, and streams the expert's routed rows through it, so the `[E,N,K]` BF16 transient never exists and unrouted experts cost nothing. Consumes the exact `expert_ends` segments the default path already builds — no padded rows, and no host read anywhere on the path. Compiled only for cc 12.0/12.1 and only for FP4-CB two-tier v2 (`n_sub=2`, `type_size=4k+9`, superblock-aligned dimensions); resolved at model load and **fails the load** if the flag is on where the lane cannot serve. Same activation payload and one bf16 round; the weight decode is bit-identical to `cb_expand_v2` (tested with `torch.equal`), so only the FP32 reduction order changes. It takes precedence over `PRISMAQUANT_CB_BF16_SM120` for these layers, because it replaces the pair of operations that lane is one half of — and is itself outranked by `PRISMAQUANT_CB_FUSED_FP4_MOE`, which changes the activation contract (see [Lane precedence](#lane-precedence--which-flag-wins-when-several-are-set)). When overridden it is still attested at load, and the load-time dispatch line says so rather than announcing a route that will not serve. Unknown spellings and mid-process changes raise. See [KERNELS](KERNELS.md#persistent-b-decode-in-mainloop-opt-in-prismaquant_cb_moe_persistent_b) and the [benchmark table](BENCHMARKS.md#2026-08-02-persistent-b-grouped-moe-decode-in-mainloop-microbenchmark-proposal-data). |
 | `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG` | `0` | Tile override for the lane above; `0` lets the kernel choose from the SHAPES (mean routed rows per expert), which is the production setting. A non-zero value is a 1-based index into `cb_moe_persistent_b_configs()` and is **validated at model load against what this build compiled**, so a stale or mistyped index fails the load instead of aborting the first request that carries routed rows. Measurement knob only. |
-| `GRIDBOOK_MXFP8_DENSE` | off | `1` opts in Gridbook's **MXFP8 dense W8A8 lane** (`csrc/mxfp8_dense_gemm.cu`): E4M3 weights with one UE8M0 scale per 32 K-elements, served on the stock sm120/sm121 block-scaled CollectiveBuilder collective (`kind::mxf8f6f4`), activations quantized dynamically per 32. Serves two source-passthrough wire spellings of the same on-device format — producer MXFP8 (`mxfp8_e4m3_e8m0_g32`) and DeepSeek block-128 FP8 (`fp8_e4m3_ue8m0_block128`), the latter embedded EXACTLY at load by scale replication (128 = 4 × 32; proof and torch reference in `gridbook/mxfp8.py`). Correctness-audited on sm_121 against the fp32 oracle over the seven distinct DSV4-Flash body shapes (worst rel-Frobenius 5.9e-5, M=1 mostly bit-exact); **OPT-IN because the NATIVE-PARITY served bench is pending** — run `python -m gridbook.bench_mxfp8_dense` on an idle GPU for the timing half. With the flag unset, an artifact declaring these passthrough units refuses at model load with this flag named; compiled only for cc 12.0/12.1 and attested at load like every lane (`lane_select.require_lane`). Unknown spellings and mid-process changes raise. |
+| `GRIDBOOK_MXFP8_DENSE` | off | `1` opts in Gridbook's **MXFP8 dense W8A8 lane** (`csrc/mxfp8_dense_gemm.cu`): E4M3 weights with one UE8M0 scale per 32 K-elements, served on the stock sm120/sm121 block-scaled CollectiveBuilder collective (`kind::mxf8f6f4`), activations quantized dynamically per 32. Serves two source-passthrough wire spellings of the same on-device format — producer MXFP8 (`mxfp8_e4m3_e8m0_g32`) and DeepSeek block-128 FP8 (`fp8_e4m3_ue8m0_block128`), the latter embedded EXACTLY at load by scale replication (128 = 4 × 32; proof and torch reference in `gridbook/mxfp8.py`). Correctness-audited on sm_121 against the fp32 oracle over the seven distinct DSV4-Flash body shapes (worst relative Frobenius 5.9e-5 under the at-most-1e-4 numeric contract; no M=1 bit-exactness claim). The grouped `wo_a` gate on the qualified eugr baseline measures relative Frobenius 1.2460984e-5 at M=1 and 4.4897934e-5 at M=64; **OPT-IN because the NATIVE-PARITY served bench is pending** — run `python -m gridbook.bench_mxfp8_dense` on an idle GPU for the timing half. With the flag unset, an artifact declaring these passthrough units refuses at model load with this flag named; compiled only for cc 12.0/12.1 and attested at load like every lane (`lane_select.require_lane`). Unknown spellings and mid-process changes raise. |
 | `PRISMAQUANT_CB_FUSED_MIDM` | `1` | Resolved during model load. `0` skips the CUTLASS mid-M FP8 fused specialization and its JIT build; the exact native expansion/CUTLASS route remains. Only `''` (unset), `0` and `1` are accepted — before 2026-08-02 this was compared `!= "0"`, so `false` and `off` silently ENABLED the lane they read as disabling. Process-stable: changing the value after dispatch is fixed raises rather than taking effect. |
 | `PRISMAQUANT_CB_DECODE_CONTRACT` | `v1` | `v2` selects the scale-epilogue-hoist decode contract. Measured **null** on the served 27B; kept for reproducibility. |
 | `PRISMAQUANT_DEBUG_PREFIXES` | off | `1` prints, per Linear, whether it resolved to a CB scheme or to a config-declared non-CB group — the first tool to reach for when memory use is higher than expected. |

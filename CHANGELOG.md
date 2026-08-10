@@ -4,16 +4,18 @@
 
 - DeepSeek-V4's grouped `attn.wo_a` source block-FP8 projection now runs
   through Gridbook's MXFP8 dense lane instead of vLLM's unconditional
-  DeepGEMM `fp8_einsum` path. vLLM 0.24 reads `.weight_scale_inv` directly
-  for this projection, but Gridbook has already converted that tensor into
-  its audited CuTe scale plane; an ABI-guarded adapter therefore performs
+  DeepGEMM `fp8_einsum` path. The qualified eugr Spark baseline, vLLM
+  `0.26.1rc1.dev515+g653ebb52d.d20260808`, reads the weight and scale parameter
+  directly for this projection, but Gridbook has already converted that scale
+  tensor into its audited CuTe plane; an ABI-guarded adapter therefore performs
   vLLM's native inverse RoPE, groups heads in the original order, calls the
   owning Gridbook BMM method, and then calls `wo_b`. Stock DSV4 layers remain
   byte-for-byte on vLLM's original path. The grouped kernel is independently
   checked on GB10 at the artifact's exact `(G=8, N=1024, K=4096)` geometry:
-  decode M=1 is bit-exact to the dequantized oracle and M=64 has relative
-  Frobenius error 4.77e-5. This is correctness evidence; full served parity is
-  still a release gate.
+  M=1 has max-abs error 0.03125 and relative Frobenius error 1.2460984e-5;
+  M=64 has max-abs error 0.25 and relative Frobenius error 4.4897934e-5. Both
+  satisfy the relative-Frobenius contract of at most 1e-4; this is not a
+  bit-exactness claim. Full served parity is still a release gate.
 
 - Semantically heterogeneous dense fusions now preserve per-Linear ownership.
   When vLLM merges checkpoint siblings such as gate/up or DeepSeek-V4's
@@ -143,9 +145,10 @@
 - **MXFP8 correctness evidence, stated as a kernel claim.** Audited
   kernel-vs-fp32-oracle over the seven distinct DSV4-Flash body shapes from the
   **real checkpoint**: worst rel-Frobenius **5.9e-5** at M in {1, 64, 512} (M=1
-  mostly bit-exact); embedding chain worst 1.2e-4. The numbers live in a
-  verdict-pin test, so they are asserted facts rather than prose. This is a
-  correctness result and **not** a performance result — see the status note.
+  is covered by the same numeric contract, not a bit-exact contract); embedding
+  chain worst 1.2e-4. The numbers live in a verdict-pin test, so they are
+  asserted facts rather than prose. This is a correctness result and **not** a
+  performance result — see the status note.
 
 - **Activation UE8M0 exponent uses the exact frexp form.**
   `ceil(log2(amax/448))` in float32 is wrong about once in 4e5 group maxima:
