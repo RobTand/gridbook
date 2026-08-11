@@ -75,6 +75,34 @@ skip guards into spurious failures.
 | **GPU** — kernel parity, decode/prefill numerics | a CUDA GPU and `nvcc` | ❌ no GPU runners; run locally |
 | **GPU + artifacts** — end-to-end paths | an exported CB artifact on disk; a few still point at paths that only exist on the author's box | ❌ |
 
+### The GPU tier, in one process
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v "$PWD":/workspace -w /workspace \
+  -e TORCHINDUCTOR_COMPILE_THREADS=1 \
+  --entrypoint bash <cuda-image> -lc 'python3 -m pytest tests/ -q --tb=line -rf'
+```
+
+**`TORCHINDUCTOR_COMPILE_THREADS=1` is not optional.** Without it, Inductor's
+subprocess compile pool falls over partway through a whole-suite run and every
+later test that crosses a `torch.compile` boundary fails with
+`InductorError: SubprocException ... set_driver_to_gpu()`. Measured on one
+GB10 box: **290 failed → 5 failed**, same tree, that variable the only change.
+The failures look like real kernel breakage and are not — a file that fails in
+the suite passes alone (`test_cuda_gemv.py`: 60 failures in-suite, 112 passed
+in isolation). If you are staring at a wall of unrelated CUDA failures, check
+this before you debug anything.
+
+Five failures are environmental rather than yours, and are expected in a bare
+CUDA image: `test_generated_report_is_the_only_checkout_dirty_check_exclusion`
+needs `git` on PATH; `test_sass_fused_symbols_...` needs `nvdisasm`; the two
+`test_moe_grouped_invalid_expert_id_traps_fail_closed` cases re-exec a
+subprocess that must see the GPU; and
+`test_dense_contracted_scale_load_is_fail_closed_and_merged_exact` wants an
+artifact path. Install `git` and the CUDA binary utilities to clear the first
+two.
+
 CI additionally gates the packaging surface: that the wheel and sdist really
 contain `gridbook/csrc/*.cu`, that a **non-editable** install resolves them from
 `site-packages`, that `import gridbook` needs no torch/vLLM and imports no
