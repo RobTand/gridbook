@@ -66,6 +66,30 @@ except Exception:  # pragma: no cover - older vLLM
     RoutedExperts = None
 
 _MOE_LEAVES = ("gate_up_proj", "down_proj", "gate_proj", "up_proj")
+# Which logical codebook roles a physical target leaf speaks for. A fused
+# ``gate_up_proj`` target claims BOTH halves of the w13 stack with one book;
+# the unfused spellings claim one role each. ``down_proj`` is always a
+# one-role stack — which is why w2 never splits, it only picks a book.
+_MOE_LEAF_ROLES = {
+    "gate_up_proj": ("gate", "up"),
+    "gate_proj": ("gate",),
+    "up_proj": ("up",),
+    "down_proj": ("down",),
+}
+_MOE_ROLES = ("gate", "up", "down")
+
+
+def _codebook_ref_key(scheme: dict) -> tuple[str, ...]:
+    """A scheme's codebook identity as a hashable tuple.
+
+    ``codebook_ref`` is a str for a single-sub book and a list of sub-book
+    names for product mode; normalising both to a tuple lets refs be compared
+    and used as dict keys without caring which spelling the exporter used.
+    """
+    ref = scheme.get("codebook_ref")
+    if ref is None:
+        return ()
+    return tuple(ref) if isinstance(ref, (list, tuple)) else (ref,)
 # vLLM resolves a RoutedExperts stack's declared group through the *unfused*
 # per-expert projection names (``CompressedTensorsMoEMethod.get_moe_method``
 # builds ``<prefix>.0.{gate,up,down}_proj``). Gridbook's D0.2 preflight has to
@@ -1361,6 +1385,7 @@ class PrismaQuantConfig(QuantizationConfig):
         matches = self._moe_target_keys(prefix)
         if not matches:
             return None
+        self._reject_unsupported_moe_target_shapes(prefix)
         schemes = [self.target_scheme[name] for name in matches]
         fmt_keys = ("grid", "mode", "k", "n_sub", "type_size",
                     "activation_contract")
@@ -1371,7 +1396,93 @@ class PrismaQuantConfig(QuantizationConfig):
                     f"MoE stack {prefix} maps to mixed CB decode/activation "
                     "contracts — export union-find should prevent this"
                 )
-        return schemes[0]
+        return self._resolve_moe_codebook_roles(prefix, matches, schemes)
+
+    def _resolve_moe_codebook_roles(
+        self, prefix: str, matches: list[str], schemes: list[dict],
+    ) -> dict:
+        """Bind a codebook to each logical role of one routed expert stack.
+
+        Through v0.8.2 this returned ``schemes[0]`` outright, and the format
+        signature checked just above deliberately does NOT include
+        ``codebook_ref``. That combination **failed open**: an artifact naming
+        a different book per projection loaded without complaint and decoded
+        every stack with whichever scheme sorted first — ``down_proj``, since
+        ``_moe_target_keys`` returns sorted names. Silent numerical
+        corruption, not a refusal. No exporter we ship could produce such an
+        artifact (PrismaQuant self-gates its per-role emission on a ``0.8.3``
+        runtime), which is why it was never observed; the guard is here
+        because "no producer does this today" is not a loading contract.
+
+        Uniform artifacts — every routed target naming one book, which is
+        every artifact shipped to date — resolve to ``schemes[0]`` exactly as
+        before, so the whole per-role path stays dark and the decode is
+        byte-identical. Only a genuinely per-role artifact takes the split.
+        """
+        refs = {name: _codebook_ref_key(self.target_scheme[name])
+                for name in matches}
+        if len(set(refs.values())) == 1:
+            return schemes[0]                       # v0.8.2 path, untouched
+
+        by_role: dict[str, tuple[str, ...]] = {}
+        claimed_by: dict[str, str] = {}
+        for name in matches:
+            for role in _MOE_LEAF_ROLES[name.rsplit(".", 1)[-1]]:
+                if by_role.setdefault(role, refs[name]) != refs[name]:
+                    raise ValueError(
+                        f"MoE stack {prefix}: targets {claimed_by[role]!r} and "
+                        f"{name!r} both claim the {role!r} codebook role with "
+                        "different codebook_ref — a role has exactly one book"
+                    )
+                claimed_by.setdefault(role, name)
+        missing = [role for role in _MOE_ROLES if not by_role.get(role)]
+        if missing:
+            raise ValueError(
+                f"MoE stack {prefix} declares per-role codebooks but names no "
+                f"book for {missing} (targets: {matches}). Refusing rather "
+                "than decoding those rows with another role's codebook"
+            )
+        resolved = {key: value for key, value in schemes[0].items()
+                    if key != "codebook_ref"}
+        # `codebook_ref` is dropped, not carried through. It would otherwise
+        # hold whichever role sorted first, and any consumer still reading the
+        # singular key would build that one book and decode all three roles
+        # with it — the exact fail-open this resolver exists to close. Absent,
+        # such a consumer raises instead.
+        resolved["codebook_ref_by_role"] = {role: list(by_role[role])
+                                            for role in _MOE_ROLES}
+        return resolved
+
+    def _reject_unsupported_moe_target_shapes(self, prefix: str) -> None:
+        """Refuse routed CB targets this runtime cannot honour.
+
+        Per-role books and per-expert format groups are independent axes the
+        exporter's naming can compose (a role qname keeps its optional
+        ``.format_group_N`` discriminator), which would need the per-role
+        split applied inside each of ``moe_mixed``'s per-group lanes. No
+        allocation produces it — all three ``ALLOC-2p53`` variants assign one
+        rung per routed layer across all 43 layers, since union-find promotes
+        a routed stack to a single format — so 0.8.3 does not implement the
+        composition. It must still refuse it by name: ``_moe_target_keys``
+        matches on the final component, so a ``…gate_proj.format_group_0``
+        target would otherwise be skipped in silence and the stack resolved
+        from whatever else matched.
+        """
+        bases = _candidate_bases(prefix)
+        for name in self.target_scheme:
+            parts = name.split(".")
+            if len(parts) < 2 or not parts[-1].startswith("format_group_"):
+                continue
+            if parts[-2] not in _MOE_LEAF_ROLES:
+                continue
+            if any(v.startswith(b.rstrip(".") + ".")
+                   for v in _candidate_bases(name) for b in bases):
+                raise ValueError(
+                    f"MoE stack {prefix}: target {name!r} composes a logical "
+                    "codebook role with a per-expert format group. This "
+                    "runtime implements per-role books and per-expert format "
+                    "groups separately, not together"
+                )
 
     def _moe_target_keys(self, prefix: str) -> list[str]:
         """Resolved CB projection target keys below one RoutedExperts prefix."""

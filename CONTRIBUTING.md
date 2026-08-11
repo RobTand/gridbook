@@ -96,12 +96,16 @@ this before you debug anything.
 
 Five failures are environmental rather than yours, and are expected in a bare
 CUDA image: `test_generated_report_is_the_only_checkout_dirty_check_exclusion`
-needs `git` on PATH; `test_sass_fused_symbols_...` needs `nvdisasm`; the two
+needs `git` on PATH; `test_sass_fused_symbols_...` needs `nvdisasm`; and the two
 `test_moe_grouped_invalid_expert_id_traps_fail_closed` cases re-exec a
-subprocess that must see the GPU; and
-`test_dense_contracted_scale_load_is_fail_closed_and_merged_exact` wants an
-artifact path. Install `git` and the CUDA binary utilities to clear the first
-two.
+subprocess that must see the GPU. Install `git` and the CUDA binary utilities to
+clear the first two.
+
+The fifth, `test_dense_contracted_scale_load_is_fail_closed_and_merged_exact`,
+is **container-specific and its cause is not yet diagnosed** — it passes in
+0.6 s outside the image with no GPU at all, so it is not a kernel or numerics
+failure. If you can pin down what the bare CUDA image is missing, that is a
+welcome issue.
 
 CI additionally gates the packaging surface: that the wheel and sdist really
 contain `gridbook/csrc/*.cu`, that a **non-editable** install resolves them from

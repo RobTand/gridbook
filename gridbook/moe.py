@@ -82,6 +82,11 @@ from .ops import fp4_act_qdq_or_codec
 # activation POLICY env of its own (unlike the fp4 lane's mode string), so its
 # policy is the lane's name; the CONTRACT is what actually runs — the registered
 # native per-token dynamic FP8 quantizer on both stages.
+# Logical codebook roles of a routed expert stack. w13 carries `gate` then
+# `up`; w2 carries `down` alone. Order matters: it is the column order
+# `native_moe_activation` assumes in the fused gate_up buffer.
+_CB_ROLES = ("gate", "up", "down")
+
 _FP8_GROUPED_POLICY = "fp8_cb_grouped"
 _FP8_GROUPED_CONTRACT = "fp8_per_token_dynamic"
 
@@ -497,11 +502,29 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                     f"_cb_fp4_input_global_scale_{which}_f32",
                     float(expected[0]),
                 )
-        ref = self.scheme["codebook_ref"]
-        names = ref if isinstance(ref, list) else [ref]
-        subs = [codebooks[n].to(dev) for n in names]
-        layer._cb_flat = codec.build_flat_codebook(
-            subs, self.prefix, "fp4" if self.is_fp4 else "fp8")
+        grid = "fp4" if self.is_fp4 else "fp8"
+
+        def _flat(ref) -> torch.Tensor:
+            names = ref if isinstance(ref, (list, tuple)) else [ref]
+            return codec.build_flat_codebook(
+                [codebooks[n].to(dev) for n in names], self.prefix, grid)
+
+        # Per-role books (0.8.3). The resolver hands these back ONLY when the
+        # artifact names different codebooks for gate/up/down; a uniform
+        # artifact returns the scheme untouched and takes the branch below,
+        # bit-for-bit as in 0.8.2. `_cb_flat` is deliberately left unset in
+        # per-role mode: every lane that has not been taught the split reads
+        # that attribute, so its absence turns "silently decoded with the
+        # wrong role's book" into a loud failure at the call site. The lanes
+        # that HAVE been taught it are gated in `_require_per_role_lane`.
+        ref_by_role = self.scheme.get("codebook_ref_by_role")
+        layer._cb_role_split = bool(ref_by_role)
+        if ref_by_role:
+            self._require_per_role_supported()
+            layer._cb_flat_by_role = {
+                role: _flat(ref_by_role[role]) for role in _CB_ROLES}
+        else:
+            layer._cb_flat = _flat(self.scheme["codebook_ref"])
         layer._cb_row0 = torch.zeros(1, dtype=torch.int32, device=dev)
         if self.is_v2:
             layer._cb_compose = codec.build_compose_table(
@@ -511,7 +534,14 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # Materialize and validate every representation while the model is
             # loading.  A disabled grouped-decode gate must not defer this to
             # the first stock-prefill forward (which may be under capture).
-            self._stock_cb_flat_fp8(layer)
+            # Per-role builds all three books here for the same reason — and
+            # `_assert_cast_lossless` inside runs per role, so a learned table
+            # that misses the serving grid is caught at load, per book.
+            if layer._cb_role_split:
+                for role in _CB_ROLES:
+                    self._role_flat_fp8(layer, role)
+            else:
+                self._stock_cb_flat_fp8(layer)
         # Per-layer uniformity: one format for all experts (union-find at
         # export). The stacked buffer is single-format by construction; assert
         # the byte width matches the scheme so a mis-exported stack fails loudly.
@@ -521,6 +551,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             f"{self.prefix}: w13 byte width {layer.w13_cb_qweight.shape[2]} != "
             f"{exp_w13} (type_size/uniformity mismatch)")
         assert layer.w2_cb_qweight.shape[2] == exp_w2
+        if layer._cb_role_split:
+            self._split_w13_by_role(layer)
         # Which grouped GEMV each stack runs. Decided HERE, at load, on python
         # ints only — so `_apply_grouped_decode` gains no host work, the
         # call-site branch is a trace-time constant (cudagraph-safe by
@@ -1066,11 +1098,31 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         """Expand one contiguous expert slice to exact BF16 natively."""
         from . import ops as pq_ops
 
-        packed = getattr(layer, f"{which}_cb_qweight")[c0:c1].contiguous()
         n_e = c1 - c0
-        out_f = int(packed.shape[1])
         in_f = (int(layer._cb_hidden) if which == "w13"
                 else int(layer._cb_inter))
+        if which == "w13" and getattr(layer, "_cb_role_split", False):
+            # The fused stack is gone (released at load), and its rows
+            # interleave the roles per expert — gate rows then up rows, once
+            # per expert — so a single expand with one LUT cannot be sliced
+            # into two. Expand each role's own contiguous sub-stack and write
+            # it into its half, reproducing the fused row order exactly.
+            inter = int(layer._cb_inter)
+            weight = torch.empty(
+                (n_e, 2 * inter, in_f), dtype=torch.bfloat16,
+                device=layer._cb_w13_gate_qweight.device)
+            for index, role in enumerate(("gate", "up")):
+                half = self._expand_fp8_rows(
+                    layer,
+                    getattr(layer, f"_cb_w13_{role}_qweight")[c0:c1],
+                    getattr(layer, f"_cb_w13_{role}_scale")[c0:c1],
+                    self._role_flat_fp8(layer, role), in_f)
+                weight[:, index * inter:(index + 1) * inter, :] = half.view(
+                    n_e, inter, in_f)
+            return weight
+
+        packed = getattr(layer, f"{which}_cb_qweight")[c0:c1].contiguous()
+        out_f = int(packed.shape[1])
         rows = n_e * out_f
         raw = packed.reshape(rows, -1)
         if self.is_fp4:
@@ -1090,13 +1142,36 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # per-row read slack; the stacked checkpoint plane itself is
             # tightly packed and does not provide it for the final row.
             raw = codec.pad_qweight(raw)
+            # w2 is a one-role stack: same expand, just the `down` book.
+            lut = (self._role_flat_fp8(layer, "down")
+                   if getattr(layer, "_cb_role_split", False)
+                   else self._stock_cb_flat_fp8(layer))
             value = pq_ops.cb_expand_fp8(
-                raw, self._stock_cb_flat_fp8(layer), row0,
+                raw, lut, row0,
                 rows, in_f, self.k, self.n_sub, self.type_size)
             scale = getattr(layer, f"{which}_weight_scale")[c0:c1] \
                 .reshape(rows).to(torch.float32)
             weight = (value.float() * scale[:, None]).to(torch.bfloat16)
         return weight.view(n_e, out_f, in_f)
+
+    def _expand_fp8_rows(self, layer, packed, scale, lut,
+                         in_f: int) -> torch.Tensor:
+        """Exact FP8-CB -> BF16 expand of one role's `[n_e, out_f, rb]` stack.
+
+        The scaling is the same fp32 multiply the fused path does; factored
+        out only so the per-role w13 expand can run it twice with two books.
+        """
+        from . import ops as pq_ops
+
+        packed = packed.contiguous()
+        rows = packed.shape[0] * packed.shape[1]
+        raw = codec.pad_qweight(packed.reshape(rows, -1))
+        row0 = cb_cached_row_offsets(layer, rows, packed.device)
+        value = pq_ops.cb_expand_fp8(raw, lut, row0, rows, in_f,
+                                     self.k, self.n_sub, self.type_size)
+        return (value.float()
+                * scale.reshape(rows).to(torch.float32)[:, None]
+                ).to(torch.bfloat16)
 
     def _apply_prefill_native_bf16(self, layer, x, topk_weights,
                                    topk_ids, act):
@@ -1525,9 +1600,21 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # launch hands the WHOLE stack to the kernel, which TORCH_CHECKs
             # the expert stride; checking it here keeps an exotic layout a
             # silent fall-through rather than a crash inside the extension.
-            for which, in_f in (("w13", layer._cb_hidden),
-                                ("w2", layer._cb_inter)):
-                qw = getattr(layer, f"{which}_cb_qweight")
+            # Per-role (0.8.3): w13's fused stack is RELEASED at load and the
+            # lane is handed the gate/up halves instead, so check THOSE. The
+            # released placeholder is 1-D and would fail this gate, caching
+            # `ok=False` and routing every per-role layer onto the BF16 bridge
+            # at 663 ms/layer — a 22x prefill cliff with no error and no log.
+            # The halves are `[E, inter, row_bytes]` with w13's input features
+            # (hidden) unchanged: same predicate, different tensor.
+            if getattr(layer, "_cb_role_split", False):
+                stacks = [(f"w13.{role}",
+                           getattr(layer, f"_cb_w13_{role}_qweight"),
+                           layer._cb_hidden) for role in ("gate", "up")]
+            else:
+                stacks = [("w13", layer.w13_cb_qweight, layer._cb_hidden)]
+            stacks.append(("w2", layer.w2_cb_qweight, layer._cb_inter))
+            for which, qw, in_f in stacks:
                 rb = _row_bytes(in_f, self.type_size)
                 fits = (qw.dim() == 3 and qw.stride(2) == 1
                         and qw.stride(1) == rb and qw.shape[2] == rb
@@ -1578,7 +1665,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         layer._cb_gf2_tiles = sizes
         return sizes
 
-    def _grouped_call(self, fext, args, tile_m: int):
+    def _grouped_call(self, fext, args, tile_m: int, out=None,
+                      n_offset: int = 0):
         """``cb_fused_moe_grouped`` with an explicit TileM.
 
         The ``TypeError`` arm tolerates a binding that predates the ``tile_m``
@@ -1589,6 +1677,18 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         returns ``None`` to the exact native bridge instead of aborting the
         request. Such a build has exactly ONE tile, so dropping the argument is
         correct when it equals the default and a fall-through otherwise."""
+        if out is not None:
+            # Destination-slice form (per-role gate/up). A binding without the
+            # `out` parameter cannot serve a per-role stack at all, so this
+            # returns None to the exact bf16 bridge rather than silently
+            # producing a buffer with one half unwritten.
+            if not getattr(self, "_cb_grouped_out_arg", True):
+                return None
+            try:
+                return fext.cb_fused_moe_grouped(*args, tile_m, out, n_offset)
+            except TypeError:
+                self._cb_grouped_out_arg = False
+                return None
         if getattr(self, "_cb_grouped_tile_arg", True):
             try:
                 return fext.cb_fused_moe_grouped(*args, tile_m)
@@ -1700,7 +1800,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         inter = layer._cb_inter
         N1 = 2 * inter                               # w13 out (gate_up)
         d = N1 // 2
-        lut = self._stock_cb_flat_fp8(layer)
+        # Per-role: w2 is a one-role stack, so `lut` here is the `down` book
+        # and stage 1 picks gate/up books at its own call sites.
+        lut = (self._role_flat_fp8(layer, "down")
+               if getattr(layer, "_cb_role_split", False)
+               else self._stock_cb_flat_fp8(layer))
         kb = self.k
         # Never hardcode a tile: the kernel owns which TileM it compiled, and
         # (K0.4) the SELECTOR picks among them from host-known shapes alone.
@@ -1761,15 +1865,40 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         a_pad = a1x.index_select(0, dest).contiguous()
         as_pad = a1sx.index_select(0, dest).contiguous()
 
-        w13s = layer.w13_weight_scale.reshape(E, N1).to(
-            torch.float32).contiguous()
-        w2s = layer.w2_weight_scale.reshape(E, Kh).to(
-            torch.float32).contiguous()
+        per_role = getattr(layer, "_cb_role_split", False)
+        if per_role:
+            # Scales were materialised fp32-contiguous at load, so the split
+            # path skips the per-forward rebuild the fused path does below.
+            w2s = layer._cb_w2_scale
+        else:
+            w13s = layer.w13_weight_scale.reshape(E, N1).to(
+                torch.float32).contiguous()
+            w2s = layer.w2_weight_scale.reshape(E, Kh).to(
+                torch.float32).contiguous()
 
         # stage 1: gate_up = a_pad @ W13[expert_of_tile]^T
-        gate_up = self._grouped_call(
-            fext, (a_pad, layer.w13_cb_qweight.data, lut, as_pad, w13s,
-                   expert_ids, N1, Kh, kb), tile_m)                # [Mp, N1]
+        if per_role:
+            # Two GEMMs, each writing its own column half of ONE buffer, so
+            # the activation below still reads the fused [Mp, N1] layout with
+            # no concat. Splitting N preserves the tile count exactly
+            # (ceil(Mp/TM) * ceil(N/TN)), so this costs one extra launch and
+            # no extra A traffic.
+            gate_up = torch.empty((a_pad.shape[0], N1), dtype=torch.bfloat16,
+                                  device=dev)
+            for index, role in enumerate(("gate", "up")):
+                written = self._grouped_call(
+                    fext, (a_pad, getattr(layer, f"_cb_w13_{role}_qweight"),
+                           self._role_flat_fp8(layer, role), as_pad,
+                           getattr(layer, f"_cb_w13_{role}_scale"),
+                           expert_ids, inter, Kh, kb),
+                    tile_m, out=gate_up, n_offset=index * inter)
+                if written is None:
+                    gate_up = None
+                    break
+        else:
+            gate_up = self._grouped_call(
+                fext, (a_pad, layer.w13_cb_qweight.data, lut, as_pad, w13s,
+                       expert_ids, N1, Kh, kb), tile_m)            # [Mp, N1]
         del a_pad, as_pad
         if gate_up is None:                          # binding has no TileM knob
             emit_route(layer, symbol="", state="fallback",
@@ -1824,6 +1953,111 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             layer._cb_flat_fp8 = cb
         return cb
 
+    # -- per-role codebooks (0.8.3) ------------------------------------------
+    #
+    # A learned codebook is fit per (layer, projection), so gate, up and down
+    # want three different books at the SAME rung. Union-find already forces
+    # one format per routed stack — verified across all three ALLOC-2p53
+    # variants, 0 of 43 layers disagree — so the roles share `k`, `n_sub`,
+    # `type_size` and therefore row bytes. Only the LUT differs, which is why
+    # the split is a load-time slice plus a choice of `lut` argument, and why
+    # no kernel needs to learn anything about roles.
+    #
+    # w2 is a one-role stack: it never splits, it just picks the down book.
+    # Only w13 physically splits, at exactly `inter` output rows.
+
+    def _require_per_role_supported(self) -> None:
+        """Refuse a per-role artifact this build cannot decode correctly.
+
+        Scoped to FP8-CB v1 for 0.8.3: that is what the routed learned bank
+        prices (`FP8_CB` K28–K38) and therefore the only per-role artifact any
+        producer can emit today. The fp4 lanes carry a second per-layer table
+        (`_cb_compose`) and a v2 in-kernel scale section; splitting those is
+        the same idea but a different set of call sites, and shipping it
+        untested would be worse than refusing it.
+        """
+        if self.is_fp4 or self.is_v2:
+            raise ValueError(
+                f"{self.prefix}: per-role routed codebooks are implemented "
+                "for FP8-CB v1 only; this stack is "
+                f"{'fp4' if self.is_fp4 else 'fp8'}"
+                f"{'/v2' if self.is_v2 else '/v1'}"
+            )
+        if self.n_sub != 4:
+            raise ValueError(
+                f"{self.prefix}: per-role routed codebooks expect the fp8-CB "
+                f"v1 product layout (n_sub=4), got n_sub={self.n_sub}"
+            )
+
+    def _require_per_role_lane(self, layer, lane: str) -> None:
+        """Fail closed in a lane that has not been taught the split.
+
+        Reached only by a per-role artifact — `_cb_role_split` is False for
+        every artifact shipped to date, so this costs uniform serving one
+        attribute read. The alternative is what 0.8.2 did implicitly: decode
+        every stack with one role's book and return plausible garbage.
+        """
+        if getattr(layer, "_cb_role_split", False):
+            raise ValueError(
+                f"{self.prefix}: lane {lane!r} has no per-role codebook "
+                "support, and this stack declares one book per role. Refusing "
+                "rather than decoding with another role's codebook"
+            )
+
+    def _role_flat_fp8(self, layer, role: str) -> torch.Tensor:
+        """The E4M3 LUT for one logical role, built once at load."""
+        cache = getattr(layer, "_cb_flat_fp8_by_role", None)
+        if cache is None:
+            cache = {
+                name: codec.flat_codebook_fp8(flat, f"{self.prefix}.{name}")
+                for name, flat in layer._cb_flat_by_role.items()
+            }
+            layer._cb_flat_fp8_by_role = cache
+        return cache[role]
+
+    def _split_w13_by_role(self, layer) -> None:
+        """Materialise gate/up sub-stacks of w13 as contiguous buffers.
+
+        The kernels take `packed` as `[E, N, row_bytes]` and validate
+        `size(1) == N`, and a column slice of the fused stack is not
+        contiguous (its expert stride stays `2*inter*row_bytes`). So the split
+        is a real copy — of the same total bytes, with the fused buffer
+        released straight after, giving a transient peak of one extra w13
+        stack for one layer (~0.6 GB at DSv4 shapes, since
+        `process_weights_after_loading` runs per layer).
+
+        Scales are materialised fp32-contiguous here too. That is the shape
+        the grouped lane wants, so the per-role path never pays the
+        per-forward `.to(torch.float32).contiguous()` rebuild the fused path
+        does.
+        """
+        inter = layer._cb_inter
+        w13 = layer.w13_cb_qweight.data
+        assert w13.shape[1] == 2 * inter, (
+            f"{self.prefix}: w13 stack has {w13.shape[1]} rows, expected "
+            f"2*inter={2 * inter}")
+        scale = layer.w13_weight_scale.data.reshape(w13.shape[0], 2 * inter)
+        # Contract: gate occupies rows [0, inter), up occupies [inter, 2*inter)
+        # — the same halves `native_moe_activation` assumes when it reads the
+        # fused buffer as silu(first half) * (second half).
+        for index, role in enumerate(("gate", "up")):
+            lo = index * inter
+            setattr(layer, f"_cb_w13_{role}_qweight",
+                    w13[:, lo:lo + inter, :].contiguous())
+            setattr(layer, f"_cb_w13_{role}_scale",
+                    scale[:, lo:lo + inter].to(torch.float32).contiguous())
+        # Release the fused stack. Keeping it alongside the halves would double
+        # w13 residency for the whole serve — ~24 GB across DSv4's 43 layers,
+        # on a box whose entire budget is 128 GB — and nothing reads it once
+        # the split exists: every lane that touches `w13_cb_qweight` is either
+        # per-role-aware (and reads the halves) or refuses via
+        # `_require_per_role_lane`. The Parameter object survives so anything
+        # that merely inspects the attribute still finds a tensor.
+        layer._cb_w13_fused_shape = tuple(w13.shape)
+        layer.w13_cb_qweight.data = w13.new_empty((0,))
+        layer._cb_w2_scale = layer.w2_weight_scale.data.reshape(
+            w13.shape[0], layer._cb_hidden).to(torch.float32).contiguous()
+
     # -- grouped CUDA decode path -------------------------------------------
     def _cuda_moe_ok(self, layer) -> bool:
         ok = getattr(layer, "_cb_moe_cuda_ok", None)
@@ -1850,8 +2084,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             if ok and not self.is_fp4:
                 # Normally materialized during process_weights_after_loading;
                 # retain this defensive check for callers that construct a
-                # layer through an alternate/test load path.
-                self._stock_cb_flat_fp8(layer)
+                # layer through an alternate/test load path. A per-role layer
+                # has no `_cb_flat` at all, so the stock materializer would
+                # AttributeError inside the DECODE GATE, before the per-role
+                # decode branch below ever runs; build the three role books
+                # instead, which is what that branch reads.
+                if getattr(layer, "_cb_role_split", False):
+                    for role in _CB_ROLES:
+                        self._role_flat_fp8(layer, role)
+                else:
+                    self._stock_cb_flat_fp8(layer)
             layer._cb_moe_cuda_ok = ok
             if ok and not PrismaQuantCBMoEMethod._DECODE_ENGAGED_LOGGED:
                 # Positive counterpart to the warning above: one line per
@@ -1912,6 +2154,25 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                     xq, layer.w13_cb_qweight.data, layer._cb_flat,
                     layer._cb_compose, pair_expert, pair_xrow,
                     self.k, self.n_sub, self.type_size)  # (P, 2*inter)
+        elif getattr(layer, "_cb_role_split", False):     # fp8-CB v1, per-role
+            # One GEMV per role, then a concat into the fused layout
+            # `native_moe_activation` reads. The concat is free at decode
+            # scale: P is (tokens <= 16) * topk rows, so both halves together
+            # are a few hundred KB, versus the ~0.6 GB/layer the same concat
+            # would cost on the prefill path (which is why THAT lane writes
+            # column slices in-place instead).
+            xq = pq_ops.fp8_act_qdq(x.to(torch.bfloat16))
+            halves = [
+                pq_ops.cb_moe_gemv_fp8(
+                    xq, getattr(layer, f"_cb_w13_{role}_qweight"),
+                    self._role_flat_fp8(layer, role),
+                    getattr(layer, f"_cb_w13_{role}_scale"),
+                    pair_expert, pair_xrow,
+                    self.k, self.n_sub, self.type_size)  # (P, inter) each
+                for role in ("gate", "up")
+            ]
+            gate_up = torch.cat(halves, dim=-1)           # (P, 2*inter)
+            del halves
         else:                                            # fp8-CB v1
             xq = pq_ops.fp8_act_qdq(x.to(torch.bfloat16))
             gate_up = pq_ops.cb_moe_gemv_fp8(
@@ -1940,8 +2201,12 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                     self.k, self.n_sub, self.type_size)  # (P, hidden)
         else:
             aq = pq_ops.fp8_act_qdq(a)
+            # w2 is a one-role stack: no split, just the `down` book.
             y_down = pq_ops.cb_moe_gemv_fp8(
-                aq, layer.w2_cb_qweight.data, layer._cb_flat_fp8,
+                aq, layer.w2_cb_qweight.data,
+                self._role_flat_fp8(layer, "down")
+                if getattr(layer, "_cb_role_split", False)
+                else layer._cb_flat_fp8,
                 layer.w2_weight_scale.data, pair_expert, pair_self,
                 self.k, self.n_sub, self.type_size)      # (P, hidden)
         return pq_ops.cb_moe_combine(y_down, pair_w, tok_start, T)

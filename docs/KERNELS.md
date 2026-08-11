@@ -196,6 +196,32 @@ until a routed sweep pins it**; the mainloop is warp-specialized, so under
 perfect decode/MMA overlap the crossover moves and the additive model is the
 less conservative of the two in exactly the band `x` lands in.
 
+### Grouped destination slice (`out` / `n_offset`, 0.8.3)
+
+`cb_fused_moe_grouped` optionally writes its `N` output columns into a column
+slice of a wider caller-owned `[Mp, ldd]` bf16 buffer instead of allocating a
+fresh `[Mp, N]` one. Only the D leading dimension changes — the problem shape
+stays `{Mp, N, K}` and the epilogue's `b_scales` node keeps indexing its own
+`[E, N]` extent — so a bit difference between the two forms is a real defect,
+and `test_destination_slice_is_bit_identical_to_a_fresh_buffer` asserts against
+exactly that.
+
+**Why it exists.** A routed stack whose `gate` and `up` halves carry different
+codebooks is two GEMMs, but `native_moe_activation` consumes one fused
+`[Mp, 2·inter]` buffer. Concatenating afterwards would move ~0.6 GB per layer
+per forward at DeepSeek-V4-Flash shapes (~24 GB across 43 layers). Splitting
+`N` is free by construction: the tile count `ceil(Mp/TM) × ceil(N/TN)` is
+preserved exactly when `N` is split at a `TN` multiple, so two launches at
+`N=inter` issue the same total tiles as one at `N=2·inter`, plus one launch.
+
+The tile selector runs **once, and both role launches share its `tile_m`**. It
+has to: `tile_m` fixes the shape of every routing tensor (`a_pad`, `expert_ids`,
+`dest`), and the two launches share one routing build, so re-selecting per
+launch would mean re-padding the activations per role and paying the routing
+cost twice. Splitting `N` halves each launch's CTA count against the fused `N1`,
+which is a consideration for what `N` the selector is fed, not a licence to
+select twice.
+
 **Graph safety.** The selector reads *only* host-known integers —
 `topk_ids.shape`, layer constants, the extension's own compiled tile list, and
 the cached (non-synchronizing) SM count. It never touches the routed histogram,

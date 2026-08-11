@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.8.3 — 2026-08-11
+
+Per-role codebooks on routed MoE expert stacks, plus the fail-closed guard for
+the hole they exposed. A uniform artifact — every artifact published to date —
+resolves to the identical scheme object and decodes byte-for-byte as in 0.8.2.
+
+- **Routed expert stacks may now carry one codebook per logical role**
+  (`gate`, `up`, `down`) instead of one per layer. A learned codebook is fit
+  per (layer, projection), so the three roles want three books at the same
+  rung; before this, a learned routed artifact had to pool them. See
+  `docs/SPEC.md` §5.1 for the artifact grammar. Scope: FP8-CB v1 product
+  layout (`n_sub=4`), which is what the routed learned rungs use. An fp4 or
+  v2 stack declaring per-role books is **refused at load**, not silently
+  pooled — those lanes carry a second per-layer table and an in-kernel scale
+  section, and shipping the split there untested would be worse than refusing.
+
+- **SECURITY-ADJACENT FIX — the routed scheme resolver failed open.**
+  `_moe_scheme_for_prefix` compared `(grid, mode, k, n_sub, type_size,
+  activation_contract)` across a stack's targets — a tuple that does **not**
+  include `codebook_ref` — and then returned the first target's scheme by
+  sorted name, i.e. `…experts.down_proj`'s. An artifact naming different books
+  per projection therefore **loaded without complaint and decoded every stack
+  with down_proj's codebook**: silent numerical corruption, not a refusal. No
+  Gridbook release could produce such an artifact (PrismaQuant's per-role
+  emission self-gates on a `0.8.3` runtime), so no shipped checkpoint is
+  affected — verified against a published routed-CB artifact, where 0 of 47
+  routed layers disagree. The guard ships regardless of the feature: a role
+  claimed twice with different books, or left without one, now refuses to load.
+
+- **Per-role books and per-expert format groups are not composed.** A target
+  such as `…experts.gate_proj.format_group_0` is refused by name. It would
+  otherwise have been skipped in silence, because target matching keys on the
+  final path component. No allocation produces the combination — routed layers
+  take a single rung, since serving-unit promotion forces one format per
+  routed stack — so this is an explicit non-feature, recorded rather than
+  implemented.
+
+- `cb_fused_moe_grouped` takes optional `out` / `n_offset`, letting a GEMM
+  write its `N` columns into a column slice of a wider destination the caller
+  owns. Splitting `N` preserves the tile count exactly
+  (`ceil(Mp/TM) * ceil(N/TN)`), so a per-role gate/up stack costs one extra
+  launch and no extra A traffic — versus a concat of both halves, which at
+  DeepSeek-V4-Flash shapes would move ~0.6 GB per layer per forward. Existing
+  callers pass neither argument and are unaffected.
+
+- Per-role stacks materialise their `w13` halves and all weight scales as
+  contiguous fp32 at load, releasing the fused stack. Residency is unchanged
+  (the halves replace it), and the split path skips the per-forward
+  `.to(float32).contiguous()` scale rebuild the fused path performs.
+
+- **Both load-time gates are per-role aware, and that is tested on device.**
+  Releasing the fused `w13` stack put two gates at risk of judging a tensor the
+  lane no longer uses: `_cuda_moe_ok` materialises a LUT (the stock
+  materialiser reads a `_cb_flat` a per-role layer does not have), and
+  `_gf2_ok` validates `w13_cb_qweight`'s 3-D stride (which the split
+  releases). Neither failure mode is loud — the second is a silent demotion to
+  the BF16 quality bridge, ~663 ms/layer against ~29 ms on the fused lane at
+  DeepSeek-V4-Flash shapes. Until a per-role artifact exists the standing
+  evidence is an equivalence test: bind all three roles to the SAME book and
+  the split must reproduce the uniform path bit for bit across decode, grouped
+  prefill and the bridge expand, with both gates asserted to admit the split
+  layer. `tests/test_routed_per_role_codebooks.py` §F.
+
 ## 0.8.2 — 2026-08-09
 
 DeepSeek-V4-Flash serving enablement. Every entry below is additive or

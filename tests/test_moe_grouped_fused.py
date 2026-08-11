@@ -1061,3 +1061,86 @@ def test_both_compiled_tiles_are_bit_identical(distribution, tokens, topk):
         assert a.shape == b.shape
         assert torch.equal(a.view(torch.uint16), b.view(torch.uint16)), (
             f"stage {stage} differs between TileM 128 and 256")
+
+
+# --------------------------------------------------------------------------- #
+# Destination slice (0.8.3): `out` / `n_offset` let two GEMMs write column      #
+# halves of one buffer, which is how a per-role gate/up stack avoids a concat.  #
+# Only the D leading dimension changes, so a bit difference is a real defect.   #
+# --------------------------------------------------------------------------- #
+
+def _stage1_args(method, layer, tokens=96, topk=4, seed=41):
+    """The exact stage-1 argument tuple the grouped lane would issue."""
+    act = _silu_act()
+    ids, weights = _routing(tokens, layer._cb_E, topk, "uniform", seed)
+    torch.manual_seed(seed)
+    x = torch.randn(tokens, layer._cb_hidden,
+                    dtype=torch.bfloat16, device=DEV) * 0.5
+
+    captured = []
+    original = method._grouped_call
+
+    def spy(fext, args, tile_m, **kwargs):
+        captured.append((args, tile_m))
+        return original(fext, args, tile_m, **kwargs)
+
+    method._grouped_call = spy
+    try:
+        assert method._apply_prefill_grouped_fused_v2(
+            layer, x, weights, ids, act, tile_m=128) is not None
+    finally:
+        method._grouped_call = original
+    return captured[0]
+
+
+def test_destination_slice_is_bit_identical_to_a_fresh_buffer():
+    """Writing columns [n, n+N) of a wide buffer must equal writing [0, N)."""
+    from gridbook.cuda_ext import get_fused_ext
+
+    method, layer, dims = _build(seed=52, k=28)
+    _require_grouped_fused(method, layer)
+    fext = get_fused_ext()
+    args, tile_m = _stage1_args(method, layer)
+    n = int(args[6])
+
+    reference = fext.cb_fused_moe_grouped(*args, tile_m)
+    mp = reference.shape[0]
+
+    for offset in (0, n):
+        wide = torch.full((mp, 2 * n), float("nan"),
+                          dtype=torch.bfloat16, device=DEV)
+        returned = fext.cb_fused_moe_grouped(*args, tile_m, wide, offset)
+        assert returned.data_ptr() == wide.data_ptr(), (
+            "the destination form must return the caller's buffer")
+        written = wide[:, offset:offset + n]
+        assert torch.equal(written.reshape(-1).view(torch.uint16),
+                           reference.reshape(-1).view(torch.uint16)), (
+            f"column slice at n_offset={offset} differs from a fresh buffer")
+        # The other half must be untouched — a stride bug shows up here first.
+        other = wide[:, n - offset:2 * n - offset]
+        assert torch.isnan(other.float()).all(), (
+            f"writing at n_offset={offset} spilled into the other half")
+
+
+def test_destination_slice_rejects_a_slice_that_does_not_fit():
+    from gridbook.cuda_ext import get_fused_ext
+
+    method, layer, dims = _build(seed=53, k=28)
+    _require_grouped_fused(method, layer)
+    fext = get_fused_ext()
+    args, tile_m = _stage1_args(method, layer)
+    n = int(args[6])
+    reference = fext.cb_fused_moe_grouped(*args, tile_m)
+    mp = reference.shape[0]
+
+    wide = torch.zeros((mp, 2 * n), dtype=torch.bfloat16, device=DEV)
+    with pytest.raises(RuntimeError, match="does not fit"):
+        fext.cb_fused_moe_grouped(*args, tile_m, wide, n + 1)
+    with pytest.raises(RuntimeError, match="one row per padded A row"):
+        fext.cb_fused_moe_grouped(
+            *args, tile_m,
+            torch.zeros((mp + 128, 2 * n), dtype=torch.bfloat16, device=DEV), 0)
+    with pytest.raises(RuntimeError, match="row-major bf16"):
+        fext.cb_fused_moe_grouped(
+            *args, tile_m,
+            torch.zeros((mp, 2 * n), dtype=torch.float32, device=DEV), 0)

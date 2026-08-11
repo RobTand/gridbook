@@ -400,6 +400,17 @@ class PrismaQuantMixedMoEMethod(FusedMoEMethodBase):
                             family, group, "weight_scale"
                         )
                     ))
+                if "codebook_ref_by_role" in scheme:
+                    # Per-expert format groups and per-role books are separate
+                    # features; composing them needs the role split applied
+                    # inside each group's lane. `config._moe_scheme_for_prefix`
+                    # refuses the composition before a method is ever built, so
+                    # this is the second line of defence, not the first.
+                    raise ValueError(
+                        f"{method.prefix}: per-expert format group {group!r} "
+                        "declares per-role codebooks; that combination is not "
+                        "implemented"
+                    )
                 refs = scheme["codebook_ref"]
                 names = refs if isinstance(refs, list) else [refs]
                 subs = [codebooks[name].to(qparam.device) for name in names]

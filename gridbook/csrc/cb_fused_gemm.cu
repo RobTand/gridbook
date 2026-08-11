@@ -665,11 +665,26 @@ static_assert(!moe_tile_supported(256, 36) && !moe_tile_supported(384, 28),
 static_assert(!moe_tile_supported(128, 30),
               "the rung law must gate the grouped path too");
 
+// `out`/`n_offset` let a caller place this GEMM's N columns inside a WIDER
+// destination it already owns, instead of taking a fresh [Mp, N] buffer.
+//
+// Why it exists: a routed stack whose gate and up halves carry different
+// codebooks is two GEMMs, but the activation that consumes them reads one
+// fused [Mp, 2*inter] buffer. Concatenating afterwards would move ~0.6 GB per
+// layer per forward at DSv4 shapes. Writing column slices costs nothing —
+// only the D leading dimension changes, and the tile count
+// `ceil(Mp/TM) * ceil(N/TN)` is preserved exactly by splitting N, so two
+// launches at N=inter issue the same total tiles as one at N=2*inter.
+//
+// Nothing else moves: the problem shape stays {Mp, N, K}, and the EVT's
+// b_scales node keeps indexing its own [E, N] extent.
 template <int TM, int KB>
 torch::Tensor run_moe_grouped(torch::Tensor a, torch::Tensor packed,
                               torch::Tensor lut, torch::Tensor a_scales,
                               torch::Tensor b_scales, torch::Tensor expert_ids,
-                              int64_t N, int64_t K) {
+                              int64_t N, int64_t K,
+                              c10::optional<torch::Tensor> out = c10::nullopt,
+                              int64_t n_offset = 0) {
   static_assert(moe_tile_supported(TM, KB),
                 "attempted to instantiate an smem-infeasible (TileM, k_bits)");
   constexpr int Stages = 2;
@@ -686,13 +701,18 @@ torch::Tensor run_moe_grouped(torch::Tensor a, torch::Tensor packed,
   const int E = (int)packed.size(0);
   const c10::cuda::OptionalCUDAGuard guard(a.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  auto d = torch::empty({Mp, N}, a.options().dtype(torch::kBFloat16));
+  auto d = out.has_value()
+               ? *out
+               : torch::empty({Mp, N}, a.options().dtype(torch::kBFloat16));
+  // The D leading dimension is the destination's row stride, which is wider
+  // than N whenever this launch writes a column slice.
+  const int ldd = (int)d.size(1);
 
   using StrideA = typename GemmKernel::StrideA;
   using StrideC = typename GemmKernel::StrideC;
   using StrideD = typename GemmKernel::StrideD;
   StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {Mp, (int)K, 1});
-  StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {Mp, (int)N, 1});
+  StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {Mp, ldd, 1});
 
   const int* ptr_eids = expert_ids.data_ptr<int>();
 
@@ -709,7 +729,7 @@ torch::Tensor run_moe_grouped(torch::Tensor a, torch::Tensor packed,
         {{a_scales.data_ptr<float>(), 0.0f, Stride<_1, _0, _0>{}}, {}, {}},
         {}},
        nullptr, StrideC{},
-       reinterpret_cast<ElementD*>(d.data_ptr()), sd}};
+       reinterpret_cast<ElementD*>(d.data_ptr()) + n_offset, sd}};
 
   Gemm gemm;
   size_t ws = Gemm::get_workspace_size(args);
@@ -772,7 +792,9 @@ torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
                                    torch::Tensor b_scales,
                                    torch::Tensor expert_ids, int64_t N,
                                    int64_t K, int64_t k_bits,
-                                   int64_t tile_m = kMoeTileM) {
+                                   int64_t tile_m = kMoeTileM,
+                                   c10::optional<torch::Tensor> out = c10::nullopt,
+                                   int64_t n_offset = 0) {
   // --- mirrors check_fused_inputs, but packed is [E, N, row_bytes] ---
   check_fused_kbits(k_bits);   // first, for the reason given in that function
   TORCH_CHECK(a.is_cuda() && a.scalar_type() == torch::kFloat8_e4m3fn,
@@ -810,9 +832,29 @@ torch::Tensor cb_fused_moe_grouped(torch::Tensor a, torch::Tensor packed,
   gridbook::grouped::check_expert_ids(a, expert_ids, a.size(0), tile_m,
                                       packed.size(0));
 
+  // A destination slice must be a real 2-D bf16 row-major buffer that fully
+  // contains columns [n_offset, n_offset+N). Checked here rather than trusting
+  // the caller: getting it wrong writes past a live allocation.
+  if (out.has_value()) {
+    const auto& o = *out;
+    TORCH_CHECK(o.is_cuda() && o.scalar_type() == torch::kBFloat16 &&
+                    o.dim() == 2 && o.stride(1) == 1 &&
+                    o.stride(0) == o.size(1),
+                "out must be a row-major bf16 [Mp, ldd] cuda tensor");
+    TORCH_CHECK(o.size(0) == a.size(0),
+                "out must have one row per padded A row: got ", o.size(0),
+                " vs Mp=", a.size(0));
+    TORCH_CHECK(n_offset >= 0 && n_offset + N <= o.size(1),
+                "out column slice [", n_offset, ", ", n_offset + N,
+                ") does not fit in ldd=", o.size(1));
+  } else {
+    TORCH_CHECK(n_offset == 0, "n_offset requires an explicit out tensor");
+  }
+
 #define PQ_MOE_TILE_CASE(TM)                                                 \
   case TM: return moe_dispatch_kbits<TM>(k_bits, a, packed, lut, a_scales,   \
-                                         b_scales, expert_ids, N, K);
+                                         b_scales, expert_ids, N, K, out,    \
+                                         n_offset);
   switch (tile_m) { PQ_FUSED_MOE_TILES(PQ_MOE_TILE_CASE) default: break; }
 #undef PQ_MOE_TILE_CASE
   TORCH_CHECK(false, "no compiled grouped kernel for (tile_m=", tile_m,
@@ -883,10 +925,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "b_scales[E,N] applied in the fp32 EVT epilogue (same rounding order "
         "as cb_fused_prefill_mm_scaled). Mp must be a multiple of tile_m "
         "(default 128 = cb_fused_moe_tile_m()); legal tile_m values for a rung "
-        "come from cb_fused_moe_tile_sizes_for_kbits(k_bits).",
+        "come from cb_fused_moe_tile_sizes_for_kbits(k_bits). Pass `out` (a "
+        "row-major bf16 [Mp, ldd]) with `n_offset` to write this GEMM's N "
+        "columns as a slice of a wider destination instead of allocating one; "
+        "`out` is also what is returned. Used to land the two halves of a "
+        "per-role gate/up stack in one fused buffer without a concat.",
         py::arg("a"), py::arg("packed"), py::arg("lut"), py::arg("a_scales"),
         py::arg("b_scales"), py::arg("expert_ids"), py::arg("N"), py::arg("K"),
-        py::arg("k_bits"), py::arg("tile_m") = kMoeTileM);
+        py::arg("k_bits"), py::arg("tile_m") = kMoeTileM,
+        py::arg("out") = py::none(), py::arg("n_offset") = 0);
   m.def("cb_fused_kbits", &cb_fused_kbits,
         "the k_bits rungs this build actually COMPILED for the fused mid-M "
         "lane, ascending. The product FP8-CB ladder is every integer 28..48; "

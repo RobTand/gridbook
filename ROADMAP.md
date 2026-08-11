@@ -97,6 +97,30 @@ decoder, and one GEMM/grouped-GEMM per execution contract. New policies and
 backends must compose those pieces; they must not introduce a second packer,
 resident weight copy, decoder, or matmul merely to create another route.
 
+#### Deferred — in-kernel LUT plane for per-role routed codebooks
+
+0.8.3 serves per-role routed codebooks by splitting the `w13` stack at load and
+issuing one launch per role (`docs/SPEC.md` §5.1). The known optimisation is a
+second LUT *plane* selected in-kernel by row, which would collapse the two
+launches back into one. It is deferred, not rejected: the split costs one extra
+launch and no extra A traffic, so this should be funded only by a measured
+regression in a device-validation A/B — not on principle.
+
+Two things banked from an attempt that was reverted before it shipped:
+
+- A row-plane version was written against `csrc/cb_moe_persistent_b.cu` and
+  **could never have executed**: that lane gates on `persistent_b_on and
+  self.is_fp4`, i.e. FP4-only and opt-in, while per-role books are FP8-only.
+  Shipping it would have repeated the `block_output_match` lesson — *check the
+  code executes before funding the work*.
+- Each `kMultiPlane` instantiation is a **distinct device function**, so
+  `PB_SET_MAX_SMEM` must raise `cudaFuncAttributeMaxDynamicSharedMemorySize`
+  for **both** `<…, false>` and `<…, true>`. Setting only one compiles cleanly
+  and then fails at the first per-role artifact with a stale shared-memory
+  limit. (Adding the template parameter also makes the bare
+  `cb_moe_persistent_b_kernel<TM,TN,W>` reference in that macro ambiguous —
+  a compile error, which is the safe direction.)
+
 #### P0 — decide fused NVFP4 safely
 
 - [ ] **K0.1 — Align the producer and consumer releases.** In PrismaQuant, bump

@@ -452,6 +452,47 @@ the following vocabulary:
   `sub0..sub{n_sub-1}` (`product`).
 - Targets sharing one `(codebook_ref, format)` **SHOULD** be grouped into one
   config group.
+
+### 5.1 Per-role codebooks on routed expert stacks (since 0.8.3)
+
+A learned codebook is fit per (layer, projection), so the three logical roles
+of a routed expert stack — `gate`, `up`, `down` — may each want their own book
+at the same rung. An artifact expresses that by naming the roles as separate
+targets with different `codebook_ref`s:
+
+```jsonc
+"targets": ["model.layers.1.mlp.experts.gate_proj"],  // one group per book
+"targets": ["model.layers.1.mlp.experts.up_proj"],
+"targets": ["model.layers.1.mlp.experts.down_proj"],
+```
+
+Rules a consumer **MUST** apply when resolving one routed expert prefix:
+
+- All targets under the prefix **MUST** agree on `grid`, `mode`, `k`, `n_sub`,
+  `type_size` and `activation_contract`. Only `codebook_ref` may differ. (An
+  exporter's serving-unit promotion already forces one format per routed
+  stack, so this is a statement of what a valid artifact looks like, not a
+  restriction on allocation.)
+- A fused `gate_up_proj` target claims **both** the `gate` and `up` roles with
+  one book. `down_proj` claims `down` alone; w2 is a one-role stack and never
+  splits.
+- If two targets claim the same role with different books, or a role is left
+  without a book, the consumer **MUST refuse to load**. It **MUST NOT** fall
+  back to another role's codebook.
+- When every target names the same book the stack is *uniform*, and the
+  consumer **MUST** behave exactly as it did before this section existed.
+
+**Fail-open warning for consumers written against ≤0.8.2:** Gridbook 0.8.2
+compared only the format tuple above — which excludes `codebook_ref` — and
+then adopted the first target's scheme by sorted name, i.e. `down_proj`'s. A
+per-role artifact loaded silently and decoded every stack with the wrong book.
+Any consumer that resolves a routed stack from one arbitrary target has the
+same defect.
+
+Per-role books and per-expert format groups (§ `per_expert_format_groups`) are
+**independent features that Gridbook does not compose**: a target of the form
+`…experts.gate_proj.format_group_0` is refused at load. No known allocator
+emits one, since routed layers take a single rung.
 - A group is FP4-v2 iff it carries a `scale_coding` object; the top-level
   `layout_version: 2` signals that v2 groups exist. **Absence of `scale_coding`
   MUST be interpreted as v1.** Old (v1-only) artifacts therefore parse unchanged,
