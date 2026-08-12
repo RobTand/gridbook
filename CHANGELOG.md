@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: `FULL_DECODE_ONLY` capture aborted the load in the MXFP8 dense
+  lane.** `_SfOffsetCache` computes swizzled-plane offsets on the host and
+  moves them with an unpinned `.to(device)`.
+  `process_weights_after_loading` resolved the **B side** from weight
+  dimensions known at load, but the **A side** is keyed by the runtime row
+  count, so under `cudagraph_mode=FULL_DECODE_ONLY` the first call at each
+  capture size landed *inside* the capture region and raised `Cannot copy
+  between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor
+  is pinned`. It surfaced as `cudaErrorStreamCaptureUnjoined` at
+  `capture_end()`, because DeepSeek-V4 reaches this lane from inside
+  `maybe_execute_in_parallel`, leaving that side stream unjoined. The A-side
+  offsets are now pre-warmed at load for every `cudagraph_capture_sizes` entry
+  — `docs/KERNELS.md` CUDA-graph safety rule 3, mirroring `cb_gemv_v2_prepare`
+  and `cb_moe_persistent_b_prepare`. **No numerics change**: the same offsets,
+  computed earlier. Eager serving is unaffected (the reader returns `()` when
+  no capture sizes are configured, and the pre-warm is then a no-op).
+
+  Measured on one GB10 / DGX Spark (`sm_121`, arm64), vLLM
+  0.26.1rc1.dev515, torch 2.11.0+cu130, a DeepSeek-V4-Flash-0731 NVFP4-CB
+  artifact at TP=1, `--kv-cache-dtype fp8`, `--max-model-len 8192`,
+  `--compilation-config {"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY",
+  "cudagraph_capture_sizes":[1,2,4,8]}`: capture previously failed the load
+  outright; it now succeeds, and single-stream decode improves **12.05 ->
+  14.08 tok/s (+16.8%)**, 83.0 -> 71.0 ms/token.
+
+  Per-token logprobs under capture are **bit-equal** to `--enforce-eager` on
+  7 of the 8 probe prompts. The 8th is excluded on the basis of an
+  eager-vs-eager control run *before* the captured arm was compared: it is a
+  near-tie that flips between two identical eager runs, so it cannot serve as
+  a reference. Protocol: prefix caching off, serial single requests — under
+  the serving default (prefix caching on) and concurrency, eager is not
+  run-to-run reproducible either.
+
 ## 0.8.10 — 2026-08-18
 
 - **0.8.9 could not load a per-expert split-format (mixed) expert bank at

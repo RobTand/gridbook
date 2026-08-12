@@ -96,6 +96,54 @@ class _SfOffsetCache:
 _OFFSETS = _SfOffsetCache()
 
 
+def _cudagraph_capture_sizes() -> tuple[int, ...]:
+    """Decode row counts vLLM will capture graphs at, or ``()`` if unknown.
+
+    Read the same way ``ops.warn_if_capture_sizes_exceed_the_decode_gates``
+    reads it: vLLM imported inside the function so ``import gridbook`` stays
+    vLLM-free, and every failure degrading to silence rather than breaking a
+    load, because the shape of the compilation config has moved across
+    releases. Returning ``()`` costs only the pre-warm below; it cannot make
+    serving wrong.
+    """
+    try:
+        from vllm.config import get_current_vllm_config
+
+        compilation = get_current_vllm_config().compilation_config
+        sizes = getattr(compilation, "cudagraph_capture_sizes", None) or ()
+        return tuple(sorted({int(s) for s in sizes if int(s) > 0}))
+    except Exception:  # noqa: BLE001 — advisory only; never break a load
+        return ()
+
+
+def _prewarm_activation_offsets(ext, k: int, device) -> None:
+    """Populate the A-side offset cache for every graph capture size.
+
+    WHY THIS EXISTS. ``_SfOffsetCache.get`` computes offsets on the host and
+    moves them with an unpinned ``.to(device)``. That copy is illegal inside a
+    CUDA graph capture ("Cannot copy between CPU and CUDA tensors during CUDA
+    graph capture unless the CPU tensor is pinned"), so any key first seen
+    *during* capture is a hard failure rather than a slow path.
+
+    The B side never had this problem: ``process_weights_after_loading``
+    resolves it from weight dimensions known at load. The A side is keyed by
+    the runtime row count, which under ``FULL_DECODE_ONLY`` is first seen
+    inside the capture region — one first-time miss per capture size.
+
+    Doing it here is ``docs/KERNELS.md`` CUDA-graph safety rule 3 ("all
+    device-side constants and per-device kernel setup happen once, at model
+    load"), and mirrors ``cb_gemv_v2_prepare`` / ``cb_moe_persistent_b_prepare``
+    / ``cb_fused_fp4v2_prepare``, which are called from this same hook for the
+    same reason.
+
+    Not wrapped in try/except: at load these are the identical calls the
+    forward will make, so a failure here is a real defect and should surface
+    at load rather than mid-capture.
+    """
+    for rows in _cudagraph_capture_sizes():
+        _OFFSETS.get(ext, rows, k, is_b=False, device=device)
+
+
 def _quantize_activations(ext, x: torch.Tensor) -> tuple[torch.Tensor,
                                                          torch.Tensor]:
     """bf16 ``[M, K]`` -> (e4m3 ``[M, K]``, swizzled SF plane)."""
@@ -159,6 +207,12 @@ def build_mxfp8_dense_method(wire_id: str):
             ext = _require_lane_ext(device)
             w = layer.weight.data
             n, k = int(w.shape[0]), int(w.shape[1])
+            # A-side (activation) offsets, for graph capture. Both call sites
+            # that need them -- ``_quantize_activations`` and the BMM branch of
+            # ``apply`` -- key on the runtime row count at this same ``k``
+            # (``k == layer.weight.shape[1]`` for both), so one pre-warm here
+            # covers both paths.
+            _prewarm_activation_offsets(ext, k, device)
             sf_rm = layer.weight_scale.data
             del layer.weight_scale
             is_bmm = bool(getattr(layer, "is_bmm", False))
