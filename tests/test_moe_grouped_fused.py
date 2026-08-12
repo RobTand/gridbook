@@ -113,7 +113,7 @@ def _require_stack():
         pytest.skip("CUDA required for grouped-fused forward tests")
 
 
-def _build(*, experts=8, hidden=512, inter=768, seed=0, k=44):
+def _build(*, experts=8, hidden=512, inter=768, seed=0, k=44, codebook=None):
     """Build a synthetic FP8-CB MoE layer without invoking vLLM loading.
 
     ``k`` is a parameter because TileM=256 is smem-feasible only at k28/k32
@@ -127,8 +127,13 @@ def _build(*, experts=8, hidden=512, inter=768, seed=0, k=44):
 
     n_sub = 4
     type_size = fmt.nvfp4_cb_type_size(k, "fp8")
+    # `codebook=None` keeps the lattice book every existing caller gets. A
+    # caller may pass its own sub-tables to build a layer whose weights are
+    # PACKED against that book, which is what a per-role artifact needs: three
+    # roles encoded against three different books, not one book grafted onto
+    # bytes encoded for another.
     codebook = fmt._resolve_codebook(
-        k, "fp8", "product", None, torch.device(DEV))
+        k, "fp8", "product", codebook, torch.device(DEV))
 
     torch.manual_seed(seed)
     w13 = torch.randn(

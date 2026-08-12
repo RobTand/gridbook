@@ -426,3 +426,167 @@ def test_bridge_expand_is_bit_identical_with_identical_books():
     candidate = method._apply_prefill_native_bf16(
         layer, x, weights, ids, act)
     assert torch.equal(_bits(reference), _bits(candidate))
+
+
+# ---------------------------------------------------------------------------
+# (G) Three DIFFERENT books: the case equivalence testing cannot reach
+# ---------------------------------------------------------------------------
+#
+# Section (F) binds one book to all three roles, which is the strongest
+# evidence available before a per-role ARTIFACT exists -- but it is blind to
+# the defect this release was cut for. If a lane silently decoded every role
+# with ONE book (0.8.2's resolver returned down_proj's scheme for the whole
+# stack), identical books make that indistinguishable from correct behaviour:
+# every comparison still matches, bit for bit.
+#
+# These tests supply the missing discriminator without needing an analytic
+# ground truth. Pack each role against its OWN book, then lean on a fact that
+# holds for any correct implementation: if some single book B were applied to
+# all three roles, the output would equal the uniform-B run EXACTLY. So a
+# per-role layer whose output differs from all three uniform runs cannot be
+# collapsing to any one of them. Permuting which book goes to which role must
+# likewise move the output -- a lane that binds books by sorted name rather
+# than by role would not notice the permutation.
+#
+# PrismaQuant's DSv4 artifact is the first real per-role artifact (129 books,
+# one per (layer, projection), three roles per layer at K28/K32), so this is
+# the coverage that stands between it and silent numerical corruption.
+
+
+def _distinct_books(k: int, count: int = 3):
+    """`count` deterministically different product books at rung `k`.
+
+    Derived by perturbing the lattice book rather than sampling free tensors,
+    so every book stays in the value range the packer and the fused mainloop
+    expect; only the entries differ, which is all these tests need.
+
+    The perturbed values are SNAPPED onto the e4m3 grid -- the target grid for
+    `grid="fp8"`, and the strictest of the two the lanes cast to (every e4m3
+    value is exact in bf16, so the prefill path's bf16 flat table is satisfied
+    for free). `build_flat_codebook` refuses a lossy cast, correctly: a table
+    that does not survive it means every weight decodes against a silently
+    rounded book. Snapping makes these synthetic books legal inputs rather
+    than suppressing the check with PRISMAQUANT_SKIP_CB_CAST_CHECK.
+    """
+    fmt = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    from test_moe_grouped_fused import DEV
+
+    base = fmt._resolve_codebook(k, "fp8", "product", None, torch.device(DEV))
+    books = []
+    for index in range(count):
+        generator = torch.Generator(device="cpu").manual_seed(9_000 + index)
+        book = []
+        for sub in base:
+            sub = sub.detach().clone().float().cpu()
+            noise = torch.randn(sub.shape, generator=generator) * 0.10
+            perturbed = (sub * (1.0 + noise)).to(torch.float8_e4m3fn).float()
+            book.append(perturbed.to(sub.dtype).to(DEV))
+        books.append(book)
+    # Distinctness is the whole premise; assert it rather than trust the seed.
+    for i in range(count):
+        for j in range(i + 1, count):
+            assert any(
+                not torch.equal(a, b)
+                for a, b in zip(books[i], books[j])
+            ), f"books {i} and {j} are identical; the test would be vacuous"
+    return books
+
+
+def _per_role_layer(books, *, k: int = 28, seed: int = 101):
+    """A faithful per-role layer plus the uniform layer for each book.
+
+    Each uniform layer packs the SAME weights (one seed) against one book. The
+    per-role layer then takes its gate rows from uniform[0], its up rows from
+    uniform[1] and its w2 from uniform[2], so every role's bytes really are
+    encoded against the book that role will decode with -- the structure a
+    real per-role artifact has, not a book grafted onto foreign bytes.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for per-role numerics")
+    from test_moe_grouped_fused import _build
+
+    uniform = [_build(seed=seed, k=k, codebook=book) for book in books]
+    dims = uniform[0][2]
+    inter = dims["inter"]
+
+    method, layer, _ = _build(seed=seed, k=k, codebook=books[0])
+    gate_layer, up_layer, down_layer = (u[1] for u in uniform)
+    layer.w13_cb_qweight = torch.cat(
+        [gate_layer.w13_cb_qweight[:, :inter],
+         up_layer.w13_cb_qweight[:, inter:]], dim=1).contiguous()
+    layer.w13_weight_scale = torch.cat(
+        [gate_layer.w13_weight_scale[:, :inter],
+         up_layer.w13_weight_scale[:, inter:]], dim=1).contiguous()
+    layer.w2_cb_qweight = down_layer.w2_cb_qweight.clone()
+    layer.w2_weight_scale = down_layer.w2_weight_scale.clone()
+
+    method._require_per_role_supported()
+    layer._cb_flat_by_role = {
+        "gate": gate_layer._cb_flat,
+        "up": up_layer._cb_flat,
+        "down": down_layer._cb_flat,
+    }
+    del layer._cb_flat          # see (F): catches a lane reaching for the stock book
+    layer._cb_role_split = True
+    method._split_w13_by_role(layer)
+    assert layer.w13_cb_qweight.numel() == 0, "fused w13 stack must be released"
+    return (method, layer), uniform, dims
+
+
+@pytest.mark.parametrize("tokens,topk", [(1, 6), (13, 2)])
+def test_per_role_decode_differs_from_every_uniform_book(tokens, topk):
+    """Decode must not collapse three books into one."""
+    books = _distinct_books(28)
+    (method, layer), uniform, dims = _per_role_layer(books)
+    assert method._cuda_moe_ok(layer) is True
+    x, weights, ids, act = _inputs(dims, tokens, topk, seed=31)
+    candidate = method._apply_grouped_decode(layer, x, weights, ids, act)
+    for index, (ref_method, ref_layer, _) in enumerate(uniform):
+        assert ref_method._cuda_moe_ok(ref_layer)
+        reference = ref_method._apply_grouped_decode(
+            ref_layer, x, weights, ids, act)
+        assert not torch.equal(_bits(candidate), _bits(reference)), (
+            f"per-role decode reproduced the uniform run for book {index} "
+            "exactly: every role decoded with that one book"
+        )
+
+
+def test_per_role_grouped_prefill_differs_from_every_uniform_book():
+    """The fused prefill lane must honour the per-role column split."""
+    books = _distinct_books(28)
+    (method, layer), uniform, dims = _per_role_layer(books)
+    if not uniform[0][0]._gf2_ok(uniform[0][1]):
+        pytest.skip("FP8-CB grouped fused CUTLASS prefill unavailable")
+    assert method._gf2_ok(layer) is True, layer._cb_gf2_ok_reason
+    x, weights, ids, act = _inputs(dims, 48, 2, seed=37)
+    candidate = method._apply_prefill_grouped_fused_v2(
+        layer, x, weights, ids, act)
+    assert candidate is not None
+    for index, (ref_method, ref_layer, _) in enumerate(uniform):
+        reference = ref_method._apply_prefill_grouped_fused_v2(
+            ref_layer, x, weights, ids, act)
+        assert reference is not None
+        assert not torch.equal(_bits(candidate), _bits(reference)), (
+            f"per-role grouped prefill reproduced uniform book {index} "
+            "exactly: the column split did not apply per-role books"
+        )
+
+
+def test_per_role_output_moves_when_books_are_permuted():
+    """Books must bind to ROLES, not to sorted target names.
+
+    Same three books, same weights-per-book, only the role assignment rotates.
+    A lane that picks a book by position or by sorted name rather than by the
+    role it belongs to would return the same bytes for both layers.
+    """
+    books = _distinct_books(28)
+    (method_a, layer_a), _, dims = _per_role_layer(books)
+    rotated = [books[2], books[0], books[1]]
+    (method_b, layer_b), _, _ = _per_role_layer(rotated)
+    x, weights, ids, act = _inputs(dims, 13, 2, seed=41)
+    out_a = method_a._apply_grouped_decode(layer_a, x, weights, ids, act)
+    out_b = method_b._apply_grouped_decode(layer_b, x, weights, ids, act)
+    assert not torch.equal(_bits(out_a), _bits(out_b)), (
+        "rotating which book each role carries did not change the output: "
+        "books are not bound per role"
+    )
