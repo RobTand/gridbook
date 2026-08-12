@@ -77,11 +77,38 @@ _VLLM_BOUND_GRIDBOOK_MODULES = {
 
 
 def _is_isolated_runtime_module(name: str) -> bool:
+    """Modules whose binding is snapshotted and restored around one test file."""
     return (
         name == "vllm"
         or name.startswith("vllm.")
         or name in _VLLM_BOUND_GRIDBOOK_MODULES
     )
+
+
+def _may_remove_from_sys_modules(name: str) -> bool:
+    """Whether this module may be REMOVED, as opposed to merely restored.
+
+    Snapshot-and-restore is always safe: rebinding an existing module object
+    mutates nothing outside ``sys.modules``.  REMOVING one is only safe if the
+    module can be imported again, and an installed vLLM cannot: importing it
+    registers opaque types with Torch (``vllm.utils.torch_utils.LayerName`` and
+    friends) in global C++ state that no ``sys.modules`` bookkeeping can undo.
+    A second import therefore dies with
+
+        RuntimeError: Type 'vllm.utils.torch_utils.LayerName' is already
+        registered as an opaque type
+
+    and every later test needing real vLLM fails -- 290 of them in a full GPU
+    run, each passing when its file runs alone.
+
+    This is the same exemption ``gridbook.ops`` already carries, for the same
+    reason: Torch registrations outlive the import graph.  A STUB vLLM has no
+    ``__file__`` and no such side effect, so removing it is both safe and the
+    entire point of this fixture -- collection-time stubs must not leak.
+    """
+    if name in _VLLM_BOUND_GRIDBOOK_MODULES:
+        return True
+    return getattr(sys.modules.get(name), "__file__", None) is None
 
 
 def _clear_gridbook_package_attrs() -> None:
@@ -121,16 +148,20 @@ def isolated_gridbook_runtime_imports():
         for module_name in _VLLM_BOUND_GRIDBOOK_MODULES
     } if package is not None else {}
     for name in list(sys.modules):
-        if _is_isolated_runtime_module(name):
+        if _is_isolated_runtime_module(name) and _may_remove_from_sys_modules(name):
             sys.modules.pop(name, None)
     _clear_gridbook_package_attrs()
     try:
         yield
     finally:
         for name in list(sys.modules):
-            if _is_isolated_runtime_module(name):
+            if _is_isolated_runtime_module(name) and \
+                    _may_remove_from_sys_modules(name):
                 sys.modules.pop(name, None)
         _clear_gridbook_package_attrs()
+        # `before` still holds every isolated name, removable or not, so a stub
+        # a test bound over a real module is undone here even though the real
+        # module was never removed.
         sys.modules.update(before)
         package = sys.modules.get("gridbook")
         if package is not None:
