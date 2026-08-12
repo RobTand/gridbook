@@ -1,6 +1,9 @@
 {
-  "schema": "gridbook.runtime-contract.v1",
-  "contract_version": 1,
+  "schema": "gridbook.runtime-contract.v2",
+  "contract_version": 2,
+  "abi_features": {
+    "routed_moe_per_role_codebook_lut": 1
+  },
   "quant_method": {
     "canonical": "gridbook",
     "accepted": [

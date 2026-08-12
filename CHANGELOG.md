@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.4 — 2026-08-12
+
+- **Attest the routed per-role LUT ABI in the packaged runtime contract.**
+  Gridbook 0.8.3 implemented and tested one FP8-CB v1 codebook per routed
+  `gate`, `up`, and `down` role, but its producer-facing
+  `runtime_contract.json` omitted the corresponding capability marker.
+  Producers that correctly require explicit consumer attestation therefore
+  refused the 0.8.3 release. The contract now declares and validates
+  `abi_features.routed_moe_per_role_codebook_lut = 1`; malformed, missing, or
+  future-valued declarations fail closed. This additive root member advances
+  the closed contract schema from v1 to v2 rather than silently changing v1.
+  No kernel, artifact layout, or serving behavior changes from 0.8.3.
+
+- The routed per-role test module now skips cleanly when the optional vLLM
+  serving dependency is absent. This restores the installed-wheel CPU release
+  gate; the same tests still run in the qualified vLLM environment.
+
 ## 0.8.3 — 2026-08-11
 
 Per-role codebooks on routed MoE expert stacks, plus the fail-closed guard for

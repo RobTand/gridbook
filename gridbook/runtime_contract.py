@@ -11,7 +11,7 @@ from importlib.resources import files
 from typing import Any, Mapping
 
 
-RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v1"
+RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v2"
 _RESOURCE_NAME = "runtime_contract.json"
 
 #: The vLLM package roots a ``top_level_loader_modules`` entry may name. The
@@ -100,15 +100,29 @@ def validate_runtime_contract(contract: Any) -> None:
 
     root = _object(contract, "contract")
     _keys(root, "contract", {
-        "schema", "contract_version", "quant_method", "packing", "layout",
-        "formats", "producer_profiles",
+        "schema", "contract_version", "abi_features", "quant_method",
+        "packing", "layout", "formats", "producer_profiles",
     })
     if root["schema"] != RUNTIME_CONTRACT_SCHEMA:
         _fail("contract.schema", f"must be {RUNTIME_CONTRACT_SCHEMA!r}")
     contract_version = _positive_int(
         root["contract_version"], "contract.contract_version")
-    if contract_version != 1:
-        _fail("contract.contract_version", "must be 1 for this schema")
+    if contract_version != 2:
+        _fail("contract.contract_version", "must be 2 for this schema")
+
+    features = _object(root["abi_features"], "contract.abi_features")
+    _keys(features, "contract.abi_features", {
+        "routed_moe_per_role_codebook_lut",
+    })
+    per_role_lut = _positive_int(
+        features["routed_moe_per_role_codebook_lut"],
+        "contract.abi_features.routed_moe_per_role_codebook_lut",
+    )
+    if per_role_lut != 1:
+        _fail(
+            "contract.abi_features.routed_moe_per_role_codebook_lut",
+            "must be 1",
+        )
 
     quant = _object(root["quant_method"], "contract.quant_method")
     _keys(quant, "contract.quant_method", {"canonical", "accepted", "legacy"})

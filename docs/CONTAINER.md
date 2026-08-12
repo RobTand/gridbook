@@ -100,13 +100,13 @@ serving image, using [`docker/Dockerfile.gridbook-pinned`](../docker/Dockerfile.
 docker build \
   -f docker/Dockerfile.gridbook-pinned \
   --build-arg BASE_IMAGE=gridbook:local \
-  --build-arg GRIDBOOK_REF=v0.8.3 \
-  -t gridbook:v0.8.3-pinned .
+  --build-arg GRIDBOOK_REF=v0.8.4 \
+  -t gridbook:v0.8.4-pinned .
 ```
 
 `GRIDBOOK_REF` is parameterized so the same recipe works for a release tag or,
 during a pre-tag rehearsal, the exact release commit SHA. For a release image,
-use the immutable `v0.8.3` tag. The direct-VCS requirement causes pip to write
+use the immutable `v0.8.4` tag. The direct-VCS requirement causes pip to write
 the requested ref and resolved 40-character commit to the installed
 distribution's PEP 610 `direct_url.json`; the Docker build reads that record
 back and fails if the requested revision or resolved commit is absent. This is

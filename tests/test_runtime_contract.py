@@ -34,6 +34,9 @@ def test_packaged_contract_loads_and_validates():
     contract = load_runtime_contract()
     assert contract == raw
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
+    assert contract["abi_features"] == {
+        "routed_moe_per_role_codebook_lut": 1,
+    }
 
 
 def test_loader_is_vllm_torch_and_prismaquant_free(tmp_path):
@@ -139,6 +142,10 @@ def _wrong_schema(contract):
     contract["schema"] = "gridbook.runtime-contract.v999"
 
 
+def _wrong_contract_version(contract):
+    contract["contract_version"] = 1
+
+
 def _canonical_not_accepted(contract):
     contract["quant_method"]["accepted"] = ["prismaquant"]
 
@@ -173,6 +180,14 @@ def _wrong_scale_plane(contract):
     contract["layout"]["type_size_rules"][0]["scale_plane_bytes"] = 15
 
 
+def _missing_per_role_lut_capability(contract):
+    del contract["abi_features"]["routed_moe_per_role_codebook_lut"]
+
+
+def _wrong_per_role_lut_capability(contract):
+    contract["abi_features"]["routed_moe_per_role_codebook_lut"] = 2
+
+
 def _unsupported_format_mode(contract):
     contract["formats"][0]["mode"] = "full"
 
@@ -181,6 +196,7 @@ def _unsupported_format_mode(contract):
     ("mutate", "message"),
     [
         (_wrong_schema, "contract.schema"),
+        (_wrong_contract_version, "contract.contract_version"),
         (_canonical_not_accepted, "canonical must be accepted"),
         (_duplicate_rung, "sorted, unique"),
         (_unsupported_family_layout, "unsupported ABI layout"),
@@ -188,6 +204,9 @@ def _unsupported_format_mode(contract):
         (_non_vllm_loader_root, "vllm.model_executor.models or vllm.models"),
         (_empty_supported_ids, "non-empty JSON array"),
         (_wrong_scale_plane, "type_size_rules"),
+        (_missing_per_role_lut_capability,
+         "routed_moe_per_role_codebook_lut"),
+        (_wrong_per_role_lut_capability, "must be 1"),
         (_unsupported_format_mode, "unsupported grid/mode pair"),
     ],
 )
