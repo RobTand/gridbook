@@ -161,10 +161,12 @@ def test_expander_is_bit_exact_at_both_partial_block_boundaries():
 
 @pytest.mark.parametrize("m", [1, 2, 4, 8])
 def test_raw_gemv_m1_m2_m4_m8_matches_independent_oracle(m):
-    q, scales = _raw_planes(257, 385, seed=100 + m)
-    x = torch.randn(m, 1, 385, device=DEV, dtype=torch.bfloat16) * 0.125
+    # Partial block128 edges remain supported within the native bridge's
+    # eight-element alignment contract.
+    q, scales = _raw_planes(264, 392, seed=100 + m)
+    x = torch.randn(m, 1, 392, device=DEV, dtype=torch.bfloat16) * 0.125
     got = SOURCE_EXT.fp8_source_gemv(x.contiguous(), q, scales, 1)
-    expected = _reference(x, q, scales).reshape(m, 257)
+    expected = _reference(x, q, scales).reshape(m, 264)
     _assert_reassociated_close(got, expected)
 
 
@@ -350,6 +352,16 @@ def test_low_level_invalid_contracts_fail_closed():
         SOURCE_EXT.fp8_source_gemv(
             torch.zeros(1, 3, 256, device=DEV, dtype=torch.bfloat16),
             q, scales, 3)
+    q_bad_k, scales_bad_k = _raw_planes(256, 255, seed=92)
+    with pytest.raises(RuntimeError, match="K divisible by 8"):
+        SOURCE_EXT.fp8_source_gemv(
+            torch.zeros(1, 1, 255, device=DEV, dtype=torch.bfloat16),
+            q_bad_k, scales_bad_k, 1)
+    q_bad_rows, scales_bad_rows = _raw_planes(258, 256, seed=94)
+    with pytest.raises(RuntimeError, match="per-group N divisible by 8"):
+        SOURCE_EXT.fp8_source_gemv(
+            torch.zeros(1, 3, 256, device=DEV, dtype=torch.bfloat16),
+            q_bad_rows, scales_bad_rows, 3)
     with pytest.raises(RuntimeError, match="float8_e4m3fn"):
         SOURCE_EXT.fp8_source_expand_bf16(q.float(), scales)
     with pytest.raises(RuntimeError, match="scale shape"):

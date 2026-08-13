@@ -27,7 +27,6 @@ from .mxfp8 import DS_BLOCK
 
 __all__ = [
     "WIRE_FP8_BLOCK128",
-    "Fp8SourceW8A16LinearMethod",
     "build_fp8_source_w8a16_method",
 ]
 
@@ -163,9 +162,9 @@ def _build_method_class():
                 raise TypeError(
                     "source-FP8 W8A16 needs a 2-D float8_e4m3fn value "
                     f"plane, got dtype={q.dtype}, shape={tuple(q.shape)}")
-            if scales.dtype not in (torch.float8_e8m0fnu, torch.uint8):
+            if scales.dtype != torch.float8_e8m0fnu:
                 raise TypeError(
-                    "source-FP8 W8A16 needs float8_e8m0fnu/uint8 scales, "
+                    "source-FP8 W8A16 needs a float8_e8m0fnu scale plane, "
                     f"got {scales.dtype}")
             if scales.ndim != 2 or scales.device != q.device:
                 raise ValueError(
@@ -334,15 +333,52 @@ def _build_method_class():
                 fp8_source_expand_bf16,
                 fp8_source_gemv,
             )
+            from .nvfp4_activation_contract import emit_route
+
+            route = {
+                "kind": "dense",
+                "shape": (
+                    f"M{m}:G{groups}:N{rows}:K{k}"
+                    if is_bmm else f"M{m}:N{n}:K{k}"
+                ),
+                "contract": "bf16_preserved",
+                "tile_m": 0,
+            }
 
             if m <= _DECODE_MAX_M:
+                emit_route(
+                    layer,
+                    policy="source_fp8_w8a16_decode",
+                    symbol="fp8_source_gemv",
+                    state="error",
+                    reason="launch did not return",
+                    **route,
+                )
                 flat = fp8_source_gemv(x3, q, scales, groups)
                 if is_bmm:
-                    return flat.reshape(*outer, groups, rows)
-                return flat.reshape(*outer, n)
+                    result = flat.reshape(*outer, groups, rows)
+                else:
+                    result = flat.reshape(*outer, n)
+                emit_route(
+                    layer,
+                    policy="source_fp8_w8a16_decode",
+                    symbol="fp8_source_gemv",
+                    state="served",
+                    reason=None,
+                    **route,
+                )
+                return result
 
             # One bounded caller-scoped transient, consumed immediately by
             # Gridbook's owned CUTLASS bridge and never attached to the layer.
+            emit_route(
+                layer,
+                policy="source_fp8_w8a16_prefill",
+                symbol="fp8_source_expand_bf16+cb_bf16_grouped_mm",
+                state="error",
+                reason="launch chain did not return",
+                **route,
+            )
             expanded = fp8_source_expand_bf16(q, scales)
             if not is_bmm:
                 expert_ends = torch.full(
@@ -350,7 +386,16 @@ def _build_method_class():
                 result = cb_bf16_grouped_mm(
                     x3[:, 0, :], expanded.view(1, n, k), expert_ends, 0)
                 del expanded
-                return result.reshape(*outer, n)
+                result = result.reshape(*outer, n)
+                emit_route(
+                    layer,
+                    policy="source_fp8_w8a16_prefill",
+                    symbol="fp8_source_expand_bf16+cb_bf16_grouped_mm",
+                    state="served",
+                    reason=None,
+                    **route,
+                )
+                return result
 
             # The bridge's row contract is expert/group-major.  Flatten A in
             # that order, run G equal contiguous segments, then restore the
@@ -365,7 +410,16 @@ def _build_method_class():
             del expanded
             restored = grouped.view(groups, m, rows).permute(
                 1, 0, 2).contiguous()
-            return restored.reshape(*outer, groups, rows)
+            result = restored.reshape(*outer, groups, rows)
+            emit_route(
+                layer,
+                policy="source_fp8_w8a16_prefill",
+                symbol="fp8_source_expand_bf16+cb_bf16_grouped_mm",
+                state="served",
+                reason=None,
+                **route,
+            )
+            return result
 
     return Fp8SourceW8A16LinearMethod
 
@@ -379,7 +433,3 @@ def build_fp8_source_w8a16_method(wire_id: str):
             f"{WIRE_FP8_BLOCK128!r}, got {wire_id!r}; direct g32 MXFP8 stays "
             "on Mxfp8DenseLinearMethod (W8A8)")
     return _build_method_class()()
-
-
-class Fp8SourceW8A16LinearMethod:  # pragma: no cover - public identity marker
-    """Public identity of Gridbook's block128 source-FP8 W8A16 route."""

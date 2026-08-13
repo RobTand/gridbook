@@ -135,6 +135,43 @@ def test_method_accepts_block128_only_before_vllm_import(monkeypatch):
         lane.build_fp8_source_w8a16_method("mxfp8_e4m3_e8m0_g32")
 
 
+def test_source_extension_requires_exact_jit_capability_identity(monkeypatch):
+    from gridbook import cuda_ext, lane_select
+
+    extension = types.SimpleNamespace(
+        fp8_source_gemv=lambda *args: None,
+        fp8_source_expand_bf16=lambda *args: None,
+    )
+    monkeypatch.setattr(
+        lane_select, "device_capability", lambda device=None: (12, 1))
+    monkeypatch.setattr(
+        cuda_ext, "get_fp8_source_w8a16_ext", lambda: extension)
+
+    with pytest.raises(
+            cuda_ext.NativeKernelUnavailableError,
+            match="without Gridbook's JIT build-capability identity"):
+        cuda_ext.require_fp8_source_w8a16_ext("identity gate")
+
+
+def test_source_extension_requires_exact_jit_digest_and_abi(monkeypatch):
+    from gridbook import cuda_ext, lane_select
+
+    extension = types.SimpleNamespace(
+        fp8_source_gemv=lambda *args: None,
+        fp8_source_expand_bf16=lambda *args: None,
+        __gridbook_jit_capability__=(12, 1),
+    )
+    monkeypatch.setattr(
+        lane_select, "device_capability", lambda device=None: (12, 1))
+    monkeypatch.setattr(
+        cuda_ext, "get_fp8_source_w8a16_ext", lambda: extension)
+
+    with pytest.raises(
+            cuda_ext.NativeKernelUnavailableError,
+            match="without the exact Gridbook source/toolchain identity"):
+        cuda_ext.require_fp8_source_w8a16_ext("identity gate")
+
+
 def test_process_keeps_exact_raw_planes_resident(monkeypatch):
     lane, _, method, layer, calls, q_before, s_before = _built_layer(monkeypatch)
     assert type(method).__name__ == "Fp8SourceW8A16LinearMethod"
@@ -159,12 +196,54 @@ def test_dense_decode_and_prefill_choose_native_arms(monkeypatch):
     assert torch.equal(decode, expected_decode)
     assert calls == [("gemv", 2, 1)]
 
+    from gridbook.nvfp4_activation_contract import read_route
+    decode_route = read_route(layer)
+    assert decode_route["policy"] == "source_fp8_w8a16_decode"
+    assert decode_route["symbol"] == "fp8_source_gemv"
+    assert decode_route["shape"] == "M2:N128:K128"
+    assert decode_route["contract"] == "bf16_preserved"
+    assert decode_route["state"] == "served"
+
     calls.clear()
     prefill_x = torch.randn(9, 128, dtype=torch.bfloat16)
     prefill = method.apply(layer, prefill_x)
     expected_prefill = (prefill_x.float() @ w.float().t()).to(torch.bfloat16)
     assert torch.equal(prefill, expected_prefill)
     assert calls == [("expand",), ("grouped", (9,))]
+
+    assert read_route(layer) == {
+        "kind": "dense",
+        "policy": "source_fp8_w8a16_prefill",
+        "symbol": "fp8_source_expand_bf16+cb_bf16_grouped_mm",
+        "tile_m": 0,
+        "shape": "M9:N128:K128",
+        "contract": "bf16_preserved",
+        "state": "served",
+        "reason": None,
+        "tile_candidate_ctas": 0,
+        "tile_sm_count": 0,
+        "tile_rho": 0,
+        "tile_compiled": "",
+    }
+
+
+def test_source_route_telemetry_retains_error_when_launch_raises(monkeypatch):
+    from gridbook import ops
+    from gridbook.nvfp4_activation_contract import read_route
+
+    _, _, method, layer, _, _, _ = _built_layer(monkeypatch)
+    monkeypatch.setattr(
+        ops,
+        "fp8_source_gemv",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("launch failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="launch failed"):
+        method.apply(layer, torch.randn(1, 128, dtype=torch.bfloat16))
+    route = read_route(layer)
+    assert route["symbol"] == "fp8_source_gemv"
+    assert route["state"] == "error"
+    assert route["reason"] == "launch did not return"
 
 
 def test_bmm_decode_and_prefill_preserve_group_mapping(monkeypatch):
@@ -189,6 +268,11 @@ def test_bmm_decode_and_prefill_preserve_group_mapping(monkeypatch):
     prefill_x = torch.randn(9, 2, 128, dtype=torch.bfloat16)
     assert torch.equal(method.apply(layer, prefill_x), oracle(prefill_x))
     assert calls == [("expand",), ("grouped", (9, 18))]
+    from gridbook.nvfp4_activation_contract import read_route
+    route = read_route(layer)
+    assert route["shape"] == "M9:G2:N128:K128"
+    assert route["contract"] == "bf16_preserved"
+    assert route["state"] == "served"
 
 
 def test_apply_refuses_activation_cast_and_bias(monkeypatch):

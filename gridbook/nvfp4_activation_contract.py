@@ -100,6 +100,7 @@ ROUTE_CONTRACTS = frozenset((
     "fp8_per_token_dynamic",
     "fp4_group16_rtn",
     "fp32_emulated_group_qdq",
+    "bf16_preserved",
 ))
 
 ROUTE_STATES = frozenset(("served", "fallback", "error"))

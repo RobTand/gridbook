@@ -34,6 +34,16 @@
   installed-wheel, metadata, and GPU pre-tag compile gates therefore fail
   explicitly if either source or either strict native ABI is missing.
 
+- Load and dispatch now fail closed at the remaining raw-wire boundaries:
+  vLLM checkpoint loaders validate the E4M3 and UE8M0 source dtypes before a
+  destination `copy_` can cast them; grouped DSV4 `wo_a` admits only
+  `G=8,N=1024,K=4096,tp=1` (dense serving is separately TP=1); and the native
+  extension must carry the exact JIT digest, ABI schema, and live-device build
+  capability. Decode and prefill publish two-phase route telemetry identifying
+  `fp8_source_gemv` versus
+  `fp8_source_expand_bf16+cb_bf16_grouped_mm`, with the activation contract
+  recorded as preserved BF16 rather than dynamic FP8 QDQ.
+
 ## 0.8.4 — 2026-08-12
 
 - **Attest the routed per-role LUT ABI in the packaged runtime contract.**

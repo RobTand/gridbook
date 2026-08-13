@@ -255,6 +255,13 @@ startup/dispatch logs proving:
 4. DSV4 wo_a used the grouped W8A16 adapter; and
 5. no source unit fell back or entered mxfp8_dense_mm/activation QDQ.
 
+The source method writes this proof through Gridbook's existing latest-route
+telemetry: `contract=bf16_preserved`; decode names `fp8_source_gemv`; prefill
+names `fp8_source_expand_bf16+cb_bf16_grouped_mm`; and the two-phase state
+remains `error` if either launch chain raises. Exact-artifact evidence must read
+these records from the loaded layers rather than infer dispatch from format
+metadata.
+
 Use fixed prompts to compare eager and graph tokens plus per-token logprobs, and
 run the workload matrix in NATIVE-PARITY.md with byte, resident-memory,
 peak-scratch, TTFT, ITL, and throughput limits declared **before** inspecting

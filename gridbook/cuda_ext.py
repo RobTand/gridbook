@@ -1950,12 +1950,30 @@ def require_fp8_source_w8a16_ext(operation: str = "this operation",
             f"{operation} requires the source-FP8 W8A16 lane release-gated "
             f"for compute capability 12.1; this device reports {rendered}.")
     built_for = getattr(ext, "__gridbook_jit_capability__", None)
-    if built_for is not None and tuple(built_for) != tuple(capability):
+    if built_for is None:
+        raise NativeKernelUnavailableError(
+            f"{operation} found a source-FP8 W8A16 module without Gridbook's "
+            "JIT build-capability identity. Gridbook cannot prove that the "
+            f"module targets this device ({capability[0]}.{capability[1]}) "
+            "and refuses the load.")
+    if tuple(built_for) != tuple(capability):
         raise NativeKernelUnavailableError(
             f"{operation} found a source-FP8 W8A16 module built for compute "
             f"capability {built_for[0]}.{built_for[1]}, but this device "
             f"reports {capability[0]}.{capability[1]}. Serve each capability "
             "from its own process; Gridbook refuses a cross-device launch.")
+    identity = getattr(ext, "__gridbook_jit_identity__", None)
+    abi_schema = getattr(ext, "__gridbook_jit_abi_schema__", None)
+    if (
+        not isinstance(identity, str)
+        or len(identity) != 64
+        or any(char not in "0123456789abcdef" for char in identity)
+        or abi_schema != _FP8_SOURCE_W8A16_ABI_SCHEMA
+    ):
+        raise NativeKernelUnavailableError(
+            f"{operation} found a source-FP8 W8A16 module without the exact "
+            "Gridbook source/toolchain identity and ABI schema. Gridbook "
+            "refuses an unbound or stale JIT module.")
     return ext
 
 

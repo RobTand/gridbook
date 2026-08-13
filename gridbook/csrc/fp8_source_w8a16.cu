@@ -202,6 +202,10 @@ torch::Tensor fp8_source_gemv(torch::Tensor x,
               "FP8 source activation shape must be [M,groups,K]");
   TORCH_CHECK(n64 % groups == 0,
               "FP8 source output rows N must be divisible by groups");
+  TORCH_CHECK(k64 % 8 == 0,
+              "FP8 source W8A16 GEMV needs K divisible by 8");
+  TORCH_CHECK((n64 / groups) % 8 == 0,
+              "FP8 source W8A16 GEMV needs per-group N divisible by 8");
 
   const c10::cuda::OptionalCUDAGuard guard(x.device());
   auto output = torch::empty({m64, n64}, x.options());
