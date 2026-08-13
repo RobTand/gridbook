@@ -1,4 +1,4 @@
-"""Narrow DeepSeek-V4 output-projection adapter for Gridbook MXFP8 BMM."""
+"""Narrow DeepSeek-V4 output-projection adapter for Gridbook-owned BMM."""
 from __future__ import annotations
 
 import types

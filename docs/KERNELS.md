@@ -8,7 +8,8 @@ here is evidence and design context, not a second backlog.
 
 Terminology used below: **GEMM** = matrix-matrix multiply (prefill / large batch);
 **GEMV** = matrix-vector multiply (decode / batch-1 or small batch); **M** = the
-number of activation rows (tokens) in a matmul; **MMA** = a tensor-core
+number of flattened token rows in a dispatch (for grouped source-FP8 BMM this
+does not include the separate `G` dimension); **MMA** = a tensor-core
 matrix-multiply-accumulate instruction; **QDQ** = quantize-then-dequantize the
 activations; **smem** = GPU shared memory; **TTFT** = time to first token
 (prefill latency).
@@ -109,9 +110,11 @@ change the activation format. Gridbook retains the source E4M3 bytes and one
 UE8M0 exponent per 128-by-128 weight block. BF16 activations cross the complete
 route unchanged; neither arm calls an activation quantizer or QDQ operation.
 
-- `fp8_source_gemv` owns `M <= 8`. It reads the raw E4M3 weight byte and the
-  matching 128-by-128 UE8M0 scale in the GEMV, accumulates in FP32, and rounds
-  the output to BF16. It does not materialize a weight tile.
+- `fp8_source_gemv` owns `M <= 8`, where `M` is the product of the leading
+  token dimensions after `[...,G,K]` is viewed as `[M,G,K]`; it is not `G*M`.
+  It reads the raw E4M3 weight byte and the matching 128-by-128 UE8M0 scale in
+  the GEMV, accumulates in FP32, and rounds the output to BF16. It does not
+  materialize a weight tile.
 - `fp8_source_expand_bf16` owns the large-M weight conversion. It expands one
   layer to a contiguous BF16 scratch tensor, which is consumed by
   `cb_bf16_grouped_mm` and then released. Dense Linear uses the bridge with
@@ -122,12 +125,17 @@ route unchanged; neither arm calls an activation quantizer or QDQ operation.
   involved.
 - Load requires both the source extension and the owned grouped-BF16 bridge.
   Missing source, strict symbol, supported device, shape, or bridge capability
-  is a load-time refusal. DSV4's qualified geometry is exactly
-  `G=8, N=1024, K=4096` at `tp=1`; a mismatch fails closed.
+  is a load-time refusal. Grouped BMM is qualified only for DSV4's exact
+  per-group geometry `G=8, N=1024, K=4096` at `tp=1`; any near miss is refused
+  before extension resolution or adapter-marker installation. Dense source-FP8
+  Linears are a separate contract: they retain the alignment and scale-shape
+  gates above and are not restricted to the grouped `wo_a` geometry; this
+  release still admits them only at `tp=1`.
 - Whole-layer dispatch stays behind an opaque custom op. `M` is selected when
-  the operation executes, so `FULL_DECODE_ONLY` captures only the native GEMV
-  arm for fixed sizes `[1,2,4,8]`; large-M expansion remains outside those
-  graphs.
+  the operation executes. The unit gate covers dense CUDA-graph replay at actual
+  flattened decode-token sizes `M in {1,2,4,8}`; `G` does not turn a grouped
+  `M=1` decode into `M=8`. Large-M expansion remains outside those graphs, and
+  exact-artifact grouped graph evidence remains a pre-tag gate.
 
 The direct `mxfp8_e4m3_e8m0_g32` wire is intentionally separate. It retains the
 existing opt-in W8A8 `mxfp8_dense_gemm.cu` route and dynamically quantized MXFP8
@@ -908,11 +916,13 @@ data-dependent control flow. The kernels follow these rules:
    behind a per-device atomic, which in steady state is one load.
 4. **Hoist the whole M-gated dispatch behind one opaque op.** The retired
    pre-hardening host branch was capture-hostile: a prefill-sized trace could
-   bake the expand arm into decode. Every current Linear/MoE call permanently
-   crosses one opaque `cb_*_forward` op whose eager implementation resolves M at
-   capture time. A `FULL_DECODE_ONLY` capture records the GEMV arm at each fixed
-   decode size; prefill stays outside that graph and resolves the large-M arm
-   independently. There is no environment switch back to the retired branch.
+   bake the expand arm into decode. Every current Linear/MoE/source-BMM call
+   permanently crosses one opaque `cb_*_forward` op whose eager implementation
+   resolves M at capture time. A `FULL_DECODE_ONLY` capture records the GEMV arm
+   at each fixed actual flattened token count `M <= 8`; a source-BMM group count
+   is not folded into M. Prefill stays outside that graph and resolves the
+   large-M arm independently. There is no environment switch back to the
+   retired branch.
 5. **Use full-decode graphs without compilation over the plugin.** The validated
    shape is `mode=0`, `cudagraph_mode=FULL_DECODE_ONLY`, capture sizes
    `[1,2,4,8]`. No Gridbook op carries `torch.Tag.cudagraph_unsafe`, so nothing
@@ -924,6 +934,8 @@ data-dependent control flow. The kernels follow these rules:
    evidence, not an exact-byte 27B claim. The FP4-v2 295B path separately
    measured +24% decode. Capture only the batch sizes the deployment needs:
    the 0.6B validation reported ~30 s startup and 2.64 GiB for four sizes.
+   Those served measurements predate source-FP8 W8A16 and must not be cited as
+   its exact-artifact graph evidence.
 
 ## A measurement side-effect worth knowing
 
@@ -944,7 +956,7 @@ too.
 
 | Path | Status |
 |---|---|
-| Source block-FP8 W8A16, dense + DSV4 grouped `wo_a` | **0.8.5 candidate; release evidence pending.** Raw E4M3/UE8M0 stays resident; BF16 activations are unchanged; `M<=8` uses native CUDA GEMV and larger M uses bounded native BF16 expansion plus the owned CUTLASS grouped bridge. Direct MXFP8 g32 remains the separate opt-in W8A8 lane. Do not claim shipped served parity or performance until the exact-artifact gates in RELEASING are recorded |
+| Source block-FP8 W8A16, dense + DSV4 grouped `wo_a` | **0.8.5 candidate; release evidence pending.** Raw E4M3/UE8M0 stays resident; BF16 activations are unchanged; actual flattened decode-token `M<=8` uses native CUDA GEMV and larger M uses bounded native BF16 expansion plus the owned CUTLASS grouped bridge. Grouped BMM is admitted only at `(G=8,N=1024,K=4096,tp=1)`; dense geometry is gated separately and also remains `tp=1` only. Direct MXFP8 g32 remains the separate opt-in W8A8 lane. Do not claim shipped served parity or performance until the exact-artifact gates in RELEASING are recorded |
 | FP8-CB decode (dense) | **Shipped**, at/above native parity |
 | FP4-CB v2 decode (dense) | **Shipped**: bit-matched CUDA GEMV (13/13 parity against the historical Triton result plus the independent expansion reference). The decode chain is compute-bound at GEMV shapes (ncu SM 71%/mem 44%) under the bit-exact contract — the measured ceiling, not a staging problem |
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |

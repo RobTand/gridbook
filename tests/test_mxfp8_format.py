@@ -1,10 +1,12 @@
-"""MXFP8 reference semantics and the DeepSeek block-128 embedding (CPU-only).
+"""MXFP8 reference semantics and a block-128 embedding proof (CPU-only).
 
 The embedding claim these tests pin: DeepSeek's FP8 convention (E4M3 values,
 one UE8M0 scale per 128x128 tile) embeds EXACTLY into MXFP8 (same values, one
 UE8M0 scale per 32 K-elements) by scale replication — 128 = 4 * 32, so a chunk
 never straddles a tile, and the map ``SF_mx[n, c] = S_ds[n // 128, c // 4]``
-is total, arithmetic-free and bit-exact.
+is total, arithmetic-free and bit-exact. This is a mathematical/reference
+property, not the operational route: source block-FP8 is served by the separate
+W8A16 lane and is never activation-quantized through the MXFP8 W8A8 method.
 """
 import pytest
 

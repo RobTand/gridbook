@@ -272,8 +272,8 @@ def test_format_with_empty_audited_set_refuses_everything():
 
     Uses a synthetic format rather than a real registry entry, so this stays
     true whatever the registry's current verdicts are — the fp8-block entry
-    carried the empty set until Gridbook's own MXFP8 lane was audited, and the
-    verdict pin for that entry lives in
+    carried the empty set until Gridbook's source-FP8 W8A16 lane was admitted,
+    and the verdict pin for that entry lives in
     ``test_fp8_block_verdict_is_gridbook_owned_route`` below.
     """
     blocked = FORMATS[FP8_BLOCK]._replace(audited_backends=frozenset())

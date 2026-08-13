@@ -24,6 +24,7 @@ if tuple(torch.cuda.get_device_capability()) != (12, 1):
                 allow_module_level=True)
 
 from gridbook import cuda_ext, dsv4_woa, ops  # noqa: E402
+from gridbook import fp8_source_w8a16 as source_lane  # noqa: E402
 from gridbook.fp8_source_w8a16 import (  # noqa: E402
     WIRE_FP8_BLOCK128,
     build_fp8_source_w8a16_method,
@@ -242,6 +243,11 @@ def test_large_m_transient_is_not_retained(monkeypatch):
 
 def test_grouped_whole_method_decode_and_prefill_are_isolated(monkeypatch):
     groups, rows, k = 8, 128, 256
+    # This compact case isolates group indexing and leakage. Exact release
+    # geometry is exercised below; CPU refusal coverage pins every near miss.
+    monkeypatch.setattr(source_lane, "_DSV4_BMM_GROUPS", groups)
+    monkeypatch.setattr(source_lane, "_DSV4_BMM_ROWS", rows)
+    monkeypatch.setattr(source_lane, "_DSV4_BMM_K", k)
     q, scales = _raw_planes(groups * rows, k, seed=51)
     method, layer = _layer_for(
         q, scales, groups=groups, monkeypatch=monkeypatch)

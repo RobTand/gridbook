@@ -1666,8 +1666,8 @@ def _load_fused_fp4v2_ext_locked():
     return _fused_fp4v2
 # =========================== END P2a BLOCK ========================================
 # ===========================================================================
-# BEGIN ADDITIVE BLOCK — MXFP8 dense block-scaled loader (task: MXFP8 lane;
-# serves producer MXFP8 and the DeepSeek fp8-ue8m0-block128 embedding).
+# BEGIN ADDITIVE BLOCK — direct-g32 MXFP8 dense block-scaled loader.
+# DeepSeek's block128 source-FP8 wire is owned by the separate W8A16 loader.
 # Self-contained: adds module-level globals, constants and three functions,
 # and modifies nothing above.
 # ===========================================================================
@@ -1780,18 +1780,18 @@ def _load_mxfp8_dense_ext_locked():
             capability=cc)
     except StaleExtensionError as exc:
         print(f"[prismaquant-cb] ERROR: incompatible MXFP8 dense extension — "
-              f"{exc} MXFP8/DeepSeek-FP8 passthrough units stay refused "
+              f"{exc} Direct-g32 MXFP8 units stay refused "
               f"(fail-closed).", file=sys.stderr, flush=True)
         _mxfp8_dense = None
     except IncompleteInstallError as exc:
         print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
-              f"MXFP8/DeepSeek-FP8 passthrough units stay refused "
+              f"Direct-g32 MXFP8 units stay refused "
               f"(fail-closed).", file=sys.stderr, flush=True)
         _mxfp8_dense = None
     except Exception as exc:  # noqa: BLE001 — capability probe is fail-soft
         print(f"[prismaquant-cb] WARNING: MXFP8 dense extension unavailable "
-              f"({type(exc).__name__}: {exc}); MXFP8/DeepSeek-FP8 passthrough "
-              f"units will refuse at load (expected off cc 12.0/12.1 and "
+              f"({type(exc).__name__}: {exc}); direct-g32 MXFP8 units will "
+              f"refuse at load (expected off cc 12.0/12.1 and "
               f"without nvcc). To enable the native path: {_NVCC_HINT}.",
               file=sys.stderr, flush=True)
         _mxfp8_dense = None

@@ -38,6 +38,10 @@ _READY_ATTR = "_gridbook_fp8_source_w8a16_ready"
 _READY_ABI = 1
 _DECODE_MAX_M = 8
 _GEMM_ALIGNMENT = 8
+_DSV4_BMM_GROUPS = 8
+_DSV4_BMM_ROWS = 1024
+_DSV4_BMM_K = 4096
+_DSV4_RELEASE_TP = 1
 
 
 def _checked_source_loader(weight_loader, *, expected_dtype: torch.dtype,
@@ -187,6 +191,7 @@ def _build_method_class():
             is_bmm = bool(getattr(layer, "is_bmm", False))
             groups = 1
             rows = n
+            tp_size = int(getattr(layer, "tp_size", 1))
             if is_bmm:
                 groups = int(getattr(layer, "bmm_batch_size", 0))
                 if groups <= 0 or n % groups != 0:
@@ -194,13 +199,22 @@ def _build_method_class():
                         "source-FP8 W8A16 BMM needs a positive group count "
                         f"dividing N; got groups={groups}, N={n}")
                 rows = n // groups
-                if int(getattr(layer, "tp_size", 1)) != 1:
+                geometry = (groups, rows, k, tp_size)
+                qualified = (
+                    _DSV4_BMM_GROUPS,
+                    _DSV4_BMM_ROWS,
+                    _DSV4_BMM_K,
+                    _DSV4_RELEASE_TP,
+                )
+                if geometry != qualified:
                     raise ValueError(
-                        "source-FP8 W8A16 BMM is release-gated only for TP=1")
-                if rows % DS_BLOCK != 0 or k % DS_BLOCK != 0:
-                    raise ValueError(
-                        "block128 source-FP8 W8A16 BMM needs per-group N and "
-                        f"K divisible by {DS_BLOCK}; got N={rows}, K={k}")
+                        "source-FP8 W8A16 BMM is qualified only for grouped "
+                        "geometry G=8, N=1024, K=4096, TP=1; got "
+                        f"G={groups}, N={rows}, K={k}, TP={tp_size}")
+            elif tp_size != _DSV4_RELEASE_TP:
+                raise ValueError(
+                    "source-FP8 W8A16 dense serving is release-gated only "
+                    f"for TP=1; got TP={tp_size}")
             if rows % _GEMM_ALIGNMENT != 0:
                 raise ValueError(
                     "source-FP8 W8A16 needs per-group N divisible by the "

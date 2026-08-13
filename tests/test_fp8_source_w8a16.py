@@ -110,6 +110,12 @@ def _built_layer(monkeypatch, *, groups=1):
     if groups > 1:
         layer.is_bmm = True
         layer.bmm_batch_size = groups
+        # Keep this small tensor focused on group-ordering math. The immutable
+        # release geometry and every near miss are pinned independently in
+        # test_fp8_source_w8a16_geometry.py.
+        monkeypatch.setattr(lane, "_DSV4_BMM_GROUPS", groups)
+        monkeypatch.setattr(lane, "_DSV4_BMM_ROWS", rows)
+        monkeypatch.setattr(lane, "_DSV4_BMM_K", k)
     torch.manual_seed(9)
     layer.weight.data.copy_(
         (torch.randn(groups * rows, k) * 0.25).to(torch.float8_e4m3fn))

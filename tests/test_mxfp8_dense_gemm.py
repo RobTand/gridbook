@@ -4,7 +4,9 @@ The full audit (real DSV4-Flash body tensors, seven distinct shapes, worst
 rel-Frobenius 5.9e-5) ran against the checkpoint on the GB10 and is recorded
 in ``source_passthrough.py``; these tests keep the fast, checkpoint-free core
 of it pinned in CI: SF-plane offsets from the mainloop's own layout, synthetic
-kernel-vs-oracle parity, and the DeepSeek block-128 embedding end-to-end.
+kernel-vs-oracle parity, and the mathematical DeepSeek block-128 embedding.
+That embedding remains reference coverage; serving block128 source weights is
+owned by the separate W8A16 lane and does not enter this W8A8 kernel.
 """
 import pytest
 
@@ -61,9 +63,10 @@ def test_kernel_matches_fp32_oracle(m, n, k):
 
 
 def test_deepseek_block128_embedding_end_to_end():
-    """Block-quantized weights -> broadcast scales -> swizzled plane ->
+    """Reference-only: block weights -> broadcast scales -> swizzled plane ->
     kernel, judged against the block-dequant oracle (NOT the broadcast one),
-    so the whole embedding chain is what is being verified."""
+    so the mathematical embedding is verified without claiming serving
+    ownership for this W8A8 lane."""
     torch.manual_seed(1)
     n, k, m = 136, 576, 64
     w_q = (torch.randn(n, k) * 64).to(torch.float8_e4m3fn)

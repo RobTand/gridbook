@@ -346,15 +346,17 @@ Two things banked from an attempt that was reverted before it shipped:
     `embed_tokens` are built with no quant config. `attn.wo_a` is created and
     post-processed through the quant contract but **applied outside it**
     (`nvidia/ops/o_proj.py` reads `.weight`/`.weight_scale_inv` directly), so
-    it is not CB-eligible. Its source block-FP8 form is nevertheless served on
-    sm_121 by Gridbook's ABI-guarded DSV4 adapter, which preserves vLLM's
-    inverse-RoPE and head-group ordering while routing the BMM through the
-    owning MXFP8 method. The distinction and hardware evidence are documented
-    in [`docs/PLUGIN.md`](docs/PLUGIN.md).
+    it is not CB-eligible. Its source block-FP8 form is now owned on sm_121 by
+    Gridbook's release-candidate W8A16 method and ABI-guarded DSV4 adapter,
+    which preserve vLLM's inverse-RoPE and head-group ordering. The direct-g32
+    MXFP8 W8A8 method is a separate, opt-in route. This is not yet a shipped
+    served-parity claim; the distinction and pending hardware gates are
+    documented in [`docs/PLUGIN.md`](docs/PLUGIN.md) and
+    [`docs/RELEASING.md`](docs/RELEASING.md).
 
-  Remaining before a real artifact loads is not contract work — see the
-  DSV4-Flash study's release gate (items 4-5: production calibration of the
-  eight K14 expert groups, then export/load/generate/benchmark).
+  Remaining work is release evidence, not another operator contract:
+  exact-artifact load/generate, served parity, graph replay, and performance
+  must be recorded through the DSV4-Flash release gate before promotion.
 - [ ] **D0.2 — Complete packed-expert native delegation if the assignment needs
   it.** Reuse Gridbook's existing top-level expert-loader path, canonical
   producer packers/metadata, and a version-attested upstream vLLM backend for
