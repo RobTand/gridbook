@@ -40,6 +40,43 @@ _DECODE_MAX_M = 8
 _GEMM_ALIGNMENT = 8
 
 
+def _checked_source_loader(weight_loader, *, expected_dtype: torch.dtype,
+                           plane: str):
+    """Reject a mis-typed checkpoint tensor before vLLM can cast-copy it.
+
+    vLLM's default, fused, and merged loaders all receive the destination
+    parameter followed by ``loaded_weight``; fused loaders may add a positional
+    shard id, while merged loaders may pass it by keyword.  Keep that call
+    shape opaque and delegate it unchanged after checking the source tensor.
+    """
+
+    if weight_loader is None:
+        return None
+
+    def checked_loader(*args, **kwargs):
+        if len(args) >= 2:
+            loaded_weight = args[1]
+        elif "loaded_weight" in kwargs:
+            loaded_weight = kwargs["loaded_weight"]
+        else:
+            raise TypeError(
+                f"source-FP8 W8A16 {plane} loader requires the checkpoint "
+                "tensor as loaded_weight")
+        if not isinstance(loaded_weight, torch.Tensor):
+            raise TypeError(
+                f"source-FP8 W8A16 {plane} checkpoint value must be a "
+                f"torch.Tensor before vLLM loader delegation, got "
+                f"{type(loaded_weight).__name__}")
+        if loaded_weight.dtype != expected_dtype:
+            raise TypeError(
+                f"source-FP8 W8A16 {plane} checkpoint tensor must be "
+                f"exactly {expected_dtype} before vLLM loader delegation, "
+                f"got {loaded_weight.dtype}")
+        return weight_loader(*args, **kwargs)
+
+    return checked_loader
+
+
 def _require_source_cuda(tensor: torch.Tensor) -> None:
     """Fail closed off CUDA; kept as the narrow CPU policy-test seam."""
 
@@ -75,12 +112,22 @@ def _build_method_class():
                     "source-FP8 W8A16 needs positive N and K, got "
                     f"N={out_size}, K={in_size}")
             weight_loader = extra_weight_attrs.get("weight_loader")
+            value_loader = _checked_source_loader(
+                weight_loader,
+                expected_dtype=torch.float8_e4m3fn,
+                plane="value-plane",
+            )
+            scale_loader = _checked_source_loader(
+                weight_loader,
+                expected_dtype=torch.float8_e8m0fnu,
+                plane="scale-plane",
+            )
             weight = ModelWeightParameter(
                 data=torch.empty(out_size, in_size,
                                  dtype=torch.float8_e4m3fn),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=weight_loader,
+                weight_loader=value_loader,
             )
             layer.register_parameter("weight", weight)
 
@@ -95,7 +142,7 @@ def _build_method_class():
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=weight_loader,
+                weight_loader=scale_loader,
             )
             # DeepSeek's checkpoint spelling.  The loader copies the UE8M0
             # bytes verbatim; "inv" is a name, not a numeric transformation.
