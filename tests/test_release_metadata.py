@@ -21,6 +21,7 @@ import ast
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 
 import gridbook
@@ -41,6 +42,8 @@ SDIST_ONLY_GLOBS = ("gridbook/csrc/tools/*",
 WHEEL_REQUIRED = (
     "cb_gemv.cu",
     "cb_gemv_v2.cu",
+    "fp8_source_w8a16.cu",
+    "mxfp8_dense_gemm.cu",
     "cb_bf16_grouped_gemm.cu",
     "cb_fused_gemm.cu",
     "cb_fused_fp4_gemm.cu",
@@ -119,6 +122,29 @@ def test_sdist_only_split_is_declared_in_all_three_places():
     declared = re.search(r"SDIST_ONLY_GLOBS = \[(.*?)\]", gate, flags=re.S)
     assert declared is not None, "check_dist.py has no SDIST_ONLY_GLOBS list"
     assert declared.group(1).count("f\"{PKG}/") == len(SDIST_ONLY_GLOBS)
+
+
+def test_native_serving_floor_mirrors_are_exactly_equal():
+    """The three literal source floors must advance in the same change.
+
+    A package-data glob catches files that exist in a checkout, but it cannot
+    keep an installed-wheel probe or a future checkout's non-vacuous floor in
+    sync. Normalizing and comparing the mirrors makes the documented lockstep
+    relationship executable.
+    """
+    if not _source_checkout():
+        pytest.skip("release scripts are not shipped in the wheel")
+
+    dist = runpy.run_path(str(ROOT / ".github/scripts/check_dist.py"))
+    installed = runpy.run_path(
+        str(ROOT / ".github/scripts/check_installed.py")
+    )
+    dist_floor = {
+        path.removeprefix("gridbook/") for path in dist["REQUIRED"]
+    }
+    installed_floor = set(installed["REQUIRED_SOURCES"])
+    metadata_floor = {f"csrc/{path}" for path in WHEEL_REQUIRED}
+    assert dist_floor == installed_floor == metadata_floor
 
 
 def test_cpu_gate_locates_source_utilities_without_ci_environment(tmp_path):

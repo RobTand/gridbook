@@ -69,9 +69,23 @@ def test_adapter_runs_inverse_rope_group_bmm_then_wo_b():
 def test_adapter_refuses_missing_or_stale_method_protocol():
     attention = _attention()
     setattr(attention.wo_a, dsv4_woa.DSV4_MXFP8_BMM_ATTR, 99)
-    with pytest.raises(RuntimeError, match="does not own the MXFP8 BMM"):
+    with pytest.raises(RuntimeError, match="does not own a supported"):
         dsv4_woa.dsv4_mxfp8_o_proj(
             attention, torch.zeros(1, 4, 2), torch.zeros(1, dtype=torch.long))
+
+
+def test_adapter_accepts_source_fp8_w8a16_bmm_marker():
+    attention = _attention()
+    delattr(attention.wo_a, dsv4_woa.DSV4_MXFP8_BMM_ATTR)
+    setattr(attention.wo_a, dsv4_woa.DSV4_FP8_SOURCE_W8A16_BMM_ATTR,
+            dsv4_woa.DSV4_FP8_SOURCE_W8A16_BMM_ABI)
+    o = torch.arange(2 * 4 * 2, dtype=torch.bfloat16).reshape(2, 4, 2)
+    result = dsv4_woa.dsv4_gridbook_o_proj(
+        attention, o, torch.tensor([3, 9]))
+    grouped = (o * 2).reshape(2, 2, 4)
+    expected = torch.einsum(
+        "tgk,grk->tgr", grouped.float(), attention.wo_a.weights)
+    assert torch.equal(result, expected.flatten(1) + 7)
 
 
 def test_class_wrapper_leaves_stock_wo_a_byte_for_byte():

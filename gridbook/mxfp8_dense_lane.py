@@ -1,16 +1,15 @@
-"""The MXFP8 dense serving lane: one linear method, two wire spellings.
+"""The direct-g32 MXFP8 dense serving lane.
 
-Serves passthrough ``linear`` units whose weights are E4M3 with UE8M0
-scales — either producer-emitted MXFP8 (``mxfp8_e4m3_e8m0_g32``, scales
-row-major per 32) or DeepSeek block-128 FP8 (``fp8_e4m3_ue8m0_block128``,
-scales per 128x128 tile, embedded exactly into MXFP8 by scale replication at
-load; see ``gridbook/mxfp8.py`` for the one-line proof).
+Serves producer-emitted MXFP8 ``linear`` units whose weights are E4M3 with
+row-major UE8M0 scales per 32 K elements (``mxfp8_e4m3_e8m0_g32``).
+DeepSeek block-128 source FP8 is deliberately rejected: that wire is W8A16
+and belongs exclusively to ``Fp8SourceW8A16LinearMethod``.  Keeping the
+rejection here as well as in the source-format registry makes it impossible
+for a stale factory to silently restore dynamic activation quantization.
 
-W8A8: activations are quantized dynamically to MXFP8 per 32-element group —
-strictly FINER than the per-[1,128] grouping the checkpoint's own serving
-path uses, so reference accuracy bounds this lane's.  The GEMM is the stock
-sm120/sm121 block-scaled CollectiveBuilder collective (``kind::mxf8f6f4``)
-via ``cuda_ext.get_mxfp8_dense_ext``.
+W8A8: activations are quantized dynamically to MXFP8 per 32-element group.
+The GEMM is the stock sm120/sm121 block-scaled CollectiveBuilder collective
+(``kind::mxf8f6f4``) via ``cuda_ext.get_mxfp8_dense_ext``.
 
 OPT-IN (``GRIDBOOK_MXFP8_DENSE=1``): the lane is correctness-audited
 (kernel-vs-oracle parity over the DSV4 body shapes, recorded in
@@ -32,9 +31,7 @@ import torch
 from . import cuda_ext
 from .lane_select import latched_bool, require_lane
 from .mxfp8 import (
-    DS_BLOCK,
     SFVEC,
-    broadcast_block128_scales,
     fill_sf_plane,
     quantize_mxfp8,
 )
@@ -44,13 +41,13 @@ __all__ = [
     "mxfp8_dense_enabled",
     "build_mxfp8_dense_method",
     "WIRE_MXFP8_G32",
-    "WIRE_FP8_BLOCK128",
 ]
 
 MXFP8_DENSE_FLAG = "GRIDBOOK_MXFP8_DENSE"
 
-#: The two wire spellings this lane serves (ids owned by source_passthrough).
+#: The sole wire spelling this W8A8 lane serves.
 WIRE_MXFP8_G32 = "mxfp8_e4m3_e8m0_g32"
+# Kept private as an explicit hard-refusal sentinel for stale callers.
 WIRE_FP8_BLOCK128 = "fp8_e4m3_ue8m0_block128"
 
 
@@ -116,12 +113,16 @@ def build_mxfp8_dense_method(wire_id: str):
     vLLM present.  The returned instance's CLASS NAME is the audited backend
     label in ``source_passthrough.FORMATS`` — renaming it is a registry edit.
     """
-    if wire_id not in (WIRE_MXFP8_G32, WIRE_FP8_BLOCK128):
+    if wire_id == WIRE_FP8_BLOCK128:
+        raise ValueError(
+            "block128 source FP8 is a W8A16 contract and cannot enter "
+            "Mxfp8DenseLinearMethod (W8A8); use "
+            "Fp8SourceW8A16LinearMethod")
+    if wire_id != WIRE_MXFP8_G32:
         raise ValueError(f"unknown MXFP8 dense wire id {wire_id!r}")
 
     from vllm.model_executor.layers.linear import LinearMethodBase
     from vllm.model_executor.parameter import (
-        BlockQuantScaleParameter,
         GroupQuantScaleParameter,
         ModelWeightParameter,
     )
@@ -146,40 +147,20 @@ def build_mxfp8_dense_method(wire_id: str):
                                  dtype=torch.float8_e4m3fn),
                 input_dim=1, output_dim=0, weight_loader=weight_loader)
             layer.register_parameter("weight", weight)
-            if self._wire == WIRE_FP8_BLOCK128:
-                # MergedColumnParallelLinear needs this block shape to place
-                # each physical role's scale shard at the correct output-row
-                # offset on the homogeneous native fast path.
-                layer.weight_block_size = [DS_BLOCK, DS_BLOCK]
-                scale = BlockQuantScaleParameter(
-                    data=torch.empty(
-                        (out_size + DS_BLOCK - 1) // DS_BLOCK,
-                        (in_size + DS_BLOCK - 1) // DS_BLOCK,
-                        dtype=torch.float8_e8m0fnu),
-                    input_dim=1, output_dim=0, weight_loader=weight_loader)
-                # The checkpoint spelling: DeepSeek stores the reciprocal-form
-                # name; bytes are copied verbatim by the producer.
-                layer.register_parameter("weight_scale_inv", scale)
-            else:
-                layer.weight_block_size = None
-                scale = GroupQuantScaleParameter(
-                    data=torch.empty(out_size, in_size // SFVEC,
-                                     dtype=torch.float8_e8m0fnu),
-                    input_dim=1, output_dim=0, weight_loader=weight_loader)
-                layer.register_parameter("weight_scale", scale)
+            layer.weight_block_size = None
+            scale = GroupQuantScaleParameter(
+                data=torch.empty(out_size, in_size // SFVEC,
+                                 dtype=torch.float8_e8m0fnu),
+                input_dim=1, output_dim=0, weight_loader=weight_loader)
+            layer.register_parameter("weight_scale", scale)
 
         def process_weights_after_loading(self, layer) -> None:
             device = layer.weight.device
             ext = _require_lane_ext(device)
             w = layer.weight.data
             n, k = int(w.shape[0]), int(w.shape[1])
-            if self._wire == WIRE_FP8_BLOCK128:
-                s_block = layer.weight_scale_inv.data
-                sf_rm = broadcast_block128_scales(s_block, n, k)
-                del layer.weight_scale_inv
-            else:
-                sf_rm = layer.weight_scale.data
-                del layer.weight_scale
+            sf_rm = layer.weight_scale.data
+            del layer.weight_scale
             is_bmm = bool(getattr(layer, "is_bmm", False))
             if is_bmm:
                 groups = int(getattr(layer, "bmm_batch_size", 0))
@@ -190,11 +171,6 @@ def build_mxfp8_dense_method(wire_id: str):
                 rows = n // groups
                 if int(getattr(layer, "tp_size", 1)) != 1:
                     raise ValueError("MXFP8 BMM is audited only for TP=1")
-                if (self._wire == WIRE_FP8_BLOCK128 and
-                        (rows % DS_BLOCK != 0 or k % DS_BLOCK != 0)):
-                    raise ValueError(
-                        "block128 MXFP8 BMM needs per-group N and K divisible "
-                        f"by {DS_BLOCK}; got N={rows}, K={k}")
                 sf_groups = sf_rm.reshape(groups, rows, k // SFVEC).to(device)
                 offs = _OFFSETS.get(
                     ext, rows, k, is_b=True, device=device)

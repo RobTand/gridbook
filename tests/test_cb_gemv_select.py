@@ -320,6 +320,8 @@ def test_check_dist_native_floor_tracks_serving_not_retired_research():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert "gridbook/csrc/cb_gemv_v2.cu" in mod.REQUIRED
+    assert "gridbook/csrc/fp8_source_w8a16.cu" in mod.REQUIRED
+    assert "gridbook/csrc/mxfp8_dense_gemm.cu" in mod.REQUIRED
     assert "gridbook/csrc/cb_bf16_grouped_gemm.cu" in mod.REQUIRED
     assert "gridbook/csrc/cb_persistent_tc.cu" not in mod.REQUIRED
     assert "gridbook/kernels.py" in mod.FORBIDDEN

@@ -37,6 +37,7 @@ _LOADER_STATE = (
     ("_fused", "_fused_tried"),
     ("_fused_fp4", "_fused_fp4_tried"),
     ("_fused_fp4v2", "_fused_fp4v2_tried"),
+    ("_fp8_source_w8a16", "_fp8_source_w8a16_tried"),
 )
 
 
@@ -234,6 +235,59 @@ def _fp8_identity_fixture(tmp_path):
     packed.parent.mkdir(parents=True)
     packed.write_text("// packed v1\n")
     return src, cutlass, util
+
+
+def test_source_fp8_w8a16_identity_is_source_complete_without_cutlass(
+        tmp_path):
+    src = tmp_path / "csrc"
+    src.mkdir()
+    source = src / "fp8_source_w8a16.cu"
+    source.write_text("// source W8A16 v1\n")
+    fake_cpp = types.SimpleNamespace(
+        CUDA_HOME="/toolkit", get_cxx_compiler=lambda: "c++")
+
+    before, payload = cuda_ext._fp8_source_w8a16_build_identity(
+        _fake_torch(), fake_cpp, src_dir=str(src), capability=(12, 1))
+    assert payload["schema"] == cuda_ext._FP8_SOURCE_W8A16_ABI_SCHEMA
+    assert set(payload["inputs"]) == {"fp8_source_w8a16.cu"}
+    assert payload["target"]["code"] == "sm_121"
+    assert "cutlass_inputs" not in payload
+
+    source.write_text("// source W8A16 v2\n")
+    after, _ = cuda_ext._fp8_source_w8a16_build_identity(
+        _fake_torch(), fake_cpp, src_dir=str(src), capability=(12, 1))
+    assert after != before
+
+
+def test_source_fp8_w8a16_loader_uses_own_identity_directory(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _patch_capability(monkeypatch, (12, 1))
+    good = _stub(cuda_ext._FP8_SOURCE_W8A16_SYMBOLS)
+    calls = _patch_load(monkeypatch, good)
+
+    assert cuda_ext.get_fp8_source_w8a16_ext() is good
+    kwargs = calls[0][1]
+    assert re.fullmatch(r"pq_fp8_source_w8a16_[0-9a-f]{64}", kwargs["name"])
+    identity = kwargs["name"].removeprefix("pq_fp8_source_w8a16_")
+    assert kwargs["build_directory"] == str(
+        tmp_path / "fp8_source_w8a16" / identity)
+    assert kwargs["sources"] == [
+        os.path.join(cuda_ext.csrc_dir(), "fp8_source_w8a16.cu")]
+    assert "-gencode=arch=compute_121,code=sm_121" in \
+        kwargs["extra_cuda_cflags"]
+    assert not any("121a" in flag for flag in kwargs["extra_cuda_cflags"])
+    assert good.__gridbook_jit_capability__ == (12, 1)
+
+
+def test_source_fp8_w8a16_rejects_non_spark_before_build(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _patch_capability(monkeypatch, (12, 0))
+    calls = _patch_load(
+        monkeypatch, error=AssertionError("source W8A16 build ran on sm120"))
+    assert cuda_ext.get_fp8_source_w8a16_ext() is None
+    assert calls == []
 
 
 def test_fp8_identity_names_every_packaged_build_input():

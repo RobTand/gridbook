@@ -24,13 +24,14 @@ LOADERS = {
     "fp4v2": "get_fused_fp4v2_ext",                   # cb_fused_fp4v2_gemm.cu
     "moe_persistent_b": "get_moe_persistent_b_ext",   # cb_moe_persistent_b.cu
     "mxfp8_dense": "get_mxfp8_dense_ext",             # mxfp8_dense_gemm.cu
+    "fp8_source_w8a16": "get_fp8_source_w8a16_ext",   # fp8_source_w8a16.cu
 }
 
 
 def _patch_all(monkeypatch, calls, *, resident=(), raises=()):
     """Replace EVERY loader with a recording stub.
 
-    All eight must be stubbed in every test: the warm-up really does call all
+    All nine must be stubbed in every test: the warm-up really does call all
     of them now, so an unpatched loader would start a real multi-minute nvcc
     build inside the test run. Any family the implementation has grown past
     this file is stubbed too, so inventory drift is reported by the coverage
@@ -48,8 +49,8 @@ def _patch_all(monkeypatch, calls, *, resident=(), raises=()):
         monkeypatch.setattr(cuda_ext, attr, stub)
 
 
-def test_registry_names_exactly_the_eight_loader_families():
-    """The warm-up inventory is all eight modules — no more, no fewer."""
+def test_registry_names_exactly_the_nine_loader_families():
+    """The warm-up inventory is all nine modules — no more, no fewer."""
     assert dict(cuda_ext._PRELOAD_FAMILIES) == LOADERS
     assert len(cuda_ext._PRELOAD_FAMILIES) == len(LOADERS)  # no duplicate keys
     for attr in LOADERS.values():
@@ -57,7 +58,7 @@ def test_registry_names_exactly_the_eight_loader_families():
 
 
 def test_preload_attempts_every_loader_family(monkeypatch):
-    """All eight independent JIT modules are warmed, each exactly once."""
+    """All nine independent JIT modules are warmed, each exactly once."""
     calls = []
     _patch_all(monkeypatch, calls, resident=set(LOADERS))
 

@@ -1,8 +1,9 @@
 {
-  "schema": "gridbook.runtime-contract.v2",
-  "contract_version": 2,
+  "schema": "gridbook.runtime-contract.v3",
+  "contract_version": 3,
   "abi_features": {
-    "routed_moe_per_role_codebook_lut": 1
+    "routed_moe_per_role_codebook_lut": 1,
+    "source_fp8_block128_w8a16": 1
   },
   "quant_method": {
     "canonical": "gridbook",

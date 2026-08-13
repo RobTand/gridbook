@@ -15,10 +15,11 @@ activations; **smem** = GPU shared memory; **TTFT** = time to first token
 
 ## The three invariants everything is built around
 
-- **INV-1 — no resident expansion.** The resident weight is always the packed
-  `cb_qweight` (indices + scale plane) plus the small shared codebook. The dense
-  weight is **never** materialized in memory. Decoding happens in registers/smem
-  per tile, or into a per-layer scratch buffer that is freed after the matmul.
+- **INV-1 — no resident expansion.** A CB layer keeps its packed `cb_qweight`
+  (indices + scale plane) plus the small shared codebook; a source block-FP8
+  layer keeps its raw E4M3 weight plus UE8M0 scale blocks. The dense BF16 weight
+  is **never resident**. Decoding happens in registers/smem per tile, or into a
+  per-layer scratch buffer that is freed after the matmul.
   This is what makes a smaller-on-disk artifact also smaller in memory — the
   reason the format fits large models on one box. A resident-footprint assertion
   is a load-time gate, not a nicety.
@@ -86,6 +87,8 @@ serving contract:
 | FP8-CB, `9 ≤ M ≤ 128` | Fused CUTLASS decode-in-prologue when the rung/layout/device predicates hold; otherwise native CUDA FP8 expansion + CUTLASS W8A8 GEMM |
 | FP8-CB, `M > 128` | Native CUDA FP8 expansion + CUTLASS W8A8 GEMM |
 | FP4-CB, `M > 8` | Native CUDA BF16 expansion + Gridbook-owned CUTLASS grouped BF16 GEMM with `E=1` |
+| Source block-FP8, `M <= 8` | Native CUDA raw-E4M3/UE8M0 W8A16 GEMV; BF16 activations are not quantized |
+| Source block-FP8, `M > 8` | Native CUDA BF16 expansion + Gridbook-owned CUTLASS grouped BF16 GEMM; `E=1` for dense and one problem per DSV4 `wo_a` group |
 
 A missing native extension is an error, not another dispatch arm. See the
 CUDA-graph section for why this host-side branch matters. FP4-v2 model load
@@ -98,6 +101,40 @@ must be biasless, and FP4 must be unsigned product-v2. A non-`None` bias,
 signed S-rung, or FP4-v1 dense layer is format-valid where applicable but has
 no complete owned every-M native operation. The public method rejects bias;
 model load rejects the unsupported FP4 families.
+
+### Source block-FP8 W8A16 (`fp8_e4m3_ue8m0_block128`)
+
+This source-passthrough wire is a **weight-storage contract**, not permission to
+change the activation format. Gridbook retains the source E4M3 bytes and one
+UE8M0 exponent per 128-by-128 weight block. BF16 activations cross the complete
+route unchanged; neither arm calls an activation quantizer or QDQ operation.
+
+- `fp8_source_gemv` owns `M <= 8`. It reads the raw E4M3 weight byte and the
+  matching 128-by-128 UE8M0 scale in the GEMV, accumulates in FP32, and rounds
+  the output to BF16. It does not materialize a weight tile.
+- `fp8_source_expand_bf16` owns the large-M weight conversion. It expands one
+  layer to a contiguous BF16 scratch tensor, which is consumed by
+  `cb_bf16_grouped_mm` and then released. Dense Linear uses the bridge with
+  `E=1`. For grouped DSV4 `attn.wo_a`, `[M,G,K]` activations are made
+  group-major, the expanded weight is viewed as `[G,N,K]`, and cumulative
+  endpoints `[M,2M,...,G*M]` describe exactly one existing CUTLASS problem per
+  group; the result is restored to `[M,G,N]`. No new framework BMM fallback is
+  involved.
+- Load requires both the source extension and the owned grouped-BF16 bridge.
+  Missing source, strict symbol, supported device, shape, or bridge capability
+  is a load-time refusal. DSV4's qualified geometry is exactly
+  `G=8, N=1024, K=4096` at `tp=1`; a mismatch fails closed.
+- Whole-layer dispatch stays behind an opaque custom op. `M` is selected when
+  the operation executes, so `FULL_DECODE_ONLY` captures only the native GEMV
+  arm for fixed sizes `[1,2,4,8]`; large-M expansion remains outside those
+  graphs.
+
+The direct `mxfp8_e4m3_e8m0_g32` wire is intentionally separate. It retains the
+existing opt-in W8A8 `mxfp8_dense_gemm.cu` route and dynamically quantized MXFP8
+activations. The W8A16 source route does not reuse its scale-plane conversion or
+its activation quantizer. Kernel unit gates, exact-artifact served parity, and
+served performance for W8A16 remain pre-tag requirements; no result is claimed
+here before those gates are recorded.
 
 ---
 
@@ -879,7 +916,7 @@ data-dependent control flow. The kernels follow these rules:
 5. **Use full-decode graphs without compilation over the plugin.** The validated
    shape is `mode=0`, `cudagraph_mode=FULL_DECODE_ONLY`, capture sizes
    `[1,2,4,8]`. No Gridbook op carries `torch.Tag.cudagraph_unsafe`, so nothing
-   partitions the captured region — the two whole-dispatch ops are the only
+   partitions the captured region — Gridbook's whole-dispatch ops are opaque
    graph nodes and are capture-safe by construction. On a close-rate
    0.6B canary, changed inputs at capture sizes 1 and 4 matched eager text,
    tokens, and per-token logprobs exactly; 32+256 latency improved 20.1% and was
@@ -907,6 +944,7 @@ too.
 
 | Path | Status |
 |---|---|
+| Source block-FP8 W8A16, dense + DSV4 grouped `wo_a` | **0.8.5 candidate; release evidence pending.** Raw E4M3/UE8M0 stays resident; BF16 activations are unchanged; `M<=8` uses native CUDA GEMV and larger M uses bounded native BF16 expansion plus the owned CUTLASS grouped bridge. Direct MXFP8 g32 remains the separate opt-in W8A8 lane. Do not claim shipped served parity or performance until the exact-artifact gates in RELEASING are recorded |
 | FP8-CB decode (dense) | **Shipped**, at/above native parity |
 | FP4-CB v2 decode (dense) | **Shipped**: bit-matched CUDA GEMV (13/13 parity against the historical Triton result plus the independent expansion reference). The decode chain is compute-bound at GEMV shapes (ncu SM 71%/mem 44%) under the bit-exact contract — the measured ceiling, not a staging problem |
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |

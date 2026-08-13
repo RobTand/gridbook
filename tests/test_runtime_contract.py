@@ -34,8 +34,10 @@ def test_packaged_contract_loads_and_validates():
     contract = load_runtime_contract()
     assert contract == raw
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
+    assert contract["contract_version"] == 3
     assert contract["abi_features"] == {
         "routed_moe_per_role_codebook_lut": 1,
+        "source_fp8_block128_w8a16": 1,
     }
 
 
@@ -143,7 +145,7 @@ def _wrong_schema(contract):
 
 
 def _wrong_contract_version(contract):
-    contract["contract_version"] = 1
+    contract["contract_version"] = 2
 
 
 def _canonical_not_accepted(contract):
@@ -188,6 +190,14 @@ def _wrong_per_role_lut_capability(contract):
     contract["abi_features"]["routed_moe_per_role_codebook_lut"] = 2
 
 
+def _missing_source_fp8_w8a16_capability(contract):
+    del contract["abi_features"]["source_fp8_block128_w8a16"]
+
+
+def _wrong_source_fp8_w8a16_capability(contract):
+    contract["abi_features"]["source_fp8_block128_w8a16"] = 2
+
+
 def _unsupported_format_mode(contract):
     contract["formats"][0]["mode"] = "full"
 
@@ -207,6 +217,9 @@ def _unsupported_format_mode(contract):
         (_missing_per_role_lut_capability,
          "routed_moe_per_role_codebook_lut"),
         (_wrong_per_role_lut_capability, "must be 1"),
+        (_missing_source_fp8_w8a16_capability,
+         "source_fp8_block128_w8a16"),
+        (_wrong_source_fp8_w8a16_capability, "must be 1"),
         (_unsupported_format_mode, "unsupported grid/mode pair"),
     ],
 )

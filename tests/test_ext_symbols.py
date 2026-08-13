@@ -383,6 +383,7 @@ def _exports(cu_name):
 @pytest.mark.parametrize("required,cu_name", [
     (cuda_ext._EXT_SYMBOLS, "cb_gemv.cu"),
     (cuda_ext._FUSED_SYMBOLS, "cb_fused_gemm.cu"),
+    (cuda_ext._FP8_SOURCE_W8A16_SYMBOLS, "fp8_source_w8a16.cu"),
 ])
 def test_strict_symbols_exist_in_packaged_source(required, cu_name):
     assert not (set(required) - _exports(cu_name))

@@ -1,16 +1,11 @@
 // MXFP8 dense W8A8 block-scaled GEMM (sm120/sm121).
 //
-// Serves two producer spellings of the SAME on-device format — E4M3 elements
-// with one UE8M0 (F8_E8M0) exponent scale per 32 contiguous K elements:
-//
-//  * ``mxfp8_e4m3_e8m0_g32``: producer-emitted MXFP8, scales stored row-major
-//    [rows, ceil(K/32)] on disk;
-//  * ``fp8_e4m3_ue8m0_block128``: DeepSeek-convention block quantization
-//    (one UE8M0 scale per 128x128 tile).  128 = 4 * 32, so a 32-wide MX chunk
-//    never straddles a block boundary and the block form embeds EXACTLY into
-//    MXFP8 by pure scale replication: SF_mx[n, c] = S_ds[n // 128, c // 4].
-//    No element byte changes, no scale arithmetic, no rounding.  The Python
-//    lane (gridbook/mxfp8.py) performs that broadcast at model load.
+// Serves only producer-emitted ``mxfp8_e4m3_e8m0_g32``: E4M3 elements with
+// one UE8M0 (F8_E8M0) exponent scale per 32 contiguous K elements, stored
+// row-major [rows, ceil(K/32)] on disk.  DeepSeek's
+// ``fp8_e4m3_ue8m0_block128`` wire is a distinct W8A16 contract and is
+// deliberately rejected by mxfp8_dense_lane.py; it is served by the raw-plane
+// fp8_source_w8a16.cu path with unchanged BF16 activations.
 //
 // The GEMM itself is the STOCK sm120 block-scaled CollectiveBuilder mainloop —
 // kind::mxf8f6f4 with hardware SF application every 32 elements — the one

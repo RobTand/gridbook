@@ -6,7 +6,7 @@ see [`INSTALL.md`](INSTALL.md) and [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md);
 for the format itself see [`SPEC.md`](SPEC.md).
 
 The served path is Gridbook's packaged **native CUDA/CUTLASS kernel set** under
-`gridbook/csrc/`. Native CUDA handles decode GEMV, codebook expansion,
+`gridbook/csrc/`. Native CUDA handles decode GEMV, codebook/source expansion,
 activation QDQ, and routing/combine support; CUTLASS handles GEMM and grouped
 GEMM. Gridbook defines, compiles, and dispatches no Triton operator and has no
 Triton dependency or serving fallback. Required native operations fail closed
@@ -29,10 +29,11 @@ gated activations are attested during model load and invoke their registered
 
 ## Invariants
 
-- **INV-1 (honored):** the resident weight is the packed k-bit index stream +
-  the tiny flat codebook + the (pre-decoded) scales. The dense `[N,K]` weight is
-  never materialized in HBM as a *model-wide* tensor — each superblock's weight
-  tile is expanded inside the kernel, in registers, then consumed by the matmul.
+- **INV-1 (honored):** a CB resident weight is the packed k-bit index stream +
+  the tiny flat codebook + the (pre-decoded) scales; a source block-FP8 resident
+  weight is its raw E4M3 tensor + UE8M0 scale blocks. A dense BF16 `[N,K]`
+  weight is never materialized in HBM as a *model-wide* tensor — each tile is
+  expanded inside the kernel, in registers, then consumed by the matmul.
   The large-M transient-expand prefill path materializes one layer's `[N,K]` tile
   at a time (expand → GEMM → free), a bounded, deliberate relaxation.
 - **INV-2 (native tensor-core matrix kernels):** honored by the CUTLASS
@@ -49,8 +50,11 @@ gated activations are attested during model load and invoke their registered
 
 The producer/runtime boundary is machine-readable at
 `gridbook/runtime_contract.json` and loadable without torch or vLLM through
-`gridbook.runtime_contract.load_runtime_contract()`. It declares accepted
-quantization names, serialized packing/type-size rules, supported CB rung
+`gridbook.runtime_contract.load_runtime_contract()`. Closed schema v3 also
+attests `abi_features.source_fp8_block128_w8a16 = 1`, so a producer can require
+the BF16-activation source route without inferring semantics from the package
+version. It declares accepted quantization names, serialized packing/type-size
+rules, supported CB rung
 families, and producer-profile loader coverage. The plugin derives its own
 registration aliases and top-level loader-module list from this file rather
 than repeating them in Python. PrismaQuant pins an immutable Gridbook
@@ -208,16 +212,16 @@ Gridbook.
   config, but it remains source block-FP8 rather than CB: the qualified eugr
   vLLM baseline's grouped output projection bypasses `apply()` and reads
   `.weight` plus its scale parameter for DeepGEMM directly. On sm_121 that
-  DeepGEMM scale transform is unsupported, and Gridbook has already converted
-  the source scales into its own MXFP8 CuTe planes. Gridbook therefore installs
-  a narrow, ABI-guarded DSV4 adapter only on marked `wo_a` modules: native
-  inverse RoPE, the Gridbook-owned grouped MXFP8 method, then `wo_b`. Every
+  DeepGEMM scale transform is unsupported. Gridbook therefore keeps the raw
+  E4M3 weight and block-128 UE8M0 scale resident and installs a narrow,
+  ABI-guarded DSV4 adapter only on marked `wo_a` modules: native inverse RoPE,
+  the Gridbook-owned grouped W8A16 method on unchanged BF16 activations, then
+  `wo_b`. Every
   unmarked stock DSV4 layer continues through vLLM's original `_o_proj` method
   unchanged. Exact artifact geometry `(G=8, N=1024, K=4096)` is
-  correctness-audited on GB10: M=1 max-abs 0.03125, relative Frobenius
-  1.2460984e-5; M=64 max-abs 0.25, relative Frobenius 4.4897934e-5. Both meet
-  the numeric contract of relative Frobenius at most 1e-4; neither is a
-  bit-exactness claim. End-to-end served parity remains a release gate.
+  covered by the exact-artifact W8A16 gates in `RELEASING.md`. Historical
+  grouped-MXFP8 W8A8 numbers are not evidence for this route. End-to-end served
+  parity and performance remain release gates.
 - **Fail-closed.** Outside `mtp.*`, vLLM's DSV4 loader looks parameters up
   unguarded, so any tensor the artifact emits with no matching parameter is a
   hard load failure rather than a silent skip. On the Gridbook side the usual
@@ -227,12 +231,14 @@ Gridbook.
 
 ## CUDA kernel set (decode-GEMV + prefill)
 
-JIT-built native CUDA/CUTLASS extensions. Numerics contract everywhere: identical weight
-rounding to the reference decode (`w = bf16_rn(codebook · scale)`), fp8/fp4
-activation QDQ bit-exact to the codec, and **fp32 accumulation** — so a CUDA
-result differs from the independent PyTorch/FP64 reference only by summation
-**reassociation**, held to `≤1 bf16 output ULP + a norm backstop` in the native
-kernel tests.
+JIT-built native CUDA/CUTLASS extensions. For CB lanes, the numerics contract is
+identical weight rounding to the reference decode
+(`w = bf16_rn(codebook · scale)`), fp8/fp4 activation QDQ bit-exact to the codec,
+and **fp32 accumulation**. The source block-FP8 W8A16 lane instead preserves its
+BF16 activation tensor and decodes the raw E4M3/UE8M0 weight directly. CUDA
+results are held against independent references with the operation-specific
+exactness/tolerance gate; summation reassociation remains the only admitted
+GEMM/GEMV difference.
 
 **`gridbook/csrc/cb_gemv.cu`** (`cuda_ext.get_ext()`) — dense M≤8, grouped-MoE
 M≤16, plus native expansion/support operators:
@@ -273,6 +279,20 @@ M≤16, plus native expansion/support operators:
 - `fp8_act_qdq`, `cb_moe_combine` — fused per-token fp8 QDQ and the deterministic
   expert-ascending bf16 combine.
 
+**`gridbook/csrc/fp8_source_w8a16.cu`**
+(`cuda_ext.get_fp8_source_w8a16_ext()`) — source block-FP8 W8A16:
+
+- `fp8_source_gemv` consumes BF16 activations and resident E4M3 weights with
+  their original 128-by-128 UE8M0 scale blocks for `M<=8`. It accumulates in
+  FP32 and emits BF16; no activation-QDQ operator is called.
+- `fp8_source_expand_bf16` creates the one-layer BF16 weight transient used for
+  `M>8`. The transient feeds the existing owned grouped-BF16 CUTLASS bridge and
+  is released immediately. DSV4 BMM uses one bridge problem per group rather
+  than a Python or framework matmul loop.
+- The extension has a strict two-symbol ABI and is required during weight load.
+  It is a separate digest-keyed JIT family so its source/toolchain identity
+  cannot alias the CB main module or direct-MXFP8 module.
+
 **`gridbook/csrc/cb_gemv_v2.cu`** (`cuda_ext.get_ext_v2()`) — required FP4-v2
 quality expansion plus an optional alternate decode GEMV:
 
@@ -307,7 +327,9 @@ quality-preserving BF16 bridge:
 
 - **`cb_bf16_grouped_mm`** — consumes ragged expert segments and transiently
   expanded BF16 weights in one owned CUTLASS grouped GEMM. MoE prefill uses
-  `E>1`; dense FP4-CB uses the same binding with `E=1` for every `M>8`. This
+  `E>1`; dense FP4-CB and dense source block-FP8 use the same binding with `E=1`
+  for every `M>8`. Grouped DSV4 source block-FP8 uses `E=G` with equal `M`-row
+  segments. This
   retains Gridbook's established activation-QDQ contract and must not be
   described as the quality-red native-W4A4 experiment. Its current
   SM80-compatible `DefaultGemmGrouped` schedule is not Blackwell-optimized: on
@@ -363,7 +385,7 @@ tooling and model cards — see the README's naming section.)
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PRISMAQUANT_CB_EXT_DIR` | `~/.cache/prismaquant-cb-ext` | Root of the JIT build cache. Point it at a persistent, writable directory in containers so a cold start does not rebuild every module it reaches. Each of the eight modules owns a SUBDIRECTORY of it — `main`, `v2`, and the identity-keyed `bf16_grouped/<digest>`, `fused/<digest>`, `fused_fp4/<digest>`, `fused_fp4v2/<digest>`, `moe_persistent_b/<digest>`, `mxfp8_dense/<digest>` — so no two ninja workspaces share artefacts and a changed source, header, lane macro, target or toolchain ABI lands in a new directory instead of serving a stale kernel. Upgrading Gridbook therefore costs ONE rebuild per affected module; the old directories are inert and can be deleted. |
+| `PRISMAQUANT_CB_EXT_DIR` | `~/.cache/prismaquant-cb-ext` | Root of the JIT build cache. Point it at a persistent, writable directory in containers so a cold start does not rebuild every module it reaches. Each of the nine modules owns a SUBDIRECTORY of it — `main`, `v2`, and the identity-keyed `bf16_grouped/<digest>`, `fused/<digest>`, `fused_fp4/<digest>`, `fused_fp4v2/<digest>`, `moe_persistent_b/<digest>`, `mxfp8_dense/<digest>`, `fp8_source_w8a16/<digest>` — so no two ninja workspaces share artefacts and a changed source, header, lane macro, target or toolchain ABI lands in a new directory instead of serving a stale kernel. Upgrading Gridbook therefore costs ONE rebuild per affected module; the old directories are inert and can be deleted. |
 | `PRISMAQUANT_CUTLASS_INCLUDE` | unset (vLLM's bundled copy) | The `include` directory — the one holding `cutlass/cutlass.h` — that all **four** CUTLASS-compiling modules build against: grouped-BF16, fused FP8-CB, fused NVFP4-CB and the fused FP4-CB v2 mid-M lane. Set it to build in a venv with no vLLM wheel, or against a CUTLASS newer than the bundled tree. Unset, the path is discovered under `vllm/third_party/` *without importing vLLM* (importing it merely to locate files would eagerly initialize optional compiler backends, Triton among them). A set-but-wrong value **fails** with the missing header named; it never falls back silently, because compiling against a different CUTLASS than the one asked for is the surprise this override exists to prevent. |
 | `PRISMAQUANT_CB_GEMV` | `inherited` | Which grouped FP4-CB **decode GEMV** serves a layer: `inherited` \| `auto` \| `v2`. All FP4-v2 quality paths build/load `cb_gemv_v2.cu` and run its cc 12.0/12.1 device prepare because that module also owns the required exact expander. Unset/`inherited` keeps the shipped decode schedule; `auto` or `v2` may additionally use the module's smem-resident decode GEMV where its occupancy predicate says it wins. That alternate decode is **not** bit-exact against `inherited` (reassociation class). FP8-only serves do not need the v2 module. An unknown spelling raises; changing it mid-process raises. |
 | `PRISMAQUANT_CB_FUSED_FP4` | off | Dense fp4-CB native-FP4 prefill opt-in. `1`/`midm` use a fully attested artifact scalar for all prefill shapes / `16 < M <= 128`. `static_lsq`/`static_lsq_midm` keep that exact `G` and the native E2M1/SFA payload, but fit the existing per-row EVT residual by least squares; they add no model metadata, weight copy, decoder, or GEMM. `rowwise`/`rowwise_midm` instead derive an independent full-range scalar per runtime row and are the only fused choices accepted for legacy artifacts. All dense modes use one occupancy selector: TileM256 is chosen only for `M >= 256` and `ceil(M/256) * ceil(N/128) >= ceil(2*SM_count/3)`; otherwise TileM128 runs. The `*_midm` modes therefore always remain TileM128. All values are experimental and default-off; unknown spellings and mid-process changes fail. **Tops the dense precedence chain** — it changes the served activation contract, so it outranks `PRISMAQUANT_CB_FP4_FUSED_MIDM` and `PRISMAQUANT_CB_BF16_SM120` (see [Lane precedence](#lane-precedence--which-flag-wins-when-several-are-set)). A selected mode that the **load-time** gate finds ineligible **fails the load**; a mode that passes that gate and then declines a concrete **call** (in practice the rowwise / static-LSQ quantizers' half-precision guard) **raises** naming the activation dtype and shape. Neither falls through to the exact BF16 route: that route's activation bucket is the fp32-emulated group QDQ rather than the format's native ue4m3 scale factors, so serving it would silently substitute the contract the flag exists to make explicit. The K24 short exact gate passed, but long-context evidence is mixed and no >=4B/MoE served validation exists; see the [dated audit](audits/fused_nvfp4_enablement_2026-07-31.md). |
@@ -372,11 +394,11 @@ tooling and model cards — see the README's naming section.)
 | `PRISMAQUANT_CB_FP4_FUSED_MIDM` | off | `1` routes **dense FP4-CB v2 quality prefill at 9 ≤ M ≤ 128** to the fused decode-in-prologue lane (`csrc/cb_fused_fp4v2_gemm.cu`) instead of `expand_fp4_v2_to_weight` + the owned CUTLASS bridge. CONTRACT-PRESERVING: the decoded weights are bit-identical to `cb_expand_v2` and the activation is the same group-16 QDQ output, so only the FP32 GEMM reduction order changes. Compiled only for cc 12.0/12.1; resolved at model load and **fails the load** if unavailable rather than silently serving the bridge. Since 2026-08-02 the load-time gate is per LAYER, not merely "is the extension present": an uncompiled rung, `K % 256 ≠ 0`, `N % 8 ≠ 0`, a non-v2/non-product format, or a fused module whose roles use different interned codebooks all **fail the load** with the reason named — those are properties of the layer, so with the flag on they would otherwise have served the bridge for every request while the load reported success. The **M band is the one call-time fall-through** and is deliberate: `9 ≤ M ≤ 128` is a property of the REQUEST (and `M ≤ 128` is a HARD gate the kernel itself enforces, since decode-in-prologue re-decodes B per M-tile), so out-of-band shapes take today's exact path unchanged — that is what makes this a mid-M lane. Measured 1.06–4.37× the bridge at M ∈ {9,16,32,64,128}, bit-checked against a same-config oracle; served protocol NOT run. **Outranked by `PRISMAQUANT_CB_FUSED_FP4`** and above `PRISMAQUANT_CB_BF16_SM120` in the dense chain; still attested at load when overridden (see [Lane precedence](#lane-precedence--which-flag-wins-when-several-are-set)). Unknown spellings and mid-process changes raise. See [KERNELS](KERNELS.md#fp4-cb-v2-fused-mid-m-opt-in-prismaquant_cb_fp4_fused_midm) and the [benchmark table](BENCHMARKS.md#2026-08-02-fp4-cb-v2-fused-mid-m-lane-microbenchmark-proposal-data). |
 | `PRISMAQUANT_CB_MOE_PERSISTENT_B` | off | `1` routes the **FP4-CB MoE quality prefill** above the `M<=16` GEMV band to the persistent-B decode-in-mainloop kernel (`csrc/cb_moe_persistent_b.cu`, ROADMAP K1.1) instead of expand + grouped bridge. A CTA owns one (expert, N-tile), decodes that weight tile from packed CB bytes into shared memory ONCE, and streams the expert's routed rows through it, so the `[E,N,K]` BF16 transient never exists and unrouted experts cost nothing. Consumes the exact `expert_ends` segments the default path already builds — no padded rows, and no host read anywhere on the path. Compiled only for cc 12.0/12.1 and only for FP4-CB two-tier v2 (`n_sub=2`, `type_size=4k+9`, superblock-aligned dimensions); resolved at model load and **fails the load** if the flag is on where the lane cannot serve. Same activation payload and one bf16 round; the weight decode is bit-identical to `cb_expand_v2` (tested with `torch.equal`), so only the FP32 reduction order changes. It takes precedence over `PRISMAQUANT_CB_BF16_SM120` for these layers, because it replaces the pair of operations that lane is one half of — and is itself outranked by `PRISMAQUANT_CB_FUSED_FP4_MOE`, which changes the activation contract (see [Lane precedence](#lane-precedence--which-flag-wins-when-several-are-set)). When overridden it is still attested at load, and the load-time dispatch line says so rather than announcing a route that will not serve. Unknown spellings and mid-process changes raise. See [KERNELS](KERNELS.md#persistent-b-decode-in-mainloop-opt-in-prismaquant_cb_moe_persistent_b) and the [benchmark table](BENCHMARKS.md#2026-08-02-persistent-b-grouped-moe-decode-in-mainloop-microbenchmark-proposal-data). |
 | `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG` | `0` | Tile override for the lane above; `0` lets the kernel choose from the SHAPES (mean routed rows per expert), which is the production setting. A non-zero value is a 1-based index into `cb_moe_persistent_b_configs()` and is **validated at model load against what this build compiled**, so a stale or mistyped index fails the load instead of aborting the first request that carries routed rows. Measurement knob only. |
-| `GRIDBOOK_MXFP8_DENSE` | off | `1` opts in Gridbook's **MXFP8 dense W8A8 lane** (`csrc/mxfp8_dense_gemm.cu`): E4M3 weights with one UE8M0 scale per 32 K-elements, served on the stock sm120/sm121 block-scaled CollectiveBuilder collective (`kind::mxf8f6f4`), activations quantized dynamically per 32. Serves two source-passthrough wire spellings of the same on-device format — producer MXFP8 (`mxfp8_e4m3_e8m0_g32`) and DeepSeek block-128 FP8 (`fp8_e4m3_ue8m0_block128`), the latter embedded EXACTLY at load by scale replication (128 = 4 × 32; proof and torch reference in `gridbook/mxfp8.py`). Correctness-audited on sm_121 against the fp32 oracle over the seven distinct DSV4-Flash body shapes (worst relative Frobenius 5.9e-5 under the at-most-1e-4 numeric contract; no M=1 bit-exactness claim). The grouped `wo_a` gate on the qualified eugr baseline measures relative Frobenius 1.2460984e-5 at M=1 and 4.4897934e-5 at M=64; **OPT-IN because the NATIVE-PARITY served bench is pending** — run `python -m gridbook.bench_mxfp8_dense` on an idle GPU for the timing half. With the flag unset, an artifact declaring these passthrough units refuses at model load with this flag named; compiled only for cc 12.0/12.1 and attested at load like every lane (`lane_select.require_lane`). Unknown spellings and mid-process changes raise. |
+| `GRIDBOOK_MXFP8_DENSE` | off | `1` opts in Gridbook's **direct MXFP8 dense W8A8 lane** (`csrc/mxfp8_dense_gemm.cu`) for `mxfp8_e4m3_e8m0_g32`: E4M3 weights with one UE8M0 scale per 32 K-elements, served on the stock sm120/sm121 block-scaled CollectiveBuilder collective (`kind::mxf8f6f4`), with activations quantized dynamically per 32. Correctness was audited on sm_121, but the NATIVE-PARITY served timing bench remains pending. With the flag unset, a direct-MXFP8 passthrough unit refuses at model load with this flag named; compiled only for cc 12.0/12.1 and attested at load like every lane (`lane_select.require_lane`). The source `fp8_e4m3_ue8m0_block128` wire is **not controlled by this flag** and never enters this W8A8 lane: it uses the separately attested W8A16 source route with unchanged BF16 activations. Unknown spellings and mid-process changes raise. |
 | `PRISMAQUANT_CB_FUSED_MIDM` | `1` | Resolved during model load. `0` skips the CUTLASS mid-M FP8 fused specialization and its JIT build; the exact native expansion/CUTLASS route remains. Only `''` (unset), `0` and `1` are accepted — before 2026-08-02 this was compared `!= "0"`, so `false` and `off` silently ENABLED the lane they read as disabling. Process-stable: changing the value after dispatch is fixed raises rather than taking effect. |
 | `PRISMAQUANT_CB_DECODE_CONTRACT` | `v1` | `v2` selects the scale-epilogue-hoist decode contract. Measured **null** on the served 27B; kept for reproducibility. |
 | `PRISMAQUANT_DEBUG_PREFIXES` | off | `1` prints, per Linear, whether it resolved to a CB scheme or to a config-declared non-CB group — the first tool to reach for when memory use is higher than expected. |
-| `PRISMAQUANT_PRELOAD_FUSED` | off | `1` independently attempts to build/preload **every** native extension family at registration — decode GEMV, GEMV-v2, grouped BF16, both fused FP8-CB/NVFP4-CB modules, fused FP4-v2, persistent-B MoE and MXFP8 dense — so both arms of a served A/B can carry identical extension residency. (Before 2026-08-02 it warmed only the two fused modules, which left the other five free to differ between arms; the name is kept because it is the published one.) Each family is attempted independently and fail-soft: one that will not build on this box leaves the others warmed. Only `''` (unset), `0` and `1` are accepted: this was compared `== "1"` until 2026-08-02, so `true` and a stray-space `" 1 "` warmed nothing while the operator believed both arms were residency-matched — a failure invisible in the results. A family that does not warm is now named on stderr rather than silently skipped. Registration treats this as a capability probe; a serving caller still requires its selected native operation and fails closed (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |
+| `PRISMAQUANT_PRELOAD_FUSED` | off | `1` independently attempts to build/preload **every** native extension family at registration — decode GEMV, GEMV-v2, grouped BF16, both fused FP8-CB/NVFP4-CB modules, fused FP4-v2, persistent-B MoE, direct MXFP8 dense, and source block-FP8 W8A16 — so both arms of a served A/B can carry identical extension residency. (Before 2026-08-02 it warmed only the two fused modules, which left the other five free to differ between arms; the name is kept because it is the published one.) Each family is attempted independently and fail-soft: one that will not build on this box leaves the others warmed. Only `''` (unset), `0` and `1` are accepted: this was compared `== "1"` until 2026-08-02, so `true` and a stray-space `" 1 "` warmed nothing while the operator believed both arms were residency-matched — a failure invisible in the results. A family that does not warm is now named on stderr rather than silently skipped. Registration treats this as a capability probe; a serving caller still requires its selected native operation and fails closed (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |
 
 ### Lane precedence — which flag wins when several are set
 
@@ -524,4 +546,7 @@ and fp4-v2, QDQ bit-exactness, the expander) against independent PyTorch/FP64
 references. The grouped-BF16 bridge is gated against segmented BF16 matmul
 references, while `tests/test_fused_prefill.py` gates the specialized prefill
 kernels and `tests/test_persistent_tc.py` gates the research-only persistent-N
-source behind its opt-in.
+source behind its opt-in. `tests/test_fp8_source_w8a16_cuda.py` independently
+gates the source GEMV and BF16 expander; the integration suite separately pins
+resident raw storage, dense/grouped dispatch, no activation QDQ, and fail-closed
+load behavior.
