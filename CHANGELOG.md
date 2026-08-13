@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.8.6 — 2026-08-13
+
+- **Load separately quantized DeepSeek-V4 DSpark drafts without rewriting
+  namespaces.** DSpark constructs quantization methods under
+  `model.layers.{L+stage}`, registers parameters under
+  `model.layers.{stage}`, and stores draft tensors under `mtp.{stage}`.
+  Gridbook now reuses DSpark's own `_remap_dspark_name` at the top-level load
+  boundary, including routed-expert stacks and mixed fused roles, so those
+  three namespaces reconcile explicitly and fail closed on ambiguity.
+
+- DSpark construction now binds Gridbook's lazy `quant_config.json` and
+  `cb_codebooks.pqcb` lookup to vLLM's explicit
+  `speculative_config.draft_model_config`. The target body keeps its own
+  `model_config` authority even when speculation is configured; a missing or
+  malformed explicit draft config fails before draft initialization. This
+  prevents a separately quantized draft from accidentally opening the target
+  model's sidecars.
+
+- The optional `gridbook.dspark-target-bridge.v1` record binds activation
+  scalar targets to physical checkpoint tensors when an activation execution
+  contract exists. Weight-only CB drafts do not invent an activation bridge;
+  their construction-to-registered loader mapping is still covered by the
+  new `abi_features.dspark_construction_physical_bridge = 1` runtime feature.
+  The packaged loader allow-list now includes the unforked vLLM DSpark module.
+  Adding this closed feature advances the producer/runtime contract from v3 to
+  v4; consumers must not reinterpret the expanded key set as the older schema.
+
+- This release adds no new quantization format. Target-only serving remains the
+  DSV4-Flash shipping default. On the exact qualified candidate
+  stack, native MXFP4 DSpark improved the fixed eager 8 x 128 suite by only
+  `0.95%` while adding `10.13 GiB` of model residency, and K12-CB regressed
+  throughput by `10.81%`; DSpark therefore remains an opt-in experimental
+  companion rather than a production default. The final clean-commit image
+  still has to repeat the release smoke before tagging.
+
+- The optional smem-resident FP4-CB decode GEMV now preserves the inherited
+  default's exact reduction order on DSV4 K=2048/4096 via eight named virtual
+  warp accumulators. The final-source cc 12.1 gate (source SHA256
+  `d72b15ecaad14e7af07f8af555259f5d1423cee2dacce160c13b3caf7b8bc92b`)
+  passed 30/30 eager/graph operator tests for k12/k16/k18 and both decode
+  contracts, measured a bit-exact 1.8175–1.9977x v1 direct-op speedup, and
+  produced zero full-vocabulary KL, NLL, PPL, and target-logprob delta over 240
+  same-process DSV4 positions. This is a release-shape candidate behind
+  explicit `PRISMAQUANT_CB_GEMV=v2`, with every `PRISMAQUANT_CB_W2_*` override
+  absent; the global default remains `inherited`, and final clean-wheel served
+  graph/throughput qualification remains open. Exact evidence paths are in
+  `docs/RELEASING.md`.
+
+- Routed dispatch now handles vLLM's `VLLM_MOE_SKIP_PADDING` convention at
+  Gridbook's opaque MoE boundary. The documented expert-id `-1` padding
+  sentinel is mapped to a valid placeholder expert and its router weight is
+  replaced with exact zero using device-only tensor operations; every other
+  expert id remains unchanged, caller tensors are not mutated, and the
+  separately scheduled shared-expert path is untouched. Previously a fully
+  padded profile batch reached Gridbook's routed-count `scatter_add_` with
+  `-1` indices and raised a CUDA device-side bounds assertion, later reported
+  at the next codebook-expansion API call.
+
+- Dense CB methods now reject `is_bmm` layers during weight finalization.
+  DeepSeek-V4 `attn.wo_a` is a grouped BMM whose result shape cannot be
+  represented by the dense CB method; released DSpark sidecars must keep its
+  three projections on the already-qualified source-FP8 W8A16 route. A future
+  grouped-CB implementation needs its own numeric and performance gate.
+
 ## 0.8.5 — 2026-08-12
 
 - **Correct source block-FP8 serving to W8A16.** The

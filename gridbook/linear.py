@@ -372,6 +372,20 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         layer._cb_fp4_input_global_scale_f32 = float(expected_scales[0])
 
     def process_weights_after_loading(self, layer):
+        # vLLM stamps grouped-BMM geometry only after the Linear constructor
+        # (and therefore after get_quant_method/create_weights).  A dense CB
+        # method must not reinterpret [T,G,K] as T*G independent dense rows:
+        # that would multiply every group by all G output blocks and return
+        # [T,G,G*N] instead of the required [T,G,N].  Keep this load-time and
+        # fail-closed until Gridbook owns a measured grouped-CB kernel.  The
+        # released DeepSeek-V4 wo_a route is source FP8 W8A16, whose grouped
+        # BMM contract is separately qualified.
+        if bool(getattr(layer, "is_bmm", False)):
+            raise RuntimeError(
+                f"{self.prefix}: dense CB Linear does not implement grouped "
+                "BMM semantics; declare this projection as source FP8 W8A16 "
+                "instead of serving a shape-incorrect CB fallback"
+            )
         dev = layer.cb_qweight.device
         codebooks = self.quant_config.get_codebooks()
 

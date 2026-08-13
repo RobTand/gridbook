@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -283,6 +284,135 @@ def _canonical_target(name: str) -> str:
     return _canonical_prefix(name)
 
 
+_DSPARK_TARGET_BRIDGE_SCHEMA = "gridbook.dspark-target-bridge.v1"
+_DSPARK_CANONICAL_INDEX = r"(?:0|[1-9]\d*)"
+_DSPARK_CANONICAL_TAIL = (
+    r"[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:[.](?:[A-Za-z_][A-Za-z0-9_]*|0|[1-9]\d*))*"
+)
+_DSPARK_CONSTRUCTION_TARGET_RE = re.compile(
+    rf"^model[.]layers[.](?P<layer>{_DSPARK_CANONICAL_INDEX})[.]"
+    rf"(?P<rest>{_DSPARK_CANONICAL_TAIL})$"
+)
+_DSPARK_PHYSICAL_TARGET_RE = re.compile(
+    rf"^mtp[.](?P<stage>{_DSPARK_CANONICAL_INDEX})[.]"
+    rf"(?P<rest>{_DSPARK_CANONICAL_TAIL})$"
+)
+
+
+def _parse_dspark_target_bridge(config: dict, contract: dict | None
+                                ) -> dict[str, str]:
+    """Validate the explicit DSpark construction -> physical target map.
+
+    Quantization dispatch constructs DSpark's layers under
+    ``model.layers.{num_hidden_layers + stage}``, while activation-contract
+    scalars are serialized under the checkpoint's ``mtp.{stage}`` namespace.
+    The bridge is producer metadata, not a runtime guess: its topology and
+    every same-tail mapping are checked here, and its physical values must be
+    exactly the digest-bound activation contract target set.
+    """
+    raw = config.get("dspark_target_bridge")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("dspark_target_bridge must be an object")
+    expected_fields = {
+        "schema", "num_hidden_layers", "n_mtp_layers",
+        "construction_to_physical",
+    }
+    missing = sorted(expected_fields - set(raw))
+    extra = sorted(set(raw) - expected_fields)
+    if missing or extra:
+        raise ValueError(
+            "dspark_target_bridge fields mismatch: "
+            f"missing={missing}, unknown={extra}"
+        )
+    if raw["schema"] != _DSPARK_TARGET_BRIDGE_SCHEMA:
+        raise ValueError(
+            f"dspark_target_bridge.schema={raw['schema']!r}; expected "
+            f"{_DSPARK_TARGET_BRIDGE_SCHEMA!r}"
+        )
+    num_hidden = raw["num_hidden_layers"]
+    n_mtp = raw["n_mtp_layers"]
+    if (isinstance(num_hidden, bool) or not isinstance(num_hidden, int)
+            or num_hidden <= 0):
+        raise ValueError(
+            "dspark_target_bridge.num_hidden_layers must be a positive integer"
+        )
+    if (isinstance(n_mtp, bool) or not isinstance(n_mtp, int) or n_mtp <= 0):
+        raise ValueError(
+            "dspark_target_bridge.n_mtp_layers must be a positive integer"
+        )
+    if contract is None:
+        raise ValueError(
+            "dspark_target_bridge requires the nvfp4_w4a4 execution contract"
+        )
+    mapping = raw["construction_to_physical"]
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError(
+            "dspark_target_bridge.construction_to_physical must be a "
+            "non-empty object"
+        )
+
+    result: dict[str, str] = {}
+    for construction, physical in mapping.items():
+        if (not isinstance(construction, str) or not construction
+                or not isinstance(physical, str) or not physical):
+            raise ValueError(
+                "dspark_target_bridge mappings require non-empty string keys "
+                "and values"
+            )
+        canonical = _canonical_target(construction)
+        if canonical != construction:
+            raise ValueError(
+                f"dspark construction target {construction!r} is not in the "
+                f"canonical namespace; use {canonical!r}"
+            )
+        construction_match = _DSPARK_CONSTRUCTION_TARGET_RE.fullmatch(
+            construction
+        )
+        physical_match = _DSPARK_PHYSICAL_TARGET_RE.fullmatch(physical)
+        if construction_match is None or physical_match is None:
+            raise ValueError(
+                f"invalid DSpark target bridge {construction!r} -> "
+                f"{physical!r}; expected model.layers.N.<tail> -> "
+                "mtp.S.<tail>"
+            )
+        stage = int(physical_match.group("stage"))
+        layer = int(construction_match.group("layer"))
+        if stage >= n_mtp:
+            raise ValueError(
+                f"DSpark physical target {physical!r} has stage {stage}, "
+                f"outside n_mtp_layers={n_mtp}"
+            )
+        if layer != num_hidden + stage:
+            raise ValueError(
+                f"DSpark construction target {construction!r} has layer "
+                f"{layer}; expected num_hidden_layers + stage = "
+                f"{num_hidden + stage}"
+            )
+        if construction_match.group("rest") != physical_match.group("rest"):
+            raise ValueError(
+                f"DSpark target bridge {construction!r} -> {physical!r} "
+                "changes the target tail"
+            )
+        result[construction] = physical
+
+    if len(set(result.values())) != len(result):
+        raise ValueError(
+            "dspark_target_bridge physical targets must be one-to-one"
+        )
+    contract_targets = set(contract["target_names"])
+    if set(result.values()) != contract_targets:
+        raise ValueError(
+            "dspark_target_bridge physical targets must exactly equal the "
+            "nvfp4_w4a4 execution contract target_names; "
+            f"bridge_only={sorted(set(result.values()) - contract_targets)}, "
+            f"contract_only={sorted(contract_targets - set(result.values()))}"
+        )
+    return result
+
+
 def _sidecar_revision(model_config: Any, model_dir: str) -> str | None:
     """Return one immutable revision for every sidecar of a Hub model.
 
@@ -374,6 +504,10 @@ class PrismaQuantConfig(QuantizationConfig):
         self._nvfp4_activation_contract: dict | None = None
         self._nvfp4_activation_scales: dict[str, float] | None = None
         self._target_physical_name: dict[str, str] = {}
+        # Producer-declared DSpark construction topology, rechecked against
+        # the instantiated draft model by the top-level loader before copying
+        # any tensor. None is the permanent non-DSpark/legacy state.
+        self._dspark_target_bridge_topology: tuple[int, int] | None = None
         # Delegated (non-CB) target -> the stock group that declares it. The
         # D0.2 preflight needs the *declaration*, and the declaration lives in
         # the config group, not in whatever tensors happen to be on disk.
@@ -393,8 +527,18 @@ class PrismaQuantConfig(QuantizationConfig):
     def _get_sidecar_source(self) -> tuple[str, str | None]:
         if self._sidecar_source is None:
             from vllm.config import get_current_vllm_config
+            from .moe_toplevel_loader import (
+                active_dspark_draft_model_config,
+            )
 
-            model_config = get_current_vllm_config().model_config
+            # vLLM retains the target model_config while constructing a
+            # separate DSpark draft.  Only the DSpark class's exact
+            # construction context can override this source; the existence of
+            # speculative_config by itself changes nothing for body/legacy
+            # configs.
+            model_config = active_dspark_draft_model_config()
+            if model_config is None:
+                model_config = get_current_vllm_config().model_config
             try:
                 model_dir = os.fspath(model_config.model)
             except TypeError as exc:
@@ -500,7 +644,8 @@ class PrismaQuantConfig(QuantizationConfig):
 
     @staticmethod
     def _validate_cb_activation_scheme(
-        scheme: dict, target: str, contract: dict | None
+        scheme: dict, target: str, contract: dict | None,
+        *, physical_target: str | None = None,
     ) -> None:
         """Validate a custom scheme's top-level activation-contract link."""
 
@@ -521,10 +666,12 @@ class PrismaQuantConfig(QuantizationConfig):
                 f"{_NVFP4_ACTIVATION_CONTRACT_KEY!r}, but the top-level "
                 "execution contract is absent"
             )
+        contract_target = physical_target or target
         if (reference is not None and contract is not None
-                and target not in contract["target_names"]):
+                and contract_target not in contract["target_names"]):
             raise ValueError(
-                f"CB target {target!r}: activation_contract scalar is absent "
+                f"CB target {target!r}: physical activation target "
+                f"{contract_target!r} is absent "
                 "from execution_contracts.nvfp4_w4a4.target_names"
             )
         if contract is not None and grid == "fp4" and reference is None:
@@ -648,6 +795,19 @@ class PrismaQuantConfig(QuantizationConfig):
 
     # -- lazy resolution of the (possibly pointer) quant config --------------
     def _ensure_resolved(self) -> None:
+        # Pointer configs necessarily bind their model source below when they
+        # open quant_config.json.  An inline config can otherwise finish
+        # resolution without touching either sidecar, then first ask for its
+        # codebook during post-load finalization after the DSpark constructor's
+        # draft-authority ContextVar has been restored.  Pin that authority
+        # while it is available, even when this config was already resolved;
+        # ordinary target configs still see no DSpark context and retain the
+        # historical current-vLLM-config path.
+        if self._sidecar_source is None:
+            from .moe_toplevel_loader import active_dspark_draft_model_config
+
+            if active_dspark_draft_model_config() is not None:
+                self._get_sidecar_source()
         if self._resolved:
             return
         cfg = self._raw_config
@@ -659,11 +819,28 @@ class PrismaQuantConfig(QuantizationConfig):
                 cfg = json.load(fh)
             self.codebook_file = cfg.get("codebook_file", self.codebook_file)
         self._nvfp4_activation_contract = _parse_nvfp4_activation_contract(cfg)
+        dspark_target_bridge = _parse_dspark_target_bridge(
+            cfg, self._nvfp4_activation_contract
+        )
+        if dspark_target_bridge:
+            bridge_record = cfg["dspark_target_bridge"]
+            self._dspark_target_bridge_topology = (
+                int(bridge_record["num_hidden_layers"]),
+                int(bridge_record["n_mtp_layers"]),
+            )
 
         # Preserve the producer's physical spelling before resolver namespace
-        # canonicalization.  Digest membership is over these exact names.
-        physical_by_canonical: dict[str, str] = {}
+        # canonicalization. Digest membership is over these exact names. The
+        # DSpark bridge covers the complete activation contract (including a
+        # delegated stock-NVFP4 target); custom CB targets add the legacy
+        # identity mapping when no bridge is present.
+        physical_by_canonical: dict[str, str] = dict(dspark_target_bridge)
+        declared_targets: set[str] = set()
         for group in cfg["config_groups"].values():
+            declared_targets.update(
+                _canonical_target(str(target))
+                for target in group.get("targets", [])
+            )
             scheme = group.get("scheme")
             if scheme is None:
                 continue
@@ -671,18 +848,34 @@ class PrismaQuantConfig(QuantizationConfig):
                 raise ValueError("CB config group scheme must be an object")
             for raw_target in group.get("targets", []):
                 target = str(raw_target)
+                canonical = _canonical_target(target)
+                physical = dspark_target_bridge.get(canonical, target)
                 self._validate_cb_activation_scheme(
-                    scheme, target, self._nvfp4_activation_contract
+                    scheme,
+                    target,
+                    self._nvfp4_activation_contract,
+                    physical_target=physical,
                 )
                 if scheme.get("activation_contract") is None:
                     continue
-                canonical = _canonical_target(target)
-                previous = physical_by_canonical.setdefault(canonical, target)
-                if previous != target:
+                previous = physical_by_canonical.setdefault(
+                    canonical, physical
+                )
+                if previous != physical:
                     raise ValueError(
-                        f"contracted CB targets {previous!r} and {target!r} "
-                        f"collapse to runtime namespace {canonical!r}"
+                        f"contracted CB runtime target {canonical!r} maps to "
+                        f"conflicting physical targets {previous!r} and "
+                        f"{physical!r}"
                     )
+        if dspark_target_bridge:
+            bridge_keys = set(dspark_target_bridge)
+            undeclared = bridge_keys - declared_targets
+            if undeclared:
+                raise ValueError(
+                    "dspark_target_bridge construction targets must be "
+                    "declared by config_groups; "
+                    f"undeclared={sorted(undeclared)}"
+                )
         # Normalise stored namespaces ONCE, here, so all downstream resolution
         # (ours and the delegated CT config's) sees canonical target names.
         cfg = dict(cfg)
@@ -800,6 +993,9 @@ class PrismaQuantConfig(QuantizationConfig):
             CompressedTensorsConfig,
         )
         ct_dict = dict(self._full_config)
+        # Gridbook-only construction/physical namespace metadata is consumed
+        # above and must not leak into compressed-tensors' closed vocabulary.
+        ct_dict.pop("dspark_target_bridge", None)
         ct_dict["quant_method"] = "compressed-tensors"
         ct_dict["config_groups"] = dict(stock_groups)
         # Passthrough units join CB targets in CT's ignore: both are owned by

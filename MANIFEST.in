@@ -15,6 +15,8 @@ recursive-include tests *.py
 include scripts/prepare_lfm_fused_validation.py
 include scripts/validate_fused_nvfp4_ab.py
 include scripts/validate_fused_nvfp4_three_arm.py
+include scripts/validate_moe_persistent_b_ab.py
+include scripts/validate_moe_gemv_v2_ab.py
 
 # Developer tools that live inside the package directory but are NOT package
 # data: standalone main() binaries (gridbook/csrc/tools/) that nothing loads at

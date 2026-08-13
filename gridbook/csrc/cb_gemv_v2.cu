@@ -37,16 +37,16 @@
 // the k20 (16 KB) and k24 (64 KB) staged-dictionary configurations expressible
 // at all.
 //
-// NUMERICS — NOT bit-exact against the default inherited schedule. The byte
-// format, the decode semantics, the wv rounding (v1: w = bf16_rn(f32(cb)*sc);
-// v2 contract: raw values with sc applied to the lane partial), the FMA chain
-// order, the ascending-superblock per-warp accumulation and the 32-lane tree
-// reduce are all IDENTICAL to cb_gemv.cu's `cb_moe_gemv_fp4_v2_rowpack_kernel`
-// (PRISMAQUANT_CB_W2_SCHED=rowpack), against which this kernel is bit-exact.
-// The inherited DEFAULT schedule sums in a different order, so v2-vs-default is
-// a REASSOCIATION-class difference, the same class as the CUDA-vs-Triton gate
-// in tests/test_cuda_gemv.py. Measured on a 204-cell synthetic sweep: 9 cells
-// differ, worst max_rel 5.88e-03. Do not describe this kernel as bit-exact.
+// NUMERICS. The byte format, decode semantics and wv rounding are identical to
+// cb_gemv.cu (v1: w = bf16_rn(f32(cb)*sc); v2 contract: raw values with sc
+// applied to the lane partial). On the exact DSV4 K=2048/4096 shapes (8/16
+// superblocks), a compile-time specialization emulates the inherited DEFAULT
+// kernel's eight independent warp accumulators and final w=0..7 sum while one
+// physical warp still owns each output row. It is therefore required to be
+// bit-exact to the shipped default there. Other shapes retain the original
+// ascending-superblock rowpack reduction and are bit-exact to
+// `cb_moe_gemv_fp4_v2_rowpack_kernel` instead; those may reassociate against
+// the inherited default. Keep the two contracts separate in tests and claims.
 //
 // Scope: fp4 grid, product mode n_sub=2, two-tier v2 scale plane
 // (type_size = 4k+9), stacked [E, N, row_bytes] MoE experts. Signed/full/fp8
@@ -99,6 +99,106 @@ struct Split2 {
   }
 };
 
+// One superblock of the per-lane FP4-CB dot product.  Keeping this helper
+// shared by the ordinary rowpack schedule and the exact DSV4 specialization
+// below makes the byte extraction, dictionary gather, weight rounding and FMA
+// instructions identical; only the accumulator that receives superblock s is
+// selected by the caller.
+template <int DS>
+DEVINL void cb_gemv_v2_accumulate_superblock(
+    const int s, const int lane, const int head_off,
+    const uint8_t* __restrict__ slot,
+    const uint16_t* __restrict__ xr, const int type_size,
+    const uint16_t* __restrict__ cb, const float* __restrict__ compose,
+    const uint16_t* __restrict__ dict, const Split2& sp,
+    const int k_bits, const int scale_off, const int v2,
+    float& acc) {
+  const int sb_off = head_off + s * type_size;
+  const int bitpos = sb_off * 8 + lane * k_bits;
+  const int b0 = bitpos >> 3;
+  const int rem = ((b0 & 3) << 3) + (bitpos & 7);
+  const uint32_t* s32 = reinterpret_cast<const uint32_t*>(slot);
+  const int widx = b0 >> 2;
+  const uint32_t w0_ = s32[widx];
+  const uint32_t w1_ = s32[widx + 1];
+  const uint32_t w2_ = (rem + k_bits > 64) ? s32[widx + 2] : 0u;
+  const int grp = lane >> 1;
+  const uint8_t super_e = slot[sb_off + scale_off];
+  const uint8_t sub_byte = slot[sb_off + scale_off + 1 + (grp >> 1)];
+  const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
+  uint64_t code = lo >> rem;
+  if (rem + k_bits > 64) code |= (uint64_t)w2_ << (64 - rem);
+  code &= (k_bits >= 64) ? ~0ull : ((1ull << k_bits) - 1ull);
+
+  const uint32_t code16 =
+      (uint32_t)((sub_byte >> ((grp & 1) * 4)) & 0xFu);
+  const float sc = __ldg(compose + (int)super_e * 16 + (int)code16);
+
+  const uint32_t i0 = (uint32_t)code & sp.m0;
+  const uint32_t i1 = (uint32_t)(code >> sp.w0) & sp.m1;
+  uint2 q0, q1;
+  if constexpr (DS != 0) {
+    q0 = *reinterpret_cast<const uint2*>(dict + (int64_t)i0 * 4);
+  } else {
+    q0 = __ldg(reinterpret_cast<const uint2*>(cb + (int64_t)i0 * 4));
+  }
+  if constexpr (DS == 2) {
+    q1 = *reinterpret_cast<const uint2*>(dict + sp.e1 + (int64_t)i1 * 4);
+  } else {
+    q1 = __ldg(reinterpret_cast<const uint2*>(cb + sp.e1 +
+                                              (int64_t)i1 * 4));
+  }
+  float wv[8];
+  if (v2) {
+    wv[0] = bf16_to_f32((uint16_t)(q0.x & 0xffffu));
+    wv[1] = bf16_to_f32((uint16_t)(q0.x >> 16));
+    wv[2] = bf16_to_f32((uint16_t)(q0.y & 0xffffu));
+    wv[3] = bf16_to_f32((uint16_t)(q0.y >> 16));
+    wv[4] = bf16_to_f32((uint16_t)(q1.x & 0xffffu));
+    wv[5] = bf16_to_f32((uint16_t)(q1.x >> 16));
+    wv[6] = bf16_to_f32((uint16_t)(q1.y & 0xffffu));
+    wv[7] = bf16_to_f32((uint16_t)(q1.y >> 16));
+  } else {
+    wv[0] = bf16_to_f32(f32_to_bf16_rn(
+        bf16_to_f32((uint16_t)(q0.x & 0xffffu)) * sc));
+    wv[1] = bf16_to_f32(f32_to_bf16_rn(
+        bf16_to_f32((uint16_t)(q0.x >> 16)) * sc));
+    wv[2] = bf16_to_f32(f32_to_bf16_rn(
+        bf16_to_f32((uint16_t)(q0.y & 0xffffu)) * sc));
+    wv[3] = bf16_to_f32(f32_to_bf16_rn(
+        bf16_to_f32((uint16_t)(q0.y >> 16)) * sc));
+    wv[4] = bf16_to_f32(f32_to_bf16_rn(
+        bf16_to_f32((uint16_t)(q1.x & 0xffffu)) * sc));
+    wv[5] = bf16_to_f32(f32_to_bf16_rn(
+        bf16_to_f32((uint16_t)(q1.x >> 16)) * sc));
+    wv[6] = bf16_to_f32(f32_to_bf16_rn(
+        bf16_to_f32((uint16_t)(q1.y & 0xffffu)) * sc));
+    wv[7] = bf16_to_f32(f32_to_bf16_rn(
+        bf16_to_f32((uint16_t)(q1.y >> 16)) * sc));
+  }
+
+  const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
+  const uint4 xv = __ldg(reinterpret_cast<const uint4*>(xr + xbase));
+  const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+  if (v2) {
+    float ppart = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      ppart = fmaf(wv[2 * i], bf16_to_f32((uint16_t)(xw[i] & 0xffffu)),
+                   ppart);
+      ppart = fmaf(wv[2 * i + 1], bf16_to_f32((uint16_t)(xw[i] >> 16)),
+                   ppart);
+    }
+    acc = fmaf(sc, ppart, acc);
+  } else {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      acc = fmaf(wv[2 * i], bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc);
+      acc = fmaf(wv[2 * i + 1], bf16_to_f32((uint16_t)(xw[i] >> 16)), acc);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Grouped MoE fp4-v2 decode GEMV, smem-resident dictionary + whole-row stage.
 //   x        [Xrows, K] bf16 (as u16), act-QDQ'd outside (same as inherited)
@@ -124,7 +224,13 @@ struct Split2 {
 //   1 HALF  : sub0 in smem, sub1 by __ldg — halves both the smem bill and the
 //             divergent-gather rate.  The k24 compromise.
 // sub0 has 2^ceil(k/2) entries (elements [0, e1)), sub1 the rest.
-template <int WARPS, int DS>
+// INHERITED_NSB is zero for the existing rowpack reduction.  The 8/16
+// specializations preserve the shipped inherited kernel's eight-warp FP32
+// reduction order on the exact DSV4 w2/w13 shapes while retaining v2's one
+// physical warp per output row and its shared-dictionary/whole-row staging.
+// Eight named accumulators are intentional: a runtime-indexed array can spill
+// to local memory and would erase the decode win this specialization protects.
+template <int WARPS, int DS, int INHERITED_NSB = 0>
 __global__ __launch_bounds__(WARPS * 32) void cb_gemv_v2_kernel(
     const uint16_t* __restrict__ x,
     const uint8_t* __restrict__ qw,
@@ -138,6 +244,11 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_v2_kernel(
     const int rpb, const int slot_bytes, const int cb_elems,
     const int64_t last_row_byte,   // total bytes of qw (OOB guard for u64 tail)
     const int v2) {
+  static_assert(INHERITED_NSB == 0 || WARPS == 8,
+                "inherited-order specialization requires eight physical warps");
+  static_assert(INHERITED_NSB == 0 || INHERITED_NSB == 8 ||
+                    INHERITED_NSB == 16,
+                "unsupported inherited-order superblock count");
   const int n_sb = (int)(K >> 8);
   const int64_t row_bytes = (int64_t)n_sb * type_size;
   const int64_t nblk_per_pair = (Nout + rpb - 1) / rpb;
@@ -196,102 +307,60 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_v2_kernel(
     }
     __syncwarp();
 
-    // --- Phase 2: decode superblocks ascending (inherited rowpack order) ----
-    float acc = 0.0f;
-    for (int s = 0; s < n_sb; ++s) {
-      const int sb_off = off8 + s * type_size;
-      const int bitpos = sb_off * 8 + lane * k_bits;
-      const int b0 = bitpos >> 3;
-      const int rem = ((b0 & 3) << 3) + (bitpos & 7);
-      const uint32_t* s32 = reinterpret_cast<const uint32_t*>(slot);
-      const int widx = b0 >> 2;
-      const uint32_t w0_ = s32[widx];
-      const uint32_t w1_ = s32[widx + 1];
-      const uint32_t w2_ = (rem + k_bits > 64) ? s32[widx + 2] : 0u;
-      const int grp = lane >> 1;
-      const uint8_t super_e = slot[sb_off + scale_off];
-      const uint8_t sub_byte = slot[sb_off + scale_off + 1 + (grp >> 1)];
-      const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
-      uint64_t code = lo >> rem;
-      if (rem + k_bits > 64) code |= (uint64_t)w2_ << (64 - rem);
-      code &= (k_bits >= 64) ? ~0ull : ((1ull << k_bits) - 1ull);
-
-      const uint32_t code16 = (uint32_t)((sub_byte >> ((grp & 1) * 4)) & 0xFu);
-      const float sc = __ldg(compose + (int)super_e * 16 + (int)code16);
-
-      // Sub-index gathers -> SMEM (the entire point of this kernel) or, when
-      // the dict is too large to stage without starving occupancy, __ldg.
-      const uint32_t i0 = (uint32_t)code & sp.m0;
-      const uint32_t i1 = (uint32_t)(code >> sp.w0) & sp.m1;
-      uint2 q0, q1;
-      if (DS != 0) {
-        q0 = *reinterpret_cast<const uint2*>(dict + (int64_t)i0 * 4);
-      } else {
-        q0 = __ldg(reinterpret_cast<const uint2*>(cb + (int64_t)i0 * 4));
+    if constexpr (INHERITED_NSB == 8 || INHERITED_NSB == 16) {
+      // Emulate the inherited 8-warp schedule with eight virtual warp
+      // accumulators.  For NSB=16, vacc[w] receives s=w and then s=w+8,
+      // exactly the FMA chain of inherited physical warp w; for NSB=8 it
+      // receives just s=w.  Each accumulator then gets the same lane tree,
+      // followed by the same w=0..7 serial sum and one BF16 output round.
+      float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+      float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+#define CBV2_ACC(S, A) cb_gemv_v2_accumulate_superblock<DS>(                 \
+        (S), lane, off8, slot, xr, type_size, cb, compose, dict, sp,       \
+        k_bits,                                                            \
+        scale_off, v2, (A))
+      CBV2_ACC(0, acc0); CBV2_ACC(1, acc1);
+      CBV2_ACC(2, acc2); CBV2_ACC(3, acc3);
+      CBV2_ACC(4, acc4); CBV2_ACC(5, acc5);
+      CBV2_ACC(6, acc6); CBV2_ACC(7, acc7);
+      if constexpr (INHERITED_NSB == 16) {
+        CBV2_ACC(8, acc0);  CBV2_ACC(9, acc1);
+        CBV2_ACC(10, acc2); CBV2_ACC(11, acc3);
+        CBV2_ACC(12, acc4); CBV2_ACC(13, acc5);
+        CBV2_ACC(14, acc6); CBV2_ACC(15, acc7);
       }
-      if (DS == 2) {
-        q1 = *reinterpret_cast<const uint2*>(dict + sp.e1 + (int64_t)i1 * 4);
-      } else {
-        q1 = __ldg(reinterpret_cast<const uint2*>(cb + sp.e1 +
-                                                  (int64_t)i1 * 4));
-      }
-      float wv[8];
-      if (v2) {
-        wv[0] = bf16_to_f32((uint16_t)(q0.x & 0xffffu));
-        wv[1] = bf16_to_f32((uint16_t)(q0.x >> 16));
-        wv[2] = bf16_to_f32((uint16_t)(q0.y & 0xffffu));
-        wv[3] = bf16_to_f32((uint16_t)(q0.y >> 16));
-        wv[4] = bf16_to_f32((uint16_t)(q1.x & 0xffffu));
-        wv[5] = bf16_to_f32((uint16_t)(q1.x >> 16));
-        wv[6] = bf16_to_f32((uint16_t)(q1.y & 0xffffu));
-        wv[7] = bf16_to_f32((uint16_t)(q1.y >> 16));
-      } else {
-        wv[0] = bf16_to_f32(f32_to_bf16_rn(
-            bf16_to_f32((uint16_t)(q0.x & 0xffffu)) * sc));
-        wv[1] = bf16_to_f32(f32_to_bf16_rn(
-            bf16_to_f32((uint16_t)(q0.x >> 16)) * sc));
-        wv[2] = bf16_to_f32(f32_to_bf16_rn(
-            bf16_to_f32((uint16_t)(q0.y & 0xffffu)) * sc));
-        wv[3] = bf16_to_f32(f32_to_bf16_rn(
-            bf16_to_f32((uint16_t)(q0.y >> 16)) * sc));
-        wv[4] = bf16_to_f32(f32_to_bf16_rn(
-            bf16_to_f32((uint16_t)(q1.x & 0xffffu)) * sc));
-        wv[5] = bf16_to_f32(f32_to_bf16_rn(
-            bf16_to_f32((uint16_t)(q1.x >> 16)) * sc));
-        wv[6] = bf16_to_f32(f32_to_bf16_rn(
-            bf16_to_f32((uint16_t)(q1.y & 0xffffu)) * sc));
-        wv[7] = bf16_to_f32(f32_to_bf16_rn(
-            bf16_to_f32((uint16_t)(q1.y >> 16)) * sc));
-      }
-
-      // FMA against x: one 16-byte L2 load per lane (identical to inherited).
-      const int64_t xbase = ((int64_t)s << 8) + (lane << 3);
-      const uint4 xv = __ldg(reinterpret_cast<const uint4*>(xr + xbase));
-      const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
-      if (v2) {
-        float ppart = 0.0f;
+#undef CBV2_ACC
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          ppart = fmaf(wv[2 * i], bf16_to_f32((uint16_t)(xw[i] & 0xffffu)),
-                       ppart);
-          ppart = fmaf(wv[2 * i + 1], bf16_to_f32((uint16_t)(xw[i] >> 16)),
-                       ppart);
-        }
-        acc = fmaf(sc, ppart, acc);
-      } else {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          acc = fmaf(wv[2 * i], bf16_to_f32((uint16_t)(xw[i] & 0xffffu)), acc);
-          acc = fmaf(wv[2 * i + 1], bf16_to_f32((uint16_t)(xw[i] >> 16)), acc);
-        }
+      for (int off = 16; off > 0; off >>= 1) {
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, off);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, off);
+        acc2 += __shfl_down_sync(0xffffffffu, acc2, off);
+        acc3 += __shfl_down_sync(0xffffffffu, acc3, off);
+        acc4 += __shfl_down_sync(0xffffffffu, acc4, off);
+        acc5 += __shfl_down_sync(0xffffffffu, acc5, off);
+        acc6 += __shfl_down_sync(0xffffffffu, acc6, off);
+        acc7 += __shfl_down_sync(0xffffffffu, acc7, off);
       }
+      if (lane == 0) {
+        float total = 0.0f;
+        total += acc0; total += acc1; total += acc2; total += acc3;
+        total += acc4; total += acc5; total += acc6; total += acc7;
+        y[p * Nout + n] = f32_to_bf16_rn(total);
+      }
+    } else {
+      // Existing rowpack order for every shape not explicitly specialized.
+      float acc = 0.0f;
+      for (int s = 0; s < n_sb; ++s) {
+        cb_gemv_v2_accumulate_superblock<DS>(
+            s, lane, off8, slot, xr, type_size, cb, compose, dict, sp,
+            k_bits,
+            scale_off, v2, acc);
+      }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+      if (lane == 0) y[p * Nout + n] = f32_to_bf16_rn(acc);
     }
-
-    // 32-lane tree reduce (identical to inherited rowpack), direct write.
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-      acc += __shfl_down_sync(0xffffffffu, acc, off);
-    if (lane == 0) y[p * Nout + n] = f32_to_bf16_rn(acc);
     __syncwarp();
   }
 }
@@ -460,6 +529,12 @@ static void cbv2_prepare_device(int device) {
   CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 0>));
   CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 1>));
   CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 2>));
+  CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 0, 8>));
+  CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 1, 8>));
+  CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 2, 8>));
+  CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 0, 16>));
+  CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 1, 16>));
+  CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 2, 16>));
   CBV2_SET_MAX_SMEM((cb_expand_v2_kernel<8>));
 #undef CBV2_SET_MAX_SMEM
 
@@ -527,6 +602,7 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
   TORCH_CHECK(K > 0 && K % 256 == 0 &&
               K <= std::numeric_limits<int>::max(),
               "decoded K must be a positive int-sized multiple of 256");
+  const int n_sb = (int)(K >> 8);
   TORCH_CHECK(row_bytes <= std::numeric_limits<int>::max() - 32,
               "packed row is too wide for the kernel's slot indexing");
   TORCH_CHECK(x.size(1) == K, "x width != decoded row width");
@@ -648,9 +724,9 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
               P <= std::numeric_limits<int>::max() / nbp,
               "CB-GEMV-v2 launch grid exceeds CUDA's x dimension");
   const int v2 = pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2") ? 1 : 0;
-#define LAUNCH_CBV2(DS)                                                      \
-  cb_gemv_v2_kernel<WARPS, DS><<<(unsigned)(P * nbp), WARPS * 32, smem,      \
-                                 stream>>>(                                  \
+#define LAUNCH_CBV2(DS, NSB)                                                 \
+  cb_gemv_v2_kernel<WARPS, DS, NSB>                                          \
+      <<<(unsigned)(P * nbp), WARPS * 32, smem, stream>>>(                   \
       reinterpret_cast<const uint16_t*>(x.data_ptr()),                       \
       qw_stack.data_ptr<uint8_t>(),                                          \
       reinterpret_cast<const uint16_t*>(cb_flat.data_ptr()),                 \
@@ -659,9 +735,19 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
       reinterpret_cast<uint16_t*>(y.data_ptr()),                             \
       P, Nout, K, (int)k_bits, (int)type_size, (int)rpb, slot_bytes,         \
       (int)cb_elems, qw_stack.numel(), (int)v2)
-  if (ds == 2) { LAUNCH_CBV2(2); }
-  else if (ds == 1) { LAUNCH_CBV2(1); }
-  else { LAUNCH_CBV2(0); }
+  if (n_sb == 8) {
+    if (ds == 2) { LAUNCH_CBV2(2, 8); }
+    else if (ds == 1) { LAUNCH_CBV2(1, 8); }
+    else { LAUNCH_CBV2(0, 8); }
+  } else if (n_sb == 16) {
+    if (ds == 2) { LAUNCH_CBV2(2, 16); }
+    else if (ds == 1) { LAUNCH_CBV2(1, 16); }
+    else { LAUNCH_CBV2(0, 16); }
+  } else {
+    if (ds == 2) { LAUNCH_CBV2(2, 0); }
+    else if (ds == 1) { LAUNCH_CBV2(1, 0); }
+    else { LAUNCH_CBV2(0, 0); }
+  }
 #undef LAUNCH_CBV2
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;

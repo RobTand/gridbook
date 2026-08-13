@@ -50,10 +50,13 @@ gated activations are attested during model load and invoke their registered
 
 The producer/runtime boundary is machine-readable at
 `gridbook/runtime_contract.json` and loadable without torch or vLLM through
-`gridbook.runtime_contract.load_runtime_contract()`. Closed schema v3 also
-attests `abi_features.source_fp8_block128_w8a16 = 1`, so a producer can require
-the BF16-activation source route without inferring semantics from the package
-version. It declares accepted quantization names, serialized packing/type-size
+`gridbook.runtime_contract.load_runtime_contract()`. Closed schema v4 also
+attests `abi_features.source_fp8_block128_w8a16 = 1` and
+`abi_features.dspark_construction_physical_bridge = 1`, so a producer can
+require the BF16-activation source route or the complete DSpark sidecar loader
+and construction/physical namespace ABI (including weight-only drafts) without
+inferring semantics from the package version. It
+declares accepted quantization names, serialized packing/type-size
 rules, supported CB rung
 families, and producer-profile loader coverage. The plugin derives its own
 registration aliases and top-level loader-module list from this file rather
@@ -142,19 +145,25 @@ per-platform vLLM package is a submodule rather than the package itself.
 | `hy_v3` | `HYV3ForCausalLM`, `HYV3MTP` | `vllm.model_executor.models.hy_v3`, `…hy_v3_mtp` |
 | `laguna` | `LagunaForCausalLM` | `vllm.model_executor.models.laguna` |
 | `qwen3_5`, `qwen3_5_dense`, `qwen3` | Qwen3.5-MoE `ForCausalLM` / `ForConditionalGeneration` + MTP | `vllm.model_executor.models.qwen3_5`, `…qwen3_5_mtp`, `…lfm2_moe` |
-| `deepseek_v4` | `DeepseekV4ForCausalLM` | `vllm.models.deepseek_v4.nvidia.model` |
+| `deepseek_v4` | `DeepseekV4ForCausalLM`, `DSparkDeepseekV4ForCausalLM` | `vllm.models.deepseek_v4.nvidia.model`, `…nvidia.dspark` |
 
 #### DeepSeek-V4 (`deepseek_v4`)
 
-Established against immutable eugr Spark image
-`eugr/spark-vllm@sha256:7bf752a9fa225b528b27c6a1118cb1727cddd7c383096d83281010c4f8b407bc`
-(vLLM `0.26.1rc1.dev515+g653ebb52d.d20260808`, torch `2.11.0+cu130`) and the
-released DSV4-Flash config (43 layers, all MoE, 256 routed experts + 1 shared,
-top-6, MLA with `q_lora_rank`/`o_lora_rank` 1024 and `o_groups` 8). Single GPU,
-`tp=1`, and on GB10 the class selects a FlashInfer SM120 MLA backend that
-**requires
+The current passing integration contract is the immutable eugr Spark image
+`eugr/spark-vllm@sha256:58862b388e0fab05a5c9b673f21d1d7b41a1123953a2d9ace49aae6c79319869`:
+vLLM `0.26.1rc1.dev693+g7f7a32cfe.d20260812` at commit
+`7f7a32cfec0f1bc5b73c37200b86631523a1ea8f`, torch `2.13.0+cu130`, and
+FlashInfer `0.6.18` at commit
+`9ffd99510d92b883f154fc9f2e3d5aac93e231ca`. The startup preflight must find
+the native `(head_dim=64, topk=256)` entry in FlashInfer's SM120 DSV4 decode
+dispatch and `VLLM_MOE_SKIP_PADDING=True`; Gridbook makes the resulting `-1`
+routed-padding sentinel inert at its opaque MoE boundary. This contract uses
+the released DSV4-Flash config (43 layers, all MoE, 256 routed experts + 1
+shared, top-6, MLA with `q_lora_rank`/`o_lora_rank` 1024 and `o_groups` 8), one
+GB10, and `tp=1`. The FlashInfer SM120 MLA backend **requires
 `--kv-cache-dtype fp8`** — `auto` aborts model construction, independently of
-Gridbook.
+Gridbook. Older EUGR/vLLM/FlashInfer combinations are not interchangeable with
+this qualified tuple merely because they expose the same Python classes.
 
 - **Native CB.** The routed expert stacks
   (`…ffn.experts.routed_experts.w13/w2`), the MLA projections `attn.wq_a` +
@@ -187,19 +196,79 @@ Gridbook.
   `attn`/`ffn` and loads `w1`/`w3`/`w2`; config resolution bridges those exact
   structural aliases. Both the expert loader and config-side target resolution
   handle either outer namespace spelling.
-- **Passthrough, not served: MTP and DSpark.** The artifact preserves
-  `mtp.*` (4,705 tensors across the three DSpark stages `mtp.0/1/2`) verbatim.
-  `DeepseekV4ForCausalLM.load_weights` builds
-  `AutoWeightsLoader(self, skip_substrs=["mtp."])`, so **every one of them is
-  dropped before any parameter lookup** at plain serving time. The drafter
-  class `DeepSeekV4MTPModel` exists but is reachable only under
-  `--speculative-config`, and it consumes the payload in its source format —
-  Gridbook writes no CB stacks there and registers no loader for it. `dspark`
-  appears nowhere in the vLLM package, so `dspark_block_size`,
-  `dspark_target_layer_ids`, `dspark_markov_rank` and `dspark_noise_token_id`
-  are read by nothing at serving time. Gridbook claims none of this and adds no
-  support vLLM lacks. If a future artifact ever does ship CB expert stacks for
-  an MTP layer, `cb_fill_guard` fails the load and names the module path to add.
+- **MTP / DSpark is isolated from the target body.** The target artifact can
+  preserve `mtp.*` (4,705 tensors across the three DSpark stages `mtp.0/1/2`).
+  `DeepseekV4ForCausalLM.load_weights` still builds
+  `AutoWeightsLoader(self, skip_substrs=["mtp."])`, so every one is dropped at
+  body-only serving time and the target-body path is unchanged. Under DSpark
+  speculative serving, the separate `DSparkDeepseekV4ForCausalLM` class in
+  `vllm.models.deepseek_v4.nvidia.dspark` consumes that payload.
+- **Target-only is the 0.8.6 shipping default; DSpark is experimental.** Omit
+  `--speculative-config` for the release launch. On the exact runtime above,
+  the same target artifact, eager 12,288-token configuration, and fixed
+  sequential 8-prompt x 128-output-token suite measured `10.2389` output tok/s
+  without MTP. The native MXFP4 draft measured `10.3364` tok/s (`+0.95%`) but
+  raised model residency from `95.12` to `105.25` GiB; its acceptance was
+  `42.289%` overall, `78.916%` at position zero, and `2.114` accepted
+  speculative tokens per draft cycle. A K12-CB hybrid draft measured only
+  `9.1319` tok/s (`-10.81%`). Those results prove that the loader can serve a
+  coherent DSpark draft, but neither draft earns production-default status or
+  justifies its memory cost. They are not graph-mode, concurrency, or 128k
+  context claims.
+- **Three DSpark namespaces stay distinct.** Decoder layers are constructed
+  with quantization prefixes `model.layers.43/44/45` (more generally,
+  `num_hidden_layers + stage`), registered by the three-element `ModuleList` as
+  `model.layers.0/1/2`, and stored in the checkpoint as `mtp.0/1/2`. A DSpark
+  Gridbook quantization config therefore declares the construction prefixes.
+  At load time the wrapper calls the model's own callable
+  `_remap_dspark_name` to obtain the registered prefix before running the
+  existing mixed-fused and stacked-expert resolvers. It does not reproduce or
+  guess that mapping. Mixed-fusion carriers retain their construction prefix;
+  the transaction router derives the corresponding registered role prefix from
+  the carrier's actual `named_parameters()` path and rejects inconsistent
+  metadata.
+- **Contracted activation scalars are explicitly bridged.** Contracted FP4-CB
+  config targets remain in the construction namespace while serialized
+  `input_global_scale` tensors and their digest-bound contract names remain
+  physical `mtp.*`. `dspark_target_bridge` declares that one-to-one mapping
+  for the complete activation contract (including a delegated stock-NVFP4
+  target) with `L`, stage count, and same-tail validation. Gridbook accepts no
+  inferred layer offset, undeclared construction target, incomplete map, or
+  physical target outside the activation contract; delegated source-format
+  `main_proj` is never included. Before consuming the
+  checkpoint stream, the loader also compares stamped `L`/stage count with
+  `config.num_hidden_layers` and the instantiated model's
+  `num_dspark_layers`.
+- **Stock ownership is preserved.** Stacked Gridbook expert planes and
+  independently owned mixed-fusion planes are intercepted exactly as for the
+  target body. Every other tensor is delegated under its original checkpoint
+  name; draft tensors therefore retain their physical `mtp.*` spelling. This
+  includes ordinary direct/fused dense CB planes, source-format tensors,
+  model-level heads, non-MTP tensors, and the unwired confidence head. DSpark's
+  stock loader remains their sole mapping/filtering authority. The
+  draft reuses the existing Gridbook Linear/MoE methods and CUDA kernels; this
+  loader registration adds no format or kernel.
+- **Draft sidecars have draft authority.** vLLM intentionally leaves the
+  target `model_config` installed while constructing the separate DSpark
+  model. Gridbook scopes the explicit
+  `speculative_config.draft_model_config` to that exact DSpark constructor, so
+  its pointer `quant_config.json` and `cb_codebooks.pqcb` resolve from the
+  draft rather than `/model`. Merely enabling speculation never redirects the
+  target body, and absent or malformed draft authority fails before the
+  constructor consumes weights.
+- **Grouped `wo_a` is source W8A16, not dense CB.** The three DSpark
+  `attn.wo_a` projections are grouped BMMs. The generic dense CB method has no
+  grouped output contract and therefore rejects `is_bmm` at load instead of
+  returning a shape-incorrect `[T,G,G*N]` result. These projections retain
+  their E4M3/UE8M0 source planes and use the qualified grouped W8A16 adapter;
+  the other eligible draft projections may use CB.
+
+- **Evidence and provenance.** The DSpark figures above are pre-release
+  integration/performance classification, not clean-tag provenance. Public
+  release documentation does not treat operator-local paths or a rehearsal
+  wheel identity as durable evidence. The clean committed wheel and derived
+  image must satisfy the target-only 256k gate in
+  [`RELEASING.md`](RELEASING.md); DSpark keeps its separate experimental gate.
 - **Passed through unquantized.** Hyper-connection parameters (`hc_mult` 4:
   `hc_head_*`, `layers.N.hc_attn_*`, `layers.N.hc_ffn_*`), the hash-routing
   tables (`num_hash_layers` 3: `ffn.gate.tid2eid`), `ffn.gate` and its
@@ -308,7 +377,10 @@ quality expansion plus an optional alternate decode GEMV:
 - **`cb_gemv_v2`** is the optional smem-resident-dictionary decode schedule
   selected by `PRISMAQUANT_CB_GEMV=auto|v2`. The default `inherited` decode
   schedule still loads and prepares this extension because it needs
-  `cb_expand_v2` for quality prefill.
+  `cb_expand_v2` for quality prefill. On DSV4 K=2048/4096, and only with all
+  `PRISMAQUANT_CB_W2_*` overrides absent, its virtual-warp specialization is
+  bit-exact to the inherited default for the k12/k16/k18 release surface;
+  other widths keep rowpack reduction order and may reassociate.
 
 **`gridbook/csrc/cb_fused_gemm.cu`** (CUTLASS, separate JIT ext) — prefill:
 
@@ -387,7 +459,7 @@ tooling and model cards — see the README's naming section.)
 |---|---|---|
 | `PRISMAQUANT_CB_EXT_DIR` | `~/.cache/prismaquant-cb-ext` | Root of the JIT build cache. Point it at a persistent, writable directory in containers so a cold start does not rebuild every module it reaches. Each of the nine modules owns a SUBDIRECTORY of it — `main`, `v2`, and the identity-keyed `bf16_grouped/<digest>`, `fused/<digest>`, `fused_fp4/<digest>`, `fused_fp4v2/<digest>`, `moe_persistent_b/<digest>`, `mxfp8_dense/<digest>`, `fp8_source_w8a16/<digest>` — so no two ninja workspaces share artefacts and a changed source, header, lane macro, target or toolchain ABI lands in a new directory instead of serving a stale kernel. Upgrading Gridbook therefore costs ONE rebuild per affected module; the old directories are inert and can be deleted. |
 | `PRISMAQUANT_CUTLASS_INCLUDE` | unset (vLLM's bundled copy) | The `include` directory — the one holding `cutlass/cutlass.h` — that all **four** CUTLASS-compiling modules build against: grouped-BF16, fused FP8-CB, fused NVFP4-CB and the fused FP4-CB v2 mid-M lane. Set it to build in a venv with no vLLM wheel, or against a CUTLASS newer than the bundled tree. Unset, the path is discovered under `vllm/third_party/` *without importing vLLM* (importing it merely to locate files would eagerly initialize optional compiler backends, Triton among them). A set-but-wrong value **fails** with the missing header named; it never falls back silently, because compiling against a different CUTLASS than the one asked for is the surprise this override exists to prevent. |
-| `PRISMAQUANT_CB_GEMV` | `inherited` | Which grouped FP4-CB **decode GEMV** serves a layer: `inherited` \| `auto` \| `v2`. All FP4-v2 quality paths build/load `cb_gemv_v2.cu` and run its cc 12.0/12.1 device prepare because that module also owns the required exact expander. Unset/`inherited` keeps the shipped decode schedule; `auto` or `v2` may additionally use the module's smem-resident decode GEMV where its occupancy predicate says it wins. That alternate decode is **not** bit-exact against `inherited` (reassociation class). FP8-only serves do not need the v2 module. An unknown spelling raises; changing it mid-process raises. |
+| `PRISMAQUANT_CB_GEMV` | `inherited` | Which grouped FP4-CB **decode GEMV** serves a layer: `inherited` \| `auto` \| `v2`. All FP4-v2 quality paths build/load `cb_gemv_v2.cu` and run its cc 12.0/12.1 device prepare because that module also owns the required exact expander. Unset/`inherited` keeps the shipped decode schedule; `auto` or `v2` may additionally use the module's smem-resident decode GEMV where its occupancy predicate says it wins. On DSV4 K=2048/4096 with every `PRISMAQUANT_CB_W2_*` override absent, that alternate is bit-exact to the inherited default for k12/k16/k18; other widths retain rowpack reduction order and may reassociate. It is a DSV4 release-shape quality/performance candidate, not the global default, and the final clean-wheel served graph/throughput gate remains open. FP8-only serves do not need the v2 module. An unknown spelling raises; changing it mid-process raises. |
 | `PRISMAQUANT_CB_FUSED_FP4` | off | Dense fp4-CB native-FP4 prefill opt-in. `1`/`midm` use a fully attested artifact scalar for all prefill shapes / `16 < M <= 128`. `static_lsq`/`static_lsq_midm` keep that exact `G` and the native E2M1/SFA payload, but fit the existing per-row EVT residual by least squares; they add no model metadata, weight copy, decoder, or GEMM. `rowwise`/`rowwise_midm` instead derive an independent full-range scalar per runtime row and are the only fused choices accepted for legacy artifacts. All dense modes use one occupancy selector: TileM256 is chosen only for `M >= 256` and `ceil(M/256) * ceil(N/128) >= ceil(2*SM_count/3)`; otherwise TileM128 runs. The `*_midm` modes therefore always remain TileM128. All values are experimental and default-off; unknown spellings and mid-process changes fail. **Tops the dense precedence chain** — it changes the served activation contract, so it outranks `PRISMAQUANT_CB_FP4_FUSED_MIDM` and `PRISMAQUANT_CB_BF16_SM120` (see [Lane precedence](#lane-precedence--which-flag-wins-when-several-are-set)). A selected mode that the **load-time** gate finds ineligible **fails the load**; a mode that passes that gate and then declines a concrete **call** (in practice the rowwise / static-LSQ quantizers' half-precision guard) **raises** naming the activation dtype and shape. Neither falls through to the exact BF16 route: that route's activation bucket is the fp32-emulated group QDQ rather than the format's native ue4m3 scale factors, so serving it would silently substitute the contract the flag exists to make explicit. The K24 short exact gate passed, but long-context evidence is mixed and no >=4B/MoE served validation exists; see the [dated audit](audits/fused_nvfp4_enablement_2026-07-31.md). |
 | `PRISMAQUANT_CB_FUSED_FP4_MOE` | off | Grouped-MoE fp4-CB native-FP4 prefill opt-in. Static `1`/`128` and `256` select TileM 128 and 256 and require both attested stage scalars. `static_lsq`/`static_lsq128` and `static_lsq256` select those same tiles while reusing the shared fixed-`G` LSQ quantizer. `rowwise`/`rowwise128` and `rowwise256` use independent runtime row scales and may serve legacy artifacts. **Tops the routed precedence chain** — it changes the served activation contract, so it outranks `PRISMAQUANT_CB_MOE_PERSISTENT_B` and `PRISMAQUANT_CB_BF16_SM120` (see [Lane precedence](#lane-precedence--which-flag-wins-when-several-are-set)). An ineligible selection **fails the load**, naming the cached eligibility reason; a mode that passes that gate and then misses at **call** time **raises** (`became unavailable after model load`). Neither returns to the exact native BF16 quality bridge — that bridge serves a different activation contract, and Gridbook does not substitute one silently. Unknown spellings and mid-process changes fail. Keep this off pending the dated audit's routed-quality, workload, and routing-policy gates. |
 | `PRISMAQUANT_CB_BF16_SM120` | off | `1` routes the quality-preserving BF16 grouped bridge (every default NVFP4-CB prefill — dense `E=1` and routed MoE — plus the FP8-CB fallback) to the **sm12x-native** CUTLASS 3.x collective instead of the default SM80-schedule `DefaultGemmGrouped`. Compiled only for cc 12.0/12.1; resolved at model load and **fails the load** if unavailable rather than silently serving the other lane. Same operands, same single bf16 round, different FP32 reduction order — bit-gated against the torch reference, served protocol NOT run. The lane's collective has two A-source modes (bit-identical to each other, gated `torch.equal`): the row-padded copy, and an **in-mainloop A-row gather** that never materializes the padded activation; with the gather mode and the swizzle-group-aligned expert order, measured (GB10, pingpong 64×128×64): 1.13–1.37× the default bridge, and vs segmented BF16 matmuls **1.03–1.05× at T=128 and 1.10–1.15× at T=512** (the padded-copy mode's 0.83–0.92× T=512 deficit is closed at the construction level). The routed path still pays one host read of the per-expert block offsets per layer. **The swizzle-group packing is coupled to the expert-chunk size and is off unless ONE chunk covers the layer** (`chunk >= E`): the decoded BF16 transient is chunked over experts by `PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK`, or by `PRISMAQUANT_CB_PREFILL_CHUNK_BYTES` (1 GiB) divided by one expert's `w13` BF16 bytes (`2·inter·hidden·2`), and a narrower chunk indexes blocks as `block_off[c0]..block_off[c1]`, which assumes expert-major contiguity. So a layer whose experts do not fit one chunk — the `E=128` cells in the benchmark run at `chunks=2` — takes the gather but NOT the packing, and lowering `..._CHUNK_BYTES` disables it the same way. The measured order win is an `E=32` result. Packing within a chunk is queued in [ROADMAP](../ROADMAP.md#p1--close-the-remaining-native-parity-gaps). **Lowest lane in both precedence chains**: a fused NVFP4 mode or, on the routed path, `PRISMAQUANT_CB_MOE_PERSISTENT_B` will serve instead where set — this lane is still attested at load either way (see [Lane precedence](#lane-precedence--which-flag-wins-when-several-are-set)). Unknown spellings and mid-process changes raise. See [KERNELS](KERNELS.md#sm12x-native-grouped-bf16-opt-in-prismaquant_cb_bf16_sm120) and the [benchmark table](BENCHMARKS.md#2026-08-02-sm12x-grouped-bf16-lane-in-mainloop-a-row-gather--swizzle-aligned-tile-order-proposal-data). |

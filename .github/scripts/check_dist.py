@@ -162,6 +162,8 @@ SDIST_REQUIRED_UTILITIES = [
     "scripts/prepare_lfm_fused_validation.py",
     "scripts/validate_fused_nvfp4_ab.py",
     "scripts/validate_fused_nvfp4_three_arm.py",
+    "scripts/validate_moe_persistent_b_ab.py",
+    "scripts/validate_moe_gemv_v2_ab.py",
 ]
 
 _errors: list[str] = []

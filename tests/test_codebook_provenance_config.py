@@ -131,6 +131,48 @@ def _set_model(
     return model_config
 
 
+def _set_target_and_draft(monkeypatch, target_config, draft_config):
+    current = types.SimpleNamespace(
+        model_config=target_config,
+        speculative_config=types.SimpleNamespace(
+            draft_model_config=draft_config,
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_config, "get_current_vllm_config", lambda: current
+    )
+    return current
+
+
+def _model_config(model: str, *, resolved_commit: str | None = None):
+    return types.SimpleNamespace(
+        model=model,
+        hf_config=types.SimpleNamespace(_commit_hash=resolved_commit),
+        revision=None,
+    )
+
+
+def _dspark_class(on_init):
+    class FakeDSpark:
+        def __init__(self):
+            on_init()
+
+        @staticmethod
+        def _remap_dspark_name(name):
+            return name
+
+        def named_parameters(self):
+            return ()
+
+        def load_weights(self, weights):
+            return {name for name, _ in weights}
+
+    # The production gate is deliberately exact: a remapper on an arbitrary
+    # model is not authority to reinterpret its sidecar source as DSpark.
+    FakeDSpark.__module__ = "vllm.models.deepseek_v4.nvidia.dspark"
+    return FakeDSpark
+
+
 def test_inline_config_verifies_then_memoizes(tmp_path, monkeypatch):
     sidecar = tmp_path / "cb_codebooks.pqcb"
     table = _write_sidecar(sidecar)
@@ -175,6 +217,232 @@ def test_pointer_config_resolves_hashes_and_sidecar_path(tmp_path, monkeypatch):
     assert cfg.codebook_file == relative_sidecar
     assert torch.equal(got[_NAME], table)
     assert cfg._sidecar_source == (str(tmp_path), None)
+
+
+def test_speculative_config_alone_keeps_target_sidecar_source(
+    tmp_path, monkeypatch
+):
+    """Loading the target body must not inherit the draft's sidecars."""
+
+    target = tmp_path / "target"
+    draft = tmp_path / "draft"
+    target_table = _write_sidecar(target / "cb_codebooks.pqcb", value=1.0)
+    draft_table = _write_sidecar(draft / "cb_codebooks.pqcb", value=2.0)
+    (target / "quant_config.json").write_text(
+        json.dumps(_full_config(codebook_tensor_sha256(target_table))),
+        encoding="utf-8",
+    )
+    (draft / "quant_config.json").write_text(
+        json.dumps(_full_config(codebook_tensor_sha256(draft_table))),
+        encoding="utf-8",
+    )
+    _set_target_and_draft(
+        monkeypatch,
+        _model_config(str(target)),
+        _model_config(str(draft)),
+    )
+
+    cfg = PrismaQuantConfig.from_config({"config_file": "quant_config.json"})
+    got = cfg.get_codebooks()[_NAME]
+    assert torch.equal(got, target_table)
+    assert cfg._sidecar_source == (str(target), None)
+
+
+def test_dspark_construction_loads_both_sidecars_from_explicit_draft(
+    tmp_path, monkeypatch
+):
+    """DSpark pointer config and its declared pqcb share draft authority."""
+
+    from gridbook.moe_toplevel_loader import (
+        active_dspark_draft_model_config,
+        install_toplevel_cb_expert_loader,
+    )
+
+    target = tmp_path / "target"
+    draft = tmp_path / "draft"
+    target_table = _write_sidecar(target / "cb_codebooks.pqcb", value=1.0)
+    draft_table = _write_sidecar(draft / "cb_codebooks.pqcb", value=2.0)
+    (target / "quant_config.json").write_text(
+        json.dumps(_full_config(codebook_tensor_sha256(target_table))),
+        encoding="utf-8",
+    )
+    (draft / "quant_config.json").write_text(
+        json.dumps(_full_config(codebook_tensor_sha256(draft_table))),
+        encoding="utf-8",
+    )
+    draft_config = _model_config(str(draft))
+    _set_target_and_draft(
+        monkeypatch, _model_config(str(target)), draft_config
+    )
+
+    cfg = PrismaQuantConfig.from_config({"config_file": "quant_config.json"})
+    observed = []
+
+    def on_init():
+        assert active_dspark_draft_model_config() is draft_config
+        observed.append(cfg.get_codebooks()[_NAME])
+
+    dspark = _dspark_class(on_init)
+    install_toplevel_cb_expert_loader(dspark)
+    dspark()
+
+    assert len(observed) == 1
+    assert torch.equal(observed[0], draft_table)
+    assert cfg._sidecar_source == (str(draft), None)
+    assert active_dspark_draft_model_config() is None
+
+    # A fresh ordinary config after the DSpark constructor proves context
+    # restoration and retains the target source.
+    target_cfg = PrismaQuantConfig.from_config(
+        {"config_file": "quant_config.json"}
+    )
+    assert torch.equal(target_cfg.get_codebooks()[_NAME], target_table)
+
+
+def test_dspark_inline_config_pins_draft_before_delayed_codebook_read(
+    tmp_path, monkeypatch
+):
+    """Inline config must retain draft authority after construction exits."""
+
+    from gridbook.moe_toplevel_loader import (
+        active_dspark_draft_model_config,
+        install_toplevel_cb_expert_loader,
+    )
+
+    target = tmp_path / "target"
+    draft = tmp_path / "draft"
+    target_table = _write_sidecar(target / "cb_codebooks.pqcb", value=1.0)
+    draft_table = _write_sidecar(draft / "cb_codebooks.pqcb", value=2.0)
+    current = _set_target_and_draft(
+        monkeypatch,
+        _model_config(str(target)),
+        _model_config(str(draft)),
+    )
+    cfg = PrismaQuantConfig.from_config(
+        _full_config(codebook_tensor_sha256(draft_table))
+    )
+    # Inline metadata can be parsed before model construction without needing
+    # either external sidecar.  The later call inside DSpark must therefore pin
+    # draft authority even though the ordinary resolution early-return applies.
+    cfg._ensure_resolved()
+    assert cfg._resolved is True
+    assert cfg._sidecar_source is None
+
+    def on_init():
+        assert active_dspark_draft_model_config() \
+            is current.speculative_config.draft_model_config
+        cfg._ensure_resolved()
+        assert cfg._resolved is True
+        assert cfg._codebooks is None
+        assert cfg._sidecar_source == (str(draft), None)
+
+    dspark = _dspark_class(on_init)
+    install_toplevel_cb_expert_loader(dspark)
+    dspark()
+    assert active_dspark_draft_model_config() is None
+
+    # The first codebook read is deliberately after __init__, when vLLM no
+    # longer publishes a current config.  It must use the source pinned above.
+    monkeypatch.setattr(
+        vllm_config,
+        "get_current_vllm_config",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("delayed draft lookup was not pinned")
+        ),
+    )
+    assert torch.equal(cfg.get_codebooks()[_NAME], draft_table)
+
+    # Restoring the ordinary vLLM context proves a fresh non-DSpark config is
+    # still target-owned rather than inheriting the draft's cached authority.
+    monkeypatch.setattr(
+        vllm_config, "get_current_vllm_config", lambda: current
+    )
+    target_cfg = PrismaQuantConfig.from_config(
+        _full_config(codebook_tensor_sha256(target_table))
+    )
+    assert torch.equal(target_cfg.get_codebooks()[_NAME], target_table)
+    assert target_cfg._sidecar_source == (str(target), None)
+
+
+@pytest.mark.parametrize("same_model_config_object", [False, True])
+def test_dspark_accepts_explicit_collocated_draft_source(
+    tmp_path, monkeypatch, same_model_config_object
+):
+    """Explicit role survives co-location and even intentional object reuse."""
+
+    from gridbook.moe_toplevel_loader import install_toplevel_cb_expert_loader
+
+    table = _write_sidecar(tmp_path / "cb_codebooks.pqcb", value=3.0)
+    (tmp_path / "quant_config.json").write_text(
+        json.dumps(_full_config(codebook_tensor_sha256(table))),
+        encoding="utf-8",
+    )
+    target_config = _model_config(str(tmp_path))
+    draft_config = (
+        target_config
+        if same_model_config_object
+        else _model_config(str(tmp_path))
+    )
+    _set_target_and_draft(monkeypatch, target_config, draft_config)
+    cfg = PrismaQuantConfig.from_config({"config_file": "quant_config.json"})
+    observed = []
+    dspark = _dspark_class(
+        lambda: observed.append(cfg.get_codebooks()[_NAME])
+    )
+    install_toplevel_cb_expert_loader(dspark)
+
+    dspark()
+    assert torch.equal(observed[0], table)
+
+
+@pytest.mark.parametrize(
+    "speculative_config,message",
+    [
+        (None, "requires vLLM speculative_config.draft_model_config"),
+        (types.SimpleNamespace(), "requires vLLM speculative_config"),
+        (
+            types.SimpleNamespace(draft_model_config=None),
+            "requires vLLM speculative_config",
+        ),
+        (
+            types.SimpleNamespace(
+                draft_model_config=types.SimpleNamespace()
+            ),
+            "draft_model_config.model is not",
+        ),
+        (
+            types.SimpleNamespace(
+                draft_model_config=types.SimpleNamespace(model=object())
+            ),
+            "draft_model_config.model is not",
+        ),
+        (
+            types.SimpleNamespace(
+                draft_model_config=types.SimpleNamespace(model="")
+            ),
+            "draft_model_config.model is not a nonempty string",
+        ),
+    ],
+)
+def test_dspark_missing_or_malformed_draft_source_fails_before_init(
+    monkeypatch, speculative_config, message
+):
+    from gridbook.moe_toplevel_loader import install_toplevel_cb_expert_loader
+
+    current = types.SimpleNamespace(
+        model_config=_model_config("/target"),
+        speculative_config=speculative_config,
+    )
+    monkeypatch.setattr(
+        vllm_config, "get_current_vllm_config", lambda: current
+    )
+    entered = []
+    dspark = _dspark_class(lambda: entered.append(True))
+    install_toplevel_cb_expert_loader(dspark)
+
+    with pytest.raises(RuntimeError, match=message):
+        dspark()
+    assert entered == []
 
 
 @pytest.mark.parametrize(

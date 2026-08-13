@@ -1743,53 +1743,89 @@ def _kl_convention(kl_mode: str) -> str:
     raise ValueError(f"unknown KL mode {kl_mode!r}")
 
 
-def _quality_summary(
-    pairs: Sequence[Mapping[str, Any]], *, kl_mode: str = KL_COARSE_TOPK
-) -> dict[str, Any]:
-    arm_targets: dict[str, list[float]] = {arm: [] for arm in ARMS}
-    coverages: dict[str, list[float]] = {arm: [] for arm in ARMS}
-    forward_kl: list[float] = []
-    reverse_kl: list[float] = []
-    target_abs_delta: list[float] = []
-    confident_forward: list[float] = []
-    per_prompt = []
-    for pair in pairs:
-        baseline: PromptScore = pair["scores"]["baseline"]
-        fused: PromptScore = pair["scores"]["fused"]
-        if len(baseline.rows) != len(fused.rows):
-            raise RuntimeError("paired arms returned different prompt-score lengths")
-        prompt_fwd, prompt_rev = [], []
-        for b_row, f_row, b_target, f_target in zip(
-            baseline.rows,
-            fused.rows,
-            baseline.target_logprobs,
-            fused.target_logprobs,
-        ):
-            fwd = _row_kl(b_row, f_row, kl_mode)
-            rev = _row_kl(f_row, b_row, kl_mode)
-            forward_kl.append(fwd)
-            reverse_kl.append(rev)
-            prompt_fwd.append(fwd)
-            prompt_rev.append(rev)
-            target_abs_delta.append(abs(b_target - f_target))
-            if math.exp(max(b_row.logprobs)) > 0.5:
-                confident_forward.append(fwd)
-        for arm, score in (("baseline", baseline), ("fused", fused)):
-            arm_targets[arm].extend(score.target_logprobs)
-            coverages[arm].extend(row.coverage for row in score.rows)
-        per_prompt.append({
-            "prompt_index": pair["prompt_index"],
-            "pair_order": pair["pair_order"],
-            "positions": len(baseline.rows),
-            "baseline_mean_nll": baseline.mean_nll,
-            "fused_mean_nll": fused.mean_nll,
-            "mean_nll_delta_fused_minus_baseline": (
-                fused.mean_nll - baseline.mean_nll
-            ),
-            "baseline_to_fused_kl_mean": statistics.fmean(prompt_fwd),
-            "fused_to_baseline_kl_mean": statistics.fmean(prompt_rev),
-        })
+def _new_quality_accumulator(*, kl_mode: str) -> dict[str, Any]:
+    """Create the scalar-only state consumed by the shared quality scorer.
 
+    Keeping this state public to sibling validation entry points lets a
+    full-vocabulary harness add one paired prompt at a time and release its
+    cardinality-sized rows immediately.  The ordinary path below uses the
+    same API, so incremental and retained scoring cannot drift numerically.
+    """
+
+    if kl_mode not in (KL_COARSE_TOPK, KL_FULL_VOCAB):
+        raise ValueError(f"unknown KL mode {kl_mode!r}")
+    return {
+        "kl_mode": kl_mode,
+        "arm_targets": {arm: [] for arm in ARMS},
+        "coverages": {arm: [] for arm in ARMS},
+        "forward_kl": [],
+        "reverse_kl": [],
+        "target_abs_delta": [],
+        "confident_forward": [],
+        "per_prompt": [],
+    }
+
+
+def _accumulate_quality_pair(
+    accumulator: MutableMapping[str, Any], pair: Mapping[str, Any]
+) -> None:
+    """Score one pair into scalar state without retaining either row set."""
+
+    kl_mode = accumulator["kl_mode"]
+    baseline: PromptScore = pair["scores"]["baseline"]
+    fused: PromptScore = pair["scores"]["fused"]
+    if len(baseline.rows) != len(fused.rows):
+        raise RuntimeError("paired arms returned different prompt-score lengths")
+    if (
+        len(baseline.target_logprobs) != len(baseline.rows)
+        or len(fused.target_logprobs) != len(fused.rows)
+    ):
+        raise RuntimeError("paired arms returned different target-score lengths")
+    prompt_fwd, prompt_rev = [], []
+    for b_row, f_row, b_target, f_target in zip(
+        baseline.rows,
+        fused.rows,
+        baseline.target_logprobs,
+        fused.target_logprobs,
+    ):
+        fwd = _row_kl(b_row, f_row, kl_mode)
+        rev = _row_kl(f_row, b_row, kl_mode)
+        accumulator["forward_kl"].append(fwd)
+        accumulator["reverse_kl"].append(rev)
+        prompt_fwd.append(fwd)
+        prompt_rev.append(rev)
+        accumulator["target_abs_delta"].append(abs(b_target - f_target))
+        if math.exp(max(b_row.logprobs)) > 0.5:
+            accumulator["confident_forward"].append(fwd)
+    for arm, score in (("baseline", baseline), ("fused", fused)):
+        accumulator["arm_targets"][arm].extend(score.target_logprobs)
+        accumulator["coverages"][arm].extend(
+            row.coverage for row in score.rows
+        )
+    accumulator["per_prompt"].append({
+        "prompt_index": pair["prompt_index"],
+        "pair_order": pair["pair_order"],
+        "positions": len(baseline.rows),
+        "baseline_mean_nll": baseline.mean_nll,
+        "fused_mean_nll": fused.mean_nll,
+        "mean_nll_delta_fused_minus_baseline": (
+            fused.mean_nll - baseline.mean_nll
+        ),
+        "baseline_to_fused_kl_mean": statistics.fmean(prompt_fwd),
+        "fused_to_baseline_kl_mean": statistics.fmean(prompt_rev),
+    })
+
+
+def _finish_quality_accumulator(
+    accumulator: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Finalize the same schema returned by :func:`_quality_summary`."""
+
+    kl_mode = accumulator["kl_mode"]
+    arm_targets = accumulator["arm_targets"]
+    coverages = accumulator["coverages"]
+    if any(not arm_targets[arm] for arm in ARMS):
+        raise RuntimeError("quality summary contains no scored targets")
     arm_metrics = {}
     for arm in ARMS:
         mean_nll = -statistics.fmean(arm_targets[arm])
@@ -1807,17 +1843,32 @@ def _quality_summary(
             "mean_nll_fused_minus_baseline": nll_delta,
             "ppl_fused_over_baseline": ppl_ratio,
             "ppl_relative_regression": ppl_ratio - 1.0,
-            "target_logprob_abs_delta": summarize_values(target_abs_delta),
-            "kl_baseline_to_fused": summarize_values(forward_kl),
-            "kl_fused_to_baseline": summarize_values(reverse_kl),
+            "target_logprob_abs_delta": summarize_values(
+                accumulator["target_abs_delta"]
+            ),
+            "kl_baseline_to_fused": summarize_values(
+                accumulator["forward_kl"]
+            ),
+            "kl_fused_to_baseline": summarize_values(
+                accumulator["reverse_kl"]
+            ),
             "kl_baseline_to_fused_confident_positions": summarize_values(
-                confident_forward
+                accumulator["confident_forward"]
             ),
         },
-        "per_prompt": per_prompt,
+        "per_prompt": accumulator["per_prompt"],
         "kl_mode": kl_mode,
         "kl_convention": _kl_convention(kl_mode),
     }
+
+
+def _quality_summary(
+    pairs: Sequence[Mapping[str, Any]], *, kl_mode: str = KL_COARSE_TOPK
+) -> dict[str, Any]:
+    accumulator = _new_quality_accumulator(kl_mode=kl_mode)
+    for pair in pairs:
+        _accumulate_quality_pair(accumulator, pair)
+    return _finish_quality_accumulator(accumulator)
 
 
 def _pairwise_score_summary(

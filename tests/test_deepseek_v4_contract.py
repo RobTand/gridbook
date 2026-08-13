@@ -23,12 +23,12 @@ CPU-first with synthetic fixtures:
    published only through ``stacked_params_mapping``, so Gridbook's fused
    fallback tables are the only merge information it has.
 
-MTP/DSpark is deliberately NOT exercised as a load path: the body's
+This file deliberately exercises only the target body's MTP behavior: its
 ``load_weights`` is ``AutoWeightsLoader(self, skip_substrs=["mtp."])``, so all
-4,705 ``mtp.*`` tensors are dropped before any parameter lookup, and no
-``dspark_*`` config key is referenced anywhere in the vLLM package. The test
-that matters for them is that a stacked-CB MTP tensor still DEFERS rather than
-being mis-routed into a body layer.
+4,705 ``mtp.*`` tensors are dropped before any parameter lookup. A stacked-CB
+MTP tensor must still DEFER rather than being mis-routed into a body layer.
+The separate DSpark draft entrypoint and its physical/registered/construction
+namespaces are covered in ``test_dspark_cb_loader.py``.
 
 torch-only for the loader/resolver halves (they import no vLLM); the
 class-shaped resolution test is skip-guarded and runs in the container.
@@ -138,13 +138,15 @@ def _cb_params():
 # 1. Registration
 # --------------------------------------------------------------------------
 
-def test_contract_registers_deepseek_v4_profile_and_defining_module():
+def test_contract_registers_deepseek_v4_profile_and_defining_modules():
     profiles = load_runtime_contract()["producer_profiles"]
     assert "deepseek_v4" in profiles["supported_ids"]
     # plugin.py installs on the module that DEFINES the entrypoint class; for
     # DSV4 that is the platform submodule, not the package __init__ (which only
     # re-exports and would be skipped by the __module__ guard).
     assert ("vllm.models.deepseek_v4.nvidia.model"
+            in profiles["top_level_loader_modules"])
+    assert ("vllm.models.deepseek_v4.nvidia.dspark"
             in profiles["top_level_loader_modules"])
     assert ("vllm.models.deepseek_v4"
             not in profiles["top_level_loader_modules"])
@@ -531,7 +533,8 @@ def test_real_vllm_deepseek_v4_class_matches_the_contract():
     # The merges Gridbook's fallback table has to know about.
     assert '"attn.fused_wqa_wkv", "attn.wq_a"' in src.replace("(", "").replace(
         ")", "") or "fused_wqa_wkv" in src
-    # No DSpark support to wire to.
+    # The target-body module itself owns no DSpark implementation; the draft is
+    # defined in the separately registered nvidia.dspark module.
     assert "dspark" not in src.lower()
 
 

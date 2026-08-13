@@ -36,6 +36,17 @@ ROOT = Path(__file__).resolve().parents[1]
 SDIST_ONLY_GLOBS = ("gridbook/csrc/tools/*",
                     "gridbook/csrc/cutlass_fork/*_orig.hpp")
 
+# Source-only validation entry points. ``check_dist.py`` applies this exact
+# floor to the built sdist and rejects any wheel leak; this source-level mirror
+# prevents a new utility from being named in only one packaging declaration.
+SDIST_REQUIRED_UTILITIES = (
+    "scripts/prepare_lfm_fused_validation.py",
+    "scripts/validate_fused_nvfp4_ab.py",
+    "scripts/validate_fused_nvfp4_three_arm.py",
+    "scripts/validate_moe_persistent_b_ab.py",
+    "scripts/validate_moe_gemv_v2_ab.py",
+)
+
 # The wheel must carry every source cuda_ext.py JIT-compiles. Same floor as
 # check_dist.REQUIRED / check_installed.REQUIRED_SOURCES, expressed against the
 # installed package.
@@ -82,6 +93,52 @@ def test_citation_and_changelog_match_package_version():
     assert re.search(rf"^## {re.escape(version)}(?:\s|$)", changelog,
                      flags=re.MULTILINE), (
         f"CHANGELOG.md has no release heading for {version}")
+
+
+def test_release_pinned_image_default_matches_package_version():
+    """The convenience image must not silently reinstall the prior release."""
+
+    if not _source_checkout():
+        pytest.skip("container recipe is not shipped in the wheel")
+    expected = f"v{gridbook.__version__}"
+    dockerfile = (
+        ROOT / "docker" / "Dockerfile.gridbook-pinned"
+    ).read_text(encoding="utf-8")
+    match = re.search(
+        r"^ARG GRIDBOOK_REF=([^\s]+)\s*$", dockerfile, flags=re.MULTILINE
+    )
+    assert match is not None, "pinned-image Dockerfile has no GRIDBOOK_REF"
+    assert match.group(1) == expected
+
+    container_doc = (ROOT / "docs" / "CONTAINER.md").read_text(
+        encoding="utf-8"
+    )
+    assert f"--build-arg GRIDBOOK_REF={expected}" in container_doc
+    assert f"gridbook:{expected}-pinned" in container_doc
+
+
+def test_release_workflow_rejects_tags_off_master():
+    """A tag alone must not authorize an off-release-branch upload."""
+
+    if not _source_checkout():
+        pytest.skip("release workflow is not shipped in the wheel")
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "fetch-depth: 0" in workflow
+    assert "Tag commit must be reachable from master" in workflow
+    assert 'git rev-parse "${GITHUB_REF}^{commit}"' in workflow
+    assert "refs/remotes/origin/master" in workflow
+    assert "git merge-base --is-ancestor" in workflow
+    assert workflow.index("Tag commit must be reachable from master") < (
+        workflow.index("Install build tooling")
+    )
+    assert "wheel_sha256: ${{ steps.meta.outputs.wheel_sha256 }}" in workflow
+    assert 'hashlib.file_digest(handle, "sha256")' in workflow
+    assert workflow.count("needs.build.outputs.wheel_sha256") == 3
+    assert "Downloaded wheel must match the build receipt" in workflow
+    assert "Downloaded wheel must match the verified build" in workflow
+    assert "Release wheel must match the published build" in workflow
 
 
 def test_sdist_only_split_is_declared_in_all_three_places():
@@ -145,6 +202,26 @@ def test_native_serving_floor_mirrors_are_exactly_equal():
     installed_floor = set(installed["REQUIRED_SOURCES"])
     metadata_floor = {f"csrc/{path}" for path in WHEEL_REQUIRED}
     assert dist_floor == installed_floor == metadata_floor
+
+
+def test_sdist_validation_utility_floor_matches_manifest_and_checkout():
+    """Every source-only harness must be present in the built-sdist gate.
+
+    ``check_dist.py::check_validation_utilities`` performs the artifact-level
+    membership test after build. This declaration test prevents CI's checkout
+    locator from masking an omitted MANIFEST entry before that build occurs.
+    """
+
+    if not _source_checkout():
+        pytest.skip("release packaging declarations are not shipped in the wheel")
+    manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    dist = runpy.run_path(str(ROOT / ".github/scripts/check_dist.py"))
+    assert tuple(dist["SDIST_REQUIRED_UTILITIES"]) == SDIST_REQUIRED_UTILITIES
+    for utility in SDIST_REQUIRED_UTILITIES:
+        assert (ROOT / utility).is_file(), f"missing source utility {utility}"
+        assert f"include {utility}" in manifest, (
+            f"{utility} is gated for the built sdist but MANIFEST.in omits it"
+        )
 
 
 def test_cpu_gate_locates_source_utilities_without_ci_environment(tmp_path):

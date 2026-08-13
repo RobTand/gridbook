@@ -90,6 +90,11 @@ _CB_ROLES = ("gate", "up", "down")
 _FP8_GROUPED_POLICY = "fp8_cb_grouped"
 _FP8_GROUPED_CONTRACT = "fp8_per_token_dynamic"
 
+# Native routed decode/prefill boundary.  Keep this public because validation
+# reports must attest the exact branch used by the serving runtime rather than
+# restating a literal that can drift from it.
+MOE_PREFILL_M_THRESHOLD = 16
+
 
 def _moe_shape(layer, topk_ids) -> str:
     """Compact routed problem shape for the dispatch record.
@@ -752,7 +757,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         act = getattr(layer, "_cb_native_activation", layer.activation.value)
         num_tokens = x.shape[0]
 
-        if num_tokens <= 16:
+        if num_tokens <= MOE_PREFILL_M_THRESHOLD:
             if not self._cuda_moe_ok(layer):
                 from .cuda_ext import NativeKernelUnavailableError
                 raise NativeKernelUnavailableError(

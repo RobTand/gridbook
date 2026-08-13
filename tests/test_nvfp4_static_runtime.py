@@ -133,6 +133,18 @@ def _config(scales, *, scheme=None, targets=None, contract=True):
     return result
 
 
+def _dspark_config(scales, construction_to_physical, *, hidden=43,
+                   n_mtp=3):
+    config = _config(scales, targets=list(construction_to_physical))
+    config["dspark_target_bridge"] = {
+        "schema": "gridbook.dspark-target-bridge.v1",
+        "num_hidden_layers": hidden,
+        "n_mtp_layers": n_mtp,
+        "construction_to_physical": dict(construction_to_physical),
+    }
+    return config
+
+
 def _resolved(tmp_path, scales, *, cfg=None):
     _write_f32_scalars(
         tmp_path / "model.safetensors",
@@ -182,6 +194,207 @@ def test_config_attests_complete_physical_payload(tmp_path):
 
     cfg.apply_vllm_mapper(Mapper())
     assert cfg.activation_scales_for_targets(["served." + target]) == [3.25]
+
+
+def test_dspark_bridge_attests_mtp_physical_scalars_for_construction_targets(
+        tmp_path):
+    construction = {
+        "model.layers.44.ffn.experts.gate_up_proj":
+            "mtp.1.ffn.experts.gate_up_proj",
+        "model.layers.44.ffn.experts.down_proj":
+            "mtp.1.ffn.experts.down_proj",
+        "model.layers.44.blocks.0.proj": "mtp.1.blocks.0.proj",
+    }
+    scales = {
+        "mtp.1.ffn.experts.gate_up_proj": 2.5,
+        "mtp.1.ffn.experts.down_proj": 1.25,
+        "mtp.1.blocks.0.proj": 0.5,
+    }
+    cfg = _resolved(
+        tmp_path,
+        scales,
+        cfg=_dspark_config(scales, construction),
+    )
+
+    assert cfg._target_physical_name == construction
+    assert cfg._dspark_target_bridge_topology == (43, 3)
+    prefix = "model.layers.44.ffn.experts"
+    stages = cfg.moe_activation_stage_targets(prefix)
+    assert stages == {
+        "w13": [prefix + ".gate_up_proj"],
+        "w2": [prefix + ".down_proj"],
+    }
+    assert cfg.activation_scales_for_targets(stages["w13"]) == [2.5]
+    assert cfg.activation_scales_for_targets(stages["w2"]) == [1.25]
+
+
+def test_dspark_bridge_keeps_delegated_stock_nvfp4_target_physical(
+        tmp_path, monkeypatch):
+    """A contracted stock target crosses the same explicit DSpark bridge.
+
+    The bridge covers the complete activation contract, not only Gridbook's
+    custom-CB subset.  Quantization construction must delegate the
+    ``model.layers.L+stage`` spelling to compressed-tensors, while payload
+    attestation must resolve that target to the physical ``mtp.stage`` scalar.
+    """
+
+    from gridbook import config as config_module
+
+    cb_target = "model.layers.44.ffn.experts.down_proj"
+    stock_target = "model.layers.44.attn.wq_b"
+    cb_physical = "mtp.1.ffn.experts.down_proj"
+    stock_physical = "mtp.1.attn.wq_b"
+    construction_to_physical = {
+        cb_target: cb_physical,
+        stock_target: stock_physical,
+    }
+    scales = {cb_physical: 1.25, stock_physical: 2.75}
+    config = _dspark_config(scales, construction_to_physical)
+    config["config_groups"]["cb"]["targets"] = [cb_target]
+    stock_group = {
+        "format": "nvfp4-pack-quantized",
+        "targets": [stock_target],
+        "weights": {
+            "num_bits": 4,
+            "type": "float",
+            "strategy": "tensor_group",
+            "group_size": 16,
+        },
+        "input_activations": {
+            "num_bits": 4,
+            "type": "float",
+            "strategy": "tensor_group",
+            "group_size": 16,
+            "dynamic": "local",
+        },
+    }
+    config["config_groups"]["stock_nvfp4"] = stock_group
+
+    delegated: dict[str, object] = {}
+    compressed_package_name = (
+        "vllm.model_executor.layers.quantization.compressed_tensors"
+    )
+    compressed_module_name = compressed_package_name + ".compressed_tensors"
+    utils_module_name = compressed_package_name + ".utils"
+    compressed_package = types.ModuleType(compressed_package_name)
+    compressed_package.__path__ = []
+    compressed_module = types.ModuleType(compressed_module_name)
+
+    class _FakeCompressedTensorsConfig:
+        def __init__(self, raw):
+            self.raw = raw
+            self.packed_modules_mapping = {}
+
+        @classmethod
+        def from_config(cls, raw):
+            delegated["config"] = raw
+            return cls(raw)
+
+        def get_quant_method(self, layer, prefix):
+            del layer
+            delegated["prefix"] = prefix
+            return "stock-nvfp4-method"
+
+    compressed_module.CompressedTensorsConfig = _FakeCompressedTensorsConfig
+    utils_module = types.ModuleType(utils_module_name)
+
+    def find_matched_target(prefix, layer, targets, fused):
+        del layer, fused
+        return prefix if prefix in targets else None
+
+    utils_module.find_matched_target = find_matched_target
+    utils_module.should_ignore_layer = lambda *args, **kwargs: False
+    monkeypatch.setitem(
+        sys.modules, compressed_package_name, compressed_package
+    )
+    monkeypatch.setitem(sys.modules, compressed_module_name, compressed_module)
+    monkeypatch.setitem(sys.modules, utils_module_name, utils_module)
+
+    def record_preflight(**kwargs):
+        delegated["preflight"] = kwargs
+
+    monkeypatch.setattr(
+        config_module, "require_native_delegated_backend", record_preflight
+    )
+    cfg = _resolved(tmp_path, scales, cfg=config)
+
+    assert cfg._target_physical_name == construction_to_physical
+    assert cfg.activation_scales_for_targets([stock_target]) == [2.75]
+    assert cfg._stock_group_by_target == {stock_target: "stock_nvfp4"}
+    delegated_config = delegated["config"]
+    assert isinstance(delegated_config, dict)
+    assert "dspark_target_bridge" not in delegated_config
+    assert delegated_config["config_groups"] == {
+        "stock_nvfp4": stock_group
+    }
+
+    layer = config_module.LinearBase()
+    assert cfg.get_quant_method(layer, stock_target) == "stock-nvfp4-method"
+    assert delegated["prefix"] == stock_target
+    preflight = delegated["preflight"]
+    assert isinstance(preflight, dict)
+    assert preflight["prefix"] == stock_target
+    assert preflight["group_name"] == "stock_nvfp4"
+    assert preflight["group"] == stock_group
+
+
+@pytest.mark.parametrize(
+    ("construction", "physical", "message"),
+    [
+        ("model.layers.45.attn.wq_b", "mtp.1.attn.wq_b",
+         "expected num_hidden_layers \\+ stage = 44"),
+        ("model.layers.44.attn.wq_b", "mtp.3.attn.wq_b",
+         "outside n_mtp_layers=3"),
+        ("model.layers.44.attn.wq_b", "mtp.1.attn.wo_b",
+         "changes the target tail"),
+        ("layers.44.attn.wq_b", "mtp.1.attn.wq_b",
+         "not in the canonical namespace"),
+        ("model.layers.044.attn.wq_b", "mtp.1.attn.wq_b",
+         "invalid DSpark target bridge"),
+        ("model.layers.44.attn.wq_b", "mtp.01.attn.wq_b",
+         "invalid DSpark target bridge"),
+        ("model.layers.44.attn..wq_b", "mtp.1.attn..wq_b",
+         "invalid DSpark target bridge"),
+    ],
+)
+def test_dspark_bridge_rejects_topology_or_tail_mutation(
+        construction, physical, message):
+    scales = {physical: 2.5}
+    cfg = PrismaQuantConfig.from_config(_dspark_config(
+        scales, {construction: physical}
+    ))
+    with pytest.raises(ValueError, match=message):
+        cfg._ensure_resolved()
+
+
+def test_dspark_bridge_requires_exact_contracted_target_set_and_contract():
+    construction = "model.layers.44.attn.wq_b"
+    extra_construction = "model.layers.44.attn.wo_b"
+    physical = "mtp.1.attn.wq_b"
+    extra_physical = "mtp.1.attn.wo_b"
+    scales = {physical: 2.5, extra_physical: 3.5}
+    bridge = {
+        construction: physical,
+        extra_construction: extra_physical,
+    }
+    cfg_dict = _dspark_config(scales, bridge)
+    cfg_dict["config_groups"]["cb"]["targets"] = [construction]
+    cfg = PrismaQuantConfig.from_config(cfg_dict)
+    with pytest.raises(ValueError, match="declared by config_groups"):
+        cfg._ensure_resolved()
+
+    missing_contract = _config(
+        {physical: 2.5}, targets=[construction], contract=False
+    )
+    missing_contract["dspark_target_bridge"] = {
+        "schema": "gridbook.dspark-target-bridge.v1",
+        "num_hidden_layers": 43,
+        "n_mtp_layers": 3,
+        "construction_to_physical": {construction: physical},
+    }
+    cfg = PrismaQuantConfig.from_config(missing_contract)
+    with pytest.raises(ValueError, match="requires the nvfp4_w4a4"):
+        cfg._ensure_resolved()
 
 
 def test_moe_stage_resolution_keeps_gate_up_and_down_scales_distinct(tmp_path):
@@ -258,6 +471,17 @@ def test_legacy_fp4_config_does_not_read_or_register_scale(monkeypatch):
     )
     assert not hasattr(layer, "input_global_scale")
     assert method._fused_fp4_ok(layer, 256) is False
+
+
+def test_dense_cb_grouped_bmm_fails_closed_at_load():
+    """A DSv4-style grouped projection must use the qualified W8A16 lane."""
+
+    method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)
+    method.prefix = "model.layers.43.attn.wo_a"
+    layer = types.SimpleNamespace(is_bmm=True)
+
+    with pytest.raises(RuntimeError, match="source FP8 W8A16"):
+        method.process_weights_after_loading(layer)
 
 
 def test_dense_contracted_scale_load_is_fail_closed_and_merged_exact(tmp_path):

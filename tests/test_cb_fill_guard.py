@@ -229,6 +229,7 @@ def test_registry_is_data_not_a_try_except_chain():
     # DeepSeek-V4 (D0.1) lives in vLLM 0.24's per-platform package tree, and
     # the contract names the submodule that DEFINES the entrypoint class.
     assert "vllm.models.deepseek_v4.nvidia.model" in paths
+    assert "vllm.models.deepseek_v4.nvidia.dspark" in paths
     # no arch-specific class imports left in the install path
     imported = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
     assert not any((m or "").startswith("vllm.model_executor.models")

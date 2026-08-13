@@ -664,10 +664,35 @@ def _fp8_source_linear_forward_fake(x, layer_id):
                        dtype=x.dtype, device=x.device)
 
 
+def _neutralize_moe_padding_sentinel(
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Make vLLM's ``-1`` padded routes inert without a device-to-host read.
+
+    With ``VLLM_MOE_SKIP_PADDING``, vLLM preserves the static token shape and
+    marks every routed slot of a padded token with expert id ``-1``.  Gridbook
+    owns several routed implementations, all behind :func:`cb_moe_forward`;
+    normalizing at that opaque boundary keeps every implementation safe and
+    keeps the pointwise work out of Dynamo's graph.
+
+    Only the documented ``-1`` sentinel is rewritten.  Every other id remains
+    unchanged; validation of generally corrupt router output is a separate
+    contract and is not implied here.  The corresponding weight is set to
+    exact zero (rather than multiplied by a mask, which would preserve NaN),
+    making the padded routed contribution inert.  This does not touch ``x``
+    or the separately scheduled shared-expert path.
+    """
+    padding = topk_ids == -1
+    return (topk_weights.masked_fill(padding, 0),
+            topk_ids.masked_fill(padding, 0))
+
+
 @torch.library.custom_op("prismaquant::cb_moe_forward", mutates_args=())
 def cb_moe_forward(x: torch.Tensor, topk_weights: torch.Tensor,
                    topk_ids: torch.Tensor, layer_id: int) -> torch.Tensor:
     method, layer = _lookup_cb_layer(layer_id)
+    topk_weights, topk_ids = _neutralize_moe_padding_sentinel(
+        topk_weights, topk_ids)
     return method._apply_inline(layer, x, topk_weights, topk_ids)
 
 

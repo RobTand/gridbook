@@ -150,7 +150,7 @@ fields may not. The manifest is the authoritative identity for mixed menus; a
 single average bpp or headline format is not.
 
 For source block-FP8, `fp8_e4m3_ue8m0_block128` identifies the serialized
-**weight** representation only. Its Gridbook 0.8.5 assignment must say
+**weight** representation only. Every Gridbook 0.8.5+ assignment must say
 `quant_contract: "W8A16"`: the runtime consumes BF16 activations unchanged. The
 assignment's backend must name the complete owned dispatch chain, for example
 `gridbook-fp8-source-w8a16(fp8_source_gemv|fp8_source_expand_bf16+cb_bf16_grouped_mm)`,
@@ -196,7 +196,7 @@ used as evidence for W4A4 merely because both reuse a native weight family.
 The same rule is release-critical for the source block-FP8 correction. Historical
 block-128 results obtained by replicating scales into MXFP8 and dynamically
 quantizing activations are W8A8 results. They do not validate W8A16 quality,
-logits, CUDA-graph behavior, or speed. A 0.8.5 release claim needs a fresh
+logits, CUDA-graph behavior, or speed. Any 0.8.5+ release claim needs a fresh
 same-artifact run whose manifest, logs, and server evidence prove unchanged BF16
 activations and the W8A16 kernel chain above.
 
