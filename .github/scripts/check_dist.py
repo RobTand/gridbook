@@ -103,6 +103,8 @@ PKG = "gridbook"
 REQUIRED = [
     f"{PKG}/csrc/cb_gemv.cu",
     f"{PKG}/csrc/cb_gemv_v2.cu",
+    f"{PKG}/csrc/fp8_source_w8a16.cu",
+    f"{PKG}/csrc/mxfp8_dense_gemm.cu",
     f"{PKG}/csrc/cb_bf16_grouped_gemm.cu",
     f"{PKG}/csrc/cb_fused_gemm.cu",
     f"{PKG}/csrc/cb_fused_fp4_gemm.cu",

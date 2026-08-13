@@ -41,6 +41,8 @@ ENTRY_POINT_GROUP = "vllm.general_plugins"
 REQUIRED_SOURCES = [
     "csrc/cb_gemv.cu",
     "csrc/cb_gemv_v2.cu",
+    "csrc/fp8_source_w8a16.cu",
+    "csrc/mxfp8_dense_gemm.cu",
     "csrc/cb_bf16_grouped_gemm.cu",
     "csrc/cb_fused_gemm.cu",
     "csrc/cb_fused_fp4_gemm.cu",

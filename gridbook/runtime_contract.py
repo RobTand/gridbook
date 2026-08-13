@@ -11,7 +11,7 @@ from importlib.resources import files
 from typing import Any, Mapping
 
 
-RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v2"
+RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v3"
 _RESOURCE_NAME = "runtime_contract.json"
 
 #: The vLLM package roots a ``top_level_loader_modules`` entry may name. The
@@ -107,12 +107,13 @@ def validate_runtime_contract(contract: Any) -> None:
         _fail("contract.schema", f"must be {RUNTIME_CONTRACT_SCHEMA!r}")
     contract_version = _positive_int(
         root["contract_version"], "contract.contract_version")
-    if contract_version != 2:
-        _fail("contract.contract_version", "must be 2 for this schema")
+    if contract_version != 3:
+        _fail("contract.contract_version", "must be 3 for this schema")
 
     features = _object(root["abi_features"], "contract.abi_features")
     _keys(features, "contract.abi_features", {
         "routed_moe_per_role_codebook_lut",
+        "source_fp8_block128_w8a16",
     })
     per_role_lut = _positive_int(
         features["routed_moe_per_role_codebook_lut"],
@@ -121,6 +122,15 @@ def validate_runtime_contract(contract: Any) -> None:
     if per_role_lut != 1:
         _fail(
             "contract.abi_features.routed_moe_per_role_codebook_lut",
+            "must be 1",
+        )
+    source_fp8_w8a16 = _positive_int(
+        features["source_fp8_block128_w8a16"],
+        "contract.abi_features.source_fp8_block128_w8a16",
+    )
+    if source_fp8_w8a16 != 1:
+        _fail(
+            "contract.abi_features.source_fp8_block128_w8a16",
             "must be 1",
         )
 

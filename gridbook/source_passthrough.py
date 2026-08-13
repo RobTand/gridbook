@@ -164,17 +164,12 @@ _FP8_BLOCK_LINEAR = SourceFormat(
     ),
     audited_capabilities=((12, 1),),
     # The route is GRIDBOOK-OWNED: every rung in vLLM 0.24's block-scaled FP8
-    # linear ladder was measured to fail on sm_121 for UE8M0 scales (the
-    # known_broken_backends below record each symptom), so Gridbook serves the
-    # format itself by embedding it into MXFP8 — 128 = 4 * 32, one scale byte
-    # replicated per chunk, bit-exact by construction — and running the stock
-    # sm120 block-scaled collective (gridbook/mxfp8_dense_lane.py; the
-    # embedding proof is in gridbook/mxfp8.py).  Correctness-audited
-    # kernel-vs-oracle over the ordinary DSV4 body shapes and its grouped
-    # wo_a projection on sm_121; NATIVE-PARITY *served* evidence pending, so
-    # the lane is OPT-IN
-    # (GRIDBOOK_MXFP8_DENSE=1) and the factory refuses without it.
-    audited_backends=frozenset({"Mxfp8DenseLinearMethod"}),
+    # linear ladder fails for this UE8M0 wire on sm_121 (recorded below).
+    # Gridbook keeps the source E4M3 + block128 UE8M0 planes verbatim and
+    # serves BF16 activations through a raw-plane native decode GEMV or a
+    # caller-scoped BF16 transient consumed by its CUTLASS bridge.  Release
+    # evidence is pending; admission is intentionally limited to Spark.
+    audited_backends=frozenset({"Fp8SourceW8A16LinearMethod"}),
     known_broken_backends={
         "DeepGemmFp8BlockScaledMMKernel": (
             "DeepGEMM's UE8M0 scale-layout transform rejects sm_121 "
@@ -198,15 +193,18 @@ _FP8_BLOCK_LINEAR = SourceFormat(
             "and its can_implement does not verify UE8M0 128x128 handling"
         ),
     },
-    quantizes_activations=True,
+    quantizes_activations=False,
     remedy=(
         "No native block-scaled FP8 kernel serves UE8M0 scales on sm_121 in "
-        "vLLM 0.24; Gridbook's own MXFP8 lane does. Set "
-        "GRIDBOOK_MXFP8_DENSE=1 to opt in (correctness-audited; serve-parity "
-        "bench pending), export the unit as Gridbook FP8-CB, or serve it on "
-        "an audited device."
+        "vLLM 0.24; Gridbook's raw-resident W8A16 route preserves the source "
+        "planes and BF16 activations. Use the pinned Gridbook runtime carrying "
+        "source_fp8_block128_w8a16 ABI feature 1, export the unit as Gridbook "
+        "FP8-CB, or serve it on an admitted device."
     ),
-    method_factory="gridbook.source_passthrough:_build_gridbook_mxfp8_block128_method",
+    method_factory=(
+        "gridbook.source_passthrough:"
+        "_build_gridbook_fp8_source_w8a16_method"
+    ),
 )
 
 _MXFP8_LINEAR = SourceFormat(
@@ -217,8 +215,8 @@ _MXFP8_LINEAR = SourceFormat(
         "exponent scale per 32 contiguous K elements, scales stored row-major"
     ),
     audited_capabilities=((12, 1),),
-    # Same Gridbook-owned route as fp8_e4m3_ue8m0_block128, minus the
-    # load-time scale broadcast: the wire already stores per-32 scales.
+    # Distinct from the block-128 W8A16 route above: this direct per-32 wire
+    # deliberately enters the dynamically quantized W8A8 MXFP8 collective.
     audited_backends=frozenset({"Mxfp8DenseLinearMethod"}),
     known_broken_backends={},
     quantizes_activations=True,
@@ -440,13 +438,16 @@ def _require_mxfp8_opt_in(fmt_id: str, prefix: str) -> None:
         )
 
 
-def _build_gridbook_mxfp8_block128_method(layer: Any, prefix: str) -> Any:
-    """Gridbook's MXFP8 dense lane reading the DeepSeek block-128 wire."""
+def _build_gridbook_fp8_source_w8a16_method(layer: Any, prefix: str) -> Any:
+    """Gridbook's raw-resident W8A16 route for DeepSeek block-128 FP8."""
 
-    _require_mxfp8_opt_in(_FP8_BLOCK_LINEAR.id, prefix)
-    from .mxfp8_dense_lane import WIRE_FP8_BLOCK128, build_mxfp8_dense_method
+    del layer, prefix
+    from .fp8_source_w8a16 import (
+        WIRE_FP8_BLOCK128,
+        build_fp8_source_w8a16_method,
+    )
 
-    return build_mxfp8_dense_method(WIRE_FP8_BLOCK128)
+    return build_fp8_source_w8a16_method(WIRE_FP8_BLOCK128)
 
 
 def _build_gridbook_mxfp8_direct_method(layer: Any, prefix: str) -> Any:
@@ -461,8 +462,9 @@ def _build_gridbook_mxfp8_direct_method(layer: Any, prefix: str) -> Any:
 _FACTORIES: dict[str, Callable[[Any, str], Any]] = {
     "gridbook.source_passthrough:_build_vllm_mxfp4_moe_method":
         _build_vllm_mxfp4_moe_method,
-    "gridbook.source_passthrough:_build_gridbook_mxfp8_block128_method":
-        _build_gridbook_mxfp8_block128_method,
+    ("gridbook.source_passthrough:"
+     "_build_gridbook_fp8_source_w8a16_method"):
+        _build_gridbook_fp8_source_w8a16_method,
     "gridbook.source_passthrough:_build_gridbook_mxfp8_direct_method":
         _build_gridbook_mxfp8_direct_method,
 }

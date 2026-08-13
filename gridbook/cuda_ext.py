@@ -18,16 +18,17 @@ extension build fails.
 Build cache: ``PRISMAQUANT_CB_EXT_DIR`` if set, else ``~/.cache/prismaquant-
 cb-ext``. EVERY module builds in its own subdirectory of that root — ``main``,
 ``v2``, ``bf16_grouped/<identity>``, ``fused/<identity>``,
-``fused_fp4/<identity>``, ``fused_fp4v2/<identity>`` and
-``moe_persistent_b/<identity>``, seven in all — so no two ninja workspaces
-share artefacts. Inside the container the root is ephemeral, so a cold start
+``fused_fp4/<identity>``, ``fused_fp4v2/<identity>``,
+``mxfp8_dense/<identity>``, ``fp8_source_w8a16/<identity>`` and
+``moe_persistent_b/<identity>``, nine in all — so no two ninja workspaces share
+artefacts. Inside the container the root is ephemeral, so a cold start
 pays ONE build per module it actually reaches; mount a host dir over it to
 persist those builds across restarts. Never ``/tmp``. There is deliberately no
 single build-time figure here: the modules differ by more than an order of
 magnitude in compile cost (the CUTLASS collectives dominate the hand-written
 CUDA), what a given serve reaches depends on format and opt-in flags, and the
 one measurement this docstring used to quote was taken against a single module
-before five of the seven existed. ``docs/CONTAINER.md`` carries the measured
+before seven of the nine existed. ``docs/CONTAINER.md`` carries the measured
 image-build numbers.
 
 Architecture: every module is compiled for exactly the live device's compute
@@ -46,11 +47,12 @@ module. Strict call contracts use :func:`_require_symbols`; fused FP4 uses
 independent symbol families because its dense and grouped call sites are
 separately guarded. An incompatible module would otherwise fail with
 ``AttributeError`` mid-forward, or silently disable a probed fast path. The
-five digest-keyed modules — ``fused`` (FP8), ``fused_fp4``, ``bf16_grouped``,
-``fused_fp4v2`` and ``moe_persistent_b`` — additionally hash their packaged
+seven digest-keyed modules — ``fused`` (FP8), ``fused_fp4``, ``bf16_grouped``,
+``fused_fp4v2``, ``mxfp8_dense``, ``fp8_source_w8a16`` and
+``moe_persistent_b`` — additionally hash their packaged
 sources, Gridbook headers (transitively: a header reached only through another
 Gridbook header counts), target, compiled-in lane macros and toolchain ABI
-into the module name and build directory, so a loaded module of those five is
+into the module name and build directory, so a loaded module of those seven is
 always built from the current sources. ``main`` and ``v2`` are not keyed that
 way: they include no Gridbook header, so torch's own versioner over the
 ``.cu`` is already complete for them.
@@ -913,8 +915,8 @@ def _load_bf16_grouped_ext_locked():
 # file remains authoritative for the complete external include graph.
 # --------------------------------------------------------------------------
 def _fused_build_identity(torch, cpp_extension, *, src_dir: str,
-                          cutlass_include: str,
-                          util_include: str,
+                          cutlass_include: str | None,
+                          util_include: str | None,
                           capability: tuple[int, int],
                           build_inputs: tuple[str, ...],
                           bindings,
@@ -954,18 +956,20 @@ def _fused_build_identity(torch, cpp_extension, *, src_dir: str,
         name: _sha256_file(os.path.join(src_dir, name))
         for name in build_inputs
     }
-    cutlass_inputs = {}
-    for label, path in (
-        ("cutlass/cutlass.h",
-         os.path.join(cutlass_include, "cutlass", "cutlass.h")),
-        ("cutlass/version.h",
-         os.path.join(cutlass_include, "cutlass", "version.h")),
-        ("cutlass/util/packed_stride.hpp",
-         os.path.join(util_include, "cutlass", "util",
-                      "packed_stride.hpp")),
-    ):
-        cutlass_inputs[label] = (
-            _sha256_file(path) if os.path.isfile(path) else None)
+    cutlass_inputs = None
+    if cutlass_include is not None and util_include is not None:
+        cutlass_inputs = {}
+        for label, path in (
+            ("cutlass/cutlass.h",
+             os.path.join(cutlass_include, "cutlass", "cutlass.h")),
+            ("cutlass/version.h",
+             os.path.join(cutlass_include, "cutlass", "version.h")),
+            ("cutlass/util/packed_stride.hpp",
+             os.path.join(util_include, "cutlass", "util",
+                          "packed_stride.hpp")),
+        ):
+            cutlass_inputs[label] = (
+                _sha256_file(path) if os.path.isfile(path) else None)
 
     major, minor = capability
     compute, code = _arch_target((major, minor), accelerated=accelerated)
@@ -975,7 +979,6 @@ def _fused_build_identity(torch, cpp_extension, *, src_dir: str,
             [label, list(names)] for label, names in bindings
         ],
         "inputs": packaged_inputs,
-        "cutlass_inputs": cutlass_inputs,
         "target": {
             "capability": [major, minor],
             "compute": compute,
@@ -1013,6 +1016,8 @@ def _fused_build_identity(torch, cpp_extension, *, src_dir: str,
         "host_compiler": _compiler_identity(
             None if cxx is None else os.fspath(cxx)),
     }
+    if cutlass_inputs is not None:
+        payload["cutlass_inputs"] = cutlass_inputs
     if defines:
         payload["defines"] = {str(k): str(v) for k, v in defines.items()}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
@@ -1181,7 +1186,7 @@ def preload_native_extensions(*, strict: bool = False) -> dict[str, bool]:
     docs/KERNELS.md "a measurement side-effect worth knowing"), so an arm that
     warms only the two fused modules is still residency-MISmatched against an
     arm that later touches ``cb_gemv_v2`` or the grouped BF16 bridge. This
-    warms every loader in ``_PRELOAD_FAMILIES`` — all seven modules — so both
+    warms every loader in ``_PRELOAD_FAMILIES`` — all nine modules — so both
     arms of an A/B carry the same set (2026-08-01 performance audit §3 P4,
     "preload completeness").
 
@@ -1661,8 +1666,8 @@ def _load_fused_fp4v2_ext_locked():
     return _fused_fp4v2
 # =========================== END P2a BLOCK ========================================
 # ===========================================================================
-# BEGIN ADDITIVE BLOCK — MXFP8 dense block-scaled loader (task: MXFP8 lane;
-# serves producer MXFP8 and the DeepSeek fp8-ue8m0-block128 embedding).
+# BEGIN ADDITIVE BLOCK — direct-g32 MXFP8 dense block-scaled loader.
+# DeepSeek's block128 source-FP8 wire is owned by the separate W8A16 loader.
 # Self-contained: adds module-level globals, constants and three functions,
 # and modifies nothing above.
 # ===========================================================================
@@ -1712,12 +1717,11 @@ def get_mxfp8_dense_ext():
     """The MXFP8 dense W8A8 block-scaled extension (mxfp8_dense_gemm.cu), or
     None.
 
-    Serves two wire spellings of one on-device format: producer-emitted MXFP8
-    (``mxfp8_e4m3_e8m0_g32``) and DeepSeek block-128 FP8
-    (``fp8_e4m3_ue8m0_block128``), the latter embedded exactly by scale
-    replication at load (gridbook/mxfp8.py).  Fail-soft here, fail-closed at
-    the lane: ``mxfp8_dense_lane`` attests symbols, device and built-for
-    capability via ``lane_select.require_lane`` before any unit is served.
+    Serves only producer-emitted ``mxfp8_e4m3_e8m0_g32``.  The DeepSeek
+    block-128 source wire is W8A16 and belongs exclusively to the separate
+    ``fp8_source_w8a16`` module.  Fail-soft here, fail-closed at the lane:
+    ``mxfp8_dense_lane`` attests symbols, device and built-for capability via
+    ``lane_select.require_lane`` before any unit is served.
     """
     if _mxfp8_dense_tried:
         return _mxfp8_dense
@@ -1776,18 +1780,18 @@ def _load_mxfp8_dense_ext_locked():
             capability=cc)
     except StaleExtensionError as exc:
         print(f"[prismaquant-cb] ERROR: incompatible MXFP8 dense extension — "
-              f"{exc} MXFP8/DeepSeek-FP8 passthrough units stay refused "
+              f"{exc} Direct-g32 MXFP8 units stay refused "
               f"(fail-closed).", file=sys.stderr, flush=True)
         _mxfp8_dense = None
     except IncompleteInstallError as exc:
         print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
-              f"MXFP8/DeepSeek-FP8 passthrough units stay refused "
+              f"Direct-g32 MXFP8 units stay refused "
               f"(fail-closed).", file=sys.stderr, flush=True)
         _mxfp8_dense = None
     except Exception as exc:  # noqa: BLE001 — capability probe is fail-soft
         print(f"[prismaquant-cb] WARNING: MXFP8 dense extension unavailable "
-              f"({type(exc).__name__}: {exc}); MXFP8/DeepSeek-FP8 passthrough "
-              f"units will refuse at load (expected off cc 12.0/12.1 and "
+              f"({type(exc).__name__}: {exc}); direct-g32 MXFP8 units will "
+              f"refuse at load (expected off cc 12.0/12.1 and "
               f"without nvcc). To enable the native path: {_NVCC_HINT}.",
               file=sys.stderr, flush=True)
         _mxfp8_dense = None
@@ -1802,6 +1806,181 @@ def _load_mxfp8_dense_ext_locked():
 _PRELOAD_FAMILIES.append(("mxfp8_dense", "get_mxfp8_dense_ext"))
 # ===========================================================================
 # END ADDITIVE BLOCK — MXFP8 dense block-scaled loader
+# ===========================================================================
+# BEGIN ADDITIVE BLOCK — raw-resident block128 source-FP8 W8A16 loader.
+#
+# This module intentionally has no CUTLASS dependency.  Its decode kernel
+# streams the checkpoint's E4M3 + UE8M0 planes directly; its second symbol
+# expands one caller-scoped BF16 tile for the existing owned grouped-BF16
+# bridge.  Keeping it separate from the MXFP8 W8A8 module makes activation
+# numerics part of the attested module contract instead of a runtime branch.
+# ===========================================================================
+_fp8_source_w8a16 = None
+_fp8_source_w8a16_tried = False
+_fp8_source_w8a16_lock = threading.Lock()
+
+_FP8_SOURCE_W8A16_BUILD_INPUTS = ("fp8_source_w8a16.cu",)
+_FP8_SOURCE_W8A16_ABI_SCHEMA = 1
+_FP8_SOURCE_W8A16_SYMBOLS = (
+    "fp8_source_gemv",
+    "fp8_source_expand_bf16",
+)
+# Spark / GB10 is this release's sole target.  The source is architecture-
+# generic CUDA, but admission stays limited while measured release evidence
+# is pending rather than silently creating another serving lane.
+_FP8_SOURCE_W8A16_CAPABILITIES = ((12, 1),)
+
+
+def fp8_source_w8a16_buildable(capability) -> bool:
+    """Whether raw-resident source-FP8 W8A16 is audited for ``capability``."""
+    return tuple(capability) in _FP8_SOURCE_W8A16_CAPABILITIES
+
+
+def _fp8_source_w8a16_build_identity(torch, cpp_extension, *, src_dir: str,
+                                      capability: tuple[int, int]):
+    """``(digest, payload)`` for the source-FP8 W8A16 module's ABI."""
+    return _fused_build_identity(
+        torch, cpp_extension, src_dir=src_dir,
+        cutlass_include=None, util_include=None,
+        capability=capability,
+        build_inputs=_FP8_SOURCE_W8A16_BUILD_INPUTS,
+        bindings=(("source FP8 W8A16", _FP8_SOURCE_W8A16_SYMBOLS),),
+        abi_schema=_FP8_SOURCE_W8A16_ABI_SCHEMA,
+        accelerated=False)
+
+
+def get_fp8_source_w8a16_ext():
+    """Return the raw-resident block128 source-FP8 W8A16 module, or None.
+
+    This loader remains fail-soft for capability probes and preload inventory.
+    Model construction uses :func:`require_fp8_source_w8a16_ext` and therefore
+    refuses the unit before serving if the exact native contract is absent.
+    """
+    if _fp8_source_w8a16_tried:
+        return _fp8_source_w8a16
+    with _fp8_source_w8a16_lock:
+        if _fp8_source_w8a16_tried:
+            return _fp8_source_w8a16
+        return _load_fp8_source_w8a16_ext_locked()
+
+
+def _load_fp8_source_w8a16_ext_locked():
+    """Build/publish source-FP8 W8A16 with its loader lock held."""
+    global _fp8_source_w8a16, _fp8_source_w8a16_tried
+    build_dir = "<unresolved>"
+    try:
+        import torch  # noqa: F401  (must import before cpp_extension)
+        from torch.utils import cpp_extension
+
+        cc = _target_capability(
+            "the raw-resident source-FP8 W8A16 extension "
+            "(fp8_source_w8a16.cu)")
+        if not fp8_source_w8a16_buildable(cc):
+            raise RuntimeError(
+                "raw-resident source-FP8 W8A16 is release-gated only for "
+                f"compute capability 12.1, got {cc[0]}.{cc[1]}")
+        src_dir = _require_csrc(*_FP8_SOURCE_W8A16_BUILD_INPUTS)
+        identity, _identity_payload = _fp8_source_w8a16_build_identity(
+            torch, cpp_extension, src_dir=src_dir, capability=cc)
+        module_name = f"pq_fp8_source_w8a16_{identity}"
+        build_root = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
+        build_dir = os.path.join(build_root, "fp8_source_w8a16", identity)
+        os.makedirs(build_dir, exist_ok=True)
+        mod = cpp_extension.load(
+            name=module_name,
+            sources=[os.path.join(src_dir, "fp8_source_w8a16.cu")],
+            extra_include_paths=[src_dir],
+            extra_cuda_cflags=[
+                "-O3", _gencode_flag(cc, accelerated=False),
+            ],
+            build_directory=build_dir,
+            verbose=False)
+        mod = _require_symbols(
+            mod, _FP8_SOURCE_W8A16_SYMBOLS, build_dir=build_dir,
+            source="fp8_source_w8a16.cu")
+        _fp8_source_w8a16 = _require_fused_identity(
+            mod, expected_name=module_name, identity=identity,
+            abi_schema=_FP8_SOURCE_W8A16_ABI_SCHEMA,
+            build_dir=build_dir, source="fp8_source_w8a16.cu",
+            capability=cc)
+    except StaleExtensionError as exc:
+        print("[prismaquant-cb] ERROR: incompatible source-FP8 W8A16 "
+              f"extension — {exc} Source-FP8 units stay refused "
+              "(fail-closed).", file=sys.stderr, flush=True)
+        _fp8_source_w8a16 = None
+    except IncompleteInstallError as exc:
+        print(f"[prismaquant-cb] ERROR: broken gridbook install — {exc} "
+              "Source-FP8 W8A16 units stay refused (fail-closed).",
+              file=sys.stderr, flush=True)
+        _fp8_source_w8a16 = None
+    except Exception as exc:  # noqa: BLE001 — capability probe is fail-soft
+        print("[prismaquant-cb] WARNING: source-FP8 W8A16 extension "
+              f"unavailable ({type(exc).__name__}: {exc}); source-FP8 units "
+              "will refuse at load (expected off cc 12.1 and without nvcc). "
+              f"To enable the native path: {_NVCC_HINT}.",
+              file=sys.stderr, flush=True)
+        _fp8_source_w8a16 = None
+    finally:
+        _fp8_source_w8a16_tried = True
+    return _fp8_source_w8a16
+
+
+def require_fp8_source_w8a16_ext(operation: str = "this operation",
+                                  device=None):
+    """Return the exact source-FP8 W8A16 module or fail at model load."""
+    from .lane_select import device_capability
+
+    capability = device_capability(device)
+    ext = get_fp8_source_w8a16_ext()
+    missing = [name for name in _FP8_SOURCE_W8A16_SYMBOLS
+               if ext is None or not hasattr(ext, name)]
+    if missing:
+        raise NativeKernelUnavailableError(
+            f"{operation} requires Gridbook's native raw-resident "
+            "source-FP8 W8A16 extension (fp8_source_w8a16.cu), but it is "
+            f"unavailable or incomplete (missing {missing}; device "
+            f"capability {capability}). Gridbook does not expand weights "
+            "persistently, quantize activations, or fall back to torch. "
+            f"To enable the native path: {_NVCC_HINT}.")
+    if capability is None or not fp8_source_w8a16_buildable(capability):
+        rendered = ("unavailable" if capability is None else
+                    f"{capability[0]}.{capability[1]}")
+        raise NativeKernelUnavailableError(
+            f"{operation} requires the source-FP8 W8A16 lane release-gated "
+            f"for compute capability 12.1; this device reports {rendered}.")
+    built_for = getattr(ext, "__gridbook_jit_capability__", None)
+    if built_for is None:
+        raise NativeKernelUnavailableError(
+            f"{operation} found a source-FP8 W8A16 module without Gridbook's "
+            "JIT build-capability identity. Gridbook cannot prove that the "
+            f"module targets this device ({capability[0]}.{capability[1]}) "
+            "and refuses the load.")
+    if tuple(built_for) != tuple(capability):
+        raise NativeKernelUnavailableError(
+            f"{operation} found a source-FP8 W8A16 module built for compute "
+            f"capability {built_for[0]}.{built_for[1]}, but this device "
+            f"reports {capability[0]}.{capability[1]}. Serve each capability "
+            "from its own process; Gridbook refuses a cross-device launch.")
+    identity = getattr(ext, "__gridbook_jit_identity__", None)
+    abi_schema = getattr(ext, "__gridbook_jit_abi_schema__", None)
+    if (
+        not isinstance(identity, str)
+        or len(identity) != 64
+        or any(char not in "0123456789abcdef" for char in identity)
+        or abi_schema != _FP8_SOURCE_W8A16_ABI_SCHEMA
+    ):
+        raise NativeKernelUnavailableError(
+            f"{operation} found a source-FP8 W8A16 module without the exact "
+            "Gridbook source/toolchain identity and ABI schema. Gridbook "
+            "refuses an unbound or stale JIT module.")
+    return ext
+
+
+_PRELOAD_FAMILIES.append(
+    ("fp8_source_w8a16", "get_fp8_source_w8a16_ext"))
+# ===========================================================================
+# END ADDITIVE BLOCK — raw-resident block128 source-FP8 W8A16 loader
 # ===========================================================================
 # BEGIN ADDITIVE BLOCK — persistent-B grouped MoE loader (ROADMAP K1.1, audit
 # §3 P2b).  Self-contained: it adds module-level globals, constants and three

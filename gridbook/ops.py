@@ -178,6 +178,42 @@ def _cb_bf16_grouped_mm_out_fake(out, a, weights, expert_ends,
     return None
 
 
+@torch.library.custom_op("prismaquant::fp8_source_gemv", mutates_args=())
+def fp8_source_gemv(x: torch.Tensor, q: torch.Tensor, scales: torch.Tensor,
+                     groups: int) -> torch.Tensor:
+    """Raw-resident block128 source-FP8 GEMV for BF16 activations."""
+    from .cuda_ext import require_fp8_source_w8a16_ext
+
+    return require_fp8_source_w8a16_ext(
+        "source-FP8 W8A16 decode GEMV", device=x.device
+    ).fp8_source_gemv(x, q, scales, groups)
+
+
+@fp8_source_gemv.register_fake
+def _fp8_source_gemv_fake(x, q, scales, groups):
+    del scales, groups
+    return torch.empty((x.shape[0], q.shape[0]), dtype=torch.bfloat16,
+                       device=x.device)
+
+
+@torch.library.custom_op("prismaquant::fp8_source_expand_bf16",
+                         mutates_args=())
+def fp8_source_expand_bf16(q: torch.Tensor,
+                           scales: torch.Tensor) -> torch.Tensor:
+    """Expand one caller-scoped BF16 source-weight tile for native prefill."""
+    from .cuda_ext import require_fp8_source_w8a16_ext
+
+    return require_fp8_source_w8a16_ext(
+        "source-FP8 W8A16 transient expansion", device=q.device
+    ).fp8_source_expand_bf16(q, scales)
+
+
+@fp8_source_expand_bf16.register_fake
+def _fp8_source_expand_bf16_fake(q, scales):
+    del scales
+    return torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+
+
 @torch.library.custom_op("prismaquant::cb_bf16_grouped_mm_sm120",
                          mutates_args=())
 def cb_bf16_grouped_mm_sm120(a: torch.Tensor, weights: torch.Tensor,
@@ -606,6 +642,26 @@ def _cb_linear_forward_fake(x, layer_id):
     _method, layer = _lookup_cb_layer(layer_id)
     return torch.empty((*x.shape[:-1], layer._cb_N), dtype=x.dtype,
                        device=x.device)
+
+
+@torch.library.custom_op("prismaquant::fp8_source_linear_forward",
+                         mutates_args=())
+def fp8_source_linear_forward(x: torch.Tensor, layer_id: int) -> torch.Tensor:
+    """Opaque whole-dispatch op for raw-resident source-FP8 W8A16."""
+    method, layer = _lookup_cb_layer(layer_id)
+    return method._apply_inline(layer, x)
+
+
+@fp8_source_linear_forward.register_fake
+def _fp8_source_linear_forward_fake(x, layer_id):
+    _method, layer = _lookup_cb_layer(layer_id)
+    groups = int(layer._fp8_source_groups)
+    rows = int(layer._fp8_source_rows)
+    if bool(getattr(layer, "is_bmm", False)):
+        return torch.empty((*x.shape[:-2], groups, rows), dtype=x.dtype,
+                           device=x.device)
+    return torch.empty((*x.shape[:-1], int(layer._fp8_source_N)),
+                       dtype=x.dtype, device=x.device)
 
 
 @torch.library.custom_op("prismaquant::cb_moe_forward", mutates_args=())

@@ -123,7 +123,7 @@ and recorded commands.
 
 Format labels are not execution evidence. Every report requires the
 format/rung, serialized weight layout, scale coding, full weight/activation
-contract (`W4A4`, `W8A8`, and so on), concrete kernel/backend, tensor-parallel
+contract (`W4A4`, `W8A8`, `W8A16`, and so on), concrete kernel/backend, tensor-parallel
 size, fallback state, exact server vLLM/runtime build, GPU identifier, driver,
 and accelerator runtime (for example CUDA or ROCm). Client and server runtime
 identifiers are separate required fields because the benchmark may run outside
@@ -148,6 +148,19 @@ identity fields. If an assignment uses more than one value, that CLI field must
 say `mixed`. Only these aggregate CLI fields may say `mixed`; per-unit assignment
 fields may not. The manifest is the authoritative identity for mixed menus; a
 single average bpp or headline format is not.
+
+For source block-FP8, `fp8_e4m3_ue8m0_block128` identifies the serialized
+**weight** representation only. Its Gridbook 0.8.5 assignment must say
+`quant_contract: "W8A16"`: the runtime consumes BF16 activations unchanged. The
+assignment's backend must name the complete owned dispatch chain, for example
+`gridbook-fp8-source-w8a16(fp8_source_gemv|fp8_source_expand_bf16+cb_bf16_grouped_mm)`,
+rather than the generic words `Gridbook`, `FP8`, or `source-passthrough`. Attach
+logs proving `fp8_source_gemv` for decode-sized calls and
+`fp8_source_expand_bf16` plus `cb_bf16_grouped_mm` for larger calls. For DSV4
+`wo_a`, the same evidence must show the grouped W8A16 adapter and `tp=1`.
+Conversely, direct `mxfp8_e4m3_e8m0_g32` remains W8A8 and must name
+`mxfp8_dense_mm`. Neither wire may borrow the other's arithmetic label or
+evidence merely because both store E4M3 weights with UE8M0 scales.
 
 Minimal syntax examples look like this (real inventories enumerate every
 shipped file, and production execution manifests must be generated from and
@@ -179,6 +192,13 @@ not a slower sample of the requested arm.
 An intentional Gridbook W4A16 arm is valid when its exact packing/metadata,
 profile, loader, and delegated backend are recorded as W4A16; it must never be
 used as evidence for W4A4 merely because both reuse a native weight family.
+
+The same rule is release-critical for the source block-FP8 correction. Historical
+block-128 results obtained by replicating scales into MXFP8 and dynamically
+quantizing activations are W8A8 results. They do not validate W8A16 quality,
+logits, CUDA-graph behavior, or speed. A 0.8.5 release claim needs a fresh
+same-artifact run whose manifest, logs, and server evidence prove unchanged BF16
+activations and the W8A16 kernel chain above.
 
 The opt-in fused native-FP4 prefill path is another contract-changing cell, not
 a transparent acceleration switch: it moves activation scaling from the

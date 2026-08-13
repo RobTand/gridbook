@@ -314,7 +314,7 @@ def test_passthrough_linear_unit_dispatches_through_the_same_guard(monkeypatch):
 
 def test_fp8_block_broken_vllm_rung_still_named_and_refused(monkeypatch):
     """A measured-broken vLLM rung refuses BY NAME even now that the format's
-    audited route is Gridbook's own MXFP8 lane: if dispatch ever resolves one
+    audited route is Gridbook's source-FP8 W8A16 lane: if dispatch resolves one
     of the broken classes, the operator gets the diagnosed symptom rather
     than a generic UNKNOWN."""
     monkeypatch.setattr(config_mod, "_live_device_capability",

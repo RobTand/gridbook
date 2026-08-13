@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.8.5 — 2026-08-12
+
+- **Correct source block-FP8 serving to W8A16.** The
+  `fp8_e4m3_ue8m0_block128` source-passthrough wire keeps its E4M3 weight bytes
+  and UE8M0 128-by-128 scale blocks resident, but no longer dynamically
+  quantizes BF16 activations to MXFP8. Decode-sized `M <= 8` calls use the owned
+  `fp8_source_gemv` CUDA kernel directly on BF16 activations. Larger calls use
+  `fp8_source_expand_bf16` to materialize one bounded BF16 weight transient,
+  consume it with Gridbook's existing owned CUTLASS grouped-BF16 bridge, and
+  release it immediately. DeepSeek-V4's grouped `attn.wo_a` uses the same
+  contract, with the existing bridge expressed as one problem per group. There
+  is no PyTorch, cuBLAS, Triton, or persistent BF16 fallback.
+
+- The correction is deliberately scoped to the source block-128 wire. Direct
+  `mxfp8_e4m3_e8m0_g32` remains the opt-in `Mxfp8DenseLinearMethod` W8A8 lane
+  behind `GRIDBOOK_MXFP8_DENSE=1`; its resident format and dynamic MXFP8
+  activation quantization are unchanged. The existing v0.8.0 W8A8 measurements
+  remain historical evidence for that direct lane only, not evidence for the
+  new W8A16 route. Served quality and performance evidence for the W8A16 route
+  is pending the pre-tag gates in `docs/RELEASING.md`; this entry makes no
+  throughput or served-parity claim.
+
+- The packaged producer/runtime contract advances from closed schema v2 to v3
+  and explicitly attests
+  `abi_features.source_fp8_block128_w8a16 = 1`. Producers must require this
+  capability rather than infer correct activation semantics from a package
+  version. Missing, malformed, or future-valued declarations fail closed.
+
+- The distribution floor now names both serving-reachable source files that
+  were absent from its literal mirrors: the existing direct-MXFP8
+  `mxfp8_dense_gemm.cu` and the new `fp8_source_w8a16.cu`. The built-artifact,
+  installed-wheel, metadata, and GPU pre-tag compile gates therefore fail
+  explicitly if either source or either strict native ABI is missing.
+
+- Load and dispatch now fail closed at the remaining raw-wire boundaries:
+  vLLM checkpoint loaders validate the E4M3 and UE8M0 source dtypes before a
+  destination `copy_` can cast them; grouped DSV4 `wo_a` admits only
+  `G=8,N=1024,K=4096,tp=1` (dense serving is separately TP=1); and the native
+  extension must carry the exact JIT digest, ABI schema, and live-device build
+  capability. Decode and prefill publish two-phase route telemetry identifying
+  `fp8_source_gemv` versus
+  `fp8_source_expand_bf16+cb_bf16_grouped_mm`, with the activation contract
+  recorded as preserved BF16 rather than dynamic FP8 QDQ.
+
 ## 0.8.4 — 2026-08-12
 
 - **Attest the routed per-role LUT ABI in the packaged runtime contract.**

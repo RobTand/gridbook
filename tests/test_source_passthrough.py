@@ -93,6 +93,13 @@ class Mxfp8DenseLinearMethod:
 Mxfp8DenseLinearMethod.__module__ = "gridbook.mxfp8_dense_lane"
 
 
+class Fp8SourceW8A16LinearMethod:
+    """Gridbook's terminal block128 source-FP8 W8A16 lane."""
+
+
+Fp8SourceW8A16LinearMethod.__module__ = "gridbook.fp8_source_w8a16"
+
+
 def _declaration(units, version=1):
     return {SCHEMA_KEY: {"version": version, "units": units}}
 
@@ -265,8 +272,8 @@ def test_format_with_empty_audited_set_refuses_everything():
 
     Uses a synthetic format rather than a real registry entry, so this stays
     true whatever the registry's current verdicts are — the fp8-block entry
-    carried the empty set until Gridbook's own MXFP8 lane was audited, and the
-    verdict pin for that entry lives in
+    carried the empty set until Gridbook's source-FP8 W8A16 lane was admitted,
+    and the verdict pin for that entry lives in
     ``test_fp8_block_verdict_is_gridbook_owned_route`` below.
     """
     blocked = FORMATS[FP8_BLOCK]._replace(audited_backends=frozenset())
@@ -281,42 +288,27 @@ def test_format_with_empty_audited_set_refuses_everything():
 def test_fp8_block_verdict_is_gridbook_owned_route():
     """The VERDICT pin — this test SHOULD fail when the verdict changes.
 
-    Every vLLM 0.24 rung for UE8M0 128x128 blocks on sm_121 measured broken
-    (the known_broken_backends record each symptom), so the audited route is
-    Gridbook's own MXFP8 dense lane: the block form embeds exactly into MXFP8
-    (128 = 4 * 32, scale replication, bit-exact) and the stock sm120
-    block-scaled collective serves it.  Correctness audit 2026-08-03 on
-    sm_121: kernel-vs-fp32-oracle rel-Frobenius worst 5.9e-5 over the seven
-    distinct ordinary DSV4-Flash body shapes at M in {1, 64, 512}, under the
-    at-most-1e-4 numeric contract rather than a bit-exact contract; the
-    DeepSeek-embedding path (block scales -> broadcast -> plane -> kernel)
-    worst 1.2e-4 vs the block-dequant oracle.  The grouped wo_a artifact
-    geometry (G=8, N=1024, K=4096) is separately checked on the immutable eugr
-    vLLM 0.26.1rc1.dev515+g653ebb52d.d20260808 baseline: M=1 max-abs 0.03125
-    and relative Frobenius 1.2460984e-5; M=64 max-abs 0.25 and relative
-    Frobenius 4.4897934e-5.
-
-    Note (same date): the activation quantizer's exponent rule was moved from
-    ``ceil(log2(...))`` to the producer-matching frexp form after a measured
-    boundary defect (15 saturations / 6e6 group maxima).  The parity numbers
-    above stand unchanged as KERNEL claims: kernel and oracle consumed the
-    same quantized operands in every comparison, so the quantizer defect
-    cancelled identically on both sides.
+    Every stock vLLM rung for UE8M0 128x128 blocks on sm_121 remains recorded
+    as broken.  The Gridbook-owned route now preserves BF16 activations and
+    the raw checkpoint planes; evidence is pending, so the verdict pin is the
+    explicit method/activation contract rather than a stale W8A8 claim.
     """
     fmt = FORMATS[FP8_BLOCK]
-    assert fmt.audited_backends == frozenset({"Mxfp8DenseLinearMethod"})
+    assert fmt.audited_backends == frozenset({
+        "Fp8SourceW8A16LinearMethod"})
+    assert fmt.quantizes_activations is False
     # The vLLM delegation outcomes stay recorded: a refusal for one of those
     # classes must name the measured symptom, not a generic UNKNOWN.
     assert {"DeepGemmFp8BlockScaledMMKernel", "CutlassFp8BlockScaledMMKernel",
             "TritonFp8BlockScaledMMKernel"} <= set(fmt.known_broken_backends)
-    assert "GRIDBOOK_MXFP8_DENSE" in fmt.remedy
+    assert "source_fp8_block128_w8a16" in fmt.remedy
 
 
 def test_gridbook_native_method_is_itself_the_audited_backend():
     require_native_passthrough_backend(
         prefix="model.layers.0.self_attn.q_proj",
         source_format=FORMATS[FP8_BLOCK],
-        method=Mxfp8DenseLinearMethod(),
+        method=Fp8SourceW8A16LinearMethod(),
     )
 
 

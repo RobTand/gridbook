@@ -140,7 +140,9 @@ docker run --rm --gpus all -v "$PWD/dist:/dist" \
   TORCH_CUDA_ARCH_LIST=12.1a python -c "
 from gridbook.cuda_ext import (
     csrc_dir, get_bf16_grouped_ext, get_ext, get_ext_v2,
-    get_fused_ext, get_fused_fp4_ext,
+    get_fp8_source_w8a16_ext, get_fused_ext, get_fused_fp4_ext,
+    get_fused_fp4v2_ext, get_moe_persistent_b_ext,
+    get_mxfp8_dense_ext,
 )
 from gridbook.native_cutlass import (
     require_native_fp8_cutlass, require_native_moe_activation,
@@ -169,18 +171,105 @@ for symbol in (\"cb_fused_fp4_prefill_mm_scaled\",
                \"cb_fused_fp4_moe_tile_sizes\"):
     assert hasattr(fp4_fused, symbol), f\"built FP4 fused module is missing {symbol}\"
 assert list(fp4_fused.cb_fused_fp4_moe_tile_sizes()) == [128, 256]
+fp4v2_fused = get_fused_fp4v2_ext()
+assert fp4v2_fused is not None, \"fused FP4-v2 extension failed to build\"
+assert hasattr(fp4v2_fused, \"cb_fused_fp4v2_prefill_mm\")
+persistent_b = get_moe_persistent_b_ext()
+assert persistent_b is not None, \"persistent-B MoE extension failed to build\"
+assert hasattr(persistent_b, \"cb_moe_persistent_b_prefill\")
+mxfp8 = get_mxfp8_dense_ext()
+assert mxfp8 is not None, \"direct MXFP8 extension failed to build\"
+for symbol in (\"mxfp8_dense_mm\", \"mxfp8_dense_mm_out\"):
+    assert hasattr(mxfp8, symbol), f\"built MXFP8 module is missing {symbol}\"
+source_w8a16 = get_fp8_source_w8a16_ext()
+assert source_w8a16 is not None, \"source-FP8 W8A16 extension failed to build\"
+for symbol in (\"fp8_source_gemv\", \"fp8_source_expand_bf16\"):
+    assert hasattr(source_w8a16, symbol), \
+        f\"built source-W8A16 module is missing {symbol}\"
 require_native_fp8_cutlass(\"release native-op gate\")
 require_native_moe_activation(\"silu\", \"release native-op gate\")
-print(\"ok:\", m, v2, grouped, fp8_fused, fp4_fused)"'
+print(\"ok:\", m, v2, grouped, fp8_fused, fp4_fused, fp4v2_fused,
+      persistent_b, mxfp8, source_w8a16)"'
 ```
 
 This command compiles every serving-reachable packaged extension: the main and
 v2 decode/expansion modules, the required exact grouped BF16 CUTLASS quality
-bridge, and both optional fused specializations. It also attests the direct
+bridge, all fused/persistent specializations, the direct-MXFP8 W8A8 module, and
+the source block-FP8 W8A16 module. It also attests the direct
 compiled vLLM FP8/CUTLASS and activation ABI that Gridbook invokes without a
 Python fallback helper. The retained `cb_persistent_tc.cu` source is not part
 of this gate: its serving selector, custom op, and package loader were deleted,
 and it remains available only to the explicitly opted-in research test.
+
+#### 0.8.5 source block-FP8 W8A16 gate
+
+The compile check proves that the wheel carries and builds the ABI. It does not
+prove activation semantics, bounded residency, DSV4 grouping, graph behavior,
+quality, or speed. Before tagging 0.8.5, run the focused GPU suite against that
+same installed wheel on the Spark release device. Stage these test files and
+their test-only helpers outside the checkout and run from that staging
+directory, so the repository cannot shadow the wheel:
+
+```bash
+python -m pytest -q \
+  tests/test_fp8_source_w8a16.py \
+  tests/test_fp8_source_w8a16_cuda.py \
+  tests/test_source_passthrough.py \
+  tests/test_dsv4_woa.py \
+  tests/test_mixed_fused_linear.py
+```
+
+Zero failures and zero relevant skips are required. The gate must cover all of
+the following; a CPU-only skip does not count:
+
+- fp8_source_gemv against an independent dequantize-plus-FP64/FP32 oracle at
+  M in {1,2,4,8}, including scale-block boundaries and every distinct
+  DSV4-Flash source shape;
+- fp8_source_expand_bf16 against an independent raw-E4M3/UE8M0 decoder,
+  including exact BF16 transient values, then its output through
+  cb_bf16_grouped_mm;
+- dense and grouped (G=8,N=1024,K=4096) DSV4 wo_a, at decode and
+  representative prefill M, with tp=1, group isolation, and invalid geometry
+  refusal;
+- unchanged BF16 activation tensors and a source dispatch that cannot call
+  activation QDQ, mxfp8_dense_mm, PyTorch matmul, cuBLAS, or Triton;
+- resident raw E4M3 weight plus UE8M0 scale only, with no persistent BF16
+  duplicate and the one-layer large-M transient released after the call;
+- eager/fullgraph opacity and FULL_DECODE_ONLY replay at [1,2,4,8], with
+  changed inputs and eager-versus-capture output equality; and
+- load-time refusal for missing/stale source symbols, an unavailable grouped
+  BF16 bridge, unsupported device/dtype/shape, and bias.
+
+Then load and serve the **exact final DSV4-Flash artifact**, not a synthetic
+submodule, in both the intended eager configuration and mode-0
+FULL_DECODE_ONLY. Bind the final whole-directory inventory and a complete
+gridbook.execution-manifest.v1 to the reports. Every block-128 source
+assignment must say W8A16; direct MXFP8 g32 assignments, if any, must remain
+W8A8. Retain the bound producer/export compatibility evidence plus closed
+startup/dispatch logs proving:
+
+1. the v3 feature source_fp8_block128_w8a16=1 was required by the producer;
+2. source decode dispatched fp8_source_gemv;
+3. source prefill dispatched fp8_source_expand_bf16 followed by
+   cb_bf16_grouped_mm;
+4. DSV4 wo_a used the grouped W8A16 adapter; and
+5. no source unit fell back or entered mxfp8_dense_mm/activation QDQ.
+
+The source method writes this proof through Gridbook's existing latest-route
+telemetry: `contract=bf16_preserved`; decode names `fp8_source_gemv`; prefill
+names `fp8_source_expand_bf16+cb_bf16_grouped_mm`; and the two-phase state
+remains `error` if either launch chain raises. Exact-artifact evidence must read
+these records from the loaded layers rather than infer dispatch from format
+metadata.
+
+Use fixed prompts to compare eager and graph tokens plus per-token logprobs, and
+run the workload matrix in NATIVE-PARITY.md with byte, resident-memory,
+peak-scratch, TTFT, ITL, and throughput limits declared **before** inspecting
+the results. Record every block and the exact GPU/runtime/image identities.
+Historical W8A8 block-128 results are a different activation contract and
+cannot satisfy any W8A16 quality or performance cell. Until these artifacts are
+attached and their predeclared limits pass, the route is implemented but the
+0.8.5 release gate is open; do not tag or claim served parity/performance.
 
 The fused FP4 extension also requires the GPU operator/SASS suite from an
 installed wheel. Stage `tests/test_fused_fp4_prefill.py` outside the checkout,
@@ -196,7 +285,7 @@ split-toolkit images may contain only `cuda-cuobjdump`; install the matching
 the validation container. A missing or older disassembler is a failed release
 environment, not a skipped kernel gate.
 
-If the command prints all five extension modules and passes the native-op
+If the command prints all nine extension modules and passes the native-op
 attestation, the installed wheel's native serving floor is genuinely sound.
 Two ways it can fail, and they mean different things:
 

@@ -1,15 +1,15 @@
 """DeepSeek-V4 ``wo_a`` adapter for Gridbook-owned BMM linears.
 
-The qualified eugr Spark vLLM baseline
-(``0.26.1rc1.dev515+g653ebb52d.d20260808``) does not call ``self.wo_a`` from
-NVIDIA DSV4 attention.  Its specialized output projection reads
-``wo_a.weight`` and its scale parameter directly and feeds both to DeepGEMM
-``fp8_einsum``.  That is valid for vLLM's stock block-FP8 method, but not for
-Gridbook's ``Mxfp8DenseLinearMethod``: after load, the latter owns a CuTe MXFP8
-scale plane and deliberately removes the checkpoint-scale parameter.
+The qualified Spark vLLM baseline does not call ``self.wo_a`` from NVIDIA
+DSV4 attention.  Its specialized output projection instead reads the weight
+and scale parameters directly and feeds them to DeepGEMM ``fp8_einsum``.
+That bypass is invalid for either Gridbook-owned route: direct-g32 MXFP8 W8A8
+repackages its scale plane for CuTe, while block128 source-FP8 W8A16 retains
+the raw checkpoint value and scale planes for Gridbook's own dispatch.
 
 This module installs one narrowly guarded class wrapper.  It activates only
-when the ``wo_a`` module carries :data:`DSV4_MXFP8_BMM_ATTR`; every other DSV4
+when the ``wo_a`` module carries one of Gridbook's versioned BMM ownership
+markers: direct MXFP8 W8A8 or block128 source-FP8 W8A16.  Every other DSV4
 attention instance calls the original vLLM method byte-for-byte.  The guarded
 path uses vLLM's own PyTorch-native inverse RoPE, calls the BMM-aware Gridbook
 linear normally, then calls ``wo_b``.  No Gridbook Triton fallback or stock
@@ -26,13 +26,18 @@ import torch
 __all__ = [
     "DSV4_MXFP8_BMM_ATTR",
     "DSV4_MXFP8_BMM_ABI",
+    "DSV4_FP8_SOURCE_W8A16_BMM_ATTR",
+    "DSV4_FP8_SOURCE_W8A16_BMM_ABI",
+    "dsv4_gridbook_o_proj",
     "dsv4_mxfp8_o_proj",
     "install_dsv4_woa_adapter",
 ]
 
 DSV4_MXFP8_BMM_ATTR = "_gridbook_mxfp8_bmm"
 DSV4_MXFP8_BMM_ABI = 1
-_ADAPTER_ABI = 1
+DSV4_FP8_SOURCE_W8A16_BMM_ATTR = "_gridbook_fp8_source_w8a16_bmm"
+DSV4_FP8_SOURCE_W8A16_BMM_ABI = 1
+_ADAPTER_ABI = 2
 _WRAPPED_ABI_ATTR = "_gridbook_dsv4_woa_adapter_abi"
 _LOGGED = False
 
@@ -47,17 +52,28 @@ _NVIDIA_ATTN_CLASSES = {
 }
 
 
-def dsv4_mxfp8_o_proj(
+def _owns_gridbook_bmm(wo_a: Any) -> bool:
+    """Whether ``wo_a`` carries one exact Gridbook BMM contract marker."""
+
+    if wo_a is None:
+        return False
+    return (
+        getattr(wo_a, DSV4_MXFP8_BMM_ATTR, None) == DSV4_MXFP8_BMM_ABI or
+        getattr(wo_a, DSV4_FP8_SOURCE_W8A16_BMM_ATTR, None) ==
+        DSV4_FP8_SOURCE_W8A16_BMM_ABI
+    )
+
+
+def dsv4_gridbook_o_proj(
     attention: Any, o: torch.Tensor, positions: torch.Tensor
 ) -> torch.Tensor:
     """Run DSV4 output projection through the owning Gridbook BMM method."""
 
     wo_a = getattr(attention, "wo_a", None)
-    if (wo_a is None or
-            getattr(wo_a, DSV4_MXFP8_BMM_ATTR, None) != DSV4_MXFP8_BMM_ABI):
+    if not _owns_gridbook_bmm(wo_a):
         raise RuntimeError(
             "Gridbook DSV4 wo_a adapter was called for a layer that does not "
-            "own the MXFP8 BMM contract"
+            "own a supported Gridbook BMM contract"
         )
     if o.ndim != 3:
         raise RuntimeError(
@@ -99,6 +115,10 @@ def dsv4_mxfp8_o_proj(
     return result
 
 
+# Compatibility spelling used by the existing direct-MXFP8 lane and callers.
+dsv4_mxfp8_o_proj = dsv4_gridbook_o_proj
+
+
 def _wrap_attention_class(cls: type) -> bool:
     current = cls._o_proj
     abi = getattr(current, _WRAPPED_ABI_ATTR, None)
@@ -112,9 +132,8 @@ def _wrap_attention_class(cls: type) -> bool:
 
     @functools.wraps(current)
     def _o_proj(self, o, positions, _original=current):
-        if (getattr(getattr(self, "wo_a", None),
-                    DSV4_MXFP8_BMM_ATTR, None) == DSV4_MXFP8_BMM_ABI):
-            return dsv4_mxfp8_o_proj(self, o, positions)
+        if _owns_gridbook_bmm(getattr(self, "wo_a", None)):
+            return dsv4_gridbook_o_proj(self, o, positions)
         return _original(self, o, positions)
 
     setattr(_o_proj, _WRAPPED_ABI_ATTR, _ADAPTER_ABI)
@@ -147,12 +166,12 @@ def install_dsv4_woa_adapter() -> None:
             changed += int(_wrap_attention_class(cls))
     if seen == 0:
         raise RuntimeError(
-            "Gridbook MXFP8 BMM encountered DSV4 wo_a, but no audited vLLM "
-            "NVIDIA DSV4 attention class is loaded"
+            "Gridbook BMM encountered DSV4 wo_a, but no admitted vLLM NVIDIA "
+            "DSV4 attention class is loaded"
         )
     if not _LOGGED:
         print(
-            "[prismaquant-cb] dsv4_wo_a=gridbook-mxfp8-bmm "
+            "[prismaquant-cb] dsv4_wo_a=gridbook-bmm "
             f"adapter_abi={_ADAPTER_ABI} classes={seen} changed={changed}",
             flush=True,
         )

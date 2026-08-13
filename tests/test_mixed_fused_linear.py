@@ -28,9 +28,9 @@ from gridbook.moe_toplevel_loader import (  # noqa: E402
     install_toplevel_cb_expert_loader,
     mixed_fused_loader_active,
 )
-from gridbook.mxfp8_dense_lane import (  # noqa: E402
+from gridbook.fp8_source_w8a16 import (  # noqa: E402
     WIRE_FP8_BLOCK128,
-    build_mxfp8_dense_method,
+    build_fp8_source_w8a16_method,
 )
 
 
@@ -176,7 +176,7 @@ def test_homogeneous_source_fusion_uses_native_merged_shard_loader():
     layer.output_size = 256
     layer.tp_size = 1
     layer.tp_rank = 0
-    method = build_mxfp8_dense_method(WIRE_FP8_BLOCK128)
+    method = build_fp8_source_w8a16_method(WIRE_FP8_BLOCK128)
     method.create_weights(
         layer, 128, [128, 128], 128, 256, torch.bfloat16,
         weight_loader=layer.weight_loader,
@@ -205,7 +205,7 @@ def _parent() -> torch.nn.Module:
     (
         lambda cfg: [
             ("model.layers.5.ffn.shared_experts.w1",
-             build_mxfp8_dense_method(WIRE_FP8_BLOCK128)),
+             build_fp8_source_w8a16_method(WIRE_FP8_BLOCK128)),
             ("model.layers.5.ffn.shared_experts.w3",
              PrismaQuantCBLinearMethod(cfg, K38, "role.w3")),
         ],
