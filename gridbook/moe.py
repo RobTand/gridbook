@@ -42,7 +42,9 @@ from .cb_fill_guard import (
     mark_unfilled,
 )
 from .fp8_fused_lane import rung_eligible as fp8_fused_rung_eligible
-from .moe_gemv_select import cb_gemv_choice
+from .moe_gemv_select import (cb_fp8_gemv_v2_choice,
+                              cb_fp8_gemv_v2_requested,
+                              cb_gemv_choice)
 from .bf16_grouped_lane import (pack_expert_blocks,
                                 require_lane as bf16_sm120_require_lane,
                                 requested as bf16_sm120_requested,
@@ -567,6 +569,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # The two stacks are decided separately: they sit on different K
         # (hidden vs inter) and the occupancy predicate is a function of K, so
         # w13 and w2 of ONE layer can legitimately land on different kernels.
+        # Parse the independent routed-FP8 selector for every artifact type so
+        # an invalid spelling cannot hide merely because the first layers are
+        # FP4.  Its per-stack decision remains separate from FP4-v2 below.
+        cb_fp8_gemv_v2_requested()
         for which, in_f in (("w13", layer._cb_hidden), ("w2", layer._cb_inter)):
             if self.is_fp4 and self.is_v2:
                 use_v2, why = cb_gemv_choice(
@@ -580,6 +586,19 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                   f"k={self.k} n_sub={self.n_sub} type_size={self.type_size} "
                   f"K={in_f} -> {'v2' if use_v2 else 'inherited'} ({why})",
                   flush=True)
+            if not self.is_fp4:
+                use_fp8_v2, fp8_why = cb_fp8_gemv_v2_choice(
+                    self.k, self.n_sub, self.type_size, in_f)
+            else:
+                use_fp8_v2, fp8_why = False, "not routed FP8-CB"
+            setattr(layer, f"_cb_use_fp8_v2_{which}", use_fp8_v2)
+            if not self.is_fp4:
+                print(
+                    f"[prismaquant-cb] cb_fp8_gemv_kernel "
+                    f"{self.prefix}.{which} k={self.k} n_sub={self.n_sub} "
+                    f"type_size={self.type_size} K={in_f} -> "
+                    f"{'whole-row-v2' if use_fp8_v2 else 'inherited'} "
+                    f"({fp8_why})", flush=True)
         layer._cb_E = E
 
         # Attest every native extension reachable from production dispatch at
@@ -2167,8 +2186,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # would cost on the prefill path (which is why THAT lane writes
             # column slices in-place instead).
             xq = pq_ops.fp8_act_qdq(x.to(torch.bfloat16))
+            fp8_w13_op = (pq_ops.cb_moe_gemv_fp8_v2
+                          if getattr(layer, "_cb_use_fp8_v2_w13", False)
+                          else pq_ops.cb_moe_gemv_fp8)
             halves = [
-                pq_ops.cb_moe_gemv_fp8(
+                fp8_w13_op(
                     xq, getattr(layer, f"_cb_w13_{role}_qweight"),
                     self._role_flat_fp8(layer, role),
                     getattr(layer, f"_cb_w13_{role}_scale"),
@@ -2180,7 +2202,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             del halves
         else:                                            # fp8-CB v1
             xq = pq_ops.fp8_act_qdq(x.to(torch.bfloat16))
-            gate_up = pq_ops.cb_moe_gemv_fp8(
+            fp8_w13_op = (pq_ops.cb_moe_gemv_fp8_v2
+                          if getattr(layer, "_cb_use_fp8_v2_w13", False)
+                          else pq_ops.cb_moe_gemv_fp8)
+            gate_up = fp8_w13_op(
                 xq, layer.w13_cb_qweight.data, layer._cb_flat_fp8,
                 layer.w13_weight_scale.data, pair_expert, pair_xrow,
                 self.k, self.n_sub, self.type_size)      # (P, 2*inter)
@@ -2207,7 +2232,10 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         else:
             aq = pq_ops.fp8_act_qdq(a)
             # w2 is a one-role stack: no split, just the `down` book.
-            y_down = pq_ops.cb_moe_gemv_fp8(
+            fp8_w2_op = (pq_ops.cb_moe_gemv_fp8_v2
+                         if getattr(layer, "_cb_use_fp8_v2_w2", False)
+                         else pq_ops.cb_moe_gemv_fp8)
+            y_down = fp8_w2_op(
                 aq, layer.w2_cb_qweight.data,
                 self._role_flat_fp8(layer, "down")
                 if getattr(layer, "_cb_role_split", False)

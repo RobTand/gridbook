@@ -591,6 +591,47 @@ and
 These are source-tree qualification results, not the final clean-wheel served
 graph/throughput gate; that gate remains open.
 
+**Routed FP8-CB whole-row sibling (opt-in,
+`PRISMAQUANT_CB_FP8_GEMV_V2=1`).** This is independent of the FP4 selector
+above and lives in the main `csrc/cb_gemv.cu` extension. The inherited FP8
+grouped kernel assigns one CTA to one `(routed pair, output row)` and one
+physical warp to each of its eight accumulator chains. The sibling stages the
+complete packed row in warp-private shared memory, stages the exact 1 KiB K28
+E4M3 LUT once per block, and lets each physical warp serve two output rows
+while reproducing those same eight chains as named virtual accumulators. It
+preserves both decode contracts: v1 still rounds `E4M3 * row_scale` to BF16
+before each FMA, and v2 still applies the row scale once after the inherited
+lane reductions and serial eight-chain sum.
+
+The release surface is intentionally closed to
+`k=28/n_sub=4/type_size=112` and K in `{2048,4096}`. Unset or literal `0`
+keeps the inherited FP8 grouped GEMV; only literal `1` opts in. The selector
+resolves once per process and each `w13`/`w2` decision is fixed at model load.
+With the opt-in set, any other uniform FP8-CB cell fails the load instead of
+creating a partly inherited candidate arm. Per-expert mixed FP8-CB groups also
+fail because their family-local dispatch has not implemented this sibling;
+FP4-CB layers and source-passthrough groups are outside its scope. The main
+extension's strict symbol set includes `cb_moe_gemv_fp8_v2`, so a cached
+pre-sibling module is rejected before a forward can reach it.
+
+For `cb_gemv.cu` SHA256
+`3bf545f381acdbf503a9d78fb1bb9665b647ff0318fa27e7b24a5f96bbc26894`,
+the final-source cc 12.1 operator run passed all 17 eager/registered-op,
+CUDA-graph replay, fullgraph, and rejection tests for both decode contracts.
+The exact dsv4flash0731 eager same-engine report at
+`/home/rob/dq-runs/dsv4-flash-0731/mtp-throughput-research/routed-fp8-v2-quality-ab-v1/report.json`
+has SHA256
+`013ecf0efda1a707ead44fa9f57a94a017595aff2b65dc18cf142b97e8642314`
+and records exact zero full-vocabulary KL/NLL/PPL/target-logprob,
+generation-digest, and router-route delta over 240 scored positions. Its main
+extension SHA256 is
+`8f1f287e906562f152d9935deace4149dee3f0eb555d781a6400fe56e29d1104`.
+An earlier served A/B/A2 using a different main binary showed an approximately
+7.2% cycle-throughput signal, but generated-content and speculative-acceptance
+integrity differed across arms. It is held, not promoted. The selector remains
+default-off pending the final-binary served rerun and graph, concurrency, soak,
+long-prefill, and memory gates.
+
 MoE **prefill** used to be that per-expert loop, whose launch storm dominated
 TTFT. The production quality lane now expands bounded expert chunks with native
 CUDA and submits their ragged segments to a Gridbook-owned CUTLASS grouped BF16
@@ -980,6 +1021,7 @@ too.
 | FP4-CB v2 decode (dense) | **Shipped**: bit-matched CUDA GEMV (13/13 parity against the historical Triton result plus the independent expansion reference). The decode chain is compute-bound at GEMV shapes (ncu SM 71%/mem 44%) under the bit-exact contract — the measured ceiling, not a staging problem |
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
 | MoE grouped decode GEMV, smem-resident dictionary | **Opt-in** (`PRISMAQUANT_CB_GEMV=v2`), never the global default. On DSV4 K=2048/4096 with all `PRISMAQUANT_CB_W2_*` overrides absent, the virtual-warp specialization is bit-exact to inherited for k12/k16/k18 and measured 1.8175–1.9977x in the final-source captured v1 direct-op benchmark; the same-process DSV4 quality gate produced zero full-vocabulary KL/NLL/PPL/target-logprob delta over 240 positions. Other widths retain rowpack order and may reassociate. The compiled predicate still routes k24 at K≥2048 to inherited. Historical Laguna validation measured +5.97%; final clean-wheel served graph/throughput qualification remains open |
+| MoE grouped decode GEMV, routed FP8 whole-row sibling | **Default-off opt-in** (`PRISMAQUANT_CB_FP8_GEMV_V2=1`) for only K28/4/112 at K=2048/4096. The final-source operator gate passed 17/17 and the exact-artifact eager same-engine gate produced zero full-vocabulary and router-route delta over 240 positions. Unsupported uniform FP8 cells and per-expert mixed FP8-CB groups fail closed. A prior ~7.2% served cycle-throughput signal used a different binary and failed cross-arm content/acceptance integrity, so it is held pending the final-binary rerun plus graph, concurrency, soak, long-prefill, and memory gates |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
 | FP8-CB fused decode-in-prologue prefill | **Bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128**; native transient expansion + CUTLASS serves ineligible and large-M shapes. **Rung surface: `k ∈ {28,32,36,40,44,48}` — the multiples of 4 in the product range, which is the complete set the packed-B TMA box (`type_size = 4k` must be 16-byte aligned) and the mainloop's uniform `CbSubW = k/4` sub-table width admit.** The other 15 integer rungs are served (decode GEMV + expand/CUTLASS bridge), just not by this lane; the compiled set is reported by `cb_fused_kbits()` and dispatch derives eligibility from it rather than from a literal ladder |
 | FP4-CB v2 fused mid-M prefill (dense) | **Opt-in** (`PRISMAQUANT_CB_FP4_FUSED_MIDM`), contract-preserving. The in-prologue decode is proven **bit-identical to `cb_expand_v2` for the whole decoded tile at all 13 K12–K24 rungs** (one-hot read-out, no tolerance), so only the FP32 reduction order moves. Measured 1.06–4.37× the shipping expand + bridge route at M ∈ {9,16,32,64,128} on 27B/DSV4-class shapes, every cell bit-equal to the same-config oracle — a wider band than the fp8 twin because the fp4 quality expand writes BF16 (4× the fp8 expand's transient bytes). Served NATIVE-PARITY protocol **not run**; an unexplained M ≤ 12 latency cliff is open. Ineligible shapes (M ≤ 8, M > 128, multi-dictionary fused modules, uncompiled rungs) fall through to today's exact path unchanged |

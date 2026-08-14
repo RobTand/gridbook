@@ -20,6 +20,7 @@ sel = pytest.importorskip("gridbook.moe_gemv_select",
                           reason="gridbook not importable")
 
 ENV = "PRISMAQUANT_CB_GEMV"
+FP8_ENV = "PRISMAQUANT_CB_FP8_GEMV_V2"
 
 
 @pytest.fixture(autouse=True)
@@ -30,13 +31,74 @@ def _isolate(monkeypatch):
     contract), so the fixture — not the test — owns the reset.
     """
     monkeypatch.delenv(ENV, raising=False)
+    monkeypatch.delenv(FP8_ENV, raising=False)
     monkeypatch.setattr(sel, "_CB_GEMV", None, raising=False)
+    monkeypatch.setattr(sel, "_CB_FP8_GEMV_V2", None, raising=False)
     monkeypatch.setattr(sel, "_CB_GEMV_V2_OK", {}, raising=False)
     monkeypatch.setattr(sel, "_CB_GEMV_V2_WARNED", set(), raising=False)
     yield
 
 
 # --- the selector -----------------------------------------------------------
+
+def test_fp8_v2_defaults_off(monkeypatch):
+    assert sel.cb_fp8_gemv_v2_requested() is False
+    assert sel.cb_fp8_gemv_v2_choice(28, 4, 112, 4096)[0] is False
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", False), ("1", True)])
+def test_fp8_v2_accepts_only_literal_binary_values(monkeypatch, value, expected):
+    monkeypatch.setenv(FP8_ENV, value)
+    assert sel.cb_fp8_gemv_v2_requested() is expected
+
+
+@pytest.mark.parametrize("value", ["", "true", "yes", " 1", "1 ", "2", "v2"])
+def test_fp8_v2_rejects_ambiguous_or_misspelled_values(monkeypatch, value):
+    monkeypatch.setenv(FP8_ENV, value)
+    with pytest.raises(ValueError, match=FP8_ENV):
+        sel.cb_fp8_gemv_v2_requested()
+
+
+def test_fp8_v2_rejects_mid_process_mutation(monkeypatch):
+    monkeypatch.setenv(FP8_ENV, "1")
+    assert sel.cb_fp8_gemv_v2_requested() is True
+    monkeypatch.setenv(FP8_ENV, "0")
+    with pytest.raises(RuntimeError, match="mid-process"):
+        sel.cb_fp8_gemv_v2_requested()
+
+
+@pytest.mark.parametrize("width", [2048, 4096])
+def test_fp8_v2_exact_production_cells_select(width, monkeypatch):
+    monkeypatch.setenv(FP8_ENV, "1")
+    use, why = sel.cb_fp8_gemv_v2_choice(28, 4, 112, width)
+    assert use is True
+    assert "exact K28" in why
+
+
+@pytest.mark.parametrize(
+    ("k_bits", "n_sub", "type_size", "width"),
+    [(27, 4, 108, 4096), (28, 2, 112, 4096),
+     (28, 4, 111, 4096), (28, 4, 112, 1024), (28, 4, 112, 8192)],
+)
+def test_fp8_v2_explicit_arm_rejects_unsupported_cells(
+        monkeypatch, k_bits, n_sub, type_size, width):
+    monkeypatch.setenv(FP8_ENV, "1")
+    with pytest.raises(RuntimeError, match="silently mixed candidate arm"):
+        sel.cb_fp8_gemv_v2_choice(k_bits, n_sub, type_size, width)
+
+
+@pytest.mark.parametrize(
+    ("k_bits", "n_sub", "type_size", "width"),
+    [(27, 4, 108, 4096), (28, 2, 112, 4096),
+     (28, 4, 111, 4096), (28, 4, 112, 1024), (28, 4, 112, 8192)],
+)
+def test_fp8_v2_disabled_arm_keeps_generic_cells_inherited(
+        monkeypatch, k_bits, n_sub, type_size, width):
+    monkeypatch.setenv(FP8_ENV, "0")
+    use, why = sel.cb_fp8_gemv_v2_choice(
+        k_bits, n_sub, type_size, width)
+    assert use is False
+    assert "disabled/default" in why
 
 def test_mode_defaults_to_inherited_when_unset():
     assert sel.cb_gemv_mode() == "inherited"

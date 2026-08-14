@@ -440,6 +440,24 @@ def test_main_contract_rejects_pre_fp4_qdq_revision(monkeypatch, capsys,
     assert "fp4_act_qdq" in error
 
 
+def test_main_contract_rejects_pre_routed_fp8_v2_revision(
+        monkeypatch, capsys, tmp_path):
+    """An explicit FP8-v2 arm must not reuse a pre-sibling cached module."""
+    monkeypatch.setenv("PRISMAQUANT_CB_EXT_DIR", str(tmp_path))
+    _prepare_main_loader(monkeypatch)
+    old_symbols = tuple(name for name in cuda_ext._EXT_SYMBOLS
+                        if name != "cb_moe_gemv_fp8_v2")
+    stale = _stub("main", old_symbols,
+                  path=tmp_path / "prismaquant_cb_ext.so")
+    _patch_load(monkeypatch, stale)
+
+    assert cuda_ext.get_ext() is None
+    error = capsys.readouterr().err
+    assert "incompatible CUDA decode-GEMV" in error
+    assert "cb_moe_gemv_fp8_v2" in error
+    assert "prismaquant_cb_ext.so" in error
+
+
 def test_fp8_grouped_bindings_are_required_with_the_dense_entry_point():
     """The identity-keyed cache makes a dense-only fused build impossible."""
     for name in ("cb_fused_moe_grouped", "cb_fused_moe_tile_m",

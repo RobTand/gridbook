@@ -109,6 +109,98 @@ def _layer(*, experts=4, hidden=512, inter=256):
     )
 
 
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_routed_fp8_decode_routes_gate_up_and_down_through_load_fixed_choice(
+        monkeypatch, use_v2):
+    """Exercise the real per-role call chain, not just selector arithmetic.
+
+    Role identity is part of the assertion: choosing the right symbol while
+    accidentally reusing one role's LUT or packed rows would still return
+    plausible tensors and silently corrupt the model.
+    """
+    from gridbook import ops
+
+    method = _method(is_fp4=False, is_v2=False, n_sub=4, k=28)
+    layer = types.SimpleNamespace(
+        _cb_role_split=True,
+        _cb_use_fp8_v2_w13=use_v2,
+        _cb_use_fp8_v2_w2=use_v2,
+        _cb_w13_gate_qweight=torch.full((2, 3, 1), 11,
+                                        dtype=torch.uint8),
+        _cb_w13_up_qweight=torch.full((2, 3, 1), 22,
+                                      dtype=torch.uint8),
+        _cb_w13_gate_scale=torch.full((2, 3), 1.25),
+        _cb_w13_up_scale=torch.full((2, 3), 2.5),
+        w2_cb_qweight=torch.nn.Parameter(
+            torch.full((2, 4, 1), 33, dtype=torch.uint8),
+            requires_grad=False),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.full((2, 4), 3.75), requires_grad=False),
+        _cb_flat_fp8_by_role={
+            "gate": torch.full((8,), 41, dtype=torch.uint8),
+            "up": torch.full((8,), 42, dtype=torch.uint8),
+            "down": torch.full((8,), 43, dtype=torch.uint8),
+        },
+    )
+    calls = []
+
+    monkeypatch.setattr(ops, "fp8_act_qdq",
+                        lambda value: value.to(torch.bfloat16))
+
+    def gemv(route, *args):
+        calls.append((route, args))
+        return torch.zeros((args[4].numel(), args[1].shape[1]),
+                           dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        ops, "cb_moe_gemv_fp8",
+        lambda *args: gemv("inherited", *args))
+    monkeypatch.setattr(
+        ops, "cb_moe_gemv_fp8_v2",
+        lambda *args: gemv("whole-row-v2", *args))
+
+    def activate(_act, output, gate_up):
+        assert gate_up.shape == (4, 6)
+        output.zero_()
+
+    def combine(y, pair_w, tok_start, tokens):
+        assert y.shape == (4, 4)
+        assert pair_w.shape == (4,)
+        assert torch.equal(tok_start, torch.tensor([0, 2, 4],
+                                                   dtype=torch.int32))
+        return torch.zeros((tokens, y.shape[1]), dtype=y.dtype)
+
+    monkeypatch.setattr(moe, "native_moe_activation", activate)
+    monkeypatch.setattr(ops, "cb_moe_combine", combine)
+
+    x = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+    topk_ids = torch.tensor([[1, 0], [0, 1]], dtype=torch.int64)
+    topk_weights = torch.tensor([[0.25, 0.75], [0.5, 0.5]])
+    result = method._apply_grouped_decode(
+        layer, x, topk_weights, topk_ids, object())
+
+    assert result.shape == (2, 4)
+    expected_route = "whole-row-v2" if use_v2 else "inherited"
+    assert [route for route, _ in calls] == [expected_route] * 3
+
+    gate, up, down = (args for _, args in calls)
+    for args, role in zip((gate, up, down), ("gate", "up", "down")):
+        assert args[2] is layer._cb_flat_fp8_by_role[role]
+        assert args[6:] == (28, 4, 112)
+        assert torch.equal(args[4], torch.tensor([0, 1, 0, 1],
+                                                 dtype=torch.int32))
+    assert gate[1] is layer._cb_w13_gate_qweight
+    assert gate[3] is layer._cb_w13_gate_scale
+    assert up[1] is layer._cb_w13_up_qweight
+    assert up[3] is layer._cb_w13_up_scale
+    assert down[1].data_ptr() == layer.w2_cb_qweight.data_ptr()
+    assert down[3].data_ptr() == layer.w2_weight_scale.data_ptr()
+    assert torch.equal(gate[5], torch.tensor([0, 0, 1, 1],
+                                             dtype=torch.int32))
+    assert torch.equal(up[5], gate[5])
+    assert torch.equal(down[5], torch.arange(4, dtype=torch.int32))
+
+
 @pytest.fixture(autouse=True)
 def _reset_fused_fp4_mode():
     moe._FUSED_FP4_MOE_STATE.clear()

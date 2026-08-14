@@ -271,6 +271,20 @@ Two things banked from an attempt that was reverted before it shipped:
   wheel/image must still pass served graph replay, throughput, concurrency,
   long-prefill, soak, and memory gates. Evidence paths are recorded in
   `docs/RELEASING.md`.
+  The independent routed-FP8 half of this item now also has a source-tree
+  candidate: `PRISMAQUANT_CB_FP8_GEMV_V2=1` selects the main extension's
+  whole-row sibling only for `k=28/n_sub=4/type_size=112` at K=2048/4096.
+  Unsupported uniform FP8 cells and per-expert mixed FP8-CB groups fail the
+  load, while FP4 layers remain on their separately selected route. The exact
+  dsv4flash0731 eager quality report (SHA256
+  `013ecf0efda1a707ead44fa9f57a94a017595aff2b65dc18cf142b97e8642314`)
+  passed with exact zero full-vocabulary and router-route delta over 240
+  positions. An earlier served A/B/A2 produced an approximately 7.2%
+  cycle-throughput signal, but its binary did not match the quality report and
+  its generated-content/acceptance integrity did not hold, so it is retained
+  only as a signal. This selector remains default-off; its final-binary served
+  rerun and the graph, concurrency, soak, long-prefill, and memory gates keep
+  K1.4 open.
 - [ ] **K1.5 — Pack expert blocks *within* a chunk, not only across a whole
   layer.** The sm12x grouped-BF16 lane's swizzle-group-aligned expert order is
   gated on `chunk >= E`, because a narrower chunk indexes blocks as

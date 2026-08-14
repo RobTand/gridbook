@@ -48,6 +48,29 @@
   graph/throughput qualification remains open. Exact evidence paths are in
   `docs/RELEASING.md`.
 
+- Routed FP8-CB decode now has an independent, default-off whole-row sibling
+  behind `PRISMAQUANT_CB_FP8_GEMV_V2=1`. It is deliberately closed to the
+  DSV4 production cells `k=28`, `n_sub=4`, `type_size=112`, and projection
+  widths `K in {2048,4096}`. The selection is fixed per stack at model load;
+  unknown values, mid-process mutation, unsupported FP8-CB cells, and
+  per-expert mixed FP8-CB groups all fail instead of silently serving the
+  inherited kernel. FP4 layers and source-passthrough groups are outside this
+  selector. The main-extension ABI now requires the sibling symbol, so a
+  pre-sibling cached `.so` is rejected before model service.
+
+- The final-source routed-FP8 operator gate passed 17 eager/registered-op,
+  CUDA-graph replay, fullgraph, and rejection tests for both decode contracts.
+  The exact-artifact eager quality report has SHA256
+  `013ecf0efda1a707ead44fa9f57a94a017595aff2b65dc18cf142b97e8642314`
+  and produced zero full-vocabulary KL, NLL, PPL, target-logprob, generation,
+  and router-route delta over 240 scored DSV4 positions. An earlier served
+  A/B/A2 showed an approximately 7.2% cycle-throughput signal, but it used a
+  different main binary and its generated-content and speculative-acceptance
+  summaries did not match; that result remains held and is not a served-speed
+  claim. A final-binary served rerun plus graph, concurrency, soak,
+  long-prefill, and memory gates remain open. Exact evidence paths and binary
+  identities are in `docs/RELEASING.md`.
+
 - Routed dispatch now handles vLLM's `VLLM_MOE_SKIP_PADDING` convention at
   Gridbook's opaque MoE boundary. The documented expert-id `-1` padding
   sentinel is mapped to a valid placeholder expert and its router weight is

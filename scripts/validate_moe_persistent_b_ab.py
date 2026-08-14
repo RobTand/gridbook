@@ -1477,6 +1477,103 @@ def _model_contract_gate(
     }
 
 
+# Compatibility surface for the adjacent GEMV-v2 A/B harnesses.  Persistent-B
+# v6 does not call these pairwise helpers: its sealed campaign uses the triplet
+# gates below.  Keeping the established digest semantics here lets the GEMV
+# campaigns continue importing the shared compact scorer without inheriting
+# the persistent-B protocol change.
+def _pair_order_gate(pairs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    counts = {"baseline/fused": 0, "fused/baseline": 0}
+    unexpected: list[list[str]] = []
+    per_prompt: dict[int, dict[str, int]] = {}
+    missing_prompt_identity: list[int] = []
+    for pair_index, pair in enumerate(pairs):
+        key = "/".join(pair["pair_order"])
+        if key in counts:
+            counts[key] += 1
+        else:
+            unexpected.append(list(pair["pair_order"]))
+            continue
+        source_prompt = pair.get("source_prompt_index")
+        if isinstance(source_prompt, bool) or not isinstance(source_prompt, int):
+            missing_prompt_identity.append(pair_index)
+            continue
+        prompt_counts = per_prompt.setdefault(
+            source_prompt, {"baseline/fused": 0, "fused/baseline": 0}
+        )
+        prompt_counts[key] += 1
+    prompts_missing_crossover = [
+        prompt_index
+        for prompt_index, prompt_counts in sorted(per_prompt.items())
+        if not all(prompt_counts.values())
+    ]
+    return {
+        "counts": counts,
+        "unexpected": unexpected,
+        "per_source_prompt": {
+            str(prompt_index): prompt_counts
+            for prompt_index, prompt_counts in sorted(per_prompt.items())
+        },
+        "missing_source_prompt_identity_blocks": missing_prompt_identity,
+        "source_prompts_missing_both_orders": prompts_missing_crossover,
+        "pass": (
+            not unexpected
+            and not missing_prompt_identity
+            and bool(per_prompt)
+            and not prompts_missing_crossover
+            and counts["baseline/fused"] > 0
+            and counts["baseline/fused"] == counts["fused/baseline"]
+        ),
+    }
+
+
+def _full_vocab_repeat_determinism_gate(
+    pairs: Sequence[Mapping[str, Any]], *, n_prompts: int, repeats: int
+) -> dict[str, Any]:
+    """Compare compact bit digests, never cardinality-sized PromptScores."""
+
+    mismatches: list[dict[str, Any]] = []
+    for prompt_index in range(n_prompts):
+        prompt_pairs = sorted(
+            (
+                pair for pair in pairs
+                if pair["source_prompt_index"] == prompt_index
+            ),
+            key=lambda pair: pair["repeat_index"],
+        )
+        if len(prompt_pairs) != repeats:
+            mismatches.append({
+                "prompt_index": prompt_index,
+                "reason": f"observed {len(prompt_pairs)} repeats, expected {repeats}",
+            })
+            continue
+        for arm in ARMS:
+            reference = prompt_pairs[0]["score_digests"][arm]
+            for pair in prompt_pairs[1:]:
+                observed = pair["score_digests"][arm]
+                if (
+                    observed["score_sha256"] != reference["score_sha256"]
+                    or observed["row_sha256"] != reference["row_sha256"]
+                    or observed["prompt_token_ids_sha256"]
+                    != reference["prompt_token_ids_sha256"]
+                ):
+                    mismatches.append({
+                        "prompt_index": prompt_index,
+                        "arm": arm,
+                        "repeat_index": pair["repeat_index"],
+                        "expected_score_sha256": reference["score_sha256"],
+                        "observed_score_sha256": observed["score_sha256"],
+                        "reason": "full-vocabulary score/row digest differs",
+                    })
+    return {
+        "required_repeats": repeats,
+        "digest_schema": "gridbook.compact-full-vocab-score.v1",
+        "comparison": "exact prompt, target-float64, and row-float32 digests",
+        "mismatches": mismatches,
+        "pass": not mismatches,
+    }
+
+
 def _triplet_order_gate(
     triplets: Sequence[Mapping[str, Any]],
     *,

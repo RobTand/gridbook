@@ -348,6 +348,7 @@ _EXT_SYMBOLS = (
     "cb_gemv_fp4_v2",       # ops.cb_gemv_fp4_v2
     "cb_expand_fp8",        # ops.cb_expand_fp8
     "cb_moe_gemv_fp8",      # ops.cb_moe_gemv_fp8
+    "cb_moe_gemv_fp8_v2",   # ops.cb_moe_gemv_fp8_v2
     "cb_moe_gemv_fp4_v2",   # ops.cb_moe_gemv_fp4_v2
     "cb_moe_combine",       # ops.cb_moe_combine
 )
