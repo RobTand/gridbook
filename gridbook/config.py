@@ -34,6 +34,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
@@ -48,6 +49,10 @@ from .source_passthrough import (
     build_delegated_method as _build_passthrough_method,
     parse_declaration as _parse_passthrough_declaration,
     require_audited_device as _require_passthrough_device,
+)
+from .embedding import (
+    EmbeddingFormat as _EmbeddingFormat,
+    parse_declaration as _parse_embedding_declaration,
 )
 from .lane_select import device_capability as _live_device_capability
 from .nvfp4_activation_contract import (
@@ -491,6 +496,7 @@ class PrismaQuantConfig(QuantizationConfig):
         self.ignore: list[str] = []
         self.target_scheme: dict[str, dict] = {}    # CB module -> scheme dict
         self._cb_targets: set[str] = set()
+        self._embedding_units: dict[str, "_EmbeddingFormat"] = {}
         self.ct_config = None                        # stock CompressedTensorsConfig
         self._codebooks: dict[str, torch.Tensor] | None = None
         self._tp_world_size: int | None = None
@@ -921,6 +927,15 @@ class PrismaQuantConfig(QuantizationConfig):
             canonicalize=_canonical_target,
             cb_targets=frozenset(self._cb_targets),
         )
+        # Quantized embedding units.  Parsed alongside the passthrough units
+        # and against the same ``_cb_targets`` set, so a unit claimed by two
+        # vocabularies is caught here rather than by whichever branch of
+        # ``get_quant_method`` happens to run first.
+        self._embedding_units = _parse_embedding_declaration(
+            cfg,
+            canonicalize=_canonical_target,
+            cb_targets=frozenset(self._cb_targets),
+        )
         self._per_expert_format_groups = _parse_per_expert_format_groups(
             cfg,
             runtime_contract=_RUNTIME_CONTRACT,
@@ -1001,8 +1016,13 @@ class PrismaQuantConfig(QuantizationConfig):
         # Passthrough units join CB targets in CT's ignore: both are owned by
         # Gridbook's own dispatch, and a stock group that also happens to name
         # one must not be able to claim it.
+        # Quantized embeddings join them for the same reason, and for one more:
+        # compressed-tensors' embedding path accepts weight-only INT schemes
+        # and RAISES for FP8/NVFP4, so a stock group naming the embedding would
+        # not merely mis-own it -- it would refuse to load the artifact at all.
         ct_dict["ignore"] = (list(self.ignore) + sorted(self._cb_targets)
-                             + sorted(self._passthrough_units))
+                             + sorted(self._passthrough_units)
+                             + sorted(self._embedding_units))
         ct_dict.pop("codebook_file", None)
         ct_dict.pop("provenance", None)
         # Gridbook has already attested this producer-owned container record;
@@ -1331,6 +1351,23 @@ class PrismaQuantConfig(QuantizationConfig):
                     return fmt
         return None
 
+    def _embedding_format(self, prefix: str) -> "_EmbeddingFormat | None":
+        """The declared quantized-embedding format for *prefix*, or ``None``.
+
+        Matched through ``_candidate_bases`` for the same reason every other
+        lookup here is: the declaration is stored in the canonical namespace
+        and the serving prefix may arrive in any of the vintages that helper
+        enumerates.
+        """
+
+        if not self._embedding_units:
+            return None
+        for base in _candidate_bases(prefix):
+            fmt = self._embedding_units.get(base)
+            if fmt is not None:
+                return fmt
+        return None
+
     def _delegate_passthrough(
         self, layer: torch.nn.Module, prefix: str, fmt: "_SourceFormat"
     ) -> "QuantizeMethodBase | None":
@@ -1472,6 +1509,15 @@ class PrismaQuantConfig(QuantizationConfig):
             return UnquantizedLinearMethod()
 
         if isinstance(layer, VocabParallelEmbedding):
+            # ParallelLMHead SUBCLASSES VocabParallelEmbedding but is an output
+            # projection, and compressed-tensors already serves it quantized
+            # through its own LINEAR method. Only a true lookup table may be
+            # claimed here; the head keeps falling through to delegation.
+            embed_fmt = (None if isinstance(layer, ParallelLMHead)
+                         else self._embedding_format(prefix))
+            if embed_fmt is not None:
+                from .embedding import GridbookNVFP4EmbeddingMethod
+                return GridbookNVFP4EmbeddingMethod(embed_fmt, prefix)
             if self.ct_config is not None:
                 method = self._delegate(layer, prefix)
                 if method is not None:
