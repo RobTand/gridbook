@@ -397,6 +397,8 @@ _CONTRACT_MODEL_MODULES = {
     # plugin.py installs on the defining module (__module__ guard), so that is
     # the path the contract names and the path reviewed here.
     "vllm.models.deepseek_v4.nvidia.model",
+    # DSpark draft (optional, version-tolerant; see docs/PLUGIN.md).
+    "vllm.models.deepseek_v4.nvidia.dspark",
 }
 
 

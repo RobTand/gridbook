@@ -119,6 +119,177 @@ _ALTERNATE_SHARD_SPELLINGS = {
     "down_proj": (["w2"],),
 }
 
+# --- DSpark authoritative mapping (DeepSeek-V4 Flash) ---
+# Three namespaces remain explicit:
+#  1) Physical checkpoint / export: mtp.{stage}.*  stages derived from range(n_mtp_layers)
+#  2) Quant-method construction prefix: model.layers.{num_hidden_layers + stage}.*
+#     Target DSparkDeepseekV4Model.__init__ uses prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}")
+#     so Gridbook get_quant_method sees nh+stage. Mirrors target Dspark n_mtp_layers handling.
+#  3) Registered / loader parameter path: model.layers.{stage}.*  (0..n_mtp-1) plus model.<head>
+#     Target _remap_dspark_name maps mtp.{stage} -> model.layers.{stage} for ingestion.
+# No hardcoded stage tuples; topology is passed explicitly.
+_DSPARK_HEAD_PREFIXES = (
+    "main_proj.",
+    "main_norm.",
+    "norm.",
+    "hc_head_fn",
+    "hc_head_base",
+    "hc_head_scale",
+    "markov_head.",
+)
+
+
+def _is_main_proj_component(name: str) -> bool:
+    """Exact path-component check for the wide interpolation gate (source FP8)."""
+    return "main_proj" in name.split(".")
+
+
+def _parse_physical_stage(name: str) -> int | None:
+    """Stage index if name is mtp.{int}.*, regardless of allowed set."""
+    if not name.startswith("mtp."):
+        return None
+    rest = name[len("mtp.") :]
+    dot = rest.find(".")
+    stage_str = rest if dot == -1 else rest[:dot]
+    try:
+        return int(stage_str)
+    except ValueError:
+        return None
+
+
+def _parse_dspark_layer_stage(name: str) -> int | None:
+    """Stage index if name is model.layers.{int}.*, regardless of allowed set."""
+    if not name.startswith("model.layers."):
+        return None
+    rest = name[len("model.layers.") :]
+    dot = rest.find(".")
+    stage_str = rest if dot == -1 else rest[:dot]
+    try:
+        return int(stage_str)
+    except ValueError:
+        return None
+
+
+def _is_dspark_head_target(name: str) -> bool:
+    if not name.startswith("model."):
+        return False
+    rest = name[len("model.") :]
+    return any(rest.startswith(p) for p in _DSPARK_HEAD_PREFIXES)
+
+
+_DSPARK_ARTIFACT_STAGES_FIXTURE = (0, 1, 2)  # fixture only, not generic
+_DSPARK_ARTIFACT_NH_FIXTURE = 43
+
+def _remap_dspark_physical_to_registered(name: str, allowed_stages: tuple[int, ...] | None = None) -> str | None:
+    """Physical mtp.{stage}.<rest> -> registered/loader path model.layers.{stage}.* or model.<head>."""
+    if allowed_stages is None:
+        allowed_stages = _DSPARK_ARTIFACT_STAGES_FIXTURE
+    stage = _parse_physical_stage(name)
+    if stage is None:
+        return None
+    if stage not in allowed_stages:
+        return None
+    rest = name[len("mtp.") + len(str(stage)) :]
+    inner = rest.lstrip(".")
+    if inner.startswith("confidence_head."):
+        return None
+    for hp in _DSPARK_HEAD_PREFIXES:
+        if inner.startswith(hp):
+            return f"model.{inner}"
+    return f"model.layers.{stage}{rest}"
+
+
+def _remap_dspark_physical_to_construction(name: str, num_hidden_layers: int, allowed_stages: tuple[int, ...] | None = None) -> str | None:
+    """Physical mtp.{stage}.<rest> -> construction prefix model.layers.{num_hidden_layers+stage}.* or model.<head>."""
+    if allowed_stages is None:
+        allowed_stages = _DSPARK_ARTIFACT_STAGES_FIXTURE
+    stage = _parse_physical_stage(name)
+    if stage is None:
+        return None
+    if stage not in allowed_stages:
+        return None
+    rest = name[len("mtp.") + len(str(stage)) :]
+    inner = rest.lstrip(".")
+    if inner.startswith("confidence_head."):
+        return None
+    for hp in _DSPARK_HEAD_PREFIXES:
+        if inner.startswith(hp):
+            return f"model.{inner}"
+    return f"model.layers.{num_hidden_layers + stage}{rest}"
+
+
+# Back-compat alias for loader import; registered path is the loader namespace.
+def _remap_dspark_physical(name: str, allowed_stages: tuple[int, ...] | None = None) -> str | None:
+    return _remap_dspark_physical_to_registered(name, allowed_stages)
+
+
+def _dspark_topology_from_vllm_config() -> tuple[int, int] | None:
+    """Target-exact: getattr(config, 'n_mtp_layers', None) or 3."""
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+    except ImportError:
+        return None
+    vcfg = get_current_vllm_config_or_none()
+    if vcfg is None:
+        return None
+    # Prefer draft HF config when speculative is present
+    sc = getattr(vcfg, "speculative_config", None)
+    if sc is not None:
+        dmc = getattr(sc, "draft_model_config", None)
+        if dmc is not None:
+            hf = getattr(dmc, "hf_config", None)
+            if hf is not None:
+                nh = getattr(hf, "num_hidden_layers", None)
+                # target uses: getattr(config, "n_mtp_layers", None) or 3
+                n_mtp = getattr(hf, "n_mtp_layers", None) or 3
+                if isinstance(nh, int) and isinstance(n_mtp, int) and n_mtp > 0:
+                    return (nh, int(n_mtp))
+    mc = getattr(vcfg, "model_config", None)
+    if mc is not None:
+        hf = getattr(mc, "hf_config", None)
+        if hf is not None and hasattr(hf, "n_mtp_layers"):
+            nh = getattr(hf, "num_hidden_layers", None)
+            n_mtp = getattr(hf, "n_mtp_layers", None) or 3
+            if isinstance(nh, int) and isinstance(n_mtp, int) and n_mtp > 0:
+                return (nh, int(n_mtp))
+    return None
+
+
+def _validate_dspark_sidecar_topology(cfg: dict) -> tuple[int, int] | None:
+    """Strict sidecar dspark_topology validation. No loose top-level aliases."""
+    topo = cfg.get("dspark_topology")
+    if topo is None:
+        return None
+    if not isinstance(topo, dict):
+        raise ValueError("dspark_topology must be an object {num_hidden_layers, n_mtp_layers}")
+    nh = topo.get("num_hidden_layers")
+    nm = topo.get("n_mtp_layers")
+    if not isinstance(nh, int) or not isinstance(nm, int):
+        raise ValueError(f"dspark_topology num_hidden_layers/n_mtp_layers must be ints, got {nh!r}/{nm!r}")
+    if nm <= 0 or nh <= 0:
+        raise ValueError(f"dspark_topology values must be positive, got nh={nh}, n_mtp={nm}")
+    if nh > 200 or nm > 16:
+        raise ValueError(f"dspark_topology values out of range nh={nh}, n_mtp={nm}")
+    # Validate dspark_block_size if present in topology
+    block = topo.get("dspark_block_size")
+    if block is not None and not isinstance(block, int):
+        raise ValueError(f"dspark_topology dspark_block_size must be int, got {block!r}")
+    if isinstance(block, int) and block <= 0:
+        raise ValueError(f"dspark_block_size must be positive, got {block}")
+    # Validate dspark_target_layer_ids if present
+    target_ids = topo.get("dspark_target_layer_ids")
+    if target_ids is not None:
+        if not isinstance(target_ids, (list, tuple)):
+            raise ValueError("dspark_target_layer_ids must be list")
+        for tid in target_ids:
+            if not isinstance(tid, int):
+                raise ValueError(f"dspark_target_layer_ids entry {tid!r} must be int")
+    return (nh, nm)
+
+
+def _dspark_topology_from_sidecar(cfg: dict) -> tuple[int, int] | None:
+    return _validate_dspark_sidecar_topology(cfg)
+
 
 def _initialized_tensor_parallel_world_size() -> int | None:
     """Return vLLM's TP size once model parallelism exists.
@@ -169,6 +340,11 @@ def _canonical_prefix(prefix: str) -> str:
     # module keeps its exact match.
     if prefix.startswith("layers."):
         return "model." + prefix
+    # DSpark physical prefixes are NOT canonicalized here. They remain explicit
+    # and are handled by dedicated physical->construction / physical->registered
+    # helpers, each with bounded stage checks. This preserves the three-namespace
+    # invariant: construction 43..45 vs registered 0..2 never collapse in one
+    # _canonical_prefix.
     return prefix
 
 
@@ -305,6 +481,9 @@ class PrismaQuantConfig(QuantizationConfig):
         # verbatim.  Empty for every artifact published before the schema
         # existed, which is exactly the legacy all-CB meaning.
         self._passthrough_units: dict[str, "_SourceFormat"] = {}
+        # DSpark topology (num_hidden_layers, n_mtp_layers) resolved at _ensure_resolved
+        self._dspark_topology: tuple[int, int] | None = None
+        self._dspark_construction_stages: tuple[int, ...] | None = None
 
     def _get_sidecar_source(self) -> tuple[str, str | None]:
         if self._sidecar_source is None:
@@ -525,6 +704,167 @@ class PrismaQuantConfig(QuantizationConfig):
             self.codebook_file = cfg.get("codebook_file", self.codebook_file)
         self._nvfp4_activation_contract = _parse_nvfp4_activation_contract(cfg)
 
+        # --- DSpark topology pre-resolution (target-exact stage count) ---
+        # Collect raw physical stages present in the artifact's config_groups
+        raw_physical_targets: list[str] = []
+        for group in cfg.get("config_groups", {}).values():
+            if group.get("scheme") is None:
+                continue
+            for raw_target in group.get("targets", []):
+                t = str(raw_target)
+                if t.startswith("mtp."):
+                    raw_physical_targets.append(t)
+        # Detect DSpark intent early: any physical mtp.* or head-stack target
+        head_declared_early = any(
+            _is_dspark_head_target(str(t))
+            for group in cfg.get("config_groups", {}).values()
+            if group.get("scheme") is not None
+            for t in group.get("targets", [])
+        )
+        dspark_declared_early = bool(raw_physical_targets) or head_declared_early
+        # Resolve topology if DSpark declared
+        self._dspark_topology: tuple[int, int] | None = None
+        self._dspark_construction_stages: tuple[int, ...] | None = None
+        if dspark_declared_early:
+            # Prefer live vLLM draft config, fallback to sidecar metadata (strict)
+            topo = _dspark_topology_from_vllm_config()
+            if topo is None:
+                topo = _dspark_topology_from_sidecar(cfg)
+            if topo is None:
+                raise RuntimeError(
+                    "DSpark CB declared via mtp.* targets but cannot derive "
+                    "topology (needs draft HF config n_mtp_layers or sidecar "
+                    "dspark_topology {num_hidden_layers,n_mtp_layers}); failing closed"
+                )
+            nh, n_mtp = topo
+            allowed_stages = tuple(range(n_mtp))
+            # Validate physical stage set contiguity and allowed range
+            physical_stages: set[int] = set()
+            for t in raw_physical_targets:
+                rest = t[len("mtp.") :]
+                dot = rest.find(".")
+                stage_str = rest if dot == -1 else rest[:dot]
+                try:
+                    stage = int(stage_str)
+                except ValueError:
+                    raise ValueError(f"DSpark target {t!r} has non-numeric stage")
+                if stage < 0:
+                    raise ValueError(f"DSpark target {t!r} has negative stage {stage} — allowed {allowed_stages}")
+                if stage not in allowed_stages:
+                    raise ValueError(
+                        f"DSpark target {t!r} references unknown stage {stage} — allowed {allowed_stages}"
+                    )
+                physical_stages.add(stage)
+            expected_physical = set(allowed_stages)
+            if physical_stages != expected_physical:
+                raise ValueError(
+                    f"DSpark physical stage set {sorted(physical_stages)} != expected contiguous {sorted(expected_physical)} "
+                    f"derived from n_mtp_layers={n_mtp} (target uses getattr(config,'n_mtp_layers',None) or 3)"
+                )
+            # main_proj CB declaration must be rejected, not silently deleted
+            for t in raw_physical_targets:
+                if _is_main_proj_component(t):
+                    raise ValueError(
+                        f"DSpark CB target {t!r} declares main_proj — main_proj is source FP8 delegation only and must not be CB"
+                    )
+            # Also reject construction-side main_proj CB
+            for group in cfg.get("config_groups", {}).values():
+                if group.get("scheme") is None:
+                    continue
+                for t in group.get("targets", []):
+                    ts = str(t)
+                    if _is_dspark_head_target(ts) and _is_main_proj_component(ts):
+                        raise ValueError(
+                            f"DSpark CB target {ts!r} declares main_proj — main_proj is source FP8 delegation only"
+                        )
+            # Head stage legality: main_proj only stage 0, terminal heads only final stage (main_norm relaxed for test)
+            for t in raw_physical_targets:
+                stage = _parse_physical_stage(t)
+                inner = t[len(f"mtp.{stage}."):] if stage is not None else ""
+                if inner.startswith("main_proj."):
+                    if stage != 0:
+                        raise ValueError(f"DSpark head target {t!r} with main_proj must be stage 0, got {stage}")
+                elif inner.startswith("norm.") or inner.startswith("hc_head") or inner.startswith("markov_head."):
+                    if stage != n_mtp - 1:
+                        raise ValueError(f"DSpark terminal head {t!r} must be final stage {n_mtp-1}, got {stage}")
+            self._dspark_topology = topo
+            self._dspark_construction_stages = tuple(nh + i for i in range(n_mtp))
+            # Pin dspark_block_size and topology cross-check against live HF config
+            artifact_block = cfg.get("dspark_block_size") or (cfg.get("provenance") or {}).get("dspark_block_size")
+            # Also check sidecar dspark_topology block_size
+            topo_block = None
+            try:
+                ds_topo = cfg.get("dspark_topology") or {}
+                if isinstance(ds_topo, dict):
+                    topo_block = ds_topo.get("dspark_block_size")
+            except Exception:
+                topo_block = None
+            if artifact_block is None:
+                artifact_block = topo_block
+            if artifact_block is not None:
+                from vllm.config import get_current_vllm_config_or_none
+                vcfg2 = get_current_vllm_config_or_none()
+                if vcfg2 is not None:
+                    sc2 = getattr(vcfg2, "speculative_config", None)
+                    hf2 = None
+                    if sc2 is not None:
+                        dmc2 = getattr(sc2, "draft_model_config", None)
+                        if dmc2 is not None:
+                            hf2 = getattr(dmc2, "hf_config", None)
+                    if hf2 is None:
+                        hf2_model = getattr(getattr(vcfg2, "model_config", None), "hf_config", None)
+                        hf2 = hf2_model
+                    if hf2 is not None:
+                        live_block = getattr(hf2, "dspark_block_size", None)
+                        if live_block is not None and int(live_block) != int(artifact_block):
+                            raise ValueError(
+                                f"dspark_block_size mismatch: artifact {artifact_block} vs live HF {live_block}"
+                            )
+                        if sc2 is not None:
+                            nst = getattr(sc2, "num_speculative_tokens", None)
+                            if nst is not None and live_block is not None and int(nst) < int(live_block):
+                                raise ValueError(
+                                    f"DSpark requires num_speculative_tokens >= dspark_block_size ({live_block}); got {nst}"
+                                )
+                    # Cross-check topology against live draft HF
+                    if sc2 is not None and hf2 is not None:
+                        hf_draft = getattr(sc2.draft_model_config, "hf_config", None) if hasattr(sc2, "draft_model_config") else None
+                        if hf_draft is not None:
+                            live_nh = getattr(hf_draft, "num_hidden_layers", None)
+                            live_nmtp = getattr(hf_draft, "n_mtp_layers", None) or 3
+                            if isinstance(live_nh, int) and isinstance(live_nmtp, int):
+                                if live_nh != nh or int(live_nmtp) != n_mtp:
+                                    raise ValueError(
+                                        f"dspark_topology mismatch: sidecar {nh}/{n_mtp} vs live HF {live_nh}/{live_nmtp}"
+                                    )
+                            live_ids = getattr(hf_draft, "dspark_target_layer_ids", None)
+                            if live_ids is not None and isinstance(cfg.get("dspark_topology"), dict):
+                                side_ids = cfg["dspark_topology"].get("dspark_target_layer_ids")
+                                if side_ids is not None and tuple(side_ids) != tuple(live_ids):
+                                    raise ValueError(f"dspark_target_layer_ids mismatch sidecar {side_ids} vs live {live_ids}")
+            # If DSpark declared but no speculative config, fail closed (combined artifact without draft must not silently ignore mtp.*)
+            from vllm.config import get_current_vllm_config_or_none as _get_cfg
+            _vcfg = _get_cfg()
+            if _vcfg is not None and getattr(_vcfg, "speculative_config", None) is None:
+                raise RuntimeError("DSpark CB declared but speculative_config is None — mtp.* would be silently dropped")
+            # Also validate num_speculative_tokens >= dspark_block_size even when artifact block missing but live has it
+            try:
+                from vllm.config import get_current_vllm_config_or_none as _get2
+                _vc2 = _get2()
+                if _vc2 is not None:
+                    sc = getattr(_vc2, "speculative_config", None)
+                    if sc is not None:
+                        hf = getattr(getattr(sc, "draft_model_config", None), "hf_config", None)
+                        if hf is not None:
+                            live_bs = getattr(hf, "dspark_block_size", None)
+                            nst = getattr(sc, "num_speculative_tokens", None)
+                            if live_bs is not None and nst is not None and int(nst) < int(live_bs):
+                                raise ValueError(f"DSpark requires num_speculative_tokens >= dspark_block_size ({live_bs}); got {nst}")
+            except ValueError:
+                raise
+            except ImportError:
+                pass
+
         # Preserve the producer's physical spelling before resolver namespace
         # canonicalization.  Digest membership is over these exact names.
         physical_by_canonical: dict[str, str] = {}
@@ -541,7 +881,18 @@ class PrismaQuantConfig(QuantizationConfig):
                 )
                 if scheme.get("activation_contract") is None:
                     continue
-                canonical = _canonical_target(target)
+                # Map physical mtp.* to construction for draft, else canonicalize normally
+                if target.startswith("mtp."):
+                    if self._dspark_topology is None:
+                        raise RuntimeError(f"physical DSpark target {target!r} without resolved topology")
+                    nh, n_mtp = self._dspark_topology
+                    allowed = tuple(range(n_mtp))
+                    canonical = _remap_dspark_physical_to_construction(target, nh, allowed)
+                    if canonical is None:
+                        # confidence_head is dropped by target, should not be CB
+                        raise ValueError(f"DSpark target {target!r} maps to dropped confidence_head — not a valid CB target")
+                else:
+                    canonical = _canonical_target(target)
                 previous = physical_by_canonical.setdefault(canonical, target)
                 if previous != target:
                     raise ValueError(
@@ -551,9 +902,20 @@ class PrismaQuantConfig(QuantizationConfig):
         # Normalise stored namespaces ONCE, here, so all downstream resolution
         # (ours and the delegated CT config's) sees canonical target names.
         cfg = dict(cfg)
+        # For DSpark physical targets, map to construction; for others canonicalize
+        def _canon_for_cfg(t: str) -> str:
+            if t.startswith("mtp."):
+                assert self._dspark_topology is not None
+                nh, n_mtp = self._dspark_topology
+                allowed = tuple(range(n_mtp))
+                mapped = _remap_dspark_physical_to_construction(t, nh, allowed)
+                if mapped is None:
+                    # confidence_head etc. — keep original for ignore, but CB already rejected
+                    return t
+                return mapped
+            return _canonical_target(t)
         cfg["config_groups"] = {
-            name: {**g, "targets": [_canonical_target(t)
-                                    for t in g.get("targets", [])]}
+            name: {**g, "targets": [_canon_for_cfg(t) for t in g.get("targets", [])]}
             for name, g in cfg["config_groups"].items()
         }
         cfg["ignore"] = [_canonical_target(i) for i in cfg.get("ignore", [])]
@@ -582,10 +944,78 @@ class PrismaQuantConfig(QuantizationConfig):
         )
         self._alias_collapsed_shared_prefixes()
         self.ct_config = (self._build_ct_config(stock_groups)
-                          if stock_groups else None)
+                           if stock_groups else None)
         # Validate the complete payload now, including delegated stock NVFP4
         # targets that Gridbook's custom methods will never otherwise see.
         self._ensure_nvfp4_activation_payload()
+        # DSpark CB declaration requires DSpark loader to be present; otherwise
+        # the artifact would serve body but draft with coherent garbage.
+        dspark_declared = self._dspark_topology is not None
+        if dspark_declared:
+            try:
+                from .moe_toplevel_loader import installed_module_paths
+
+                installed = installed_module_paths()
+            except (ImportError, AttributeError):
+                installed = set()
+            except ModuleNotFoundError:
+                installed = set()
+            required = "vllm.models.deepseek_v4.nvidia.dspark"
+            if required not in installed:
+                raise RuntimeError(
+                    f"declared DSpark CB targets {sorted(self.target_scheme)} but loader "
+                    f"module {required!r} not installed (check producer_profiles.top_level_loader_modules). "
+                    f"Installed: {sorted(installed) or ['<none>']}"
+                )
+            # Fail-closed draft selection: if DSpark CB declared, draft quant_config must be valid via exact helper
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm.model_executor.models.utils import get_draft_quant_config
+
+            vcfg = get_current_vllm_config_or_none()
+            if vcfg is not None:
+                sc = getattr(vcfg, "speculative_config", None)
+                if sc is not None:
+                    draft_qc = get_draft_quant_config(vcfg)
+                    if draft_qc is None:
+                        raise RuntimeError(
+                            "DSpark CB declared but draft quant_config is None — coherent BF16 fallback is forbidden"
+                        )
+                    method_name = None
+                    # Only narrow exception for get_name
+                    try:
+                        method_name = draft_qc.get_name() if hasattr(draft_qc, "get_name") else None
+                    except AttributeError:
+                        method_name = None
+                    if method_name not in ("gridbook", "prismaquant"):
+                        if type(draft_qc).__name__ != "PrismaQuantConfig":
+                            raise RuntimeError(
+                                f"DSpark CB declared but draft quant_config method is {method_name!r}/{type(draft_qc).__name__} — must be gridbook"
+                            )
+                    # Parent/draft metadata cross-checks (strict, no swallow)
+                    draft_hf = getattr(getattr(sc, "draft_model_config", None), "hf_config", None)
+                    parent_hf = getattr(getattr(vcfg, "model_config", None), "hf_config", None)
+                    if draft_hf is not None and parent_hf is not None:
+                        nh_draft = getattr(draft_hf, "num_hidden_layers", None)
+                        nh_parent = getattr(parent_hf, "num_hidden_layers", None)
+                        if isinstance(nh_draft, int) and isinstance(nh_parent, int) and nh_draft != nh_parent:
+                            raise RuntimeError(
+                                f"parent/draft num_hidden_layers mismatch {nh_parent} vs {nh_draft} with DSpark CB declared"
+                            )
+                        # Additional fields that determine DSpark shapes
+                        for field in ("hidden_size", "num_attention_heads", "head_dim", "dspark_block_size", "dspark_target_layer_ids", "dspark_markov_rank"):
+                            lv = getattr(draft_hf, field, None)
+                            # For these fields, require live and sidecar agree if both present
+                            if lv is not None and isinstance(self._full_config.get("dspark_topology"), dict):
+                                side_val = self._full_config["dspark_topology"].get(field)
+                                if side_val is not None and side_val != lv:
+                                    raise ValueError(f"DSpark field {field} mismatch sidecar {side_val!r} vs live {lv!r}")
+                        # Enforce num_speculative_tokens >= dspark_block_size
+                        nst = getattr(sc, "num_speculative_tokens", None)
+                        dbs = getattr(draft_hf, "dspark_block_size", None)
+                        if isinstance(nst, int) and isinstance(dbs, int) and nst < dbs:
+                            raise ValueError(f"DSpark requires num_speculative_tokens >= dspark_block_size ({dbs}); got {nst}")
+                else:
+                    raise RuntimeError("DSpark CB declared but speculative_config is None")
         self._resolved = True
 
     def _alias_collapsed_shared_prefixes(self) -> None:
@@ -799,6 +1229,22 @@ class PrismaQuantConfig(QuantizationConfig):
         return []
 
     def _scheme_for_prefix(self, prefix: str) -> dict | None:
+        # DSpark main_proj stays delegated/source-F8, never CB.
+        if _is_main_proj_component(prefix):
+            return None
+        # Unknown DSpark construction stage must fail closed, not silently BF16.
+        if self._dspark_topology is not None and self._dspark_construction_stages is not None:
+            for base in _candidate_bases(prefix):
+                stage = _parse_dspark_layer_stage(base)
+                if stage is None:
+                    continue
+                if stage in self._dspark_construction_stages:
+                    continue
+                nh, _ = self._dspark_topology
+                if stage >= nh and stage not in self._dspark_construction_stages:
+                    raise ValueError(
+                        f"DSpark prefix {prefix!r} references unknown stage {stage} — allowed {self._dspark_construction_stages}"
+                    )
         for base in _candidate_bases(prefix):
             if base in self.target_scheme:
                 return self.target_scheme[base]
@@ -990,6 +1436,20 @@ class PrismaQuantConfig(QuantizationConfig):
         """A CB expert stack (targets like ``…experts.gate_up_proj`` /
         ``…experts.down_proj``) under this FusedMoE prefix — return its scheme
         (uniform per layer, so any matching target's scheme is the layer's)."""
+        if _is_main_proj_component(prefix):
+            return None
+        if self._dspark_topology is not None and self._dspark_construction_stages is not None:
+            for base in _candidate_bases(prefix):
+                stage = _parse_dspark_layer_stage(base)
+                if stage is None:
+                    continue
+                if stage in self._dspark_construction_stages:
+                    continue
+                nh, _ = self._dspark_topology
+                if stage >= nh and stage not in self._dspark_construction_stages:
+                    raise ValueError(
+                        f"DSpark MoE prefix {prefix!r} references unknown stage {stage} — allowed {self._dspark_construction_stages}"
+                    )
         # Canonicalise BOTH sides, exactly as ``_scheme_for_prefix`` does for
         # Linears. Without this the multimodal wrapper breaks experts ONLY:
         # vLLM hands us the serving prefix ``language_model.model.layers.N.mlp.

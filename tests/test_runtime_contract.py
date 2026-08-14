@@ -107,6 +107,9 @@ def test_contract_matches_runtime_registration_and_loader_table():
         # class is DEFINED in the platform submodule, which is what plugin.py
         # has to match on (ROADMAP D0.1).
         "vllm.models.deepseek_v4.nvidia.model",
+        # DSpark draft for DSV4-Flash (optional, version-tolerant; body-only
+        # import must not break if absent, but DSpark CB without it fails closed).
+        "vllm.models.deepseek_v4.nvidia.dspark",
     ]
     assert set(profiles["supported_ids"]) == {
         "deepseek_v4", "hy_v3", "laguna", "qwen3", "qwen3_5", "qwen3_5_dense",

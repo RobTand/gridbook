@@ -138,7 +138,7 @@ per-platform vLLM package is a submodule rather than the package itself.
 | `hy_v3` | `HYV3ForCausalLM`, `HYV3MTP` | `vllm.model_executor.models.hy_v3`, `…hy_v3_mtp` |
 | `laguna` | `LagunaForCausalLM` | `vllm.model_executor.models.laguna` |
 | `qwen3_5`, `qwen3_5_dense`, `qwen3` | Qwen3.5-MoE `ForCausalLM` / `ForConditionalGeneration` + MTP | `vllm.model_executor.models.qwen3_5`, `…qwen3_5_mtp`, `…lfm2_moe` |
-| `deepseek_v4` | `DeepseekV4ForCausalLM` | `vllm.models.deepseek_v4.nvidia.model` |
+| `deepseek_v4` | `DeepseekV4ForCausalLM` + `DSparkDeepseekV4ForCausalLM` (speculative DSpark draft) | `vllm.models.deepseek_v4.nvidia.model`, `vllm.models.deepseek_v4.nvidia.dspark` (draft, optional – absence does not break body-only, but DSpark CB without it fails closed) |
 
 #### DeepSeek-V4 (`deepseek_v4`)
 
@@ -161,19 +161,33 @@ Gridbook.
 - **Namespace.** The checkpoint has no `model.` component (keys start at
   `layers.N.`); the class re-attaches it in its own `hf_to_vllm_mapper`. Both
   the expert loader and config-side target resolution handle either spelling.
-- **Passthrough, not served: MTP and DSpark.** The artifact preserves
-  `mtp.*` (4,705 tensors across the three DSpark stages `mtp.0/1/2`) verbatim.
-  `DeepseekV4ForCausalLM.load_weights` builds
-  `AutoWeightsLoader(self, skip_substrs=["mtp."])`, so **every one of them is
-  dropped before any parameter lookup** at plain serving time. The drafter
-  class `DeepSeekV4MTPModel` exists but is reachable only under
-  `--speculative-config`, and it consumes the payload in its source format —
-  Gridbook writes no CB stacks there and registers no loader for it. `dspark`
-  appears nowhere in the vLLM package, so `dspark_block_size`,
-  `dspark_target_layer_ids`, `dspark_markov_rank` and `dspark_noise_token_id`
-  are read by nothing at serving time. Gridbook claims none of this and adds no
-  support vLLM lacks. If a future artifact ever does ship CB expert stacks for
-  an MTP layer, `cb_fill_guard` fails the load and names the module path to add.
+- **MTP / DSpark (body vs draft).** The artifact preserves `mtp.*`
+  (4,705 tensors across the three DSpark stages `mtp.0/1/2`) verbatim. At
+  **body-only** serving time `DeepseekV4ForCausalLM.load_weights` builds
+  `AutoWeightsLoader(self, skip_substrs=["mtp."])`, so every `mtp.*` tensor is
+  dropped before any parameter lookup and the draft is not involved – body
+  behaviour is unchanged. The draft class
+  `DSparkDeepseekV4ForCausalLM` (in `vllm.models.deepseek_v4.nvidia.dspark`,
+  optional – absence does not break body-only) is reachable only under
+  `--speculative-config` with `speculative_config.method="DSpark"`. Its
+  `_remap_dspark_name` maps `mtp.{0,1,2}.<rest>` → live
+  `model.layers.{0,1,2}.<rest>` (no +43, no `.mtp_block`) and
+  `main_proj/main_norm` plus head leaves (`norm`, `hc_head_*`, `markov_head`)
+  → `model.<rest>`, dropping `confidence_head` and non-MTP. When a future
+  PrismaQuant artifact declares DSpark CB (``quant_config.json`` targets like
+  ``model.layers.{0,1,2}.ffn.experts.gate_up_proj`` with a CB scheme), those
+  are claimed only when metadata names them; ``main_proj`` (`[4096,12288]`
+  wide interpolation) stays delegated/source-F8 and is never guessed as CB.
+  The top-level wrapper reuses the same MoE method/kernels for packed experts
+  (`w1`/`w3`→``gate_up_proj``) and delegates dense CB to registered Linear
+  weight loaders, verifying the returned loaded set. No new CUDA kernel is
+  introduced. If DSpark CB is declared but the draft module is absent, config
+  resolution fails closed before generation. Exact-consumption (every declared
+  CB field seen exactly once) is enforced at ingestion (copy/loader return)
+  and at the existing `cb_fill_guard`; missing/duplicate/unknown-stage/wrong
+  leaf/wrong mapping/shape mismatch all fail loudly. Body guard behaviour is
+  unchanged. ``dspark_block_size`` etc. are consumed by the speculator, not
+  by Gridbook dispatch.
 - **Passed through unquantized.** Hyper-connection parameters (`hc_mult` 4:
   `hc_head_*`, `layers.N.hc_attn_*`, `layers.N.hc_ffn_*`), the hash-routing
   tables (`num_hash_layers` 3: `ffn.gate.tid2eid`), `ffn.gate` and its
@@ -193,6 +207,13 @@ Gridbook.
   three apply: a CB tensor that resolves only to a plain BF16 Linear stops the
   load, a shape mismatch against the stacked `(E, out, bytes)` contract raises,
   and a registered-but-never-filled expert stack is caught by `cb_fill_guard`.
+  For DSpark the same three apply plus ingestion-time verification: every
+  declared DSpark CB tensor must be consumed exactly once (missing/duplicate/
+  unknown-stage/wrong-prefix/wrong-leaf/shape-mismatch/loader-not-installed
+  all fail loudly), and `main_proj` never becomes CB. Body behaviour is
+  byte/API compatible. Draft quant-config is the artifact-embedded draft HF
+  config via `get_draft_quant_config` – no global registry; parent/draft
+  mismatch is a concrete metadata comparison and fails closed.
 
 ## CUDA kernel set (decode-GEMV + prefill)
 

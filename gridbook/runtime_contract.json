@@ -162,7 +162,8 @@
       "vllm.model_executor.models.qwen3_5",
       "vllm.model_executor.models.qwen3_5_mtp",
       "vllm.model_executor.models.lfm2_moe",
-      "vllm.models.deepseek_v4.nvidia.model"
+      "vllm.models.deepseek_v4.nvidia.model",
+      "vllm.models.deepseek_v4.nvidia.dspark"
     ]
   }
 }
