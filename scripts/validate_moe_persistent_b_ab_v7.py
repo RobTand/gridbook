@@ -2436,7 +2436,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     confirmation_triplets: list[dict[str, Any]] = []
     confirmation_prompt_metrics: list[dict[str, Any]] = []
-    confirmation_executed = pilot_quality["decision"] != "FAIL"
+    # ---- v7 AMENDMENT (2026-08-14), ESCALATION LOGIC ONLY ----------------
+    # v6: confirmation_executed = pilot_quality["decision"] != "FAIL"
+    #
+    # The 8x64 screen hard-rejected Persistent-B while its OWN
+    # baseline_noise_resolution gate reported pass:false
+    # (baseline_difference_rms 0.02716 vs maximum_resolvable 0.00860), and
+    # the report listed "baseline_noise_exceeds_resolution_limit" as an
+    # inconclusive reason. A screen that cannot resolve its own baseline has
+    # not resolved anything, and this project's standing rule is that cheap
+    # screens are triage and never final selection.
+    #
+    # v7 therefore ALWAYS measures both stages, so the mandatory 8x512
+    # confirmation evidence exists instead of being skipped.
+    #
+    # NO QUALITY THRESHOLD IS CHANGED. Every gate keeps its predeclared
+    # limit and must still pass on its own terms. Both stages are reported
+    # separately; a confirmation-stage PASS alongside a pilot-stage FAIL is
+    # a result to adjudicate, NOT an automatic promotion.
+    confirmation_executed = True
     if confirmation_executed:
         # The complete 8x512 profile is the only distribution measurement that
         # can promote.  Rewarm it immediately before measuring it; the pilot's
