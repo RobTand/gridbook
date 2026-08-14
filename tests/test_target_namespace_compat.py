@@ -93,6 +93,11 @@ def _install_vllm_stubs():
     embedding = _mod("vllm.model_executor.layers.vocab_parallel_embedding")
     embedding.UnquantizedEmbeddingMethod = type("UEM", (), {})
     embedding.VocabParallelEmbedding = type("VPE", (), {})
+    # ParallelLMHead really is a SUBCLASS of VocabParallelEmbedding in
+    # vLLM; a stub where they are unrelated would let the embedding path
+    # claim the output projection without any test noticing.
+    embedding.ParallelLMHead = type(
+        "ParallelLMHead", (embedding.VocabParallelEmbedding,), {})
     fused_moe = _mod("vllm.model_executor.layers.fused_moe")
     fused_moe.RoutedExperts = type("RoutedExperts", (), {})
 

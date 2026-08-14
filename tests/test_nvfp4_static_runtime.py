@@ -63,6 +63,9 @@ def _install_vllm_stubs():
     )
     embedding.UnquantizedEmbeddingMethod = type("UEM", (), {})
     embedding.VocabParallelEmbedding = type("VPE", (), {})
+    # Subclass, as in vLLM -- see test_target_namespace_compat.
+    embedding.ParallelLMHead = type(
+        "ParallelLMHead", (embedding.VocabParallelEmbedding,), {})
     fused = module("vllm.model_executor.layers.fused_moe")
     fused.RoutedExperts = type("RoutedExperts", (), {})
 
