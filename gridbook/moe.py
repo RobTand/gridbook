@@ -50,10 +50,14 @@ from .bf16_grouped_lane import (pack_expert_blocks,
                                 requested as bf16_sm120_requested,
                                 swizzle_group as bf16_sm120_swizzle_group,
                                 tile_m as bf16_sm120_tile_m)
-from .moe_persistent_b_lane import (require_lane as persistent_b_require_lane,
-                                    requested as persistent_b_requested,
-                                    resolve_cfg as persistent_b_resolve_cfg,
-                                    supports as persistent_b_supports)
+from .moe_persistent_b_lane import (
+    d2r_requested as persistent_b_d2r_requested,
+    require_d2r_lane as persistent_b_require_d2r_lane,
+    require_lane as persistent_b_require_lane,
+    requested as persistent_b_requested,
+    resolve_cfg as persistent_b_resolve_cfg,
+    supports as persistent_b_supports,
+)
 from .moe_routing import (
     GROUPED_TILE_N,
     _expert_counts,
@@ -644,8 +648,17 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # never seen, so the operator got a silent baseline run instead of an
         # error. Parsing is separated from acting on the value.
         persistent_b_on = persistent_b_requested()
+        persistent_b_d2r_on = persistent_b_d2r_requested()
+        if persistent_b_d2r_on and not persistent_b_on:
+            raise NativeKernelUnavailableError(
+                f"{self.prefix}: "
+                "PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R=1 is a nested "
+                "experiment and requires "
+                "PRISMAQUANT_CB_MOE_PERSISTENT_B=1; Gridbook does not "
+                "ignore an explicitly requested kernel")
         fused_fp4_moe_mode = _requested_fused_fp4_moe_mode()
         layer._cb_moe_persistent_b = None
+        layer._cb_moe_persistent_b_d2r = False
         if persistent_b_on and self.is_fp4:
             reason = persistent_b_supports(
                 is_fp4=self.is_fp4, is_v2=self.is_v2, n_sub=self.n_sub,
@@ -665,6 +678,24 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # request that happens to carry routed rows.
             layer._cb_moe_persistent_b_cfg = persistent_b_resolve_cfg(
                 layer._cb_moe_persistent_b)
+            if persistent_b_d2r_on:
+                if fused_fp4_moe_mode:
+                    raise NativeKernelUnavailableError(
+                        f"{self.prefix}: explicit persistent-B D2R cannot "
+                        f"serve while PRISMAQUANT_CB_FUSED_FP4_MOE selects "
+                        f"{fused_fp4_moe_mode!r}, because that "
+                        "activation-contract-changing route outranks "
+                        "persistent-B. Disable one explicit experiment; "
+                        "Gridbook does not label a run D2R when another "
+                        "kernel will serve it")
+                d2r_ext = persistent_b_require_d2r_lane(
+                    f"{self.prefix} routed quality prefill", device=dev)
+                if d2r_ext is not layer._cb_moe_persistent_b:
+                    raise NativeKernelUnavailableError(
+                        f"{self.prefix}: persistent-B D2R resolved a "
+                        "different extension object than persistent-B; the "
+                        "candidate must share the established module/cache")
+                layer._cb_moe_persistent_b_d2r = True
             # PRECEDENCE, announced rather than discovered. An explicit fused
             # NVFP4 MoE mode CHANGES THE SERVED ACTIVATION CONTRACT; this lane
             # only changes the GEMM schedule behind the contract the artifact
@@ -688,14 +719,19 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                       f"PRISMAQUANT_CB_FUSED_FP4_MOE changes the served "
                       f"activation contract and outranks "
                       f"PRISMAQUANT_CB_MOE_PERSISTENT_B, which is attested "
-                      f"(cfg={layer._cb_moe_persistent_b_cfg}) but will NOT "
+                      f"(cfg={layer._cb_moe_persistent_b_cfg} "
+                      f"d2r={layer._cb_moe_persistent_b_d2r}) but will NOT "
                       f"serve this layer", flush=True)
             else:
+                pb_schedule = ("BF16 direct-to-register B"
+                               if layer._cb_moe_persistent_b_d2r
+                               else "shared-B")
                 print(f"[prismaquant-cb] moe_prefill {self.prefix} -> "
                       f"persistent-B decode-in-mainloop (k={self.k} "
                       f"type_size={self.type_size} hidden={layer._cb_hidden} "
                       f"inter={layer._cb_inter} "
-                      f"cfg={layer._cb_moe_persistent_b_cfg}); no expanded "
+                      f"cfg={layer._cb_moe_persistent_b_cfg} "
+                      f"schedule={pb_schedule}); no expanded "
                       f"[E,N,K] transient", flush=True)
         if not self._cuda_moe_ok(layer):
             raise NativeKernelUnavailableError(
@@ -1365,6 +1401,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # attribute read, so the hot path performs no environment lookup and
         # both stages of one forward cannot disagree.
         cfg = getattr(layer, "_cb_moe_persistent_b_cfg", 0)
+        d2r = bool(getattr(layer, "_cb_moe_persistent_b_d2r", False))
+        persistent_b_op = (pq_ops.cb_moe_persistent_b_prefill_d2r
+                           if d2r else pq_ops.cb_moe_persistent_b_prefill)
 
         pair_expert = topk_ids.reshape(-1).to(torch.int64)
         order = torch.argsort(pair_expert, stable=True)
@@ -1387,7 +1426,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
         gate_up = torch.empty((pair_count, 2 * inter), dtype=torch.bfloat16,
                               device=dev)
-        pq_ops.cb_moe_persistent_b_prefill(
+        persistent_b_op(
             gate_up, x_sorted, layer.w13_cb_qweight.data, layer._cb_flat,
             layer._cb_compose, expert_ends, self.k, self.type_size, cfg)
         del x_sorted
@@ -1401,7 +1440,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
         pair_output = torch.empty((pair_count, hidden), dtype=torch.bfloat16,
                                   device=dev)
-        pq_ops.cb_moe_persistent_b_prefill(
+        persistent_b_op(
             pair_output, aq, layer.w2_cb_qweight.data, layer._cb_flat,
             layer._cb_compose, expert_ends, self.k, self.type_size, cfg)
         del aq
@@ -1411,8 +1450,12 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         pair_output.mul_(pair_weight[:, None])
         output = torch.zeros((T, hidden), dtype=x.dtype, device=dev)
         output.index_add_(0, rows, pair_output.to(output.dtype))
-        emit_route(layer, kind="moe", policy="moe_persistent_b",
-                   symbol="cb_moe_persistent_b_prefill", tile_m=int(cfg),
+        emit_route(layer, kind="moe",
+                   policy=("moe_persistent_b_d2r" if d2r
+                           else "moe_persistent_b"),
+                   symbol=("cb_moe_persistent_b_prefill_d2r" if d2r
+                           else "cb_moe_persistent_b_prefill"),
+                   tile_m=int(cfg),
                    shape=_moe_shape(layer, topk_ids),
                    contract=_route_bridge_contract(self.is_fp4),
                    state="served", reason=None)

@@ -902,14 +902,19 @@ def test_the_module_has_no_dense_entry_point():
     """
     assert ext.cb_moe_persistent_b_is_moe_only() is True
 
-    routed = {"cb_moe_persistent_b_prefill"}
-    non_gemm = {"cb_moe_persistent_b_decode", "cb_moe_persistent_b_configs",
+    routed = {"cb_moe_persistent_b_prefill",
+              "cb_moe_persistent_b_prefill_d2r"}
+    non_gemm = {"cb_moe_persistent_b_decode",
+                "cb_moe_persistent_b_d2r_decode_pairs",
+                "cb_moe_persistent_b_configs",
+                "cb_moe_persistent_b_d2r_configs",
                 "cb_moe_persistent_b_tile_k",
                 "cb_moe_persistent_b_is_moe_only",
                 # Device attestation: sets the dynamic-smem opt-in for every
                 # compiled tile and validates the capability. No operands, no
                 # GEMM, so it cannot be a dense entry point.
-                "cb_moe_persistent_b_prepare"}
+                "cb_moe_persistent_b_prepare",
+                "cb_moe_persistent_b_d2r_prepare"}
     exported = {name for name in dir(ext) if name.startswith("cb_")}
     assert exported == routed | non_gemm, (
         f"unexpected bindings {sorted(exported - (routed | non_gemm))}: a new "
@@ -920,7 +925,8 @@ def test_the_module_has_no_dense_entry_point():
         assert "expert_ends" in doc, (
             f"{name} computes a GEMM but its signature does not take the "
             f"routing; that is a dense entry point")
-    for name in non_gemm - {"cb_moe_persistent_b_decode"}:
+    for name in non_gemm - {"cb_moe_persistent_b_decode",
+                            "cb_moe_persistent_b_d2r_decode_pairs"}:
         assert not getattr(ext, name).__doc__.count("Tensor"), (
             f"{name} is supposed to be a host-only attestation")
 

@@ -2013,6 +2013,17 @@ _MOE_PERSISTENT_B_SYMBOLS = (
     "cb_moe_persistent_b_tile_k",
     "cb_moe_persistent_b_is_moe_only",
 )
+# Experimental symbols live in the SAME source/module/cache identity, but are
+# deliberately not added to the established production ABI tuple above.  The
+# nested D2R selector requires this complete tuple at model load; with the
+# selector unset, the persistent-B loader continues to enforce ABI schema 1
+# and the exact original symbol contract.
+_MOE_PERSISTENT_B_D2R_SYMBOLS = (
+    "cb_moe_persistent_b_prefill_d2r",
+    "cb_moe_persistent_b_d2r_decode_pairs",
+    "cb_moe_persistent_b_d2r_prepare",
+    "cb_moe_persistent_b_d2r_configs",
+)
 # The capabilities whose tensor-core/`cp.async` schedule this kernel targets.
 # Same set the fused modules and the sm12x BF16 lane gate on.
 _MOE_PERSISTENT_B_CAPABILITIES = ((12, 0), (12, 1))
@@ -2050,6 +2061,25 @@ def require_moe_persistent_b_ext(operation: str = "this operation"):
     return ext
 
 
+def require_moe_persistent_b_d2r_ext(operation: str = "this operation"):
+    """Return D2R from the existing persistent-B module or fail closed.
+
+    This deliberately delegates loading/cache identity to
+    :func:`get_moe_persistent_b_ext`; D2R is not a second extension family.
+    """
+    ext = require_moe_persistent_b_ext(operation)
+    missing = [name for name in _MOE_PERSISTENT_B_D2R_SYMBOLS
+               if not hasattr(ext, name)]
+    if missing:
+        raise NativeKernelUnavailableError(
+            f"{operation} requested persistent-B's experimental BF16 "
+            f"direct-to-register path, but the existing "
+            f"cb_moe_persistent_b.cu module is missing {missing}. Gridbook "
+            "does not substitute the established shared-B schedule behind "
+            "an explicit D2R selection.")
+    return ext
+
+
 def _moe_persistent_b_build_identity(torch, cpp_extension, *, src_dir: str,
                                      capability: tuple[int, int]):
     """``(digest, payload)`` for the persistent-B module's binary ABI.
@@ -2066,7 +2096,11 @@ def _moe_persistent_b_build_identity(torch, cpp_extension, *, src_dir: str,
         cutlass_include=src_dir, util_include=src_dir,
         capability=capability,
         build_inputs=_MOE_PERSISTENT_B_BUILD_INPUTS,
-        bindings=(("persistent-B grouped MoE", _MOE_PERSISTENT_B_SYMBOLS),),
+        bindings=(
+            ("persistent-B grouped MoE", _MOE_PERSISTENT_B_SYMBOLS),
+            ("persistent-B BF16 D2R experiment",
+             _MOE_PERSISTENT_B_D2R_SYMBOLS),
+        ),
         abi_schema=_MOE_PERSISTENT_B_ABI_SCHEMA,
         accelerated=True)
 

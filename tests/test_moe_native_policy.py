@@ -897,6 +897,36 @@ def test_load_print_names_the_route_that_will_actually_serve(
     assert layer._cb_fused_fp4_moe_mode == "rowwise"
 
 
+def test_explicit_d2r_rejects_a_fused_mode_that_would_outrank_it(
+    monkeypatch, lane_latches,
+):
+    """Unlike PB-only, explicit D2R may not be attested then never served."""
+    monkeypatch.setenv("PRISMAQUANT_CB_MOE_PERSISTENT_B", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_FP4_MOE", "rowwise")
+    method = _method(k=16)
+    _stub_load(monkeypatch, method)
+    layer = _loadable_layer()
+
+    with pytest.raises(NativeKernelUnavailableError,
+                       match="explicit persistent-B D2R cannot serve"):
+        method.process_weights_after_loading(layer)
+
+
+def test_d2r_without_parent_persistent_b_flag_fails_load(
+    monkeypatch, lane_latches,
+):
+    monkeypatch.delenv("PRISMAQUANT_CB_MOE_PERSISTENT_B", raising=False)
+    monkeypatch.setenv("PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R", "1")
+    method = _method(k=16)
+    _stub_load(monkeypatch, method)
+    layer = _loadable_layer()
+
+    with pytest.raises(NativeKernelUnavailableError,
+                       match="is a nested experiment and requires"):
+        method.process_weights_after_loading(layer)
+
+
 def test_load_print_is_unchanged_when_persistent_b_is_the_only_flag(
     monkeypatch, capsys, lane_latches,
 ):

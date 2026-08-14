@@ -28,6 +28,7 @@ import os
 from . import lane_select
 
 _FLAG = "PRISMAQUANT_CB_MOE_PERSISTENT_B"
+_D2R_FLAG = "PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R"
 
 
 def requested() -> bool:
@@ -42,9 +43,22 @@ def requested() -> bool:
         _FLAG, meaning="the persistent-B grouped MoE decode-in-mainloop lane")
 
 
+def d2r_requested() -> bool:
+    """Whether the nested direct-to-register experiment was requested.
+
+    This is deliberately a second switch UNDER persistent-B: setting it
+    without ``PRISMAQUANT_CB_MOE_PERSISTENT_B=1`` is rejected by the model-load
+    wiring instead of becoming an ignored, falsely-labelled experiment.
+    """
+    return lane_select.latched_bool(
+        _D2R_FLAG,
+        meaning="persistent-B's experimental BF16 direct-to-register B path")
+
+
 def _reset_for_tests() -> None:
     """Clear the process-stable latch (tests only)."""
     lane_select.reset_for_tests(_FLAG)
+    lane_select.reset_for_tests(_D2R_FLAG)
 
 
 def require_lane(operation: str = "this operation", *, device=None):
@@ -79,6 +93,30 @@ def require_lane(operation: str = "this operation", *, device=None):
         buildable=moe_persistent_b_buildable,
         device=device,
         prepare="cb_moe_persistent_b_prepare")
+
+
+def require_d2r_lane(operation: str = "this operation", *, device=None):
+    """Attest the nested D2R symbols in the existing persistent-B module.
+
+    There is intentionally no second loader, build directory or extension
+    cache.  The established module's source digest keys the candidate code;
+    this narrower symbol/prepare gate runs only when the nested flag is on, so
+    an unset experiment retains the production ABI tuple unchanged.
+    """
+    from .cuda_ext import (_MOE_PERSISTENT_B_D2R_SYMBOLS,
+                           get_moe_persistent_b_ext,
+                           moe_persistent_b_buildable)
+
+    return lane_select.require_lane(
+        operation, flag=_D2R_FLAG,
+        lane="persistent-B's experimental BF16 direct-to-register B path",
+        source="the existing persistent-B extension (cb_moe_persistent_b.cu)",
+        alternative="the established persistent-B shared-B schedule",
+        get_ext=get_moe_persistent_b_ext,
+        symbols=_MOE_PERSISTENT_B_D2R_SYMBOLS,
+        buildable=moe_persistent_b_buildable,
+        device=device,
+        prepare="cb_moe_persistent_b_d2r_prepare")
 
 
 def supports(*, is_fp4: bool, is_v2: bool, n_sub: int, k_bits: int,
