@@ -109,6 +109,134 @@ def test_live_moe_dispatch_keeps_output_contract():
     assert torch.equal(out, torch.full_like(x, 2))
 
 
+def test_moe_dispatch_neutralizes_only_vllm_padding_sentinel():
+    """A padded route is inert before any owned MoE implementation sees it.
+
+    vLLM's static dummy/profile batches use expert id ``-1`` for all routed
+    slots of padding tokens.  The normalization belongs at the one opaque
+    dispatch boundary so uniform-CB, mixed-CB, decode and prefill cannot drift.
+    Other ids remain unchanged, and the caller-owned tensors are not mutated.
+    """
+    seen = {}
+
+    class _RecordingMethod:
+        def _apply_inline(self, layer, x, topk_weights, topk_ids):
+            del layer
+            seen["x"] = x.clone()
+            seen["weights"] = topk_weights.clone()
+            seen["ids"] = topk_ids.clone()
+            return torch.zeros_like(x)
+
+    method = _RecordingMethod()
+    layer = _Layer()
+    layer_id = ops.register_cb_layer(method, layer)
+    x = torch.arange(12, dtype=torch.float32).view(3, 4)
+    weights = torch.tensor([
+        [float("nan"), 0.25],
+        [0.50, 0.75],
+        [1.00, float("nan")],
+    ])
+    ids = torch.tensor([
+        [-1, 2],
+        [-2, 4],
+        [999, -1],
+    ], dtype=torch.int32)
+    original_weights = weights.clone()
+    original_ids = ids.clone()
+
+    out = ops.cb_moe_forward(x, weights, ids, layer_id)
+
+    assert torch.equal(out, torch.zeros_like(x))
+    assert torch.equal(seen["x"], x)
+    assert torch.equal(seen["ids"], torch.tensor([
+        [0, 2],
+        [-2, 4],
+        [999, 0],
+    ], dtype=torch.int32))
+    assert torch.equal(seen["weights"], torch.tensor([
+        [0.0, 0.25],
+        [0.50, 0.75],
+        [1.00, 0.0],
+    ]))
+    assert torch.equal(ids, original_ids)
+    torch.testing.assert_close(weights, original_weights, equal_nan=True)
+
+
+def test_moe_padding_normalization_has_no_host_read():
+    """Sentinel handling remains capture-safe and inside the opaque op."""
+    import inspect
+
+    source = inspect.getsource(ops._neutralize_moe_padding_sentinel)
+    for forbidden in (".item(", ".cpu(", ".tolist(", "bool("):
+        assert forbidden not in source
+    assert "== -1" in source
+    assert source.count("masked_fill") == 2
+
+
+def test_moe_custom_op_fake_and_schema_contract():
+    method = _MoEMethod()
+    layer = _Layer()
+    layer_id = ops.register_cb_layer(method, layer)
+    x = torch.ones((3, 7))
+    weights = torch.ones((3, 2))
+    ids = torch.zeros((3, 2), dtype=torch.int64)
+
+    torch.library.opcheck(
+        ops.cb_moe_forward, (x, weights, ids, layer_id))
+
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode() as mode:
+        fake_out = ops.cb_moe_forward(
+            mode.from_tensor(x), mode.from_tensor(weights),
+            mode.from_tensor(ids), layer_id)
+    assert fake_out.shape == x.shape
+    assert fake_out.dtype == x.dtype
+
+
+def test_moe_custom_op_compiles_opaque_with_padding_normalization():
+    """Fullgraph records one op; normalization runs only in its backend."""
+    traced = []
+    seen = []
+
+    class _RecordingMethod:
+        def _apply_inline(self, layer, x, topk_weights, topk_ids):
+            del layer
+            seen.append((topk_weights.clone(), topk_ids.clone()))
+            return torch.zeros_like(x)
+
+    method = _RecordingMethod()
+    layer = _Layer()
+    layer_id = ops.register_cb_layer(method, layer)
+
+    def backend(graph, example_inputs):
+        del example_inputs
+        traced.append(graph)
+        return graph.forward
+
+    def forward(x, weights, ids):
+        return ops.cb_moe_forward(x, weights, ids, layer_id)
+
+    compiled = torch.compile(forward, backend=backend, fullgraph=True)
+    x = torch.ones((2, 4))
+    weights = torch.tensor([[0.25, 0.75], [1.0, 1.0]])
+    ids = torch.tensor([[2, 3], [-1, -1]], dtype=torch.int32)
+    out = compiled(x, weights, ids)
+
+    assert torch.equal(out, torch.zeros_like(x))
+    assert len(traced) == 1
+    nodes = [node for node in traced[0].graph.nodes
+             if node.op == "call_function"
+             and "prismaquant" in str(node.target)]
+    assert len(nodes) == 1
+    assert len(seen) == 1
+    seen_weights, seen_ids = seen[0]
+    assert torch.equal(seen_weights, torch.tensor([
+        [0.25, 0.75], [0.0, 0.0]]))
+    assert torch.equal(seen_ids, torch.tensor([
+        [2, 3], [0, 0]], dtype=torch.int32))
+
+
 def test_linear_custom_op_fake_and_schema_contract():
     method = _Method()
     layer = _Layer()
@@ -234,8 +362,9 @@ def test_capture_size_gate_constants_match_the_dispatch_boundaries():
     from gridbook import moe
 
     assert ops._DENSE_DECODE_MAX == CUDA_GEMV_M_MAX
+    assert ops._MOE_DECODE_MAX == moe.MOE_PREFILL_M_THRESHOLD
     source = inspect.getsource(moe.PrismaQuantCBMoEMethod._apply_inline)
-    assert f"num_tokens <= {ops._MOE_DECODE_MAX}" in source
+    assert "num_tokens <= MOE_PREFILL_M_THRESHOLD" in source
 
 
 def test_capture_size_advisory_is_silent_without_a_vllm_config(capsys):

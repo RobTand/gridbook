@@ -56,10 +56,19 @@ no new per-arch loader:
   ``layers.N.ffn.experts.gate_up_proj.cb_qweight`` lands on the registered
   param without a Gridbook-side rewrite.
 
-Its MTP/DSpark payload does NOT come through here: ``DeepseekV4ForCausalLM.
-load_weights`` builds ``AutoWeightsLoader(self, skip_substrs=["mtp."])``, so all
-``mtp.*`` tensors are dropped before any parameter lookup. See the
-``deepseek_v4`` notes in ``docs/PLUGIN.md``.
+The target body's MTP payload does NOT come through here:
+``DeepseekV4ForCausalLM.load_weights`` builds
+``AutoWeightsLoader(self, skip_substrs=["mtp."])``, so all ``mtp.*`` tensors
+are dropped before any parameter lookup.  The separate DSpark draft class does
+load that payload.  Its constructor and loader deliberately use different
+namespaces: quantization dispatch sees construction prefixes
+``model.layers.{num_hidden_layers + i}``, while registered parameters are
+``model.layers.{i}`` and checkpoint tensors are ``mtp.{i}``.  For interception
+only, the wrapper calls the draft model's own ``_remap_dspark_name`` before the
+existing mixed-fused / expert resolvers.  Any tensor those Gridbook paths do
+not own is delegated under its original ``mtp.*`` name so DSpark's stock loader
+remains the sole owner of ordinary dense, head, and passthrough loading.  See
+the ``deepseek_v4`` notes in ``docs/PLUGIN.md``.
 
 **Shared-expert (``shared_mlp``) CB tensors.** ``config.py`` aliases the
 architecture's collapsed parent prefix (and its MTP ``.mtp_block`` form) so a
@@ -104,7 +113,9 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from functools import wraps
+import os
 import re
+from typing import Any
 import torch
 
 from .cb_fill_guard import mark_filled
@@ -121,12 +132,80 @@ MIXED_FUSED_LOADER_ABI = 1
 _ACTIVE_MIXED_FUSED_LOADER_ABI: ContextVar[int | None] = ContextVar(
     "gridbook_active_mixed_fused_loader_abi", default=None
 )
+# vLLM's DSpark loader intentionally keeps the target ModelConfig on the
+# current VllmConfig while it constructs the separate draft model.  That is
+# correct for DSpark's target-layer metadata, but it is not the source of the
+# draft checkpoint's Gridbook sidecars.  Bind the *explicit* speculative draft
+# ModelConfig only around the exact DSpark construction lifetime; config.py
+# reads this lazily and every non-DSpark class retains the historical global
+# model_config path.
+_ACTIVE_DSPARK_DRAFT_MODEL_CONFIG: ContextVar[Any | None] = ContextVar(
+    "gridbook_active_dspark_draft_model_config", default=None
+)
+_DSPARK_DRAFT_MODULE = "vllm.models.deepseek_v4.nvidia.dspark"
 
 
 def mixed_fused_loader_active() -> bool:
     """Whether the model currently constructing has the loader ABI."""
 
     return _ACTIVE_MIXED_FUSED_LOADER_ABI.get() == MIXED_FUSED_LOADER_ABI
+
+
+def active_dspark_draft_model_config() -> Any | None:
+    """Return the draft ModelConfig during structural DSpark construction.
+
+    The value is deliberately unavailable before and after ``__init__``.  A
+    Gridbook config that resolves a pointer sidecar during that construction
+    can therefore select the draft source without making the mere presence of
+    ``speculative_config`` affect target/body model loading.
+    """
+
+    return _ACTIVE_DSPARK_DRAFT_MODEL_CONFIG.get()
+
+
+def _is_dspark_draft_construction(model: Any) -> bool:
+    """Whether this exact registered model class is the DSpark draft."""
+
+    cls = type(model)
+    return (
+        cls.__module__ == _DSPARK_DRAFT_MODULE
+        and callable(getattr(cls, "_remap_dspark_name", None))
+    )
+
+
+def _require_dspark_draft_model_config() -> Any:
+    """Resolve the sole sidecar authority for a DSpark draft, fail closed."""
+
+    try:
+        from vllm.config import get_current_vllm_config
+
+        current = get_current_vllm_config()
+    except Exception as exc:  # noqa: BLE001 - convert context absence clearly
+        raise RuntimeError(
+            "DSpark Gridbook construction has no current vLLM config from "
+            "which to resolve speculative_config.draft_model_config"
+        ) from exc
+
+    speculative_config = getattr(current, "speculative_config", None)
+    draft_config = getattr(speculative_config, "draft_model_config", None)
+    if draft_config is None:
+        raise RuntimeError(
+            "DSpark Gridbook construction requires vLLM "
+            "speculative_config.draft_model_config"
+        )
+    try:
+        draft_source = os.fspath(draft_config.model)
+    except (AttributeError, TypeError) as exc:
+        raise RuntimeError(
+            "DSpark speculative_config.draft_model_config.model is not a "
+            "filesystem path or Hub ID"
+        ) from exc
+    if not isinstance(draft_source, str) or not draft_source:
+        raise RuntimeError(
+            "DSpark speculative_config.draft_model_config.model is not a "
+            "nonempty string path or Hub ID"
+        )
+    return draft_config
 
 
 def installed_module_paths() -> set[str]:
@@ -316,6 +395,52 @@ _MIXED_GROUP_ATTR = "_gridbook_mixed_fused_group"
 _MIXED_SOURCE_ATTR = "_gridbook_mixed_fused_source"
 _MIXED_PLANE_ATTR = "_gridbook_mixed_fused_plane"
 _MIXED_FILLED_ATTR = "_gridbook_mixed_fused_filled"
+_MIXED_CARRIER_MARKER = "._gridbook_mixed_roles."
+
+
+def _registered_mixed_source(param_name: str, group: str,
+                             source: str) -> str | None:
+    """Derive a role's registered source name from its actual parameter path.
+
+    DSpark constructs a fused module under ``model.layers.43/44/45`` but its
+    three-element ModuleList registers the same modules under layers ``0/1/2``.
+    Mixed-carrier metadata truthfully retains the construction prefix, while
+    ``named_parameters()`` is authoritative for the registered prefix used by
+    the loader.  The carrier marker is the structural join between those two
+    facts.  No layer offset is inferred here.
+
+    A standalone carrier fixture can have no owning-module prefix; in that
+    case there is no registered alias to derive and the construction route is
+    retained unchanged.  Any partially matching or internally inconsistent
+    full path fails closed.
+    """
+    if _MIXED_CARRIER_MARKER not in param_name:
+        return None
+    registered_group, marker, _ = param_name.partition(_MIXED_CARRIER_MARKER)
+    if not marker or not registered_group:
+        raise ValueError(
+            f"mixed fused parameter {param_name!r} has malformed carrier path"
+        )
+    if registered_group == group:
+        return source
+
+    construction_parent, separator, construction_leaf = group.rpartition(".")
+    registered_parent, registered_separator, registered_leaf = \
+        registered_group.rpartition(".")
+    if (not separator or not registered_separator
+            or construction_leaf != registered_leaf):
+        raise ValueError(
+            f"mixed fused parameter {param_name!r} is registered under "
+            f"{registered_group!r}, incompatible with construction group "
+            f"{group!r}"
+        )
+    construction_stem = construction_parent + "."
+    if not source.startswith(construction_stem):
+        raise ValueError(
+            f"mixed fused source {source!r} is not a sibling of construction "
+            f"group {group!r}"
+        )
+    return registered_parent + "." + source[len(construction_stem):]
 
 
 def _mixed_plane_candidates(name: str) -> tuple[str, tuple[str, ...]] | None:
@@ -364,12 +489,19 @@ class _MixedFusedTransactions:
                 raise ValueError(
                     f"mixed fused parameter {param_name!r} has incomplete "
                     "routing metadata")
-            route = (source, plane)
-            previous = self._routes.setdefault(route, param_name)
-            if previous != param_name:
-                raise ValueError(
-                    f"mixed fused route {route!r} is ambiguous between "
-                    f"{previous!r} and {param_name!r}")
+            registered_source = _registered_mixed_source(
+                param_name, group, source
+            )
+            route_sources = {source}
+            if registered_source is not None:
+                route_sources.add(registered_source)
+            for route_source in route_sources:
+                route = (route_source, plane)
+                previous = self._routes.setdefault(route, param_name)
+                if previous != param_name:
+                    raise ValueError(
+                        f"mixed fused route {route!r} is ambiguous between "
+                        f"{previous!r} and {param_name!r}")
             self._expected.setdefault(group, set()).add(param_name)
         self._pending: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
         self._committed: set[str] = set()
@@ -607,6 +739,70 @@ def _spec_layer_rename(model):
     return rename
 
 
+def _dspark_rename(model):
+    """Return DSpark's physical-to-registered name mapping, when available.
+
+    The DSpark checkpoint uses ``mtp.{stage}.*`` while the live draft module
+    registers those parameters below ``model.layers.{stage}.*`` (with a few
+    model-level heads).  The model's own ``_remap_dspark_name`` is the
+    authoritative mapping and is intentionally reused instead of duplicated
+    here.  ``None`` from that method means the stock loader owns or drops the
+    tensor; preserving the original name makes the Gridbook wrapper inert for
+    those cases and lets delegation retain DSpark's exact semantics.
+
+    Detection is structural rather than tied to a vLLM version or class name:
+    a callable ``_remap_dspark_name`` is the complete capability contract.
+    """
+    remap = getattr(model, "_remap_dspark_name", None)
+    if not callable(remap):
+        return None
+
+    def rename(name: str) -> str:
+        if not name.startswith("mtp."):
+            return name
+        mapped = remap(name)
+        return name if mapped is None else mapped
+
+    return rename
+
+
+def _validate_dspark_target_bridge_model(model) -> None:
+    """Match a declared bridge topology to the instantiated DSpark model.
+
+    Config validation proves the map is internally consistent; this load-time
+    gate proves its producer-stamped ``L``/``n`` are the topology the selected
+    runtime actually constructed.  It runs before the checkpoint generator is
+    consumed, so a mismatch cannot leave a partially populated draft.
+    """
+    quant_config = getattr(model, "quant_config", None)
+    expected = getattr(
+        quant_config, "_dspark_target_bridge_topology", None
+    )
+    if expected is None:
+        return
+    if not callable(getattr(model, "_remap_dspark_name", None)):
+        raise RuntimeError(
+            "dspark_target_bridge was declared for a model without callable "
+            "_remap_dspark_name"
+        )
+    config = getattr(model, "config", None)
+    inner = getattr(model, "model", None)
+    live_hidden = getattr(config, "num_hidden_layers", None)
+    live_mtp = getattr(inner, "num_dspark_layers", None)
+    if (isinstance(live_hidden, bool) or not isinstance(live_hidden, int)
+            or isinstance(live_mtp, bool) or not isinstance(live_mtp, int)):
+        raise RuntimeError(
+            "dspark_target_bridge requires instantiated model topology "
+            "config.num_hidden_layers and model.num_dspark_layers"
+        )
+    live = (live_hidden, live_mtp)
+    if tuple(expected) != live:
+        raise RuntimeError(
+            f"dspark_target_bridge topology {tuple(expected)} does not match "
+            f"the instantiated DSpark model topology {live}"
+        )
+
+
 def _hf_mapper_rename(model):
     """A ``checkpoint name -> vLLM module-tree name`` callable built from the
     model's OWN ``hf_to_vllm_mapper`` (a vLLM ``WeightsMapper``), or ``None``
@@ -686,9 +882,21 @@ def _install_mixed_fused_construction_gate(model_cls: type) -> None:
                 "wrapper on this overriding class"
             )
         token = _ACTIVE_MIXED_FUSED_LOADER_ABI.set(loader_abi)
+        dspark_token = None
         try:
+            # A callable remapper is DSpark's structural construction
+            # capability.  No target/body class exposes it, so speculative
+            # configuration alone can never redirect an ordinary Gridbook
+            # checkpoint to the draft's sidecars.
+            if _is_dspark_draft_construction(self):
+                draft_config = _require_dspark_draft_model_config()
+                dspark_token = _ACTIVE_DSPARK_DRAFT_MODEL_CONFIG.set(
+                    draft_config
+                )
             return orig_init(self, *args, **kwargs)
         finally:
+            if dspark_token is not None:
+                _ACTIVE_DSPARK_DRAFT_MODEL_CONFIG.reset(dspark_token)
             _ACTIVE_MIXED_FUSED_LOADER_ABI.reset(token)
 
     init._gridbook_mixed_fused_init_abi = MIXED_FUSED_LOADER_ABI
@@ -720,6 +928,7 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
         return
 
     def load_weights(self, weights):  # noqa: ANN001, ANN202
+        _validate_dspark_target_bridge_model(self)
         # named_parameters() here carries the same module-nesting prefix as the
         # incoming checkpoint names (both ``model.…`` at the top level), so the
         # suffix-rewritten target is a direct key.
@@ -728,14 +937,17 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
         reverse_fusion = _build_reverse_fusion(
             getattr(self, "packed_modules_mapping", None))
         # Spec-layer (MTP) drafters nest a spec layer's block tensors under
-        # ``.mtp_block.``; ``rename`` maps an incoming checkpoint name to the
-        # served param naming before resolution (identity for a body model).
+        # ``.mtp_block.``; DSpark instead maps physical ``mtp.i.*`` tensors to
+        # registered ``model.layers.i.*`` params. ``rename`` reuses each
+        # model's own mapping before Gridbook resolution (identity for a body
+        # model). Delegation below still yields the original checkpoint name.
         # Multimodal wrappers rename the checkpoint prefix
         # (``model.language_model.`` -> ``language_model.model.``) via their own
         # WeightsMapper, which the original loader applies only internally;
         # apply it FIRST so our anchors match the registered param names.
         rename = _compose_renames(_hf_mapper_rename(self),
-                                  _spec_layer_rename(self))
+                                  _spec_layer_rename(self),
+                                  _dspark_rename(self))
         mixed_transactions = _MixedFusedTransactions(params_dict)
         loaded: set[str] = set()
         def _passthrough():

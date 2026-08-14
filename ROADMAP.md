@@ -256,7 +256,21 @@ Two things banked from an attempt that was reverted before it shipped:
 - [ ] **K1.4 — Complete graph and alternate-schedule qualification.** Run the
   exact-byte 27B streaming gate for `FULL_DECODE_ONLY` CUDA graphs, and qualify
   `cb_gemv_v2` on `sm_120` with same-session quality, telemetry, long prefill,
-  concurrency, and soak coverage before considering a default change.
+  concurrency, and soak coverage before considering a default change. The
+  source-distributed `scripts/validate_moe_gemv_v2_ab.py` now provides the
+  fail-closed same-engine quality component for the exact dsv4flash0731
+  artifact: fixed 8x16 full-vocabulary teacher forcing, exact 35 FP4/8 FP8
+  inventory, per-request inherited/v2/FP8 dispatch counts, and exception-safe
+  restoration. **Source-tree DSV4 operator and quality components passed on
+  2026-08-13** for `cb_gemv_v2.cu` SHA256
+  `d72b15ecaad14e7af07f8af555259f5d1423cee2dacce160c13b3caf7b8bc92b`:
+  30/30 exact operator/graph tests, a bit-exact 1.8175–1.9977x v1 direct-op
+  benchmark across k12/k16/k18 x K2048/4096, and zero full-vocabulary
+  KL/NLL/PPL/target-logprob delta over 240 same-process positions. The item
+  remains OPEN: the global default is still `inherited`, and the final clean
+  wheel/image must still pass served graph replay, throughput, concurrency,
+  long-prefill, soak, and memory gates. Evidence paths are recorded in
+  `docs/RELEASING.md`.
 - [ ] **K1.5 — Pack expert blocks *within* a chunk, not only across a whole
   layer.** The sm12x grouped-BF16 lane's swizzle-group-aligned expert order is
   gated on `chunk >= E`, because a narrower chunk indexes blocks as
@@ -297,11 +311,20 @@ Two things banked from an attempt that was reverted before it shipped:
 
 #### Before DSV4 Flash (integration, not new kernels)
 
-- [x] **D0.1 — Establish the exact serving contract.** Done for the body, MTP
-  and DSpark, against vLLM **0.24.0** and the released
-  `deepseek-ai/DeepSeek-V4-Flash-0731` config. `deepseek_v4` is now a
-  registered producer profile and
-  `vllm.models.deepseek_v4.nvidia.model` a registered top-level loader module.
+- [x] **D0.1 — Establish the exact serving contract.** The body was first
+  audited against vLLM **0.24.0**; the body plus DSpark integration is now
+  requalified on the immutable 2026-08-13 EUGR image
+  `sha256:58862b388e0fab05a5c9b673f21d1d7b41a1123953a2d9ace49aae6c79319869`
+  with vLLM `0.26.1rc1.dev693+g7f7a32cfe.d20260812` at
+  `7f7a32cfec0f1bc5b73c37200b86631523a1ea8f`, torch `2.13.0+cu130`, and
+  FlashInfer `0.6.18` at
+  `9ffd99510d92b883f154fc9f2e3d5aac93e231ca`. The startup canary requires
+  native SM120 DSV4 `(head_dim=64, topk=256)` dispatch and
+  `VLLM_MOE_SKIP_PADDING=True`. This uses the released
+  `deepseek-ai/DeepSeek-V4-Flash-0731` config. `deepseek_v4` is a registered
+  producer profile; both `vllm.models.deepseek_v4.nvidia.model` and
+  `vllm.models.deepseek_v4.nvidia.dspark` are registered top-level loader
+  modules.
   What the inspection actually established, each of which changed the wiring:
   - **The architecture is not where the contract could name it.** vLLM 0.24
     ships DSV4 as a per-platform *package*; `DeepseekV4ForCausalLM` is DEFINED
@@ -333,14 +356,22 @@ Two things banked from an attempt that was reverted before it shipped:
     KV (`fused_wqa_wkv` is built `disable_tp=True`). No narrowly scoped TP
     implementation is required, so none was added and the existing rejection
     above one stands.
-  - **MTP/DSpark are passthrough, not served.** `DeepseekV4ForCausalLM.
-    load_weights` builds `AutoWeightsLoader(self, skip_substrs=["mtp."])`, so
-    all 4,705 `mtp.*` tensors are dropped before any parameter lookup; the
-    drafter `DeepSeekV4MTPModel` is reachable only through
-    `--speculative-config`; and `dspark` appears **nowhere** in the vLLM
-    package, so none of the four `dspark_*` config keys is read. The contract
-    therefore preserves them as producer passthrough and claims none of them —
-    it invents no support vLLM lacks.
+  - **MTP/DSpark stays isolated from the target body and is an explicit 0.8.6
+    integration candidate.** `DeepseekV4ForCausalLM.load_weights` still builds
+    `AutoWeightsLoader(self, skip_substrs=["mtp."])`, so all 4,705 `mtp.*`
+    tensors are dropped before body-only parameter lookup. Under
+    `--speculative-config`, the qualified vLLM runtime instead constructs the
+    separate `DSparkDeepseekV4ForCausalLM` entrypoint from
+    `vllm.models.deepseek_v4.nvidia.dspark`. Runtime-contract v4 registers that
+    defining module; Gridbook scopes sidecar lookup to the explicit draft model
+    config, reuses DSpark's own physical-to-registered name mapper, and keeps
+    construction prefixes distinct. Exact-artifact eager load, generation,
+    residency, acceptance, and paired-throughput classification now pass on
+    the qualified candidate image. Target-only remains the shipping default:
+    native MXFP4 DSpark improved the fixed 8 x 128 suite only from `10.2389` to
+    `10.3364` tok/s while increasing residency from `95.12` to `105.25` GiB,
+    and K12-CB regressed to `9.1319` tok/s. DSpark remains opt-in experimental,
+    not a served-parity or graph/128k claim.
   - **Not every DSV4 Linear is CB-eligible.** `ffn.gate`, both
     `compressor.fused_wkv_wgate`s, `indexer.weights_proj`, `lm_head` and
     `embed_tokens` are built with no quant config. `attn.wo_a` is created and
@@ -354,9 +385,11 @@ Two things banked from an attempt that was reverted before it shipped:
     documented in [`docs/PLUGIN.md`](docs/PLUGIN.md) and
     [`docs/RELEASING.md`](docs/RELEASING.md).
 
-  Remaining work is release evidence, not another operator contract:
-  exact-artifact load/generate, served parity, graph replay, and performance
-  must be recorded through the DSV4-Flash release gate before promotion.
+  Remaining work is release provenance, not another operator contract: rebuild
+  from the clean 0.8.6 commit, repeat the target-only exact-artifact smoke, and
+  bind the final image/wheel identities. Graph replay and DSpark performance
+  parity remain separate promotion gates; they do not change the target-only
+  release default.
 - [ ] **D0.2 — Complete packed-expert native delegation if the assignment needs
   it.** Reuse Gridbook's existing top-level expert-loader path, canonical
   producer packers/metadata, and a version-attested upstream vLLM backend for

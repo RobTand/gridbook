@@ -19,7 +19,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 MEASURED_PHASE_ORDER = ("timing", "quality")
@@ -234,13 +234,19 @@ def prepare_validation(
     harness_path: Path,
     helpers: Any,
     extension_none_message: str,
+    extension_loader: str = "get_fused_fp4_ext",
+    required_symbol: str | None = None,
+    validation_name: str = "fused NVFP4",
+    prompt_loader: (
+        Callable[[Any, Any], tuple[list[list[int]], dict[str, Any]]] | None
+    ) = None,
 ) -> ValidationBootstrap:
     """Load and attest shared runtime, artifact, tokenizer, and dataset state."""
 
     import torch
 
     if not torch.cuda.is_available():
-        raise RuntimeError("fused NVFP4 validation requires a CUDA GPU")
+        raise RuntimeError(f"{validation_name} validation requires a CUDA GPU")
 
     import gridbook
 
@@ -249,18 +255,25 @@ def prepare_validation(
     from gridbook import cuda_ext, linear, moe, moe_toplevel_loader
 
     extension_started = time.monotonic()
-    fused_extension = cuda_ext.get_fused_fp4_ext()
-    extension_load_s = time.monotonic() - extension_started
-    if fused_extension is None:
-        raise RuntimeError(extension_none_message)
-    required_symbol = (
-        "cb_fused_fp4_prefill_mm_scaled"
-        if args.mode == "dense"
-        else "cb_fused_fp4_moe_grouped"
-    )
-    if not hasattr(fused_extension, required_symbol):
+    try:
+        load_extension = getattr(cuda_ext, extension_loader)
+    except AttributeError as exc:
         raise RuntimeError(
-            f"fused FP4 extension lacks required {args.mode} symbol "
+            f"Gridbook has no validation extension loader {extension_loader!r}"
+        ) from exc
+    loaded_extension = load_extension()
+    extension_load_s = time.monotonic() - extension_started
+    if loaded_extension is None:
+        raise RuntimeError(extension_none_message)
+    if required_symbol is None:
+        required_symbol = (
+            "cb_fused_fp4_prefill_mm_scaled"
+            if args.mode == "dense"
+            else "cb_fused_fp4_moe_grouped"
+        )
+    if not hasattr(loaded_extension, required_symbol):
+        raise RuntimeError(
+            f"{validation_name} extension lacks required {args.mode} symbol "
             f"{required_symbol!r}"
         )
 
@@ -289,15 +302,17 @@ def prepare_validation(
             "path": str(helpers_path),
             **helpers._required_file_record(helpers_path),
         }
-    extension_path_raw = getattr(fused_extension, "__file__", None)
+    extension_path_raw = getattr(loaded_extension, "__file__", None)
     if extension_path_raw is None:
-        raise RuntimeError("loaded fused FP4 extension has no filesystem __file__")
+        raise RuntimeError(
+            f"loaded {validation_name} extension has no filesystem __file__"
+        )
     extension_path = Path(extension_path_raw).resolve()
     extension_file = helpers._required_file_record(extension_path)
     extension = {
         "preloaded_before_model": True,
         "load_seconds": extension_load_s,
-        "module": getattr(fused_extension, "__name__", None),
+        "module": getattr(loaded_extension, "__name__", None),
         "path": str(extension_path),
         "bytes": extension_file["bytes"],
         "sha256": extension_file["sha256"],
@@ -394,7 +409,11 @@ def prepare_validation(
         }
         del teacher_tokenizer
 
-    prompts, dataset = helpers._load_wikitext_windows(args, tokenizer)
+    prompts, dataset = (
+        prompt_loader(args, tokenizer)
+        if prompt_loader is not None
+        else helpers._load_wikitext_windows(args, tokenizer)
+    )
     quality_kl_mode = (
         helpers.KL_FULL_VOCAB
         if args.teacher_full_vocab_kl
@@ -456,6 +475,15 @@ def load_candidate_engine(
         "enable_prefix_caching": False,
         "seed": args.seed,
     }
+    tokenizer_mode = getattr(args, "tokenizer_mode", None)
+    if tokenizer_mode is not None:
+        llm_kwargs["tokenizer_mode"] = tokenizer_mode
+    kv_cache_memory_bytes = getattr(args, "kv_cache_memory_bytes", None)
+    if kv_cache_memory_bytes is not None:
+        llm_kwargs["kv_cache_memory_bytes"] = kv_cache_memory_bytes
+    kv_cache_dtype = getattr(args, "kv_cache_dtype", None)
+    if kv_cache_dtype is not None:
+        llm_kwargs["kv_cache_dtype"] = kv_cache_dtype
     chunked_prefill_request = args.enable_chunked_prefill
     if chunked_prefill_request is not None:
         llm_kwargs["enable_chunked_prefill"] = bool(
@@ -471,11 +499,20 @@ def load_candidate_engine(
         probe.restore()
         raise
     model_load_s = time.monotonic() - load_started
-    quality_sampling = bootstrap.sampling_params_class(
+    quality_sampling_kwargs = dict(
         max_tokens=1,
         temperature=0.0,
         prompt_logprobs=bootstrap.quality_logprobs,
         detokenize=False,
+    )
+    if bootstrap.quality_logprobs == -1:
+        # Full-vocabulary list[dict[int, Logprob]] creates one Python object
+        # graph per vocab cell.  vLLM's FlatLogprobs keeps the same values and
+        # Sequence API in primitive lists, which is the only representation
+        # with bounded-enough overhead for cardinality gates on large vocabs.
+        quality_sampling_kwargs["flat_logprobs"] = True
+    quality_sampling = bootstrap.sampling_params_class(
+        **quality_sampling_kwargs
     )
     timing_sampling = bootstrap.sampling_params_class(
         max_tokens=1,
@@ -760,6 +797,9 @@ def shared_report_settings(
         "prefix_caching": False,
         "chunked_prefill": bool(args.enable_chunked_prefill),
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "tokenizer_mode": getattr(args, "tokenizer_mode", None),
+        "kv_cache_memory_bytes": getattr(args, "kv_cache_memory_bytes", None),
+        "kv_cache_dtype": getattr(args, "kv_cache_dtype", None),
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "top_k": args.top_k,
         "quality_prompt_logprobs_request": bootstrap.quality_logprobs,

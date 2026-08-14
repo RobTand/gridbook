@@ -100,18 +100,23 @@ serving image, using [`docker/Dockerfile.gridbook-pinned`](../docker/Dockerfile.
 docker build \
   -f docker/Dockerfile.gridbook-pinned \
   --build-arg BASE_IMAGE=gridbook:local \
-  --build-arg GRIDBOOK_REF=v0.8.5 \
-  -t gridbook:v0.8.5-pinned .
+  --build-arg GRIDBOOK_REF=v0.8.6 \
+  -t gridbook:v0.8.6-pinned .
 ```
 
 `GRIDBOOK_REF` is parameterized so the same recipe works for a release tag or,
 during a pre-tag rehearsal, the exact release commit SHA. For a release image,
-use the immutable `v0.8.5` tag. The direct-VCS requirement causes pip to write
+use the immutable `v0.8.6` tag. The direct-VCS requirement causes pip to write
 the requested ref and resolved 40-character commit to the installed
 distribution's PEP 610 `direct_url.json`; the Docker build reads that record
 back and fails if the requested revision or resolved commit is absent. This is
 the attestation-clean path: provisioning happens in an auditable image layer,
 not as an unrecorded mutation when the server starts.
+
+This generic recipe retains the repository's vLLM 0.24 base by default and is
+not the DeepSeek-V4 DSpark-qualified image. DSV4-Flash must use the exact EUGR,
+vLLM, torch, and FlashInfer tuple plus the `(64, 256)` startup canary recorded
+in [`PLUGIN.md`](PLUGIN.md) and [`RELEASING.md`](RELEASING.md).
 
 Then serve from the derived image with the same arguments shown above. On the
 0.6B smoke, the one-time image build took **383 s**, while an actual serve start

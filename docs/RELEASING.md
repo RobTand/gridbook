@@ -41,9 +41,20 @@ is nothing to store.
 | `pypi` | final releases |
 | `testpypi` | pre-release tags |
 
-Recommended: add yourself as a **required reviewer** on `pypi`. That puts a
-human approval click in front of the single irreversible step in the whole
-pipeline, and it costs nothing.
+The `pypi` environment must have a **required reviewer**. The repository is
+currently configured with `RobTand` as that reviewer, so a final release needs
+a deliberate approval click before the irreversible upload. `testpypi` does
+not need this production approval barrier.
+
+The release workflow independently proves that the peeled tag commit is
+reachable from `origin/master` before it builds anything. This prevents an
+accidental final tag on a feature or stale branch from reaching either publish
+environment; the environment approval remains the independent last barrier.
+
+The workflow also computes the wheel SHA-256 once in its build job and checks
+that exact digest again after every artifact download: installed-wheel verify,
+PyPI publish, and GitHub Release. The Actions artifact digest is the digest of
+an outer archive and is not the wheel digest.
 
 ### 1.2 PyPI pending publisher
 
@@ -201,22 +212,113 @@ Python fallback helper. The retained `cb_persistent_tc.cu` source is not part
 of this gate: its serving selector, custom op, and package loader were deleted,
 and it remains available only to the explicitly opted-in research test.
 
-#### 0.8.5 source block-FP8 W8A16 gate
+#### Alternate CB-GEMV-v2 DSV4 quality gate
+
+`PRISMAQUANT_CB_GEMV=v2` remains experimental and must not be enabled on a
+production DSV4 endpoint, selected by `auto`, or made the default from synthetic
+kernel parity alone.  Before any such change, run the source-distributed
+`scripts/validate_moe_gemv_v2_ab.py` inside the exact release image against the
+exact dsv4flash0731 target artifact and producer-sealed input JSON:
+
+```bash
+python3 scripts/validate_moe_gemv_v2_ab.py \
+  --model /model \
+  --prompt-token-ids-json /inputs/dsv4-wikitext-inputs-v1.json \
+  --output /evidence/dsv4-gemv-v2-ab.json \
+  --kv-cache-dtype fp8 \
+  --max-mean-kl 0.0001 \
+  --max-mean-nll-regression 0.00498754 \
+  --max-ppl-relative-regression 0.005
+```
+
+The harness hashes the complete local artifact and compares its config,
+quantization config, codebook sidecar, 112 GB safetensors payload, and byte
+count to the dsv4flash0731 release identity.  It derives a fixed 8-prompt x
+16-token decode profile from the complete producer-sealed 8x512 WikiText
+payload and independently requires its tensor and JSON value digests.  The
+profile, two repeats, full-vocabulary scoring, and per-source arm-order
+crossover are not operator-tunable.
+
+A valid report must prove one eager vLLM engine and one PID with both native
+modules resident before measurement; the process selector pinned to `v2`; the
+decode contract pinned to `v1`; and all `PRISMAQUANT_CB_W2_*` overrides absent,
+so the control is the real inherited default rather than `rowpack`. The parser
+and engine loader must both attest the DSV4 sparse-MLA requirement
+`kv_cache_dtype=fp8`; `auto` is invalid. Its loaded
+inventory must be exactly 35 target FP4-CB layers plus 8 target FP8-CB layers.
+Every request must traverse M=16 on all 43 layers and attest exactly 70
+inherited FP4 stack calls in the baseline or 70 v2 calls in the candidate,
+plus the unchanged 24 per-role FP8 calls.  Missing calls, selector fallback,
+occupancy-wall fallback, FP8 drift, an unscoped call, a non-finite or
+wrong-cardinality vocabulary row, repeat-digest drift, or incomplete
+exception-safe restoration fails the measurement.
+
+Require `status=ok`, `measurement_valid=true`,
+`configured_gates_pass=true`, all three thresholds above present and passing,
+and retain the JSON beside the clean-wheel evidence. This is the model-quality
+gate only. On the exact DSV4 K=2048/4096 specialization no arithmetic delta is
+expected; the configured tolerances remain fail-closed corruption backstops.
+
+The 2026-08-13 source-tree gate for
+`cb_gemv_v2.cu` SHA256
+`d72b15ecaad14e7af07f8af555259f5d1423cee2dacce160c13b3caf7b8bc92b`
+passed 30/30 operator tests, including CUDA-graph exact replay across
+k12/k16/k18, both release widths, both decode contracts, and all dictionary
+residencies. The final-source v1 direct-op benchmark was bit-exact and measured
+1.8175–1.9977x over inherited. The same-process report has `status=ok`,
+`measurement_valid=true`, `configured_gates_pass=true`, and exact zero
+full-vocabulary KL, NLL regression, PPL regression, and target-logprob delta
+over 240 positions. Retained evidence:
+
+- `/home/rob/dq-runs/dsv4-flash-0731/mtp-throughput-research/gemv-v2-bitexact-operator-v4/run.log`
+- `/home/rob/dq-runs/dsv4-flash-0731/mtp-throughput-research/gemv-v2-bitexact-operator-v4/benchmark.json`
+- `/home/rob/dq-runs/dsv4-flash-0731/mtp-throughput-research/gemv-v2-bitexact-quality-ab-v2/report.json`
+
+This qualifies v2 only as an explicit `PRISMAQUANT_CB_GEMV=v2` DSV4
+release-shape candidate; the global default remains `inherited`. K1.4 remains
+open until the final clean wheel and
+image also pass served graph replay, throughput, concurrency, long-prefill,
+soak, and memory gates with v2 enabled; neither the eager quality harness nor
+the direct-operator graph replay may be cited as those served results.
+
+#### Source block-FP8 W8A16 and 0.8.6 DSpark integration gate
 
 The compile check proves that the wheel carries and builds the ABI. It does not
 prove activation semantics, bounded residency, DSV4 grouping, graph behavior,
-quality, or speed. Before tagging 0.8.5, run the focused GPU suite against that
+quality, or speed. Before tagging a release that changes this route or its
+DSpark loader integration, run the focused GPU suite against that
 same installed wheel on the Spark release device. Stage these test files and
 their test-only helpers outside the checkout and run from that staging
 directory, so the repository cannot shadow the wheel:
 
+For 0.8.6 the qualified runtime tuple is exact, not a minimum-version range:
+
+- EUGR base
+  `eugr/spark-vllm@sha256:58862b388e0fab05a5c9b673f21d1d7b41a1123953a2d9ace49aae6c79319869`;
+- vLLM `0.26.1rc1.dev693+g7f7a32cfe.d20260812`, commit
+  `7f7a32cfec0f1bc5b73c37200b86631523a1ea8f`;
+- torch `2.13.0+cu130`; and
+- FlashInfer `0.6.18`, commit
+  `9ffd99510d92b883f154fc9f2e3d5aac93e231ca`.
+
+The preflight must assert that FlashInfer's SM120 DSV4 decode dispatch contains
+`(head_dim=64, topk=256)` and that `VLLM_MOE_SKIP_PADDING=True`. A runtime that
+merely imports the DSpark class does not satisfy this gate.
+
 ```bash
 python -m pytest -q \
+  tests/test_cb_fill_guard.py \
+  tests/test_codebook_provenance_config.py \
+  tests/test_deepseek_v4_contract.py \
+  tests/test_dspark_cb_loader.py \
   tests/test_fp8_source_w8a16.py \
   tests/test_fp8_source_w8a16_cuda.py \
   tests/test_source_passthrough.py \
   tests/test_dsv4_woa.py \
-  tests/test_mixed_fused_linear.py
+  tests/test_layer_registry.py \
+  tests/test_mixed_fused_linear.py \
+  tests/test_nvfp4_static_runtime.py \
+  tests/test_runtime_contract.py
 ```
 
 Zero failures and zero relevant skips are required. The gate must cover all of
@@ -248,12 +350,52 @@ assignment must say W8A16; direct MXFP8 g32 assignments, if any, must remain
 W8A8. Retain the bound producer/export compatibility evidence plus closed
 startup/dispatch logs proving:
 
-1. the v3 feature source_fp8_block128_w8a16=1 was required by the producer;
+1. the current runtime contract feature
+   `source_fp8_block128_w8a16=1` was required by the producer (and a DSpark
+   sidecar additionally requires `dspark_construction_physical_bridge=1`);
 2. source decode dispatched fp8_source_gemv;
 3. source prefill dispatched fp8_source_expand_bf16 followed by
    cb_bf16_grouped_mm;
 4. DSV4 wo_a used the grouped W8A16 adapter; and
 5. no source unit fell back or entered mxfp8_dense_mm/activation QDQ.
+
+The production launch for 0.8.6 is **target-only 256k** and must omit
+`--speculative-config`. The clean-wheel gate must set `--max-model-len 262144`
+and record the resolved engine value as exactly `262144`. The startup record
+must also prove all of the following on the one-Spark release device:
+
+1. the allocated KV cache reports capacity for at least `262144` tokens and
+   maximum concurrency of at least `1.0` at that request length;
+2. eager mode is off, the intended decode graph is captured successfully, and
+   generation replays it without a graph break or fallback;
+3. fixed coherent generation and the release tool-call smoke both pass; and
+4. Gridbook's route telemetry proves the expected CB/source-W8A16 chains with
+   no error, fallback, activation QDQ on W8A16, or dynamically quantized
+   MXFP8 substitution.
+
+That exact-artifact startup, generation/tool smoke, graph evidence, and
+throughput record are the release gate. Merely accepting `--max-model-len` is
+not proof of 256k capacity. This clean 256k replay is currently **open**: this
+document intentionally records no clean source, wheel, or image digest until
+the run exists.
+
+Exercise DSpark separately as an opt-in experiment: require coherent
+generation, bounded residency, the stamped draft-sidecar authority,
+position-zero acceptance at or above the predeclared threshold, and paired
+throughput against the target-only run. A functional draft that does not beat
+the paired target-only throughput remains experimental and must not appear in
+the default serve command. Neither a native-source nor a CB draft is allowed to
+weaken the target-only release gate. Persistent-B likewise remains disabled in
+the release launch unless its canonical-input full-vocabulary quality gate and
+the separate served NATIVE-PARITY gate both pass.
+
+Pre-release runs from a dirty candidate wheel may classify a path and discover
+integration defects, but cannot close provenance. After the 0.8.6 source is
+committed, rebuild the wheel and derived image, record the source commit plus
+wheel/image digests, and repeat the complete target-only 256k gate above. If
+the release notes retain measured DSpark numbers, rerun that exact paired suite
+too or state explicitly that the numbers are pre-release classification
+evidence.
 
 The source method writes this proof through Gridbook's existing latest-route
 telemetry: `contract=bf16_preserved`; decode names `fp8_source_gemv`; prefill
@@ -269,7 +411,8 @@ the results. Record every block and the exact GPU/runtime/image identities.
 Historical W8A8 block-128 results are a different activation contract and
 cannot satisfy any W8A16 quality or performance cell. Until these artifacts are
 attached and their predeclared limits pass, the route is implemented but the
-0.8.5 release gate is open; do not tag or claim served parity/performance.
+current exact-artifact release gate is open; do not tag or claim served
+parity/performance.
 
 The fused FP4 extension also requires the GPU operator/SASS suite from an
 installed wheel. Stage `tests/test_fused_fp4_prefill.py` outside the checkout,
@@ -309,10 +452,16 @@ Tags are `v` + the PEP 440 version. The workflow refuses to publish if the tag
 and the built version disagree.
 
 ```bash
-git commit -am "release 0.1.0rc1"
+git status --short
+# Stage the reviewed release allowlist explicitly.  Never use `git commit -am`:
+# release utilities and their tests are source-only new files and would be
+# silently omitted.
+git add -- <reviewed-release-paths...>
+git diff --cached --name-status
+git commit -m "release 0.1.0rc1"
 git push
 # wait for CI to go green on master, then:
-git tag v0.1.0rc1
+git tag -a v0.1.0rc1 -m "gridbook 0.1.0rc1"
 git push origin v0.1.0rc1     # <- this, and only this, starts a release
 ```
 
@@ -329,6 +478,27 @@ Order of operations for a first launch:
    ```
    then re-run the compile check from §2.2 against the *downloaded* wheel.
 2. `v0.1.0` → PyPI. The name is claimed at that moment.
+
+For a final GPU-serving release, do **not** approve the `pypi` deployment as
+soon as the CPU jobs turn green. The approval pause is the exact-wheel GPU
+gate:
+
+1. Wait for `build` and `verify` to pass and for `publish` to request the
+   environment approval.
+2. Download the workflow's `dist` artifact into a fresh directory with
+   `gh run download <run-id> -R RobTand/gridbook -n dist -D <fresh-dir>`.
+3. Compare the wheel SHA-256 with the `build` receipt in the workflow log.
+   Do not use the Actions artifact digest; that identifies the outer ZIP.
+4. Install that exact CI wheel into the release image and repeat §2.2 plus the
+   exact-artifact GPU gate for the release architecture. A locally rebuilt
+   wheel is not a substitute because byte-reproducible builds are not yet a
+   project contract.
+5. Approve `pypi` only after that exact wheel passes. On failure, reject the
+   deployment, cancel the workflow, and remove the still-unpublished tag after
+   confirming PyPI has no such version.
+6. After publish, require the local CI-wheel digest, PyPI JSON digest, and
+   GitHub Release asset `digest` to agree before another project pins the
+   wheel.
 
 ### 2.4 After the release
 
@@ -396,7 +566,7 @@ that logic for no extra signal. One mechanical fact drives
 Every optional monorepo dependency in `test_cb_kernels.py` is now guarded, so
 the installed-wheel matrix collects every test module. Current CI runs the
 suite on Python 3.10–3.13 from outside the checkout, with one pytest process per
-file. Three tests also exercise validation entry points that intentionally ship
+file. Five tests also exercise validation entry points that intentionally ship
 only in the sdist. `run_cpu_tests.sh` exports `GRIDBOOK_SOURCE_ROOT`, resolved
 from its own checkout location, so those utilities remain available after the
 tests are staged and the same command works outside GitHub (where the ambient
@@ -410,17 +580,23 @@ wheel.
 build ──► verify ──► publish (pypi | testpypi) ──► github-release
 ```
 
-- **`build`** — same build + `twine check` + `check_dist.py` as CI, then asserts
-  the tag matches the version baked into the wheel, and decides PyPI vs TestPyPI
-  from whether that version is a PEP 440 pre-release.
+- **`build`** — first rejects a tag commit that is not reachable from
+  `origin/master`; then runs the same build + `twine check` + `check_dist.py`
+  as CI, asserts the tag matches the version baked into the wheel, records its
+  SHA-256, and decides PyPI vs TestPyPI from whether that version is a PEP 440
+  pre-release.
 - **`verify`** — installs the exact wheel about to be published and re-runs the
-  install gate and the CPU tests against it.
+  install gate and the CPU tests against it. It first rechecks the build-job
+  wheel digest after artifact download.
 - **`publish`** — `pypa/gh-action-pypi-publish` with `id-token: write` and no
   other permission. Trusted Publishing (OIDC): no API token, no repository
-  secret. `skip-existing` is deliberately **not** set, so a duplicate version is
-  a loud failure rather than a silent no-op.
+  secret. The final `pypi` environment requires a deliberate approval, and the
+  downloaded wheel digest is checked again. `skip-existing` is deliberately
+  **not** set, so a duplicate version is a loud failure rather than a silent
+  no-op.
 - **`github-release`** — `gh release create` with `--generate-notes`, attaching
-  both artifacts, marked `--prerelease` for pre-release versions.
+  both artifacts, marked `--prerelease` for pre-release versions, after one
+  final wheel-digest check.
 
 There is no `push: branches:` trigger and no `release:` trigger. Merging this
 workflow, or any later commit to `master`, can never attempt an upload — the

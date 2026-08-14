@@ -4,8 +4,9 @@ GPU-free and vLLM-free by construction: ``gridbook.moe_gemv_select`` imports
 nothing but the standard library, which is the reason the policy lives there
 and not in ``moe.py`` (see that module's docstring). Everything asserted here
 is the part that decides WHICH kernel a served layer runs — a wrong answer is
-silent (both kernels produce correct output; only speed and reassociation
-differ), so it has to be pinned by test rather than by observation.
+silent (both kernels produce correct output; selection changes speed and,
+outside the exact DSV4 K=2048/4096 default-schedule specializations, may change
+reduction order), so it has to be pinned by test rather than by observation.
 """
 import importlib.util
 import pathlib

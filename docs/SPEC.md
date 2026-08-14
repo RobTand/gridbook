@@ -439,6 +439,17 @@ the following vocabulary:
       }
     }
   },
+  // REQUIRED only when DSpark construction targets carry contracted FP4-CB
+  // activation scalars under physical mtp.* checkpoint names:
+  "dspark_target_bridge": {
+    "schema": "gridbook.dspark-target-bridge.v1",
+    "num_hidden_layers": 43,
+    "n_mtp_layers": 3,
+    "construction_to_physical": {
+      "model.layers.43.ffn.experts.gate_up_proj":
+        "mtp.0.ffn.experts.gate_up_proj"
+    }
+  },
   "ignore": ["model.norm", "lm_head", "..."],   // non-CB modules -> unquantized
   "provenance": {                                // RECOMMENDED, not required to decode
     "codebook_sha256": { "cb_codebook.lattice.NVFP4_CB_K16.sub0": "...", "...": "..." },
@@ -452,6 +463,19 @@ the following vocabulary:
   `sub0..sub{n_sub-1}` (`product`).
 - Targets sharing one `(codebook_ref, format)` **SHOULD** be grouped into one
   config group.
+- `dspark_target_bridge` is an explicit namespace attestation, not a name
+  heuristic. Its construction keys **MUST** be declared targets in
+  `config_groups` and cover the complete activation contract (custom FP4-CB
+  plus any delegated stock-NVFP4 activation target); its physical values
+  **MUST** be exactly
+  `execution_contracts.nvfp4_w4a4.target_names`. Every mapping is one-to-one,
+  preserves the complete target tail, uses `model.layers.(L+s)` -> `mtp.s`,
+  and satisfies `s < n_mtp_layers`. A consumer **MUST** reject an unknown
+  schema, topology mismatch, unused/missing target, changed tail, or duplicate
+  physical target. Before copying weights it **MUST** also compare stamped `L`
+  and `n_mtp_layers` with the instantiated draft model. Targets outside that
+  activation contract do not appear in this map; DSpark `main_proj` remains a
+  delegated source-format special case and is excluded.
 
 ### 5.1 Per-role codebooks on routed expert stacks (since 0.8.3)
 

@@ -30,10 +30,12 @@ import threading
 #     (csrc/cb_gemv_v2.cu). Opts in to the sm_121a 99 KB dynamic-smem budget
 #     and stages the product sub-tables when they fit, which is what buys the
 #     decode-efficiency delta on the low rungs.
-# Same byte format, same decode semantics, same FMA chain as the inherited
-# ROWPACK schedule (csrc/cb_gemv_v2.cu:40-49); only WHERE the dictionary is
-# read from changes. It is NOT bit-exact against the inherited DEFAULT
-# schedule — that is a reassociation-class difference.
+# Same byte format and decode semantics. On the DSV4 release widths
+# K=2048/4096 (8/16 superblocks), v2 uses a compile-time virtual-warp
+# specialization that reproduces the inherited DEFAULT kernel's eight
+# accumulator chains and final reduction bit-for-bit. That exactness contract
+# requires every PRISMAQUANT_CB_W2_* override to be absent. Other widths retain
+# v2's ascending rowpack reduction and may reassociate against inherited.
 #
 # Selector (resolve once per process, whitelist, fail loud, one log line):
 #   inherited  — the SHIPPING DEFAULT, kill switch and A/B control. Never

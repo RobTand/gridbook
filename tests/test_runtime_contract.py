@@ -34,8 +34,9 @@ def test_packaged_contract_loads_and_validates():
     contract = load_runtime_contract()
     assert contract == raw
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 3
+    assert contract["contract_version"] == 4
     assert contract["abi_features"] == {
+        "dspark_construction_physical_bridge": 1,
         "routed_moe_per_role_codebook_lut": 1,
         "source_fp8_block128_w8a16": 1,
     }
@@ -112,6 +113,9 @@ def test_contract_matches_runtime_registration_and_loader_table():
         # class is DEFINED in the platform submodule, which is what plugin.py
         # has to match on (ROADMAP D0.1).
         "vllm.models.deepseek_v4.nvidia.model",
+        # The DSpark draft is a separate entrypoint with its own top-level
+        # loader and physical ``mtp.*`` namespace.
+        "vllm.models.deepseek_v4.nvidia.dspark",
     ]
     assert set(profiles["supported_ids"]) == {
         "deepseek_v4", "hy_v3", "laguna", "qwen3", "qwen3_5", "qwen3_5_dense",
@@ -190,6 +194,14 @@ def _wrong_per_role_lut_capability(contract):
     contract["abi_features"]["routed_moe_per_role_codebook_lut"] = 2
 
 
+def _missing_dspark_bridge_capability(contract):
+    del contract["abi_features"]["dspark_construction_physical_bridge"]
+
+
+def _wrong_dspark_bridge_capability(contract):
+    contract["abi_features"]["dspark_construction_physical_bridge"] = 2
+
+
 def _missing_source_fp8_w8a16_capability(contract):
     del contract["abi_features"]["source_fp8_block128_w8a16"]
 
@@ -217,6 +229,9 @@ def _unsupported_format_mode(contract):
         (_missing_per_role_lut_capability,
          "routed_moe_per_role_codebook_lut"),
         (_wrong_per_role_lut_capability, "must be 1"),
+        (_missing_dspark_bridge_capability,
+         "dspark_construction_physical_bridge"),
+        (_wrong_dspark_bridge_capability, "must be 1"),
         (_missing_source_fp8_w8a16_capability,
          "source_fp8_block128_w8a16"),
         (_wrong_source_fp8_w8a16_capability, "must be 1"),

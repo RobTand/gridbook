@@ -11,7 +11,7 @@ from importlib.resources import files
 from typing import Any, Mapping
 
 
-RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v3"
+RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v4"
 _RESOURCE_NAME = "runtime_contract.json"
 
 #: The vLLM package roots a ``top_level_loader_modules`` entry may name. The
@@ -107,14 +107,24 @@ def validate_runtime_contract(contract: Any) -> None:
         _fail("contract.schema", f"must be {RUNTIME_CONTRACT_SCHEMA!r}")
     contract_version = _positive_int(
         root["contract_version"], "contract.contract_version")
-    if contract_version != 3:
-        _fail("contract.contract_version", "must be 3 for this schema")
+    if contract_version != 4:
+        _fail("contract.contract_version", "must be 4 for this schema")
 
     features = _object(root["abi_features"], "contract.abi_features")
     _keys(features, "contract.abi_features", {
+        "dspark_construction_physical_bridge",
         "routed_moe_per_role_codebook_lut",
         "source_fp8_block128_w8a16",
     })
+    dspark_bridge = _positive_int(
+        features["dspark_construction_physical_bridge"],
+        "contract.abi_features.dspark_construction_physical_bridge",
+    )
+    if dspark_bridge != 1:
+        _fail(
+            "contract.abi_features.dspark_construction_physical_bridge",
+            "must be 1",
+        )
     per_role_lut = _positive_int(
         features["routed_moe_per_role_codebook_lut"],
         "contract.abi_features.routed_moe_per_role_codebook_lut",

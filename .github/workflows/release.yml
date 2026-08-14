@@ -35,8 +35,26 @@ jobs:
       environment: ${{ steps.meta.outputs.environment }}
       repository_url: ${{ steps.meta.outputs.repository_url }}
       project_url: ${{ steps.meta.outputs.project_url }}
+      wheel_sha256: ${{ steps.meta.outputs.wheel_sha256 }}
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          # The release tag must be proven reachable from the public release
+          # branch.  A one-commit checkout cannot establish that ancestry.
+          fetch-depth: 0
+
+      - name: Tag commit must be reachable from master
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            +refs/heads/master:refs/remotes/origin/master
+          tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          master_commit="$(git rev-parse refs/remotes/origin/master)"
+          if ! git merge-base --is-ancestor "${tag_commit}" "${master_commit}"; then
+            echo "::error::${GITHUB_REF_NAME} targets ${tag_commit}, which is not reachable from origin/master ${master_commit}"
+            exit 1
+          fi
+          echo "${GITHUB_REF_NAME}: ${tag_commit} is reachable from origin/master ${master_commit}"
 
       - uses: actions/setup-python@v7.0.0
         with:
@@ -61,7 +79,7 @@ jobs:
         id: meta
         run: |
           python - "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT" <<'PY'
-          import glob, os, sys
+          import glob, hashlib, os, sys
           from packaging.utils import parse_wheel_filename
           from packaging.version import Version
 
@@ -85,6 +103,10 @@ jobs:
                                      else "https://upload.pypi.org/legacy/"))
           print("project_url=" + ("https://test.pypi.org/p/gridbook" if pre
                                   else "https://pypi.org/p/gridbook"))
+          with open(wheels[0], "rb") as handle:
+              wheel_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
+          print(f"wheel_sha256={wheel_sha256}")
+          print(f"wheel sha256: {wheel_sha256}", file=sys.stderr)
           print(f"{built} -> {'TestPyPI' if pre else 'PyPI'}", file=sys.stderr)
           PY
 
@@ -113,6 +135,22 @@ jobs:
         with:
           name: dist
           path: dist
+
+      - name: Downloaded wheel must match the build receipt
+        env:
+          EXPECTED_WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+        run: |
+          python - "$EXPECTED_WHEEL_SHA256" <<'PY'
+          import glob, hashlib, sys
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              sys.exit(f"expected exactly one wheel, got {wheels}")
+          with open(wheels[0], "rb") as handle:
+              actual = hashlib.file_digest(handle, "sha256").hexdigest()
+          if actual != sys.argv[1]:
+              sys.exit(f"wheel digest changed after build: {actual} != {sys.argv[1]}")
+          print(f"verified wheel sha256: {actual}")
+          PY
 
       - name: Install CPU torch
         run: |
@@ -156,6 +194,22 @@ jobs:
           name: dist
           path: dist
 
+      - name: Downloaded wheel must match the verified build
+        env:
+          EXPECTED_WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+        run: |
+          python - "$EXPECTED_WHEEL_SHA256" <<'PY'
+          import glob, hashlib, sys
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              sys.exit(f"expected exactly one wheel, got {wheels}")
+          with open(wheels[0], "rb") as handle:
+              actual = hashlib.file_digest(handle, "sha256").hexdigest()
+          if actual != sys.argv[1]:
+              sys.exit(f"wheel digest changed before publish: {actual} != {sys.argv[1]}")
+          print(f"verified wheel sha256: {actual}")
+          PY
+
       # Pinned to an exact release rather than the `release/v1` branch that
       # PyPA's own docs suggest: a branch ref is re-pointable, and this action
       # holds an OIDC token that can upload under our project name.
@@ -178,6 +232,22 @@ jobs:
         with:
           name: dist
           path: dist
+
+      - name: Release wheel must match the published build
+        env:
+          EXPECTED_WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+        run: |
+          python - "$EXPECTED_WHEEL_SHA256" <<'PY'
+          import glob, hashlib, sys
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              sys.exit(f"expected exactly one wheel, got {wheels}")
+          with open(wheels[0], "rb") as handle:
+              actual = hashlib.file_digest(handle, "sha256").hexdigest()
+          if actual != sys.argv[1]:
+              sys.exit(f"wheel digest changed before GitHub Release: {actual} != {sys.argv[1]}")
+          print(f"verified wheel sha256: {actual}")
+          PY
 
       # gh is preinstalled on GitHub-hosted runners, so the release step needs
       # no third-party action and no extra pin. GH_REPO is required because this

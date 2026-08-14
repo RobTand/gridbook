@@ -397,6 +397,9 @@ _CONTRACT_MODEL_MODULES = {
     # plugin.py installs on the defining module (__module__ guard), so that is
     # the path the contract names and the path reviewed here.
     "vllm.models.deepseek_v4.nvidia.model",
+    # DSpark is defined separately and consumes the checkpoint's ``mtp.*``
+    # draft payload through its own top-level loader.
+    "vllm.models.deepseek_v4.nvidia.dspark",
 }
 
 

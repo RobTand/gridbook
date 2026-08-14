@@ -80,7 +80,7 @@ def _run_v2(case, k, *, dict_mode=0):
         k, type_size, 0, dict_mode)
 
 
-def _run_inherited_rowpack(case, k):
+def _run_inherited(case, k):
     x, qw, cb, compose, pair_expert, pair_xrow, type_size = case
     return inherited.cb_moe_gemv_fp4_v2(
         x, qw, cb, compose, pair_expert, pair_xrow, k, 2, type_size)
@@ -89,17 +89,49 @@ def _run_inherited_rowpack(case, k):
 @pytest.mark.parametrize("k,K", [
     (13, 512),
     (16, 1536),
-    (20, 2048),
-    (24, 4096),
+    (20, 2304),
+    (24, 3840),
 ])
 @pytest.mark.parametrize("contract", [None, "v2"])
 def test_v2_is_bit_exact_to_inherited_rowpack(k, K, contract):
     case = _case(k, K, seed=k + K)
     with _env(PRISMAQUANT_CB_W2_SCHED="rowpack",
               PRISMAQUANT_CB_DECODE_CONTRACT=contract):
-        want = _run_inherited_rowpack(case, k)
+        want = _run_inherited(case, k)
         got = _run_v2(case, k)
     assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
+@pytest.mark.parametrize("k,K", [
+    (12, 2048),
+    (12, 4096),
+    (16, 2048),
+    (16, 4096),
+    (18, 2048),
+    (18, 4096),
+])
+def test_v2_release_shapes_are_bit_exact_to_inherited_default(k, K):
+    """Pin the actual DSV4 target/draft release baseline, not rowpack.
+
+    The inherited default selects eight warps for both production widths
+    (n_sb=8/16). Exercise both decode contracts and every relevant dictionary
+    residency: auto, forced-global, forced-half and forced-full must all
+    reproduce its exact BF16 output. This is the coverage the original
+    rowpack-only parity test did not provide.
+    """
+    case = _case(k, K, seed=10_000 + 100 * k + K)
+    for contract in (None, "v2"):
+        with _env(PRISMAQUANT_CB_W2_SCHED=None,
+                  PRISMAQUANT_CB_W2_ROWS=None,
+                  PRISMAQUANT_CB_W2_WARPS=None,
+                  PRISMAQUANT_CB_DECODE_CONTRACT=contract):
+            want = _run_inherited(case, k)
+            for dict_mode in (0, 1, 2, 3):  # auto, GLOBAL, HALF, FULL
+                got = _run_v2(case, k, dict_mode=dict_mode)
+                assert torch.equal(got.view(torch.int16),
+                                   want.view(torch.int16)), (
+                    f"k={k} K={K} contract={contract or 'v1'} "
+                    f"dict_mode={dict_mode}: v2 != inherited default")
 
 
 def test_compiled_dispatch_predicate_covers_measured_wall_and_invalid_inputs():
@@ -110,7 +142,7 @@ def test_compiled_dispatch_predicate_covers_measured_wall_and_invalid_inputs():
     assert v2ext.cb_gemv_v2_prefers_inherited(16, 73, 0) is True
 
 
-def test_cuda_graph_replay_matches_eager():
+def test_rowpack_cuda_graph_replay_matches_eager():
     k, K = 16, 512
     case = _case(k, K, seed=77)
     with _env(PRISMAQUANT_CB_DECODE_CONTRACT="v2"):
@@ -122,6 +154,37 @@ def test_cuda_graph_replay_matches_eager():
         graph.replay()
         torch.cuda.synchronize()
     assert torch.equal(captured.view(torch.int16), eager.view(torch.int16))
+
+
+@pytest.mark.parametrize("k,K", [
+    (12, 2048),
+    (12, 4096),
+    (16, 2048),
+    (16, 4096),
+    (18, 2048),
+    (18, 4096),
+])
+@pytest.mark.parametrize("contract", [None, "v2"])
+def test_release_shape_cuda_graph_replay_matches_inherited_default(
+        k, K, contract):
+    case = _case(k, K, seed=20_000 + 100 * k + K)
+    with _env(PRISMAQUANT_CB_W2_SCHED=None,
+              PRISMAQUANT_CB_W2_ROWS=None,
+              PRISMAQUANT_CB_W2_WARPS=None,
+              PRISMAQUANT_CB_DECODE_CONTRACT=contract):
+        want = _run_inherited(case, k)
+        for dict_mode in (0, 1, 2, 3):
+            eager = _run_v2(case, k, dict_mode=dict_mode)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = _run_v2(case, k, dict_mode=dict_mode)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(eager.view(torch.int16),
+                               want.view(torch.int16))
+            assert torch.equal(captured.view(torch.int16),
+                               want.view(torch.int16))
 
 
 def test_custom_op_torch_compile_contract():
