@@ -1107,6 +1107,186 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp8_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// K28 routed FP8-CB whole-row sibling.
+//
+// The inherited grouped kernel assigns one block to one (pair, output-row)
+// and eight physical warps to the row's 8/16 superblocks.  DSV4's routed
+// FP8-CB cells are value-closed at K28 with K in {2048,4096}; for those exact
+// cells this sibling assigns one physical warp to a row, stages the complete
+// packed row once, and emulates the inherited eight-warp reduction with eight
+// named virtual accumulators.  A block covers 16 output rows (two per warp),
+// so the 1-KiB K28 LUT is cooperatively staged once and reused by every row.
+//
+// Numerics are deliberately the inherited numerics, not a new contract:
+//   * v1 rounds every (E4M3 value * row scale) to BF16 before the FMA;
+//   * v2 accumulates raw E4M3 values and applies row scale once after the
+//     eight lane reductions and the serial warp-total sum;
+//   * acc[w] receives s=w and, at K4096, s=w+8, followed by the same
+//     16,8,4,2,1 lane tree and w=0..7 serial sum.
+// This makes storage-bit equality with cb_moe_gemv_fp8_kernel the gate.
+// ---------------------------------------------------------------------------
+constexpr int kFp8V2RowsPerBlock = 16;
+constexpr int kFp8V2LutBytes = 4 * 128 * 2;  // K28: four 7-bit x dim-2 LUTs.
+
+template <int S, bool V2>
+DEVINL void cb_moe_gemv_fp8_v2_accumulate(
+    int lane, const uint8_t* __restrict__ slot,
+    const uint16_t* __restrict__ lut16,
+    const uint16_t* __restrict__ xr, float sc_row, float& acc) {
+  constexpr int kBits = 28;
+  constexpr uint64_t kCodeMask = (1ull << kBits) - 1ull;
+  constexpr int kTypeSize = 112;
+  const uint8_t* sb = slot + (int64_t)S * kTypeSize;
+
+  const int bitpos = lane * kBits;
+  const int b0 = bitpos >> 3;
+  const int rem = ((b0 & 3) << 3) + (bitpos & 7);
+  const uint32_t* s32 = reinterpret_cast<const uint32_t*>(sb);
+  const int widx = b0 >> 2;
+  const uint32_t word0 = s32[widx];
+  // Lane 31 ends exactly at byte 112.  Its code fits in word0; an
+  // unconditional word1 read would cross the final superblock's row slot.
+  const uint32_t word1 =
+      (rem + kBits > 32) ? s32[widx + 1] : 0u;
+  const uint64_t code =
+      ((((uint64_t)word1 << 32) | (uint64_t)word0) >> rem) & kCodeMask;
+
+  const int64_t xbase = ((int64_t)S << 8) + (lane << 3);
+  const uint4 xv = *reinterpret_cast<const uint4*>(xr + xbase);
+  const uint32_t xword[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t idx = (uint32_t)(code >> (i * 7)) & 0x7fu;
+    // Each subtable is 128 entries x two adjacent E4M3 bytes.  lut16 is
+    // little-endian, matching the inherited low-byte/high-byte coordinate
+    // order exactly.
+    const uint16_t pair2 = lut16[i * 128 + idx];
+    float w0 = e4m3_to_f32((uint8_t)(pair2 & 0xffu));
+    float w1 = e4m3_to_f32((uint8_t)(pair2 >> 8));
+    if constexpr (!V2) {
+      w0 = bf16_to_f32(f32_to_bf16_rn(w0 * sc_row));
+      w1 = bf16_to_f32(f32_to_bf16_rn(w1 * sc_row));
+    }
+    acc = fmaf(w0, bf16_to_f32((uint16_t)(xword[i] & 0xffffu)), acc);
+    acc = fmaf(w1, bf16_to_f32((uint16_t)(xword[i] >> 16)), acc);
+  }
+}
+
+template <int NSB, bool V2>
+__global__ __launch_bounds__(kThreads, 6) void cb_moe_gemv_fp8_v2_kernel(
+    const uint16_t* __restrict__ x,          // [Xrows,K] BF16 as u16
+    const uint8_t* __restrict__ qw,          // [E,Nout,row_bytes]
+    const uint8_t* __restrict__ lut,         // exactly 1024 E4M3 bytes
+    const float* __restrict__ scale,         // [E,Nout]
+    const int32_t* __restrict__ pair_expert, // [P]
+    const int32_t* __restrict__ pair_xrow,   // [P]
+    uint16_t* __restrict__ y,                // [P,Nout]
+    int64_t P, int64_t Nout, int64_t K) {
+  static_assert(NSB == 8 || NSB == 16,
+                "routed FP8 v2 supports only K2048/K4096");
+  constexpr int kTypeSize = 112;
+  constexpr int kRowBytes = NSB * kTypeSize;
+  const int64_t blocks_per_pair =
+      (Nout + kFp8V2RowsPerBlock - 1) / kFp8V2RowsPerBlock;
+  const int64_t p = blockIdx.x / blocks_per_pair;
+  const int64_t rg = blockIdx.x % blocks_per_pair;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+
+  extern __shared__ __align__(16) uint8_t smem[];
+  uint8_t* lut_s = smem;
+  uint8_t* slot = smem + kFp8V2LutBytes + (size_t)warp * kRowBytes;
+  float* prior = reinterpret_cast<float*>(
+      smem + kFp8V2LutBytes + (size_t)kWarps * kRowBytes) + warp * 8;
+
+  // The exact K28 LUT is 64 uint4 values.  All block threads rendezvous once;
+  // subsequent row work is warp-private and intentionally has no block
+  // barrier, so a tail warp may finish without deadlocking its peers.
+  if (threadIdx.x < kFp8V2LutBytes / 16) {
+    reinterpret_cast<uint4*>(lut_s)[threadIdx.x] =
+        reinterpret_cast<const uint4*>(lut)[threadIdx.x];
+  }
+  __syncthreads();
+  const uint16_t* lut16 = reinterpret_cast<const uint16_t*>(lut_s);
+
+  const int64_t e = (int64_t)pair_expert[p];
+  const uint16_t* xr = x + (int64_t)pair_xrow[p] * K;
+  for (int nl = warp; nl < kFp8V2RowsPerBlock; nl += kWarps) {
+    const int64_t n = rg * kFp8V2RowsPerBlock + nl;
+    if (n >= Nout) break;
+    const uint8_t* row = qw + (e * Nout + n) * kRowBytes;
+    const uint4* row4 = reinterpret_cast<const uint4*>(row);
+    uint4* slot4 = reinterpret_cast<uint4*>(slot);
+#pragma unroll
+    for (int i = lane; i < kRowBytes / 16; i += 32) slot4[i] = row4[i];
+    __syncwarp();
+
+    const float sc_row = __ldg(scale + e * Nout + n);
+    // Keep two virtual inherited chains live at a time.  Their lane-reduced
+    // values are exact f32s, so a shared store/load before the final serial
+    // sum preserves every arithmetic edge while avoiding the register/stack
+    // cliff of eight simultaneously live chains on K4096.
+    float acc0 = 0.0f, acc1 = 0.0f;
+#define CB_FP8_V2_ACC(S, A) cb_moe_gemv_fp8_v2_accumulate<S, V2>(          \
+        lane, slot, lut16, xr, sc_row, (A))
+    CB_FP8_V2_ACC(0, acc0); CB_FP8_V2_ACC(1, acc1);
+    if constexpr (NSB == 16) {
+      CB_FP8_V2_ACC(8, acc0);   CB_FP8_V2_ACC(9, acc1);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      acc0 += __shfl_down_sync(0xffffffffu, acc0, off);
+      acc1 += __shfl_down_sync(0xffffffffu, acc1, off);
+    }
+    if (lane == 0) { prior[0] = acc0; prior[1] = acc1; }
+
+    float acc2 = 0.0f, acc3 = 0.0f;
+    CB_FP8_V2_ACC(2, acc2); CB_FP8_V2_ACC(3, acc3);
+    if constexpr (NSB == 16) {
+      CB_FP8_V2_ACC(10, acc2); CB_FP8_V2_ACC(11, acc3);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      acc2 += __shfl_down_sync(0xffffffffu, acc2, off);
+      acc3 += __shfl_down_sync(0xffffffffu, acc3, off);
+    }
+    if (lane == 0) { prior[2] = acc2; prior[3] = acc3; }
+
+    float acc4 = 0.0f, acc5 = 0.0f;
+    CB_FP8_V2_ACC(4, acc4); CB_FP8_V2_ACC(5, acc5);
+    if constexpr (NSB == 16) {
+      CB_FP8_V2_ACC(12, acc4);  CB_FP8_V2_ACC(13, acc5);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      acc4 += __shfl_down_sync(0xffffffffu, acc4, off);
+      acc5 += __shfl_down_sync(0xffffffffu, acc5, off);
+    }
+    if (lane == 0) { prior[4] = acc4; prior[5] = acc5; }
+
+    float acc6 = 0.0f, acc7 = 0.0f;
+    CB_FP8_V2_ACC(6, acc6); CB_FP8_V2_ACC(7, acc7);
+    if constexpr (NSB == 16) {
+      CB_FP8_V2_ACC(14, acc6); CB_FP8_V2_ACC(15, acc7);
+    }
+#undef CB_FP8_V2_ACC
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      acc6 += __shfl_down_sync(0xffffffffu, acc6, off);
+      acc7 += __shfl_down_sync(0xffffffffu, acc7, off);
+    }
+    if (lane == 0) {
+      float total = 0.0f;
+      total += prior[0]; total += prior[1]; total += prior[2]; total += prior[3];
+      total += prior[4]; total += prior[5]; total += acc6; total += acc7;
+      if constexpr (V2) total *= sc_row;
+      y[p * Nout + n] = f32_to_bf16_rn(total);
+    }
+    __syncwarp();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Grouped MoE decode GEMV for the fp4 two-tier (v2) codebook format
 // (docs/SPEC.md §1.2 for the two-tier coding restated below, and §7 INV-1,
 // which requires exactly the in-register composition this kernel does;
@@ -1532,6 +1712,92 @@ torch::Tensor cb_moe_gemv_fp8(torch::Tensor xq, torch::Tensor qw_stack,
   return y;
 }
 
+torch::Tensor cb_moe_gemv_fp8_v2(torch::Tensor xq,
+                                 torch::Tensor qw_stack,
+                                 torch::Tensor cb_flat_fp8,
+                                 torch::Tensor scale,
+                                 torch::Tensor pair_expert,
+                                 torch::Tensor pair_xrow,
+                                 int64_t k_bits, int64_t n_sub,
+                                 int64_t type_size) {
+  TORCH_CHECK(xq.is_cuda() && xq.scalar_type() == torch::kBFloat16 &&
+                  xq.dim() == 2 && xq.is_contiguous(),
+              "routed FP8 v2 x must be contiguous CUDA BF16 [Xrows,K]");
+  TORCH_CHECK(qw_stack.is_cuda() && qw_stack.dim() == 3 &&
+                  qw_stack.scalar_type() == torch::kUInt8 &&
+                  qw_stack.is_contiguous(),
+              "routed FP8 v2 qw must be contiguous CUDA uint8 [E,N,row_bytes]");
+  TORCH_CHECK(cb_flat_fp8.is_cuda() &&
+                  cb_flat_fp8.scalar_type() == torch::kUInt8 &&
+                  cb_flat_fp8.is_contiguous() &&
+                  cb_flat_fp8.numel() == kFp8V2LutBytes,
+              "routed FP8 v2 LUT must be exactly 1024 contiguous CUDA bytes");
+  TORCH_CHECK(scale.is_cuda() && scale.dim() == 2 &&
+                  scale.scalar_type() == torch::kFloat32 &&
+                  scale.is_contiguous(),
+              "routed FP8 v2 scale must be contiguous CUDA fp32 [E,N]");
+  TORCH_CHECK(pair_expert.is_cuda() && pair_xrow.is_cuda() &&
+                  pair_expert.scalar_type() == torch::kInt32 &&
+                  pair_xrow.scalar_type() == torch::kInt32 &&
+                  pair_expert.dim() == 1 && pair_xrow.dim() == 1 &&
+                  pair_expert.is_contiguous() && pair_xrow.is_contiguous() &&
+                  pair_expert.numel() == pair_xrow.numel(),
+              "routed FP8 v2 pair maps must be equal-length contiguous CUDA int32");
+  TORCH_CHECK(xq.device() == qw_stack.device() &&
+                  xq.device() == cb_flat_fp8.device() &&
+                  xq.device() == scale.device() &&
+                  xq.device() == pair_expert.device() &&
+                  xq.device() == pair_xrow.device(),
+              "routed FP8 v2 tensors must share one CUDA device");
+  TORCH_CHECK(k_bits == 28 && n_sub == 4 && type_size == 112,
+              "routed FP8 v2 is release-gated only for K28/n_sub4/type112");
+
+  const int64_t E = qw_stack.size(0);
+  const int64_t Nout = qw_stack.size(1);
+  const int64_t row_bytes = qw_stack.size(2);
+  TORCH_CHECK(E > 0 && Nout > 0 && row_bytes % type_size == 0,
+              "routed FP8 v2 requires nonempty exact packed rows");
+  const int64_t K = (row_bytes / type_size) << 8;
+  TORCH_CHECK(K == 2048 || K == 4096,
+              "routed FP8 v2 supports only K=2048 or K=4096");
+  TORCH_CHECK(xq.size(1) == K, "routed FP8 v2 x width mismatch");
+  TORCH_CHECK(scale.size(0) == E && scale.size(1) == Nout,
+              "routed FP8 v2 scale shape must match [E,N]");
+
+  const int64_t P = pair_expert.numel();
+  const c10::cuda::OptionalCUDAGuard guard(xq.device());
+  auto y = torch::empty({P, Nout}, xq.options());
+  if (P == 0) return y;
+  const int64_t blocks_per_pair =
+      (Nout + kFp8V2RowsPerBlock - 1) / kFp8V2RowsPerBlock;
+  const int64_t grid = P * blocks_per_pair;
+  TORCH_CHECK(grid > 0 && grid <= 0x7fffffffll,
+              "routed FP8 v2 launch grid exceeds CUDA x-dimension");
+  const size_t smem = kFp8V2LutBytes +
+      (size_t)kWarps * (size_t)row_bytes +
+      (size_t)kWarps * 8 * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const bool v2 = pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2");
+#define LAUNCH_FP8_V2(NSB, V2)                                              \
+  cb_moe_gemv_fp8_v2_kernel<NSB, V2>                                      \
+      <<<(unsigned)grid, kThreads, smem, stream>>>(                         \
+          reinterpret_cast<const uint16_t*>(xq.data_ptr()),                 \
+          qw_stack.data_ptr<uint8_t>(), cb_flat_fp8.data_ptr<uint8_t>(),    \
+          scale.data_ptr<float>(), pair_expert.data_ptr<int32_t>(),         \
+          pair_xrow.data_ptr<int32_t>(),                                   \
+          reinterpret_cast<uint16_t*>(y.data_ptr()), P, Nout, K)
+  if (K == 2048) {
+    if (v2) { LAUNCH_FP8_V2(8, true); }
+    else { LAUNCH_FP8_V2(8, false); }
+  } else {
+    if (v2) { LAUNCH_FP8_V2(16, true); }
+    else { LAUNCH_FP8_V2(16, false); }
+  }
+#undef LAUNCH_FP8_V2
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
 torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
                                  torch::Tensor cb_flat, torch::Tensor compose,
                                  torch::Tensor pair_expert,
@@ -1891,6 +2157,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "FP8-direct transient expand (prefill; bounded per-layer tile)");
   m.def("cb_moe_gemv_fp8", &cb_moe_gemv_fp8,
         "grouped MoE decode GEMV over routed (token, expert) pairs");
+  m.def("cb_moe_gemv_fp8_v2", &cb_moe_gemv_fp8_v2,
+        "K28 whole-row grouped MoE FP8-CB decode GEMV sibling");
   m.def("cb_moe_gemv_fp4_v2", &cb_moe_gemv_fp4_v2,
         "grouped MoE decode GEMV for the fp4 two-tier (v2) codebook format");
   m.def("cb_moe_combine", &cb_moe_combine,

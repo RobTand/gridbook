@@ -87,6 +87,48 @@ def test_registers_per_family_buffers_and_index_maps():
     assert layer._w2_format_position.tolist() == [0, 1, 0, 2]
 
 
+def test_explicit_fp8_v2_refuses_mixed_fp8_groups(monkeypatch):
+    """A global candidate arm must not silently inherit inside mixed groups."""
+    moe_mod = pytest.importorskip("gridbook.moe_mixed")
+    from gridbook import moe_gemv_select
+
+    groups, schemes = _declaration()
+    method = moe_mod.PrismaQuantMixedMoEMethod.__new__(
+        moe_mod.PrismaQuantMixedMoEMethod
+    )
+    method.groups = groups
+    method.prefix = "model.layers.0.experts"
+    method.quant_config = types.SimpleNamespace(
+        target_scheme=schemes,
+        _per_expert_serving_prefixes={name: name for name in schemes},
+    )
+    monkeypatch.setattr(moe_gemv_select, "_CB_FP8_GEMV_V2", None)
+    monkeypatch.setenv("PRISMAQUANT_CB_FP8_GEMV_V2", "1")
+
+    with pytest.raises(RuntimeError, match="silently inherited candidate arm"):
+        method._require_fp8_v2_dispatch_supported()
+
+
+def test_disabled_fp8_v2_leaves_mixed_groups_on_inherited(monkeypatch):
+    moe_mod = pytest.importorskip("gridbook.moe_mixed")
+    from gridbook import moe_gemv_select
+
+    groups, schemes = _declaration()
+    method = moe_mod.PrismaQuantMixedMoEMethod.__new__(
+        moe_mod.PrismaQuantMixedMoEMethod
+    )
+    method.groups = groups
+    method.prefix = "model.layers.0.experts"
+    method.quant_config = types.SimpleNamespace(
+        target_scheme=schemes,
+        _per_expert_serving_prefixes={name: name for name in schemes},
+    )
+    monkeypatch.setattr(moe_gemv_select, "_CB_FP8_GEMV_V2", None)
+    monkeypatch.setenv("PRISMAQUANT_CB_FP8_GEMV_V2", "0")
+
+    method._require_fp8_v2_dispatch_supported()
+
+
 def test_family_loader_copies_exact_substacks_without_legacy_transpose():
     moe_mod = pytest.importorskip("gridbook.moe_mixed")
     groups, schemes = _declaration()

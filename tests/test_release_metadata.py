@@ -45,6 +45,7 @@ SDIST_REQUIRED_UTILITIES = (
     "scripts/validate_fused_nvfp4_three_arm.py",
     "scripts/validate_moe_persistent_b_ab.py",
     "scripts/validate_moe_gemv_v2_ab.py",
+    "scripts/validate_moe_fp8_gemv_v2_ab.py",
 )
 
 # The wheel must carry every source cuda_ext.py JIT-compiles. Same floor as

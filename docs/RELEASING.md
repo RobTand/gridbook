@@ -161,7 +161,8 @@ from gridbook.native_cutlass import (
 print(\"csrc:\", csrc_dir())
 m = get_ext()
 assert m is not None, \"main extension failed to build\"
-assert hasattr(m, \"cb_gemv_fp8\"), \"built module is missing cb_gemv_fp8\"
+for symbol in (\"cb_gemv_fp8\", \"cb_moe_gemv_fp8_v2\"):
+    assert hasattr(m, symbol), f\"built main module is missing {symbol}\"
 v2 = get_ext_v2()
 assert v2 is not None, \"FP4-v2 extension failed to build\"
 for symbol in (\"cb_gemv_v2\", \"cb_expand_v2\"):
@@ -280,6 +281,88 @@ open until the final clean wheel and
 image also pass served graph replay, throughput, concurrency, long-prefill,
 soak, and memory gates with v2 enabled; neither the eager quality harness nor
 the direct-operator graph replay may be cited as those served results.
+
+#### Routed FP8-CB whole-row DSV4 quality and served gate
+
+`PRISMAQUANT_CB_FP8_GEMV_V2` is a separate, default-off selector for the main
+extension's routed FP8-CB whole-row sibling. Unset or literal `0` keeps the
+inherited kernel; only literal `1` opts in. The selected route is fixed for
+each stack at model load and is closed to exactly
+`k=28/n_sub=4/type_size=112` at K=2048/4096. With the selector on, an
+unsupported uniform FP8-CB stack and any per-expert mixed FP8-CB group fail
+instead of silently creating a partly inherited candidate. FP4-CB layers use
+the independent `PRISMAQUANT_CB_GEMV` route and source-passthrough groups are
+outside the selector. The main-extension load contract always requires
+`cb_moe_gemv_fp8_v2`, even when the selector is off, so a stale pre-sibling
+`.so` cannot hide until an opted-in request.
+
+Run the source-distributed exact-quality harness inside the release image
+against the sealed DSV4 artifact and input JSON:
+
+```bash
+python3 scripts/validate_moe_fp8_gemv_v2_ab.py \
+  --model /model \
+  --prompt-token-ids-json /inputs/dsv4-wikitext-inputs-v1.json \
+  --output /evidence/dsv4-fp8-gemv-v2-ab.json \
+  --kv-cache-dtype fp8 \
+  --max-mean-kl 0 \
+  --max-mean-nll-regression 0 \
+  --max-ppl-relative-regression 0
+```
+
+The harness pins `PRISMAQUANT_CB_FP8_GEMV_V2=1`,
+`PRISMAQUANT_CB_GEMV=v2`, and eager execution for one same-PID engine. It
+alternates request-scoped inherited/candidate dispatch only on the 16 FP8
+stack attributes belonging to the exact eight routed FP8-CB layers, while all
+35 FP4-CB layers remain on their fixed v2 route. Each measured request must
+observe exactly 24 per-role FP8 operations on the selected arm, 70 unchanged
+FP4-v2 operations, exact router ids/weights, and no fallback or mixed route.
+This is an eager quality test; its request-scoped Python attributes cannot be
+used as a served CUDA-graph A/B.
+
+The retained 2026-08-13 report is
+`/home/rob/dq-runs/dsv4-flash-0731/mtp-throughput-research/routed-fp8-v2-quality-ab-v1/report.json`,
+SHA256
+`013ecf0efda1a707ead44fa9f57a94a017595aff2b65dc18cf142b97e8642314`.
+It records `status=ok`, `measurement_valid=true`, and
+`configured_gates_pass=true`, with exact zero full-vocabulary KL, mean-NLL,
+PPL, target-logprob, generation-digest, and router-route delta over 240 scored
+positions. Its closed identities include `cb_gemv.cu` SHA256
+`3bf545f381acdbf503a9d78fb1bb9665b647ff0318fa27e7b24a5f96bbc26894`,
+main-extension SHA256
+`8f1f287e906562f152d9935deace4149dee3f0eb555d781a6400fe56e29d1104`,
+and FP4-v2-extension SHA256
+`4f6ba86c7fe80780b11282a99b975d9f961caa5ef8120f170468b994c4a517db`.
+The final-source operator evidence separately passed 17/17 eager,
+registered-op, CUDA-graph replay, fullgraph, and rejection tests across both
+decode contracts and both release widths.
+
+An earlier served A/B/A2 measured a 1.072101954x (approximately 7.2%) pooled
+cycle-throughput signal, but it used main-extension SHA256
+`5c3146b7f038dad46179747be9e525822d2b7c9297b1da70c80fe97962bf49fc`
+rather than the quality report's binary, and generated-content/output-per-cycle
+and speculative-acceptance summaries differed across arms. It is retained
+only as a signal and must not be cited as a passing served result.
+
+The remaining performance run is a fresh served **A/B/A2** using the exact
+final binary and otherwise identical K12 DSpark K5 artifacts, residency,
+image, eager-mode server configuration, and launch settings in all three
+arms: A sets the FP8 selector to `0`, B sets it to `1`, and A2 returns it to
+`0`. For each arm run one warmup at PP=12288/TG=64, then eight measured
+requests at PP=12288/TG=256, all at depth 0, concurrency 1, exact TG,
+temperature 0, request seed 1234, and measurement `BENCH_SEED=731`. The
+quality-report binary identity above must appear in every arm; if a rebuilt
+final wheel changes that identity, regenerate the quality report against that
+same binary before pairing the evidence.
+
+Analyze the eight paired requests fail-closed: content hashes, metrics deltas,
+output-per-cycle, and visible-token counts must be identical across A/B/A2;
+the median A-to-A2 control drift must be at most 2%; the geometric-bracketed
+paired median speedup must be at least 1.05; and its 100,000-sample bootstrap
+lower 95% bound must be greater than 1.0. Passing this eager served-throughput
+cycle still leaves served CUDA-graph replay, concurrency, soak, long-prefill,
+and memory qualification open. Until all those gates pass, the selector stays
+default-off.
 
 #### Source block-FP8 W8A16 and 0.8.6 DSpark integration gate
 
@@ -566,7 +649,7 @@ that logic for no extra signal. One mechanical fact drives
 Every optional monorepo dependency in `test_cb_kernels.py` is now guarded, so
 the installed-wheel matrix collects every test module. Current CI runs the
 suite on Python 3.10–3.13 from outside the checkout, with one pytest process per
-file. Five tests also exercise validation entry points that intentionally ship
+file. Six tests also exercise validation entry points that intentionally ship
 only in the sdist. `run_cpu_tests.sh` exports `GRIDBOOK_SOURCE_ROOT`, resolved
 from its own checkout location, so those utilities remain available after the
 tests are staged and the same command works outside GitHub (where the ambient

@@ -493,6 +493,26 @@ def _cb_moe_gemv_fp8_fake(xq, qw, cb_flat_fp8, scale, pair_expert, pair_xrow,
                        device=xq.device)
 
 
+@torch.library.custom_op("prismaquant::cb_moe_gemv_fp8_v2", mutates_args=())
+def cb_moe_gemv_fp8_v2(xq: torch.Tensor, qw: torch.Tensor,
+                       cb_flat_fp8: torch.Tensor, scale: torch.Tensor,
+                       pair_expert: torch.Tensor, pair_xrow: torch.Tensor,
+                       k_bits: int, n_sub: int,
+                       type_size: int) -> torch.Tensor:
+    """K28 whole-row routed FP8-CB GEMV sibling (act already FP8-QDQ'd)."""
+    from .cuda_ext import require_ext
+    return require_ext("routed FP8-CB whole-row GEMV").cb_moe_gemv_fp8_v2(
+        xq, qw, cb_flat_fp8, scale, pair_expert, pair_xrow,
+        k_bits, n_sub, type_size)
+
+
+@cb_moe_gemv_fp8_v2.register_fake
+def _cb_moe_gemv_fp8_v2_fake(xq, qw, cb_flat_fp8, scale, pair_expert,
+                              pair_xrow, k_bits, n_sub, type_size):
+    return torch.empty((pair_expert.shape[0], qw.shape[1]), dtype=xq.dtype,
+                       device=xq.device)
+
+
 @torch.library.custom_op("prismaquant::cb_moe_combine", mutates_args=())
 def cb_moe_combine(y: torch.Tensor, pair_w: torch.Tensor,
                    tok_start: torch.Tensor, T: int) -> torch.Tensor:

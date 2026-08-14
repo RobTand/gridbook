@@ -24,7 +24,8 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from . import codec
 from .cb_fill_guard import mark_filled, mark_unfilled
-from .moe_gemv_select import cb_gemv_choice
+from .moe_gemv_select import (cb_fp8_gemv_v2_requested,
+                              cb_gemv_choice)
 from .per_expert_format import (
     ExpertFormatGroup,
     LayerFormatGroups,
@@ -97,6 +98,33 @@ class PrismaQuantMixedMoEMethod(FusedMoEMethodBase):
 
     def get_fused_moe_quant_config(self, layer) -> FusedMoEQuantConfig | None:
         return None
+
+    def _require_fp8_v2_dispatch_supported(self) -> None:
+        """Refuse an explicit routed-FP8-v2 arm on mixed expert groups.
+
+        The uniform method owns the qualified whole-row dispatch.  Mixed
+        groups have separate family-local maps and currently call the
+        inherited FP8 op directly; silently accepting the global opt-in here
+        would produce a mixed/inherited benchmark mislabeled as FP8-v2.
+        Parsing the selector even for FP4-only declarations also keeps invalid
+        spellings process-global instead of depending on which layer loads
+        first.
+        """
+        if not cb_fp8_gemv_v2_requested():
+            return
+        fp8_groups = [
+            f"{family}:{group.format_wire_id}"
+            for family in ("w13", "w2")
+            for group in self.groups.groups(family)
+            if not group.is_passthrough
+            and self._scheme_for(group).get("grid") == "fp8"
+        ]
+        if fp8_groups:
+            raise RuntimeError(
+                f"{self.prefix}: PRISMAQUANT_CB_FP8_GEMV_V2=1 is not "
+                "implemented for per-expert mixed FP8 groups "
+                f"{fp8_groups}; refusing a silently inherited candidate arm"
+            )
 
     def _scheme_for(self, group: ExpertFormatGroup) -> dict:
         target = self.quant_config._per_expert_serving_prefixes[
@@ -358,6 +386,7 @@ class PrismaQuantMixedMoEMethod(FusedMoEMethodBase):
         )
         from .native_cutlass import require_native_fp8_cutlass
 
+        self._require_fp8_v2_dispatch_supported()
         codebooks = self.quant_config.get_codebooks()
         require_ext(f"{self.prefix} mixed routed CB decode/QDQ/expansion")
         require_bf16_grouped_ext(
