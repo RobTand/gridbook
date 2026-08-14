@@ -75,13 +75,20 @@ template <
   int Stages_,
   int SchedulerPipelineStageCount_,
   class ClusterShape_,
-  class KernelSchedule_
+  class KernelSchedule_,
+  bool DirectFragment_ = false,
+  int DirectKBits_ = 0
 >
 struct MainloopSm120CbFusedFp4TmaWarpSpecialized {
   constexpr static int Stages = Stages_;
   using ClusterShape = ClusterShape_;
   using Schedule = KernelSchedule_;
   constexpr static int PipelineAsyncMmaStages = 0;
+  // Research-only specialization.  The production/default instantiations keep
+  // both defaults and therefore preserve the established smem-decode path.
+  // The separate probe translation unit selects (true, 18) explicitly.
+  constexpr static bool DirectFragment = DirectFragment_;
+  constexpr static int DirectKBits = DirectKBits_;
   using ArchTag = arch::Sm120;
 };
 
@@ -95,6 +102,8 @@ template <
   int SchedulerPipelineStageCount,
   class ClusterShape,
   class KernelScheduleType,
+  bool DirectFragment_,
+  int DirectKBits_,
   class TileShape_,
   class ElementPairA_,
   class StridePairA_,
@@ -110,7 +119,7 @@ template <
   class SmemCopyAtomsB_,
   class TransformB_>
 struct CollectiveMma<
-    MainloopSm120CbFusedFp4TmaWarpSpecialized<Stages, SchedulerPipelineStageCount, ClusterShape, KernelScheduleType>,
+    MainloopSm120CbFusedFp4TmaWarpSpecialized<Stages, SchedulerPipelineStageCount, ClusterShape, KernelScheduleType, DirectFragment_, DirectKBits_>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -125,7 +134,7 @@ struct CollectiveMma<
     SmemLayoutAtomsB_,
     SmemCopyAtomsB_,
     TransformB_> {
-  using DispatchPolicy = MainloopSm120CbFusedFp4TmaWarpSpecialized<Stages, SchedulerPipelineStageCount, ClusterShape, KernelScheduleType>;
+  using DispatchPolicy = MainloopSm120CbFusedFp4TmaWarpSpecialized<Stages, SchedulerPipelineStageCount, ClusterShape, KernelScheduleType, DirectFragment_, DirectKBits_>;
   using TileShape = TileShape_;
   using ElementPairA = ElementPairA_;
   using ElementPairB = ElementPairB_;
@@ -191,8 +200,12 @@ struct CollectiveMma<
   static constexpr int TileM = size<0>(TileShape{});
   static constexpr int TileN = size<1>(TileShape{});
   static constexpr int TileK = size<2>(TileShape{});
+  static constexpr bool DirectFragment = DispatchPolicy::DirectFragment;
+  static constexpr int DirectKBits = DispatchPolicy::DirectKBits;
   static_assert(TileK == 128, "CB fused fp4 mainloop assumes TileK = 128 (half a 256-weight superblock)");
   static_assert(TileN == 128, "blockscaled SF smem atoms require TileN == Blk_MN == 128");
+  static_assert(!DirectFragment || DirectKBits == 18,
+                "the direct-fragment research specialization is deliberately K18-only");
 
   // Per-stage packed-B DESCRIPTOR (attempt-2 of the staging design; the
   // number below is the whole surviving record of why attempt-1 was rejected,
@@ -216,7 +229,7 @@ struct CollectiveMma<
   // S13..S16 is <= 1 KiB) + the two-tier compose table (256 x 16 e4m3 bytes).
   // Runtime lut_bytes selects how much is staged; the carve is constant so
   // ONE instantiation serves the whole ladder.
-  static constexpr int CbLutMaxBytes = 16384;
+  static constexpr int CbLutMaxBytes = DirectFragment ? 2048 : 16384;
   static constexpr int CbComposeBytes = 4096;
 
   // A/SFA: unchanged pipelined layouts (pristine).
@@ -266,8 +279,14 @@ struct CollectiveMma<
       alignas(1024) cute::ArrayEngine<SmemAllocTypeA, cute::cosize_v<SmemLayoutA>> smem_A;
       alignas(16) cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFA>> smem_SFA;
       alignas(16) cute::array_aligned<uint8_t, CbStageDescBytes * DispatchPolicy::Stages> smem_BP;
-      alignas(1024) cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
-      alignas(16) cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB;
+      // Keep a one-element type/shape anchor in the direct specialization so
+      // CUTLASS can still construct the register-fragment layouts, but do not
+      // reserve the decoded [TileN,TileK] B/SFB tiles.  No direct-path code may
+      // dereference either anchor; can_implement also forbids the debug dump.
+      alignas(1024) cute::ArrayEngine<SmemAllocTypeB,
+          DirectFragment ? 1 : cute::cosize_v<SmemLayoutB>> smem_B;
+      alignas(16) cute::ArrayEngine<ElementSF,
+          DirectFragment ? 1 : cute::cosize_v<SmemLayoutSFB>> smem_SFB;
       alignas(16) cute::array_aligned<uint8_t, CbLutMaxBytes> smem_lut;
       alignas(16) cute::array_aligned<uint8_t, CbComposeBytes> smem_compose;
     } tensors;
@@ -399,6 +418,17 @@ struct CollectiveMma<
     implementable = implementable &&
         (args.ptr_lut_tile_ids == nullptr || args.num_lut_tiles == ceil_div(N, TileN));
     implementable = implementable && (!args.is_v2 || args.ptr_compose != nullptr);
+    if constexpr (DirectFragment) {
+      // This ABI is intentionally a single-cell feasibility probe.  Do not
+      // let the research specialization silently widen to another rung,
+      // signed layout, v1 scale plane, merged-role LUT map, or MoE grouping.
+      implementable = implementable &&
+          args.k_bits == DirectKBits && args.n_sub == 2 && args.is_v2 == 1 &&
+          args.type_size == 4 * DirectKBits + 9 &&
+          args.lut_bytes == CbLutMaxBytes && args.num_lut_blocks == 1 &&
+          args.ptr_lut_tile_ids == nullptr && args.ptr_expert_ids == nullptr &&
+          args.ptr_debug == nullptr;
+    }
     return implementable;
   }
 
@@ -471,6 +501,21 @@ struct CollectiveMma<
     auto thr_vnk = make_coord(get<0>(thr_vmnk), make_coord(get<2>(thr_vmnk), get<3>(thr_vmnk)));
     auto partition_SFB = thr_tensor(thr_vnk, make_coord(_, repeat<rank<1,1>(thr_tensor)>(_)));
     return make_fragment_like<ValTypeSF>(partition_SFB);
+  }
+
+  // Coordinate twin of partition_fragment_SFB.  The direct-fragment probe
+  // uses it to derive each architectural SFB byte's logical (N,K) address
+  // from the CUTLASS atom itself; the normal smem path does not instantiate it.
+  template <class SFBTensor, class ThrMma>
+  CUTE_HOST_DEVICE constexpr auto
+  partition_coordinate_SFB(SFBTensor&& sfbtensor, ThrMma& thread_mma) {
+    auto thr_tensor = make_tensor(static_cast<SFBTensor&&>(sfbtensor).data(),
+                                  thrfrg_SFB(sfbtensor.layout(), thread_mma));
+    auto thr_vmnk = thread_mma.thr_vmnk_;
+    auto thr_vnk = make_coord(get<0>(thr_vmnk),
+                              make_coord(get<2>(thr_vmnk), get<3>(thr_vmnk)));
+    return thr_tensor(thr_vnk,
+                      make_coord(_, repeat<rank<1,1>(thr_tensor)>(_)));
   }
 
   template<class TiledMma_Arg>
@@ -655,6 +700,134 @@ struct CollectiveMma<
       for (int w = 0; w < NWords / ThreadCount; ++w) {
         dst[thread_idx + w * ThreadCount] = __ldg(src + thread_idx + w * ThreadCount);
       }
+    }
+  }
+
+  // --- K18 research path: packed CB -> native OMMA register fragments ------
+  //
+  // The SM120 m16n8k64 block-scaled atom's BLayout is
+  //
+  //   (T32,V16) -> (N8,K64)
+  //   Shape ((4,8),(8,2)), Stride ((64,1),(8,256)).
+  //
+  // CUTE linearises the first thread-shape mode first, so lane ``t`` owns
+  // N=t/4 and each of its two uint32 B registers
+  // owns one aligned run of eight K values:
+  //
+  //   b0 = K[8*(t%4) + 0..7]
+  //   b1 = K[32 + 8*(t%4) + 0..7].
+  //
+  // That is exactly one product-codebook codeword per register.  CUTLASS's
+  // tiled/permuted N layout is more involved than the atom, so the code below
+  // asks the TiledMma for its coordinate partition instead of duplicating that
+  // permutation by hand.  The first logical nibble of each recast uint32 names
+  // the row and aligned K base of the codeword that fills the complete register.
+  // No BF16 value or decoded B/SFB tile is formed on this path.
+  CUTLASS_DEVICE uint32_t
+  direct_decode_product_codeword_k18(
+      TensorStorage const& shared_tensors, Params const& params,
+      uint8_t const* gp, int n_base, int sb, int half,
+      int n_local, int k_local) const {
+    constexpr int Kb = 18;
+    constexpr int W0 = 9;
+    constexpr uint32_t Mask = (1u << Kb) - 1u;
+    constexpr uint32_t Mask0 = (1u << W0) - 1u;
+    constexpr uint32_t Mask1 = (1u << (Kb - W0)) - 1u;
+
+    // Every uint32 fragment register must begin at one serialized 8-value
+    // codeword.  A mapping drift is a device-side refusal, not wrong logits.
+    if ((k_local & 7) != 0 || k_local < 0 || k_local >= TileK) {
+      asm volatile("trap;");
+    }
+    int n_glob = n_base + n_local;
+    n_glob = n_glob < params.N_rows ? n_glob : (params.N_rows - 1);
+    const int64_t sb_off = int64_t(sb) * params.type_size;
+    const uint8_t* row_g = gp + int64_t(n_glob) * params.packed_row_bytes + sb_off;
+    const int codeword = k_local >> 3;
+    const int bitpos = codeword * Kb;
+    const int idx_off = half * 2 * Kb;
+    const uint8_t* pbyte = row_g + idx_off + (bitpos >> 3);
+    const uintptr_t pa = reinterpret_cast<uintptr_t>(pbyte);
+    const uint32_t* al = reinterpret_cast<const uint32_t*>(pa & ~uintptr_t(3));
+    const int rem = int((pa & 3) * 8) + (bitpos & 7);
+    const uint64_t w64 = (uint64_t(__ldg(al + 1)) << 32) | __ldg(al);
+    const uint32_t code = uint32_t(w64 >> rem) & Mask;
+
+    const uint16_t* lut16 = reinterpret_cast<const uint16_t*>(
+        shared_tensors.smem_lut.data());
+    const uint32_t p0 = lut16[code & Mask0];
+    const uint32_t p1 = lut16[(1u << W0) + ((code >> W0) & Mask1)];
+    return p0 | (p1 << 16);
+  }
+
+  CUTLASS_DEVICE uint8_t
+  direct_compose_sfb_k18(
+      TensorStorage const& shared_tensors, Params const& params,
+      uint8_t const* gp, int n_base, int sb, int half,
+      int n_local, int k_local) const {
+    constexpr int Kb = 18;
+    if ((k_local & 15) != 0 || k_local < 0 || k_local >= TileK) {
+      asm volatile("trap;");
+    }
+    int n_glob = n_base + n_local;
+    n_glob = n_glob < params.N_rows ? n_glob : (params.N_rows - 1);
+    const uint8_t* srow = gp + int64_t(n_glob) * params.packed_row_bytes +
+        int64_t(sb) * params.type_size + 4 * Kb;
+    const int gs = half * 8 + (k_local >> 4);
+    const int exponent = __ldg(srow);
+    const int codes = __ldg(srow + 1 + (gs >> 1));
+    const int code = (codes >> ((gs & 1) * 4)) & 0xf;
+    return shared_tensors.smem_compose.data()[exponent * 16 + code];
+  }
+
+  template <class FrgB, class CoordB, class FrgSFB, class CoordSFB>
+  CUTLASS_DEVICE void
+  decode_direct_fragment_k18(
+      TensorStorage const& shared_tensors, Params const& params,
+      int read_stage, int sb, int half,
+      FrgB&& tCrB_k, CoordB const& tCcB_k,
+      FrgSFB&& tCrSFB_k, CoordSFB const& tCcSFB_k) const {
+    const uint8_t* slot = shared_tensors.smem_BP.data()
+        + read_stage * CbStageDescBytes;
+    const uint8_t* __restrict__ gp = reinterpret_cast<const uint8_t*>(
+        *reinterpret_cast<const uint64_t*>(slot));
+    const int n_base = *reinterpret_cast<const int32_t*>(slot + 8);
+
+    // The atom contributes 16 four-bit B values per lane. Recasting the V
+    // mode produces exactly its two architectural uint32 B registers.
+    CUTE_STATIC_ASSERT_V(size<0>(tCrB_k) == Int<16>{});
+    auto rB = recast<uint32_t>(tCrB_k);
+    CUTE_STATIC_ASSERT_V(size<0>(rB) == Int<2>{});
+    CUTLASS_PRAGMA_UNROLL
+    for (int n_frag = 0; n_frag < int(size<1>(rB)); ++n_frag) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int reg = 0; reg < 2; ++reg) {
+        auto nk = tCcB_k(make_coord(reg * 8, n_frag));
+        const int n_local = int(get<0>(nk));
+        const int k_local = int(get<1>(nk));
+        rB(make_coord(reg, n_frag)) = direct_decode_product_codeword_k18(
+            shared_tensors, params, gp, n_base, sb, half,
+            n_local, k_local);
+      }
+    }
+
+    // SFBLayout has one physical UE4M3 byte per logical group of 16 and zero
+    // strides across the other 15 logical K positions.  Filtering those zero
+    // modes exposes exactly the architectural SFB register bytes.  Their
+    // compact order is the order recast<uint32_t> supplies to mma_unpack.
+    auto fSFB = filter_zeros(tCrSFB_k);
+    auto fCcSFB = filter_zeros(tCcSFB_k);
+    CUTE_STATIC_ASSERT_V(shape(fSFB) == shape(fCcSFB));
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < int(size(fSFB)); ++i) {
+      auto nk = fCcSFB(i);
+      const int n_local = int(get<0>(nk));
+      const int k_local = int(get<1>(nk));
+      ElementSF sf;
+      sf.storage = direct_compose_sfb_k18(
+          shared_tensors, params, gp, n_base, sb, half,
+          n_local, k_local);
+      fSFB(i) = sf;
     }
   }
 
@@ -886,16 +1059,37 @@ struct CollectiveMma<
     auto tCsSFA_stage = tCsSFA(_,_,_,read_stage);
     auto tCsSFB_stage = tCsSFB(_,_,_,Int<0>{});
 
+    int t_abs = 0;
     auto copy_kblock = [&](auto k_block) {
       copy(smem_tiled_copy_A, tCsA_stage(_,_,k_block), tCrA_copy_view(_,_,k_block));
-      copy(smem_tiled_copy_B, tCsB_stage(_,_,k_block), tCrB_copy_view(_,_,k_block));
+      if constexpr (DirectFragment) {
+        // CUTLASS-authored logical-coordinate twins. They are compile-time
+        // layout objects (no register/smem payload) and are instantiated only
+        // for the research specialization, leaving the default path's type
+        // graph unchanged.
+        auto cB = make_identity_tensor(
+            make_shape(Int<TileN>{}, Int<TileK>{}));
+        auto tCcB = thread_mma.partition_B(cB);
+        auto cSFB = make_identity_tensor(
+            make_shape(Int<TileN>{}, Int<TileK>{}));
+        auto tCcSFB = partition_coordinate_SFB(cSFB, thread_mma);
+        decode_direct_fragment_k18(
+            shared_tensors, params, read_stage, t_abs >> 1, t_abs & 1,
+            tCrB(_,_,k_block), tCcB(_,_,k_block),
+            tCrSFB(_,_,k_block), tCcSFB(_,_,k_block));
+      } else {
+        copy(smem_tiled_copy_B, tCsB_stage(_,_,k_block),
+             tCrB_copy_view(_,_,k_block));
+      }
       // Left shift A,B for FP4 (no-op for the non-f8f6f4 VS atom; kept to
       // mirror the pristine mainloop exactly).
       using MMAOp = typename TiledMma::MMA_Op;
       fp4_shift_A(MMAOp{}, tCrA_copy_view(_,_,k_block));
       fp4_shift_B(MMAOp{}, tCrB_copy_view(_,_,k_block));
       copy(tCsSFA_stage(_,_,k_block), tCrSFA_copy_view(_,_,k_block));
-      copy(tCsSFB_stage(_,_,k_block), tCrSFB_copy_view(_,_,k_block));
+      if constexpr (!DirectFragment) {
+        copy(tCsSFB_stage(_,_,k_block), tCrSFB_copy_view(_,_,k_block));
+      }
     };
     auto gemm_kblock = [&](auto k_block) {
       cute::gemm(tiled_mma,
@@ -917,7 +1111,6 @@ struct CollectiveMma<
       resident_lut_block_id_ = 0;
     }
 
-    int t_abs = 0;
     pipeline.consumer_wait(smem_pipe_read);
     if (params.ptr_lut_tile_ids != nullptr) {
       const uint8_t* slot = shared_tensors.smem_BP.data()
@@ -937,29 +1130,33 @@ struct CollectiveMma<
         resident_lut_block_id_ = lut_block_id;
       }
     }
-    decode_stage(shared_tensors, sB_base, sB_nosw, sB_sw, sfb_layout, params,
-                 read_stage, t_abs >> 1, t_abs & 1, thread_idx);
-    cutlass::arch::NamedBarrier::sync(
-        thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-    if (params.ptr_debug != nullptr && blockIdx.x == 0 && blockIdx.y == 0 &&
-        !debug_dumped_) {
-      // raw physical bytes: [smem_B cosize/2 | smem_SFB cosize | lut 16K |
-      // compose 4K]
-      constexpr int NB = cute::cosize_v<SmemLayoutB> / 2;
-      constexpr int NSFB = cute::cosize_v<SmemLayoutSFB>;
-      const uint8_t* pb = reinterpret_cast<const uint8_t*>(&shared_tensors.smem_B);
-      const uint8_t* psfb = reinterpret_cast<const uint8_t*>(&shared_tensors.smem_SFB);
-      uint8_t* d = params.ptr_debug;
-      for (int i = thread_idx; i < NB; i += ThreadCount) d[i] = pb[i];
-      d += NB;
-      for (int i = thread_idx; i < NSFB; i += ThreadCount) d[i] = psfb[i];
-      d += NSFB;
-      for (int i = thread_idx; i < CbLutMaxBytes; i += ThreadCount) d[i] = shared_tensors.smem_lut.data()[i];
-      d += CbLutMaxBytes;
-      for (int i = thread_idx; i < CbComposeBytes; i += ThreadCount) d[i] = shared_tensors.smem_compose.data()[i];
-      debug_dumped_ = true;
+    if constexpr (!DirectFragment) {
+      decode_stage(shared_tensors, sB_base, sB_nosw, sB_sw, sfb_layout, params,
+                   read_stage, t_abs >> 1, t_abs & 1, thread_idx);
       cutlass::arch::NamedBarrier::sync(
           thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+    }
+    if constexpr (!DirectFragment) {
+      if (params.ptr_debug != nullptr && blockIdx.x == 0 && blockIdx.y == 0 &&
+          !debug_dumped_) {
+        // raw physical bytes: [smem_B cosize/2 | smem_SFB cosize | lut 16K |
+        // compose 4K]
+        constexpr int NB = cute::cosize_v<SmemLayoutB> / 2;
+        constexpr int NSFB = cute::cosize_v<SmemLayoutSFB>;
+        const uint8_t* pb = reinterpret_cast<const uint8_t*>(&shared_tensors.smem_B);
+        const uint8_t* psfb = reinterpret_cast<const uint8_t*>(&shared_tensors.smem_SFB);
+        uint8_t* d = params.ptr_debug;
+        for (int i = thread_idx; i < NB; i += ThreadCount) d[i] = pb[i];
+        d += NB;
+        for (int i = thread_idx; i < NSFB; i += ThreadCount) d[i] = psfb[i];
+        d += NSFB;
+        for (int i = thread_idx; i < CbLutMaxBytes; i += ThreadCount) d[i] = shared_tensors.smem_lut.data()[i];
+        d += CbLutMaxBytes;
+        for (int i = thread_idx; i < CbComposeBytes; i += ThreadCount) d[i] = shared_tensors.smem_compose.data()[i];
+        debug_dumped_ = true;
+        cutlass::arch::NamedBarrier::sync(
+            thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+      }
     }
 
     copy_kblock(_0{});
@@ -977,10 +1174,13 @@ struct CollectiveMma<
           tCsSFA_stage = tCsSFA(_,_,_,read_stage);
           pipeline.consumer_wait(smem_pipe_read);
           ++t_abs;
-          decode_stage(shared_tensors, sB_base, sB_nosw, sB_sw, sfb_layout,
-                       params, read_stage, t_abs >> 1, t_abs & 1, thread_idx);
-          cutlass::arch::NamedBarrier::sync(
-              thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+          if constexpr (!DirectFragment) {
+            decode_stage(shared_tensors, sB_base, sB_nosw, sB_sw, sfb_layout,
+                         params, read_stage, t_abs >> 1, t_abs & 1, thread_idx);
+            cutlass::arch::NamedBarrier::sync(
+                thr_size(tiled_mma),
+                cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+          }
         }
         copy_kblock(k_block_next);
         gemm_kblock(k_block);

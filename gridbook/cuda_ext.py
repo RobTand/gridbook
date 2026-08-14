@@ -2152,3 +2152,142 @@ _PRELOAD_FAMILIES.append(("moe_persistent_b", "get_moe_persistent_b_ext"))
 # ===========================================================================
 # END ADDITIVE BLOCK — persistent-B grouped MoE loader
 # ===========================================================================
+# BEGIN ADDITIVE BLOCK — native OMMA K18 direct-fragment feasibility probe.
+#
+# Research-only and DEFAULT OFF.  This module consumes the same resident
+# packed CB/LUT/compose tensors and native E2M1+UE4M3 activation payload as the
+# existing fused FP4 extension, but it is not a serving lane and is therefore
+# intentionally absent from `_PRELOAD_FAMILIES` and every dispatch registry.
+# ===========================================================================
+_FP4_D2F_PROBE_FLAG = "PRISMAQUANT_CB_FP4_D2F_PROBE"
+_fp4_d2f_probe = None
+_fp4_d2f_probe_tried = False
+_fp4_d2f_probe_lock = threading.Lock()
+
+_FP4_D2F_PROBE_BUILD_INPUTS = (
+    "cb_fp4_direct_fragment_probe.cu",
+    "cutlass_fork/sm120_cb_fused_fp4_mma.hpp",
+    "cb_grouped_common.hpp",
+    "cutlass_fork/sm120_expert_row_broadcast.hpp",
+)
+_FP4_D2F_PROBE_ABI_SCHEMA = 1
+_FP4_D2F_PROBE_SYMBOLS = (
+    "cb_fp4_direct_fragment_k18",
+    "cb_fp4_direct_fragment_k18_out",
+    "cb_fp4_direct_fragment_k18_workspace_bytes",
+    "cb_fp4_direct_fragment_probe_contract",
+    "cb_fp4_direct_fragment_resource_report",
+)
+_FP4_D2F_PROBE_CAPABILITIES = ((12, 0), (12, 1))
+
+
+def _fp4_d2f_probe_requested() -> bool:
+    """Parse the research opt-in strictly; a typo must not build CUDA."""
+    raw = os.environ.get(_FP4_D2F_PROBE_FLAG, "").strip()
+    if raw in ("", "0"):
+        return False
+    if raw == "1":
+        return True
+    raise ValueError(
+        f"{_FP4_D2F_PROBE_FLAG} must be unset, '0', or '1', got {raw!r}")
+
+
+def fp4_d2f_probe_buildable(capability) -> bool:
+    """Whether the native OMMA instruction exists for ``capability``."""
+    return tuple(capability) in _FP4_D2F_PROBE_CAPABILITIES
+
+
+def _fp4_d2f_probe_build_identity(torch, cpp_extension, *, src_dir: str,
+                                   cutlass_include: str,
+                                   util_include: str,
+                                   capability: tuple[int, int]):
+    return _fused_build_identity(
+        torch, cpp_extension, src_dir=src_dir,
+        cutlass_include=cutlass_include, util_include=util_include,
+        capability=capability,
+        build_inputs=_FP4_D2F_PROBE_BUILD_INPUTS,
+        bindings=(("K18 native OMMA direct-fragment probe",
+                   _FP4_D2F_PROBE_SYMBOLS),),
+        abi_schema=_FP4_D2F_PROBE_ABI_SCHEMA,
+        accelerated=True)
+
+
+def get_fp4_direct_fragment_probe_ext():
+    """Return the opt-in K18 native-OMMA feasibility module, or ``None``.
+
+    Unset/``0`` returns before importing torch, discovering CUTLASS, creating a
+    build directory, or latching an attempted build.  The probe cannot affect
+    normal Gridbook startup or extension residency.
+    """
+    if not _fp4_d2f_probe_requested():
+        return None
+    if _fp4_d2f_probe_tried:
+        return _fp4_d2f_probe
+    with _fp4_d2f_probe_lock:
+        if _fp4_d2f_probe_tried:
+            return _fp4_d2f_probe
+        return _load_fp4_d2f_probe_ext_locked()
+
+
+def _load_fp4_d2f_probe_ext_locked():
+    global _fp4_d2f_probe, _fp4_d2f_probe_tried
+    try:
+        import torch  # noqa: F401
+        from torch.utils import cpp_extension
+
+        cc = _target_capability(
+            "the K18 native OMMA direct-fragment probe "
+            "(cb_fp4_direct_fragment_probe.cu)")
+        if not fp4_d2f_probe_buildable(cc):
+            raise RuntimeError(
+                "the native OMMA direct-fragment probe requires compute "
+                f"capability 12.0/12.1, got {cc[0]}.{cc[1]}")
+        cut_inc = _find_cutlass_include()
+        util_inc = os.path.join(
+            os.path.dirname(cut_inc), "tools", "util", "include")
+        src_dir = _require_csrc(*_FP4_D2F_PROBE_BUILD_INPUTS)
+        identity, _payload = _fp4_d2f_probe_build_identity(
+            torch, cpp_extension, src_dir=src_dir,
+            cutlass_include=cut_inc, util_include=util_inc, capability=cc)
+        module_name = f"pq_cb_fp4_d2f_probe_{identity}"
+        build_root = (os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext"))
+        build_dir = os.path.join(build_root, "fp4_d2f_probe", identity)
+        os.makedirs(build_dir, exist_ok=True)
+        include_paths = [cut_inc, src_dir]
+        if os.path.isdir(util_inc):
+            include_paths.append(util_inc)
+        mod = cpp_extension.load(
+            name=module_name,
+            sources=[os.path.join(src_dir,
+                                  "cb_fp4_direct_fragment_probe.cu")],
+            extra_include_paths=include_paths,
+            extra_cuda_cflags=[
+                "-O3", "--expt-relaxed-constexpr",
+                _gencode_flag(cc, accelerated=True),
+            ],
+            build_directory=build_dir,
+            verbose=False)
+        mod = _require_symbols(
+            mod, _FP4_D2F_PROBE_SYMBOLS, build_dir=build_dir,
+            source="cb_fp4_direct_fragment_probe.cu")
+        _fp4_d2f_probe = _require_fused_identity(
+            mod, expected_name=module_name, identity=identity,
+            abi_schema=_FP4_D2F_PROBE_ABI_SCHEMA,
+            build_dir=build_dir, source="cb_fp4_direct_fragment_probe.cu",
+            capability=cc)
+    except Exception as exc:  # noqa: BLE001 — explicit research probe
+        print("[prismaquant-cb] WARNING: opt-in native OMMA direct-fragment "
+              f"probe unavailable ({type(exc).__name__}: {exc}). No serving "
+              "dispatch was changed.", file=sys.stderr, flush=True)
+        _fp4_d2f_probe = None
+    finally:
+        _fp4_d2f_probe_tried = True
+    return _fp4_d2f_probe
+
+
+# Deliberately no `_PRELOAD_FAMILIES.append`: an unset feasibility probe must
+# not change module residency or benchmark arithmetic.
+# ===========================================================================
+# END ADDITIVE BLOCK — native OMMA K18 direct-fragment feasibility probe
+# ===========================================================================
