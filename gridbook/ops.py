@@ -331,6 +331,32 @@ def _cb_moe_persistent_b_prefill_fake(out, a, qw, lut, compose, expert_ends,
     return None
 
 
+@torch.library.custom_op("prismaquant::cb_moe_persistent_b_prefill_d2r",
+                         mutates_args=("out",))
+def cb_moe_persistent_b_prefill_d2r(out: torch.Tensor, a: torch.Tensor,
+                                    qw: torch.Tensor, lut: torch.Tensor,
+                                    compose: torch.Tensor,
+                                    expert_ends: torch.Tensor, k_bits: int,
+                                    type_size: int, cfg: int) -> None:
+    """Nested experimental D2R form of persistent-B, into caller-owned out.
+
+    Same extension, routing and operands as ``cb_moe_persistent_b_prefill``;
+    only the B-fragment construction inside its mainloop differs.
+    """
+    from .cuda_ext import require_moe_persistent_b_d2r_ext
+    require_moe_persistent_b_d2r_ext(
+        "persistent-B direct-to-register MoE prefill"
+    ).cb_moe_persistent_b_prefill_d2r(
+        out, a, qw, lut, compose, expert_ends, k_bits, type_size, cfg)
+
+
+@cb_moe_persistent_b_prefill_d2r.register_fake
+def _cb_moe_persistent_b_prefill_d2r_fake(out, a, qw, lut, compose,
+                                          expert_ends, k_bits, type_size,
+                                          cfg):
+    return None
+
+
 @torch.library.custom_op("prismaquant::cb_moe_persistent_b_decode",
                          mutates_args=())
 def cb_moe_persistent_b_decode(qw_flat: torch.Tensor, lut: torch.Tensor,

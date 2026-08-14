@@ -181,6 +181,36 @@
 // e4m3 plane plus a per-(expert,row) fp32 scale) can be slotted in later
 // without touching the schedule; that is deliberately NOT implemented here
 // (ROADMAP K1.2 owns the FP8 rung surface).
+//
+// ===========================================================================
+// EXPERIMENTAL DIRECT-TO-REGISTER B VARIANT
+// ===========================================================================
+// `cb_moe_persistent_b_prefill_d2r` is a DEFAULT-OFF sibling entry point in
+// THIS extension.  It preserves the activation and BF16 weight-decode
+// contract above, but does not materialize the decoded `TN x TK` B tile in
+// shared memory.  For `mma.sync.m16n8k16.row.col`, a lane owns B row
+// `n = lane >> 2` and the pair `kpair = 2 * (lane & 3)`: its two B registers
+// hold `(kpair, kpair+1)` and `(kpair+8, kpair+9)`.  `cb_decode_pair` produces
+// exactly those two rounded BF16 values from each of the two codewords.
+//
+// Removing B's `ldmatrix` also removes the reason the baseline partitions
+// warps over 32-column N slices.  The candidate sets WN=WARPS and WM=1: each
+// warp owns a UNIQUE 8- or 16-column N slice, and the four lanes sharing an N
+// row decode the four distinct pairs of a codeword exactly once.  There is no
+// full-codeword shuffle or shared-memory exchange: three width-4 shuffles
+// broadcast the two index pairs and shared scale inside each four-lane N-row
+// subgroup.  There is no cross-warp duplicate B decode.  The trade is 2-4x
+// more `ldmatrix` reads of the already-resident A tile, which is deliberately
+// left for the baseline-vs-candidate benchmark to measure.
+//
+// The candidate retains double-buffered A and the packed-superblock staging.
+// Its packed staging happens AFTER barrier (1): unlike the baseline, MMA
+// reads `sPk` directly, so that CTA barrier is the WAR fence between the last
+// pair decode of superblock s and the first overwrite with superblock s+1.
+// Each D2R warp stages exactly the contiguous sPk rows only that warp consumes
+// and publishes them with `__syncwarp`; no D2R consumer crosses a warp, so the
+// baseline's CTA-wide decoded-B publication barrier is unnecessary.  This
+// ownership and ordering are load-bearing.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -263,13 +293,9 @@ struct CbFp4V2Fmt {
 // `lut_smem` selects a plain generic load over `__ldg` because `__ldg` is
 // defined only for GLOBAL addresses; it changes where the identical bytes are
 // read from, never what they are.
-template <bool LutSmem>
-DEVINL uint4 cb_decode_codeword(const uint32_t* __restrict__ s32,
-                                const uint8_t* __restrict__ sbytes,
-                                int c,
-                                const CbFp4V2Fmt& f,
-                                const uint16_t* lut,
-                                const float* __restrict__ compose) {
+DEVINL uint64_t cb_extract_code(const uint32_t* __restrict__ s32,
+                               int c,
+                               const CbFp4V2Fmt& f) {
   const int bitpos = c * f.k_bits;
   const int b0 = bitpos >> 3;
   const int rem = ((b0 & 3) << 3) + (bitpos & 7);
@@ -281,6 +307,17 @@ DEVINL uint4 cb_decode_codeword(const uint32_t* __restrict__ s32,
     code |= (uint64_t)s32[widx + 2] << (64 - rem);
   }
   code &= (f.k_bits >= 64) ? ~0ull : ((1ull << f.k_bits) - 1ull);
+  return code;
+}
+
+template <bool LutSmem>
+DEVINL uint4 cb_decode_codeword(const uint32_t* __restrict__ s32,
+                                const uint8_t* __restrict__ sbytes,
+                                int c,
+                                const CbFp4V2Fmt& f,
+                                const uint16_t* lut,
+                                const float* __restrict__ compose) {
+  const uint64_t code = cb_extract_code(s32, c, f);
 
   // Two-tier scale: one uint8 super exponent per superblock, then 8 bytes of
   // nibbles, one nibble per group of two codewords (== per 16 output columns).
@@ -314,6 +351,79 @@ DEVINL uint4 cb_decode_codeword(const uint32_t* __restrict__ s32,
   out.z = (uint32_t)o[4] | ((uint32_t)o[5] << 16);
   out.w = (uint32_t)o[6] | ((uint32_t)o[7] << 16);
   return out;
+}
+
+DEVINL uint32_t cb_scale_pair(uint32_t q, float sc) {
+  const uint16_t h0 = (uint16_t)(q & 0xffffu);
+  const uint16_t h1 = (uint16_t)(q >> 16);
+  const uint16_t o0 = f32_to_bf16_rn(bf16_to_f32(h0) * sc);
+  const uint16_t o1 = f32_to_bf16_rn(bf16_to_f32(h1) * sc);
+  return (uint32_t)o0 | ((uint32_t)o1 << 16);
+}
+
+// Direct-to-register twin of TWO `cb_decode_codeword` calls: return the two
+// adjacent BF16 pairs one lane needs for a complete k16 MMA B fragment.
+//
+// The four lanes in a width-4 subgroup share one output N row and call this
+// with the same EVEN `c0`; `pair == lane & 3`.  Subgroup lane 0 performs the
+// two bit-window extractions and the ONE scale compose shared by c0/c0+1,
+// then broadcasts two packed (i0,i1) index pairs and the scale bits.  Every
+// lane loads exactly its own uint32 BF16 pair from each codeword.  Thus one
+// k16/N-row fragment costs two code extracts, one compose load, four pair LUT
+// loads per codeword and three width-4 shuffles -- no 4x bit/compose repeat,
+// no full-codeword broadcast, and no decoded B shared-memory exchange.
+//
+// k<=24 makes each half-index <=12 bits, so packing i0|i1<<16 is exact.
+DEVINL uint2 cb_decode_k16_pairs(const uint32_t* __restrict__ s32,
+                                const uint8_t* __restrict__ sbytes,
+                                int c0,
+                                int pair,
+                                const CbFp4V2Fmt& f,
+                                const uint16_t* lut,
+                                const float* __restrict__ compose) {
+  uint32_t packed_idx0 = 0;
+  uint32_t packed_idx1 = 0;
+  uint32_t scale_bits = 0;
+  if (pair == 0) {
+    const uint64_t code0 = cb_extract_code(s32, c0, f);
+    const uint64_t code1 = cb_extract_code(s32, c0 + 1, f);
+    const uint32_t i00 = (uint32_t)code0 & f.m0;
+    const uint32_t i01 = (uint32_t)(code0 >> f.w0) & f.m1;
+    const uint32_t i10 = (uint32_t)code1 & f.m0;
+    const uint32_t i11 = (uint32_t)(code1 >> f.w0) & f.m1;
+    packed_idx0 = i00 | (i01 << 16);
+    packed_idx1 = i10 | (i11 << 16);
+
+    // c0 is even, so c0 and c0+1 are exactly the two codewords in `grp` and
+    // share the same two-tier scale by the serialized format contract.
+    const int grp = c0 >> 1;
+    const uint32_t super_e = (uint32_t)sbytes[f.scale_off];
+    const uint32_t sub_byte =
+        (uint32_t)sbytes[f.scale_off + 1 + (grp >> 1)];
+    const uint32_t code16 = (sub_byte >> ((grp & 1) * 4)) & 0xFu;
+    scale_bits = __float_as_uint(
+        __ldg(compose + super_e * 16u + code16));
+  }
+  // Every warp lane calls the helper. `width=4` partitions the warp into
+  // eight independent four-lane groups, so srcLane=0 names each subgroup's
+  // own leader. A uniform full mask is the least ambiguous sync contract.
+  packed_idx0 = __shfl_sync(0xffffffffu, packed_idx0, 0, 4);
+  packed_idx1 = __shfl_sync(0xffffffffu, packed_idx1, 0, 4);
+  scale_bits = __shfl_sync(0xffffffffu, scale_bits, 0, 4);
+  const float sc = __uint_as_float(scale_bits);
+
+  const bool second_sub = pair >= 2;
+  const int64_t elem_base = second_sub ? (int64_t)f.e1 : 0;
+  const uint32_t idx0 = second_sub ? (packed_idx0 >> 16)
+                                   : (packed_idx0 & 0xffffu);
+  const uint32_t idx1 = second_sub ? (packed_idx1 >> 16)
+                                   : (packed_idx1 & 0xffffu);
+  const uint32_t* p0 = reinterpret_cast<const uint32_t*>(
+      lut + elem_base + (int64_t)idx0 * 4);
+  const uint32_t* p1 = reinterpret_cast<const uint32_t*>(
+      lut + elem_base + (int64_t)idx1 * 4);
+  return make_uint2(cb_scale_pair(__ldg(p0 + (pair & 1)), sc),
+                    cb_scale_pair(__ldg(p1 + (pair & 1)), sc));
 }
 
 // ---------------------------------------------------------------------------
@@ -382,11 +492,13 @@ DEVINL uint16_t* tile_at(uint16_t* base, int row, int kcol) {
 // ---------------------------------------------------------------------------
 // The persistent-B mainloop.
 //
-// Template parameters are the tile shape; WARPS*32 threads per CTA.  The warp
-// grid is WN = TN/32 columns by WM = WARPS/WN rows, so every warp owns a
-// 32x32 output patch == 2 M-atoms x 4 N-atoms == 32 accumulator registers.
+// Template parameters are the tile shape and whether B is decoded directly
+// into registers; WARPS*32 threads per CTA.  The baseline warp grid is
+// WN=TN/32, WM=WARPS/WN.  D2R uses WN=WARPS, WM=1 so each warp owns a unique
+// N slice.  Both arrangements hold exactly 32 accumulator registers/thread
+// for every compiled config.
 // ---------------------------------------------------------------------------
-template <int TM, int TN, int WARPS>
+template <int TM, int TN, int WARPS, bool D2R = false>
 __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
     const uint16_t* __restrict__ a,          // [P, K] bf16 (routed, sorted)
     const uint8_t* __restrict__ qw,          // [E, N, row_bytes] packed CB
@@ -400,23 +512,26 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
     const int n_tiles,
     const int64_t total_wu) {
   constexpr int kThreads = WARPS * 32;
-  constexpr int WN = TN / 32;
+  constexpr int WN = D2R ? WARPS : TN / 32;
   constexpr int WM = WARPS / WN;
   constexpr int MATOM = (TM / WM) / 16;
   constexpr int NATOM = (TN / WN) / 8;
   static_assert(TN % 32 == 0, "TN must be a multiple of 32");
+  static_assert(TN % (WN * 8) == 0, "warp N slices must tile in m16n8 atoms");
   static_assert(WM * WN == WARPS, "warp grid must cover the CTA");
   static_assert(TM % (16 * WM) == 0, "TM must tile the warp rows");
   static_assert(MATOM * NATOM * 4 <= 128, "accumulator register budget");
   // The MMA block issues N-atoms in PAIRS (one `ldmatrix.x4` feeds two), so an
   // odd NATOM would silently drop the last 8 output columns instead of failing
   // to compile.
-  static_assert(NATOM % 2 == 0, "N-atoms are consumed in ldmatrix.x4 pairs");
+  static_assert(D2R || NATOM % 2 == 0,
+                "baseline N-atoms are consumed in ldmatrix.x4 pairs");
 
   extern __shared__ __align__(16) uint8_t smem_raw[];
   uint16_t* sA = reinterpret_cast<uint16_t*>(smem_raw);
   uint16_t* sB = sA + 2 * TM * kTK;
-  uint8_t* sPk = reinterpret_cast<uint8_t*>(sB + TN * kTK);
+  uint8_t* sPk = reinterpret_cast<uint8_t*>(
+      D2R ? sB : sB + TN * kTK);
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -485,21 +600,25 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
         // only reader is `decode_B`, and barrier (2) of the previous stage
         // separates that read from this write.  It touches neither `sA` nor
         // `sB`, so it is safe this side of barrier (1).
-        if (st % kStagesPerSb == 0) {
-          const int sbi = st / kStagesPerSb;
-          for (int n = warp; n < TN; n += WARPS) {
-            const int gn = n0 + n;
-            uint8_t* dst = sPk + (int64_t)n * ts_pad;
-            if (gn < N) {
-              const uint8_t* src =
-                  qw_e + (int64_t)gn * row_bytes + (int64_t)sbi * fmt.type_size;
-              for (int b = lane; b < fmt.type_size; b += 32) {
-                dst[b] = __ldg(src + b);
+        if constexpr (!D2R) {
+          if (st % kStagesPerSb == 0) {
+            const int sbi = st / kStagesPerSb;
+            for (int n = warp; n < TN; n += WARPS) {
+              const int gn = n0 + n;
+              uint8_t* dst = sPk + (int64_t)n * ts_pad;
+              if (gn < N) {
+                const uint8_t* src = qw_e + (int64_t)gn * row_bytes +
+                                     (int64_t)sbi * fmt.type_size;
+                for (int b = lane; b < fmt.type_size; b += 32) {
+                  dst[b] = __ldg(src + b);
+                }
+              } else {
+                for (int b = lane; b < fmt.type_size; b += 32) dst[b] = 0;
               }
-            } else {
-              for (int b = lane; b < fmt.type_size; b += 32) dst[b] = 0;
+              for (int b = fmt.type_size + lane; b < ts_pad; b += 32) {
+                dst[b] = 0;
+              }
             }
-            for (int b = fmt.type_size + lane; b < ts_pad; b += 32) dst[b] = 0;
           }
         }
 
@@ -535,8 +654,39 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
         }
         cp_async_commit();
 
+        // D2R consumes sPk inside MMA, so only barrier (1) proves every warp
+        // finished reading the PREVIOUS superblock.  Stage the replacement on
+        // this side of that barrier. Unlike the baseline's interleaved staging
+        // above, warp w owns the exact contiguous rows its D2R N slice reads;
+        // a warp-local publication is therefore sufficient. The baseline
+        // keeps its established CTA barrier below unchanged.
+        if constexpr (D2R) {
+          if (st % kStagesPerSb == 0) {
+            const int sbi = st / kStagesPerSb;
+            constexpr int kNPerWarp = TN / WARPS;
+            const int n_begin = warp * kNPerWarp;
+            for (int n = n_begin; n < n_begin + kNPerWarp; ++n) {
+              const int gn = n0 + n;
+              uint8_t* dst = sPk + (int64_t)n * ts_pad;
+              if (gn < N) {
+                const uint8_t* src = qw_e + (int64_t)gn * row_bytes +
+                                     (int64_t)sbi * fmt.type_size;
+                for (int b = lane; b < fmt.type_size; b += 32) {
+                  dst[b] = __ldg(src + b);
+                }
+              } else {
+                for (int b = lane; b < fmt.type_size; b += 32) dst[b] = 0;
+              }
+              for (int b = fmt.type_size + lane; b < ts_pad; b += 32) {
+                dst[b] = 0;
+              }
+            }
+            __syncwarp();
+          }
+        }
+
         // ---- DECODE: TN weight rows x TK columns, once per stage ---------
-        {
+        if constexpr (!D2R) {
           const int t = st % kStagesPerSb;
           for (int i = tid; i < TN * kChunks; i += kThreads) {
             const int n = i / kChunks;
@@ -554,10 +704,12 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
             *reinterpret_cast<uint4*>(tile_at(sB, n, cc * 8)) = v;
           }
         }
-        __syncthreads();                                            // (2)
+        if constexpr (!D2R) {
+          __syncthreads();                                          // (2)
+        }
 
-        // ---- MMA: 4 k16 steps over the staged tile -----------------------
-        {
+        // ---- MMA: 4 k16 steps over the staged/direct tile ----------------
+        if constexpr (!D2R) {
           const uint16_t* abuf = sA + (st & 1) * (TM * kTK);
 #pragma unroll
           for (int kk = 0; kk < kTK / 16; ++kk) {
@@ -586,6 +738,49 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
               for (int j2 = 0; j2 < NATOM / 2; ++j2) {
                 mma_m16n8k16(acc[i][2 * j2], af[i], &bf[j2][0]);
                 mma_m16n8k16(acc[i][2 * j2 + 1], af[i], &bf[j2][2]);
+              }
+            }
+          }
+        } else {
+          const uint16_t* abuf = sA + (st & 1) * (TM * kTK);
+#pragma unroll
+          for (int kk = 0; kk < kTK / 16; ++kk) {
+            const int kbase = kk * 16;
+            const int cw0 = (st % kStagesPerSb) * kChunks + 2 * kk;
+            // At most four live B registers (NATOM<=2 in the compiled cfgs).
+            // Decode them BEFORE loading A, then load one A fragment and
+            // immediately consume it.  Materializing af[MATOM][4] here would
+            // add 32 live regs in the TM=128 cfgs and risk spills/occupancy.
+            uint32_t bf[NATOM][2];
+#pragma unroll
+            for (int j = 0; j < NATOM; ++j) {
+              const int n = wn * (TN / WN) + j * 8 + (lane >> 2);
+              const uint8_t* rowb = sPk + (int64_t)n * ts_pad;
+              const uint2 v = cb_decode_k16_pairs(
+                  reinterpret_cast<const uint32_t*>(rowb), rowb, cw0,
+                  lane & 3, fmt, lut, compose);
+              if (n0 + n < N) {
+                // mma B mapping for row.col m16n8k16:
+                //   n=lane>>2, kpair=2*(lane&3)
+                //   reg0=(kpair,kpair+1), reg1=(kpair+8,kpair+9).
+                bf[j][0] = v.x;
+                bf[j][1] = v.y;
+              } else {
+                bf[j][0] = 0u;
+                bf[j][1] = 0u;
+              }
+            }
+#pragma unroll
+            for (int i = 0; i < MATOM; ++i) {
+              uint32_t af[4];
+              const int r = i * 16 + (lane & 7) +
+                            8 * ((lane >> 3) & 1);  // WM=1 for D2R
+              const int kcol = kbase + 8 * (lane >> 4);
+              ldmatrix_x4(af, smem_addr(tile_at(
+                                  const_cast<uint16_t*>(abuf), r, kcol)));
+#pragma unroll
+              for (int j = 0; j < NATOM; ++j) {
+                mma_m16n8k16(acc[i][j], af, &bf[j][0]);
               }
             }
           }
@@ -663,6 +858,57 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_decode_kernel(
   }
 }
 
+// Probe the EXACT cooperative helper used by D2R.  One warp stages one
+// superblock; each width-4 subgroup owns one k16 fragment, so its four lanes
+// cover all four pair values while subgroup lane 0 owns the shared bit/scale
+// extraction.  Eight subgroups times two iterations cover all sixteen k16
+// codewords / 256 output values.  The output layout is the ordinary dense BF16
+// row, making a bitwise comparison to the full decoder non-vacuous.
+template <int WARPS>
+__global__ __launch_bounds__(WARPS * 32)
+void cb_moe_persistent_b_d2r_decode_pairs_kernel(
+    const uint8_t* __restrict__ qw,
+    const uint16_t* __restrict__ lut,
+    const float* __restrict__ compose,
+    uint16_t* __restrict__ w,
+    const int64_t row0, const int64_t nrows, const int64_t K,
+    const CbFp4V2Fmt fmt, const int ts_pad) {
+  const int n_sb = (int)(K / kSuperblock);
+  const int64_t row_bytes = (int64_t)n_sb * fmt.type_size;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int group = lane >> 2;
+  const int pair = lane & 3;
+
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  uint8_t* sPk = smem_raw;
+
+  const int64_t r = row0 + blockIdx.x;
+  if (r >= row0 + nrows) return;
+  const uint8_t* row = qw + r * row_bytes;
+
+  for (int s = warp; s < n_sb; s += WARPS) {
+    uint8_t* dst = sPk + (int64_t)warp * ts_pad;
+    const uint8_t* src = row + (int64_t)s * fmt.type_size;
+    for (int b = lane; b < fmt.type_size; b += 32) dst[b] = __ldg(src + b);
+    for (int b = fmt.type_size + lane; b < ts_pad; b += 32) dst[b] = 0;
+    __syncwarp();
+#pragma unroll
+    for (int batch = 0; batch < 2; ++batch) {
+      const int k16 = group + batch * 8;
+      const int c0 = 2 * k16;
+      const uint2 v = cb_decode_k16_pairs(
+          reinterpret_cast<const uint32_t*>(dst), dst, c0, pair, fmt, lut,
+          compose);
+      const int64_t base = (r - row0) * K + ((int64_t)s << 8) +
+                           (int64_t)c0 * 8 + pair * 2;
+      *reinterpret_cast<uint32_t*>(w + base) = v.x;
+      *reinterpret_cast<uint32_t*>(w + base + 8) = v.y;
+    }
+    __syncwarp();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Host side.
 // ---------------------------------------------------------------------------
@@ -689,11 +935,11 @@ constexpr TileCfg kCfgs[] = {
 };
 constexpr int kNumCfgs = int(sizeof(kCfgs) / sizeof(kCfgs[0]));
 
-// Shared-memory floor of a config: A stages + decoded B + the packed staging.
-// The optional resident LUT is added on top only when it still leaves room for
-// two CTAs per SM.
-int64_t cfg_smem_bytes(TileCfg c, int type_size) {
-  return (int64_t)2 * c.tm * kTK * 2 + (int64_t)c.tn * kTK * 2 +
+// Shared-memory floor of a config: A stages + (baseline-only) decoded B + the
+// packed staging.  D2R removes exactly `TN * TK * sizeof(bf16)` bytes.
+int64_t cfg_smem_bytes(TileCfg c, int type_size, bool d2r = false) {
+  return (int64_t)2 * c.tm * kTK * 2 +
+         (d2r ? 0 : (int64_t)c.tn * kTK * 2) +
          (int64_t)c.tn * ts_padded(type_size);
 }
 
@@ -786,13 +1032,13 @@ void cb_moe_persistent_b_prepare() {
   pb_prepare_device(device);
 }
 
-template <int TM, int TN, int WARPS>
+template <int TM, int TN, int WARPS, bool D2R = false>
 void launch_cfg(const uint16_t* a, const uint8_t* qw, const uint16_t* lut,
                 const float* compose, const int32_t* expert_ends, uint16_t* y,
                 int64_t P, int64_t N, int64_t K, CbFp4V2Fmt fmt, int ts_pad,
                 int n_tiles, int64_t total_wu, int64_t smem, unsigned grid,
                 cudaStream_t stream) {
-  auto kern = cb_moe_persistent_b_kernel<TM, TN, WARPS>;
+  auto kern = cb_moe_persistent_b_kernel<TM, TN, WARPS, D2R>;
   kern<<<grid, WARPS * 32, (size_t)smem, stream>>>(
       a, qw, lut, compose, expert_ends, y, P, N, K, fmt, ts_pad, n_tiles,
       total_wu);
@@ -802,7 +1048,7 @@ void launch_cfg(const uint16_t* a, const uint8_t* qw, const uint16_t* lut,
 void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
                       torch::Tensor lut, torch::Tensor compose,
                       torch::Tensor expert_ends, int64_t k_bits,
-                      int64_t type_size, int64_t cfg_index) {
+                      int64_t type_size, int64_t cfg_index, bool d2r) {
   TORCH_CHECK(a.is_cuda() && qw.is_cuda() && lut.is_cuda() &&
                   compose.is_cuda() && expert_ends.is_cuda() && out.is_cuda(),
               "cb_moe_persistent_b: every operand must be a CUDA tensor");
@@ -976,7 +1222,7 @@ void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
     }
   }
   const TileCfg cfg = kCfgs[idx];
-  const int64_t smem = cfg_smem_bytes(cfg, (int)type_size);
+  const int64_t smem = cfg_smem_bytes(cfg, (int)type_size, d2r);
   TORCH_CHECK(smem + kSmemReservedPerCta <= kSmemPerSm / 2,
               "cb_moe_persistent_b: config TM=", cfg.tm, " TN=", cfg.tn,
               " needs ", smem, " B of shared memory, which drops the kernel "
@@ -1005,16 +1251,28 @@ void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
   const int32_t* ep = expert_ends.data_ptr<int32_t>();
   uint16_t* yp = reinterpret_cast<uint16_t*>(out.data_ptr());
 
-#define GB_LAUNCH(TM_, TN_, W_)                                              \
-  launch_cfg<TM_, TN_, W_>(ap, qp, lp, cp, ep, yp, P, N, K, fmt, ts_pad,     \
-                           n_tiles, total_wu, smem, grid, stream)
-  switch (idx) {
-    case 0: GB_LAUNCH(128, 64, 8); break;
-    case 1: GB_LAUNCH(64, 64, 4); break;
-    case 2: GB_LAUNCH(128, 32, 4); break;
-    case 3: GB_LAUNCH(64, 128, 8); break;
-    default:
-      TORCH_CHECK(false, "cb_moe_persistent_b: unreachable config index");
+#define GB_LAUNCH(TM_, TN_, W_, D2R_)                                        \
+  launch_cfg<TM_, TN_, W_, D2R_>(                                           \
+      ap, qp, lp, cp, ep, yp, P, N, K, fmt, ts_pad, n_tiles, total_wu,       \
+      smem, grid, stream)
+  if (d2r) {
+    switch (idx) {
+      case 0: GB_LAUNCH(128, 64, 8, true); break;
+      case 1: GB_LAUNCH(64, 64, 4, true); break;
+      case 2: GB_LAUNCH(128, 32, 4, true); break;
+      case 3: GB_LAUNCH(64, 128, 8, true); break;
+      default:
+        TORCH_CHECK(false, "cb_moe_persistent_b_d2r: unreachable config index");
+    }
+  } else {
+    switch (idx) {
+      case 0: GB_LAUNCH(128, 64, 8, false); break;
+      case 1: GB_LAUNCH(64, 64, 4, false); break;
+      case 2: GB_LAUNCH(128, 32, 4, false); break;
+      case 3: GB_LAUNCH(64, 128, 8, false); break;
+      default:
+        TORCH_CHECK(false, "cb_moe_persistent_b: unreachable config index");
+    }
   }
 #undef GB_LAUNCH
 }
@@ -1025,14 +1283,25 @@ void cb_moe_persistent_b_prefill(torch::Tensor out, torch::Tensor a,
                                  torch::Tensor expert_ends, int64_t k_bits,
                                  int64_t type_size, int64_t cfg) {
   run_persistent_b(out, a, qw, lut, compose, expert_ends, k_bits, type_size,
-                   cfg);
+                   cfg, false);
 }
 
-torch::Tensor cb_moe_persistent_b_decode(torch::Tensor qw_flat,
-                                         torch::Tensor lut,
-                                         torch::Tensor compose, int64_t row0,
-                                         int64_t nrows, int64_t K,
-                                         int64_t k_bits, int64_t type_size) {
+void cb_moe_persistent_b_prefill_d2r(torch::Tensor out, torch::Tensor a,
+                                     torch::Tensor qw, torch::Tensor lut,
+                                     torch::Tensor compose,
+                                     torch::Tensor expert_ends,
+                                     int64_t k_bits, int64_t type_size,
+                                     int64_t cfg) {
+  run_persistent_b(out, a, qw, lut, compose, expert_ends, k_bits, type_size,
+                   cfg, true);
+}
+
+torch::Tensor run_decode_probe(torch::Tensor qw_flat,
+                               torch::Tensor lut,
+                               torch::Tensor compose, int64_t row0,
+                               int64_t nrows, int64_t K,
+                               int64_t k_bits, int64_t type_size,
+                               bool d2r_pairs) {
   TORCH_CHECK(qw_flat.is_cuda() && lut.is_cuda() && compose.is_cuda(),
               "cb_moe_persistent_b_decode: operands must be CUDA tensors");
   TORCH_CHECK(qw_flat.scalar_type() == torch::kUInt8 && qw_flat.dim() == 1 &&
@@ -1071,15 +1340,42 @@ torch::Tensor cb_moe_persistent_b_decode(torch::Tensor qw_flat,
 
   const c10::cuda::OptionalCUDAGuard guard(qw_flat.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  cb_moe_persistent_b_decode_kernel<kDecodeWarps>
-      <<<(unsigned)nrows, kDecodeWarps * 32, (size_t)smem, stream>>>(
-          qw_flat.data_ptr<uint8_t>(),
-          reinterpret_cast<const uint16_t*>(lut.data_ptr()),
-          compose.data_ptr<float>(),
-          reinterpret_cast<uint16_t*>(out.data_ptr()), row0, nrows, K, fmt,
-          ts_pad);
+  if (d2r_pairs) {
+    cb_moe_persistent_b_d2r_decode_pairs_kernel<kDecodeWarps>
+        <<<(unsigned)nrows, kDecodeWarps * 32, (size_t)smem, stream>>>(
+            qw_flat.data_ptr<uint8_t>(),
+            reinterpret_cast<const uint16_t*>(lut.data_ptr()),
+            compose.data_ptr<float>(),
+            reinterpret_cast<uint16_t*>(out.data_ptr()), row0, nrows, K, fmt,
+            ts_pad);
+  } else {
+    cb_moe_persistent_b_decode_kernel<kDecodeWarps>
+        <<<(unsigned)nrows, kDecodeWarps * 32, (size_t)smem, stream>>>(
+            qw_flat.data_ptr<uint8_t>(),
+            reinterpret_cast<const uint16_t*>(lut.data_ptr()),
+            compose.data_ptr<float>(),
+            reinterpret_cast<uint16_t*>(out.data_ptr()), row0, nrows, K, fmt,
+            ts_pad);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+torch::Tensor cb_moe_persistent_b_decode(torch::Tensor qw_flat,
+                                         torch::Tensor lut,
+                                         torch::Tensor compose, int64_t row0,
+                                         int64_t nrows, int64_t K,
+                                         int64_t k_bits, int64_t type_size) {
+  return run_decode_probe(qw_flat, lut, compose, row0, nrows, K, k_bits,
+                          type_size, false);
+}
+
+torch::Tensor cb_moe_persistent_b_d2r_decode_pairs(
+    torch::Tensor qw_flat, torch::Tensor lut, torch::Tensor compose,
+    int64_t row0, int64_t nrows, int64_t K, int64_t k_bits,
+    int64_t type_size) {
+  return run_decode_probe(qw_flat, lut, compose, row0, nrows, K, k_bits,
+                          type_size, true);
 }
 
 // Host-only attestation of what was actually compiled — no launch, no device
@@ -1094,6 +1390,33 @@ std::vector<std::vector<int64_t>> cb_moe_persistent_b_configs() {
                    int64_t(kSm120SmemCapacity)});
   }
   return out;
+}
+
+// Candidate attestation.  Per row:
+// [tm, tn, warps, threads, smem_at_k24, capacity, wn, wm, matom, natom].
+// All four rows have 4*matom*natom == 32 accumulator registers/thread.
+std::vector<std::vector<int64_t>> cb_moe_persistent_b_d2r_configs() {
+  std::vector<std::vector<int64_t>> out;
+  for (int i = 0; i < kNumCfgs; ++i) {
+    const TileCfg c = kCfgs[i];
+    const int wn = c.warps;
+    const int wm = 1;
+    const int matom = c.tm / 16;
+    const int natom = (c.tn / wn) / 8;
+    out.push_back({int64_t(c.tm), int64_t(c.tn), int64_t(c.warps),
+                   int64_t(c.warps) * 32,
+                   cfg_smem_bytes(c, 4 * 24 + 9, true),
+                   int64_t(kSm120SmemCapacity), int64_t(wn), int64_t(wm),
+                   int64_t(matom), int64_t(natom)});
+  }
+  return out;
+}
+
+void cb_moe_persistent_b_d2r_prepare() {
+  // D2R's largest dynamic-smem request is below the default per-block limit,
+  // but reuse the established preparation to attest cc 12.0/12.1 and the
+  // device's shared-memory capacity at model load.  No first-forward setup.
+  cb_moe_persistent_b_prepare();
 }
 
 int64_t cb_moe_persistent_b_tile_k() { return kTK; }
@@ -1117,6 +1440,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("lut"), pybind11::arg("compose"),
         pybind11::arg("expert_ends"), pybind11::arg("k_bits"),
         pybind11::arg("type_size"), pybind11::arg("cfg") = 0);
+  m.def("cb_moe_persistent_b_prefill_d2r",
+        &cb_moe_persistent_b_prefill_d2r,
+        "Experimental BF16 direct-to-register sibling of persistent-B. Same "
+        "exact routed segments and packed FP4-CB-v2 operands; removes the "
+        "decoded B shared-memory tile and fills each mma.sync B fragment "
+        "directly with the cooperative pair helper. Still MoE-only and "
+        "takes expert_ends. Default serving never calls this symbol.",
+        pybind11::arg("out"), pybind11::arg("a"), pybind11::arg("qw"),
+        pybind11::arg("lut"), pybind11::arg("compose"),
+        pybind11::arg("expert_ends"), pybind11::arg("k_bits"),
+        pybind11::arg("type_size"), pybind11::arg("cfg") = 0);
   m.def("cb_moe_persistent_b_decode", &cb_moe_persistent_b_decode,
         "The mainloop's decode stage, standalone: rows [row0, row0+nrows) of "
         "a flattened FP4-CB-v2 byte plane -> [nrows, K] BF16. Bit-identical "
@@ -1124,6 +1458,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("qw_flat"), pybind11::arg("lut"),
         pybind11::arg("compose"), pybind11::arg("row0"), pybind11::arg("nrows"),
         pybind11::arg("K"), pybind11::arg("k_bits"), pybind11::arg("type_size"));
+  m.def("cb_moe_persistent_b_d2r_decode_pairs",
+        &cb_moe_persistent_b_d2r_decode_pairs,
+        "Standalone probe of the exact cooperative pair helper used by D2R: "
+        "packed FP4-CB-v2 rows -> dense BF16, for bitwise comparison with "
+        "the established full-codeword decoder.",
+        pybind11::arg("qw_flat"), pybind11::arg("lut"),
+        pybind11::arg("compose"), pybind11::arg("row0"),
+        pybind11::arg("nrows"), pybind11::arg("K"),
+        pybind11::arg("k_bits"), pybind11::arg("type_size"));
   m.def("cb_moe_persistent_b_prepare", &cb_moe_persistent_b_prepare,
         "opt every compiled configuration in to the 99 KiB dynamic "
         "shared-memory budget on the CURRENT device, and attest the device is "
@@ -1133,6 +1476,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cb_moe_persistent_b_configs", &cb_moe_persistent_b_configs,
         "compiled tile configs: [tm, tn, warps, threads, smem_bytes_at_k24, "
         "sm120 capacity] each (enumerate THIS, never a hardcoded list)");
+  m.def("cb_moe_persistent_b_d2r_prepare",
+        &cb_moe_persistent_b_d2r_prepare,
+        "load-time device attestation for the experimental D2R sibling");
+  m.def("cb_moe_persistent_b_d2r_configs",
+        &cb_moe_persistent_b_d2r_configs,
+        "D2R configs: [tm,tn,warps,threads,smem_k24,capacity,wn,wm,matom,"
+        "natom]; same cfg indices as persistent-B");
   m.def("cb_moe_persistent_b_tile_k", &cb_moe_persistent_b_tile_k,
         "mainloop K-stage width in BF16 columns");
   m.def("cb_moe_persistent_b_is_moe_only", &cb_moe_persistent_b_is_moe_only,

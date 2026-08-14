@@ -409,7 +409,10 @@ def test_identity_moves_when_any_build_input_changes(tmp_path, mutated):
     assert set(payload["cutlass_inputs"].values()) == {None}
     assert payload["bindings"] == [
         ["persistent-B grouped MoE",
-         list(cuda_ext._MOE_PERSISTENT_B_SYMBOLS)]]
+         list(cuda_ext._MOE_PERSISTENT_B_SYMBOLS)],
+        ["persistent-B BF16 D2R experiment",
+         list(cuda_ext._MOE_PERSISTENT_B_D2R_SYMBOLS)],
+    ]
 
     (src / mutated).write_text(f"// {mutated} v2 — one byte of schedule\n")
     after, _ = identity()

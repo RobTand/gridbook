@@ -10,14 +10,19 @@ isolated inner GEMM", and this script obeys that rule literally: every arm is
 measured from ``(x, topk_ids, topk_weights)`` to the combined ``[T, hidden]``
 layer output, both projection stages included.
 
-WHAT IS TIMED. The three ways ONE FP4-CB MoE layer's routed prefill can be
+WHAT IS TIMED. Four ways ONE FP4-CB MoE layer's routed prefill can be
 executed, each the whole operator its serving method would run:
 
-* ``persistent_b``  - the OPT-IN decode-in-mainloop lane
+* ``persistent_b``  - the OPT-IN established decode-in-mainloop lane
                       (``moe.py::_apply_prefill_native_bf16_persistent_b``).
                       Exact per-expert segments, ONE
                       ``cb_moe_persistent_b_prefill`` launch per stage, and no
                       expanded ``[E, N, K]`` BF16 transient at all.
+* ``d2r``           - the nested, default-off candidate in that SAME
+                      persistent-B extension. It keeps routing and both
+                      projection stages identical, removes the decoded B
+                      shared-memory tile, and constructs MMA B registers with
+                      the cooperative BF16 pair helper.
 * ``expand_sm80``   - TODAY'S DEFAULT (``_apply_prefill_native_bf16``):
                       ``cb_expand_fp4_v2`` materializes each expert chunk as
                       BF16 in HBM and the device-scheduled CUTLASS 2.x grouped
@@ -229,7 +234,7 @@ def _weights(shape, args):
 
 
 def _arms(shape, tokens, args, tile_m, cfg, weights):
-    """Build the three whole-operator closures plus the expand-only closure."""
+    """Build four whole-operator closures plus the expand-only closure."""
     label, E, hidden, inter = shape
     dev = "cuda"
     top_k, k = args.top_k, args.k
@@ -284,7 +289,7 @@ def _arms(shape, tokens, args, tile_m, cfg, weights):
         output.index_add_(0, rows, pair_output.to(output.dtype))
         return output
 
-    def run_persistent_b():
+    def run_persistent_b_with(op):
         order, rows, ends = exact_route(True)
         xq = ops.fp4_act_qdq(x)
         x_sorted = xq.index_select(0, rows).contiguous()
@@ -292,8 +297,7 @@ def _arms(shape, tokens, args, tile_m, cfg, weights):
         pairs = int(x_sorted.shape[0])
         gate_up = torch.empty((pairs, 2 * inter), dtype=torch.bfloat16,
                               device=dev)
-        ops.cb_moe_persistent_b_prefill(gate_up, x_sorted, w13, lut, compose,
-                                        ends, k, ts, cfg)
+        op(gate_up, x_sorted, w13, lut, compose, ends, k, ts, cfg)
         del x_sorted
         activated = torch.empty((pairs, inter), dtype=torch.bfloat16,
                                 device=dev)
@@ -303,10 +307,15 @@ def _arms(shape, tokens, args, tile_m, cfg, weights):
         del activated
         pair_output = torch.empty((pairs, hidden), dtype=torch.bfloat16,
                                   device=dev)
-        ops.cb_moe_persistent_b_prefill(pair_output, aq, w2, lut, compose,
-                                        ends, k, ts, cfg)
+        op(pair_output, aq, w2, lut, compose, ends, k, ts, cfg)
         del aq
         return combine(pair_output, order, rows)
+
+    def run_persistent_b():
+        return run_persistent_b_with(ops.cb_moe_persistent_b_prefill)
+
+    def run_d2r():
+        return run_persistent_b_with(ops.cb_moe_persistent_b_prefill_d2r)
 
     def run_expand_sm80():
         order, rows, ends = exact_route(False)
@@ -407,8 +416,8 @@ def _arms(shape, tokens, args, tile_m, cfg, weights):
                 weight = expand(which, c0, min(E, c0 + chunk))
                 del weight
 
-    return (chunk, run_persistent_b, run_expand_sm80, run_expand_sm120,
-            run_expand_only)
+    return (chunk, run_persistent_b, run_d2r, run_expand_sm80,
+            run_expand_sm120, run_expand_only)
 
 
 def bench(args) -> int:
@@ -434,6 +443,18 @@ def bench(args) -> int:
         print("this build carries no persistent-B grouped MoE lane "
               "(needs cc 12.0/12.1)", file=sys.stderr)
         return 2
+    d2r_symbols = (
+        "cb_moe_persistent_b_prefill_d2r",
+        "cb_moe_persistent_b_d2r_decode_pairs",
+        "cb_moe_persistent_b_d2r_prepare",
+        "cb_moe_persistent_b_d2r_configs",
+    )
+    missing_d2r = [name for name in d2r_symbols if not hasattr(pb_ext, name)]
+    if missing_d2r:
+        print("the persistent-B extension does not carry the D2R candidate "
+              f"symbols {missing_d2r}", file=sys.stderr)
+        return 2
+    pb_ext.cb_moe_persistent_b_d2r_prepare()
     bf16_ext = get_bf16_grouped_ext()
     if bf16_ext is None or not hasattr(bf16_ext, "cb_bf16_grouped_mm_out"):
         print("the grouped-BF16 extension could not be built", file=sys.stderr)
@@ -458,6 +479,8 @@ def bench(args) -> int:
     print(f"# persistent_b cfg={cfg} "
           f"tile_k={pb_ext.cb_moe_persistent_b_tile_k()} "
           f"configs={pb_config(pb_ext)}")
+    print(f"# d2r same-extension configs="
+          f"{pb_ext.cb_moe_persistent_b_d2r_configs()}")
     if has_sm120:
         print(f"# sm120 bridge tile_m={tile_m}, config="
               f"{bf16_ext.cb_bf16_grouped_sm120_config()}")
@@ -466,8 +489,9 @@ def bench(args) -> int:
     print("# whole-operator arms: routing + QDQ + both stages + activation + "
           "combine (NATIVE-PARITY grouped-MoE rule)")
     print(f"\n{'shape':>19} {'E':>4} {'T':>5} {'P':>6} {'pb warm':>10} "
-          f"{'sm80 warm':>10} {'sm120 warm':>11} {'expand ms':>10} "
-          f"{'expand%':>8} {'sm80/pb':>8} {'sm120/pb':>9}")
+          f"{'d2r warm':>10} {'pb/d2r':>8} {'sm80 warm':>10} "
+          f"{'sm120 warm':>11} {'expand ms':>10} {'expand%':>8} "
+          f"{'sm80/pb':>8} {'sm120/pb':>9}")
 
     rows_run = 0
     for shape in SHAPES:
@@ -484,7 +508,7 @@ def bench(args) -> int:
             continue
         weights = _weights(shape, args)
         for tokens in args.tokens:
-            (chunk, run_pb, run_sm80, run_sm120,
+            (chunk, run_pb, run_d2r, run_sm80, run_sm120,
              run_expand) = _arms(shape, tokens, args, tile_m, cfg, weights)
             pairs = tokens * args.top_k
 
@@ -492,16 +516,19 @@ def bench(args) -> int:
             # compute different things is worthless.
             reference = run_sm80()
             delta_pb = _rel_l2(run_pb(), reference)
+            delta_d2r = _rel_l2(run_d2r(), reference)
             delta_120 = _rel_l2(run_sm120(), reference) if has_sm120 else 0.0
-            worst = max(delta_pb, delta_120)
+            worst = max(delta_pb, delta_d2r, delta_120)
             if worst > args.tol:
                 print(f"arms disagree on {key} T={tokens}: rel-L2 pb="
-                      f"{delta_pb:.3e} sm120={delta_120:.3e} > tol "
+                      f"{delta_pb:.3e} d2r={delta_d2r:.3e} "
+                      f"sm120={delta_120:.3e} > tol "
                       f"{args.tol:.3e}", file=sys.stderr)
                 return 2
             del reference
 
             cold_pb, warm_pb = _time(run_pb, args.iters, args.warmup)
+            cold_d2r, warm_d2r = _time(run_d2r, args.iters, args.warmup)
             cold_80, warm_80 = _time(run_sm80, args.iters, args.warmup)
             cold_ex, warm_ex = _time(run_expand, args.iters, args.warmup)
             if has_sm120:
@@ -515,16 +542,20 @@ def bench(args) -> int:
                 delta_120_text = "n/a"
 
             print(f"# {key} T={tokens} chunks={-(-E // chunk)} agree: rel-L2 "
-                  f"pb={delta_pb:.2e} sm120={delta_120_text} "
+                  f"pb={delta_pb:.2e} d2r={delta_d2r:.2e} "
+                  f"sm120={delta_120_text} "
                   f"<= {args.tol:.1e}; cold ms pb={cold_pb:.2f} "
-                  f"sm80={cold_80:.2f} sm120={cold_120_text} "
+                  f"d2r={cold_d2r:.2f} sm80={cold_80:.2f} "
+                  f"sm120={cold_120_text} "
                   f"expand={cold_ex:.2f}")
             print(f"{label:>19} {E:>4} {tokens:>5} {pairs:>6} "
-                  f"{warm_pb:>9.3f}m {warm_80:>9.3f}m {sm120_warm:>11} "
+                  f"{warm_pb:>9.3f}m {warm_d2r:>9.3f}m "
+                  f"{warm_pb / warm_d2r:>8.3f} {warm_80:>9.3f}m "
+                  f"{sm120_warm:>11} "
                   f"{warm_ex:>9.3f}m {100.0 * warm_ex / warm_80:>7.1f}% "
                   f"{warm_80 / warm_pb:>8.3f} {sm120_ratio:>9}")
             rows_run += 1
-            del run_pb, run_sm80, run_sm120, run_expand
+            del run_pb, run_d2r, run_sm80, run_sm120, run_expand
             torch.cuda.empty_cache()
         del weights
         torch.cuda.empty_cache()
@@ -532,8 +563,9 @@ def bench(args) -> int:
     if not rows_run:
         print(f"no shape matched --only {args.only!r}", file=sys.stderr)
         return 2
-    print("\n# ratios > 1 mean the persistent-B lane is FASTER than that "
-          "baseline; expand% is the share of the DEFAULT (expand_sm80) "
+    print("\n# pb/d2r > 1 means D2R is faster than established persistent-B; "
+          "other ratios > 1 mean persistent-B is faster than that baseline; "
+          "expand% is the share of the DEFAULT (expand_sm80) "
           "operator spent in the transient persistent-B deletes.")
     print("# PROPOSAL DATA (NATIVE-PARITY): microbenchmarks propose, only the "
           "served protocol promotes.")
