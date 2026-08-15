@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.8.8 — 2026-08-15
+
+- **The quantized embedding shipped in 0.8.7 could never be reached on
+  Qwen3.5/3.6.** vLLM dispatches a quantized module from inside the layer's own
+  constructor, so a model class that builds
+  `VocabParallelEmbedding(vocab_size, hidden_size)` with neither a
+  `quant_config` nor a `prefix` never calls `get_quant_method` for its lookup
+  table. 0.8.7 shipped both the method and the dispatch branch, and on this
+  architecture neither was ever reached — a mechanism can be complete and still
+  be dead if nothing calls it. Most vLLM models pass both arguments
+  (`deepseek_v2`, `arctic`, `dbrx`, …); `qwen3_5` passes neither. The failure is
+  silent at construction and surfaces much later as vLLM refusing a parameter
+  nothing claims: *"There is no module or parameter named
+  `embed_tokens.weight_global_scale`"*.
+
+  `embedding_construction.py` supplies the two arguments the model's own
+  `__init__` already holds. It is inert unless the ambient config is ours, that
+  config declares a unit for this exact prefix, and the embedding is being built
+  without a `quant_config` — so another checkpoint, another architecture, a
+  model class that already does this correctly, and a future vLLM that fixes it
+  upstream all keep their current behaviour. `ParallelLMHead` is excluded; it
+  subclasses the embedding but is an output projection served through
+  `config_groups`. The arguments are substituted *during* construction rather
+  than the module being rebuilt afterwards, because a rebuild would first
+  allocate the full BF16 table and free it — and the artifact this exists for is
+  the one being served under a deliberately tight memory budget.
+
+  The embedding is the **first** module built, before any `get_quant_method`
+  call has forced a pointer config to resolve, so the wrap resolves it itself;
+  without that the units are still empty and a declared table is silently served
+  unquantized.
+
+  Verified on a real artifact: a 12.98 GB Qwen3.8-27B CB checkpoint now loads
+  and serves on vLLM 0.26.1rc1 with 11.42 GiB of resident weights, and fits a
+  16 GiB budget with 2.75 GiB of KV cache. Before this it did not load at all.
+
 ## 0.8.7 — 2026-08-15
 
 - **Serve a quantized embedding table.** `model.embed_tokens` is 2.37 GiB on a
