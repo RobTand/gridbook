@@ -28,18 +28,33 @@ from vllm.model_executor.layers.quantization import register_quantization_config
 
 from . import ops  # noqa: F401  (registers Gridbook's native custom ops)
 from .config import PrismaQuantConfig
+from .embedding_construction import install_quantized_embedding_construction
 from .moe_toplevel_loader import install_toplevel_cb_expert_loader
 from .runtime_contract import load_runtime_contract
 
 
 _TOPLEVEL_CLASS_SUFFIXES = ("ForCausalLM", "ForCausalLMBase",
                             "ForConditionalGeneration", "MTP")
+# The INNER model classes -- the ones that own ``embed_tokens``.  Separate from
+# the entrypoint suffixes above because the two wraps attach to different
+# objects: the expert loader wraps ``load_weights`` on the entrypoint, the
+# embedding wrap supplies constructor arguments on the module that builds the
+# lookup table.
+_INNER_MODEL_CLASS_SUFFIXES = ("Model",)
 
 
 def _install_on_module_classes(module_path: str) -> None:
-    """Install the stacked-CB wrap on every top-level model class a vLLM arch
-    module DEFINES (``__module__`` guard: never on classes it merely imports)
-    whose name looks like an entrypoint and which exposes ``load_weights``.
+    """Install our two construction/load wraps on the classes a vLLM arch
+    module DEFINES (``__module__`` guard: never on classes it merely imports).
+
+    Two wraps, on two different kinds of class:
+
+    * the stacked-CB expert loader, on every top-level class whose name looks
+      like an entrypoint and which exposes ``load_weights``;
+    * the quantized-embedding construction wrap, on every inner ``*Model``
+      class -- see ``embedding_construction`` for why a model that builds
+      ``VocabParallelEmbedding`` without a ``quant_config`` can never serve a
+      quantized lookup table.
 
     Version-robust by construction: a missing module, or renamed classes within
     it, degrade to a no-op instead of an ImportError. The wrap itself is inert
@@ -57,6 +72,11 @@ def _install_on_module_classes(module_path: str) -> None:
             continue
         if getattr(obj, "__module__", None) != module_path:
             continue
+        if name.endswith(_INNER_MODEL_CLASS_SUFFIXES):
+            # Not gated on ``load_weights``: an inner model class need not
+            # define one, and the wrap is inert unless the checkpoint declares
+            # a quantized embedding for this exact prefix.
+            install_quantized_embedding_construction(obj)
         if not name.endswith(_TOPLEVEL_CLASS_SUFFIXES):
             continue
         if not callable(getattr(obj, "load_weights", None)):
