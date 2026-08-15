@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import ctypes
 import hashlib
 import importlib.util
 import json
@@ -978,7 +979,18 @@ def _compact_tensor_full_vocab_score(
         target = float(packed[int(expected_target)].item())
         if not math.isfinite(target):
             raise ValueError(f"non-finite logprob {target!r}")
-        raw = packed.numpy().tobytes(order="C")
+        # ``Tensor.numpy()`` needs NumPy, which is deliberately not a
+        # gridbook dependency and is absent from the release pipeline's
+        # installed-wheel environment -- it failed the v0.8.7 gate here.
+        # ``ctypes.string_at`` copies the same contiguous C-order buffer
+        # without it; this is the idiom ``gridbook/cb_digest.py`` already
+        # uses for exactly this reason, so the digest is unchanged.
+        if packed.device.type != "cpu" or not packed.is_contiguous():
+            raise RuntimeError(
+                "bounded full-vocabulary row must be contiguous CPU "
+                "memory to digest")
+        raw = ctypes.string_at(
+            packed.data_ptr(), packed.numel() * packed.element_size())
         row_digest = hashlib.sha256(raw).hexdigest()
         row_values.frombytes(raw)
         targets.append(target)
