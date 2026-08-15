@@ -113,6 +113,24 @@ _PRESERVES_NVFP4_W4A4: frozenset[str] = frozenset({
     # Dense NVFP4 linear kernels.
     "CutlassNvFp4LinearKernel",
     "EmulationNvFp4LinearKernel",
+    # Re-audited 2026-08-14 against vLLM 0.26.1rc1.dev693+g7f7a32cfe
+    # (`model_executor/kernels/linear/nvfp4/flashinfer.py:97`), which is the
+    # kernel this build's ladder actually selects for a delegated dense W4A4
+    # group -- `CutlassNvFp4LinearKernel` above is no longer reached, so the
+    # table as written failed CLOSED on every stock NVFP4 W4A4 Linear.  That is
+    # the re-audit branch working as designed, not a false positive to bypass.
+    # Audited on the two properties this policy exists to protect:
+    #   activation contract  `input_quant_key()` returns `kNvfp4Dynamic`, and
+    #                        `apply_weights` quantizes x through
+    #                        `scaled_fp4_quant(..., layer.input_global_scale_inv)`
+    #                        and passes `x_blockscale` into the GEMM.  The
+    #                        declared W4A4 is honored, not silently rewritten to
+    #                        weight-only the way the Marlin path rewrites it.
+    #   operator lane        `flashinfer_scaled_fp4_mm(..., backend="cutlass")`
+    #                        -- FlashInfer is the wrapper, CUTLASS is the
+    #                        operator.  No `triton` token on the class, its
+    #                        module path, or its MRO.
+    "FlashInferCutlassNvFp4LinearKernel",
 })
 
 #: Attributes on a resolved vLLM method (or on the ``scheme`` vLLM attaches to

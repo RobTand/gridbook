@@ -53,6 +53,10 @@ MarlinNvFp4LinearKernel = _cls("MarlinNvFp4LinearKernel",
                                f"{_LINEAR_KERNELS}.marlin")
 CutlassNvFp4LinearKernel = _cls("CutlassNvFp4LinearKernel",
                                 f"{_LINEAR_KERNELS}.cutlass")
+# The kernel vLLM 0.26's ladder actually selects for a delegated dense W4A4
+# group. Note the module: FlashInfer is the WRAPPER, CUTLASS is the operator.
+FlashInferCutlassNvFp4LinearKernel = _cls(
+    "FlashInferCutlassNvFp4LinearKernel", f"{_LINEAR_KERNELS}.flashinfer")
 
 
 class NvFp4MoeBackend(enum.Enum):
@@ -212,6 +216,26 @@ def test_audited_native_moe_backends_are_accepted():
 
 def test_audited_native_dense_kernel_is_accepted():
     layer = _Layer(_Scheme(CutlassNvFp4LinearKernel))
+    _check(W4A4_GROUP, _LinearMethod(), layer, name="group_dense",
+           prefix="model.layers.0.self_attn.qkv_proj")
+
+
+def test_flashinfer_cutlass_dense_kernel_is_accepted():
+    """Re-audited 2026-08-14; before that, this build could serve no stock
+    NVFP4 W4A4 Linear at all.
+
+    vLLM 0.26 selects ``FlashInferCutlassNvFp4LinearKernel`` where the table
+    only knew ``CutlassNvFp4LinearKernel``, so the policy failed CLOSED on
+    every delegated dense W4A4 group -- correct behaviour for an unknown name,
+    and exactly the re-audit branch this module documents. The audit checked
+    the two properties the policy protects: ``input_quant_key()`` is
+    ``kNvfp4Dynamic`` and ``apply_weights`` passes a real ``x_blockscale`` into
+    the GEMM (the activation contract is honoured, not rewritten weight-only
+    the way Marlin rewrites it), and the operator is
+    ``flashinfer_scaled_fp4_mm(..., backend="cutlass")`` with no ``triton``
+    token anywhere on the class, module, or MRO.
+    """
+    layer = _Layer(_Scheme(FlashInferCutlassNvFp4LinearKernel))
     _check(W4A4_GROUP, _LinearMethod(), layer, name="group_dense",
            prefix="model.layers.0.self_attn.qkv_proj")
 
