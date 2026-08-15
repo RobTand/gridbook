@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.8.7 — 2026-08-15
+
+- **Serve a quantized embedding table.** `model.embed_tokens` is 2.37 GiB on a
+  27B-class vocabulary and nothing was pricing it: the producer could pack it,
+  but every consumer path either ignored the declaration or routed it to
+  vLLM's compressed-tensors embedding handler, which raises for FP4/FP8. The
+  new declaration claims those units for Gridbook's own embedding method. It is
+  **weight-only by construction** — a lookup has no input activation, so an
+  emitted `input_global_scale` would be an unmatched checkpoint key at load —
+  and a declared unit is parsed against the same target set as the passthrough
+  units, so a unit claimed by two vocabularies fails at parse rather than in
+  whichever branch of `get_quant_method` happens to run first.
+
+- vLLM's post-load parameter sweep is an `isinstance` check against
+  `VocabParallelEmbedding`, not duck typing. A structurally complete
+  non-subclass is skipped **silently** and then dies on its first forward, so
+  the embedding method subclasses rather than mimics, and `ParallelLMHead` is
+  modelled as the subclass it actually is. `lm_head` remains refused here:
+  the producer already declined it, and the consumer now declines it too
+  instead of accepting a declaration nothing can load.
+
+- **A stock NVFP4 W4A4 Linear could not be served at all on vLLM 0.26.** The
+  audited kernel table knew `CutlassNvFp4LinearKernel`; 0.26's selection ladder
+  picks `FlashInferCutlassNvFp4LinearKernel`, which was absent, so an
+  activation-quantized declaration resolved UNKNOWN and failed closed on every
+  delegated dense W4A4 group. The re-audited entry is added, with the audit
+  recorded where the module says its authority lives.
+
+- This tag also releases the routed-MoE kernel work that landed on `master`
+  after 0.8.6 and had not yet been tagged: the persistent-B v6/v7 lane, the
+  bf16 decode-to-register lane, and an exact FP8 CB GEMV v2. Their default-path
+  posture differs and is worth reading before deploying. **GEMV v2 is opt-in
+  and default-off** — `PRISMAQUANT_CB_GEMV` unset resolves to `inherited`,
+  which is exactly the 0.8.6 kernel; the selector is resolved once per process
+  and refuses both an unknown spelling and a mid-serve change, because either
+  would make a number taken from that process unattributable. The
+  **persistent-B changes are on the default path** (`..._PERSISTENT_B_CFG`
+  unset means the kernel picks from the shapes, which is the production
+  setting); that lane carries a measured decode A/B, not merely compile and
+  parity evidence.
+
+- No format, contract, or ABI change: `gridbook.runtime-contract.v4` and the
+  three-feature ABI closure are byte-identical to 0.8.6, so a consumer pinning
+  this release moves only the version, commit and wheel hash.
+
 ## 0.8.6 — 2026-08-13
 
 - **Load separately quantized DeepSeek-V4 DSpark drafts without rewriting
