@@ -30,16 +30,18 @@
 
 - This tag also releases the routed-MoE kernel work that landed on `master`
   after 0.8.6 and had not yet been tagged: the persistent-B v6/v7 lane, the
-  bf16 decode-to-register lane, and an exact FP8 CB GEMV v2. Their default-path
-  posture differs and is worth reading before deploying. **GEMV v2 is opt-in
-  and default-off** — `PRISMAQUANT_CB_GEMV` unset resolves to `inherited`,
-  which is exactly the 0.8.6 kernel; the selector is resolved once per process
-  and refuses both an unknown spelling and a mid-serve change, because either
-  would make a number taken from that process unattributable. The
-  **persistent-B changes are on the default path** (`..._PERSISTENT_B_CFG`
-  unset means the kernel picks from the shapes, which is the production
-  setting); that lane carries a measured decode A/B, not merely compile and
-  parity evidence.
+  bf16 decode-to-register lane, and an exact FP8 CB GEMV v2. **Every one of
+  them is opt-in and default-off**, so with no environment set this release
+  dispatches exactly as 0.8.6 did and the only behaviour change is the
+  embedding mechanism and the preflight entry above. `PRISMAQUANT_CB_GEMV`
+  unset resolves to `inherited`, the shipping default, which never even probes
+  or builds the v2 extension; `PRISMAQUANT_CB_FP8_GEMV_V2` unset is disabled;
+  `PRISMAQUANT_CB_MOE_PERSISTENT_B` and its `_D2R` sibling are latched booleans
+  defaulting to off. (`..._PERSISTENT_B_CFG=0` is the production setting *within*
+  that lane — the kernel picking from the shapes — and is reached only once the
+  lane is requested.) Each selector is resolved once per process and refuses
+  both an unknown spelling and a mid-serve change, because either would make a
+  number taken from that process unattributable.
 
 - No format, contract, or ABI change: `gridbook.runtime-contract.v4` and the
   three-feature ABI closure are byte-identical to 0.8.6, so a consumer pinning
