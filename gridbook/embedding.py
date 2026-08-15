@@ -169,6 +169,21 @@ def parse_declaration(
     out: dict[str, EmbeddingFormat] = {}
     for target, fmt_id in units.items():
         key = canonicalize(str(target))
+        if key.rsplit(".", 1)[-1] == "lm_head":
+            # ParallelLMHead subclasses VocabParallelEmbedding, so a producer
+            # that named the head here is asking for the output projection to
+            # be served as a LOOKUP. ``create_weights`` already refuses it and
+            # dispatch already excludes it -- this is the third defence, and
+            # the only one that fires before a single weight is read. The
+            # producer refuses to WRITE this (prismaquant's
+            # ``build_quantized_embedding_declaration``); refusing to READ it
+            # too means the two halves of the contract agree even when the
+            # artifact came from some other producer.
+            raise EmbeddingFormatError(
+                f"unit {key!r} names the output projection. ParallelLMHead "
+                "subclasses VocabParallelEmbedding, so serving it through the "
+                "embedding path would take the head off the GEMM path; a "
+                "quantized head belongs in config_groups.")
         if key in cb_targets:
             raise EmbeddingFormatError(
                 f"unit {key!r} is claimed by both {SCHEMA_KEY!r} and the CB "

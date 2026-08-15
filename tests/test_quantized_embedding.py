@@ -168,6 +168,27 @@ def test_sign_bit_is_not_inverted(packed_case):
 # The dispatch hazard
 # --------------------------------------------------------------------------
 
+@pytest.mark.parametrize("head", [
+    "lm_head",
+    "language_model.lm_head",             # VL wrapper serving namespace
+    "model.language_model.lm_head",       # VL checkpoint namespace
+])
+def test_declaring_lm_head_is_refused_at_parse(head):
+    """The earliest of the three defences, and the only pre-load one.
+
+    Found by running the real Qwen3.8-27B namespaces through the schema: the
+    PRODUCER refuses to write ``lm_head`` here, but the consumer accepted it,
+    so the two halves of one contract disagreed. Parametrized over the VL
+    spellings because the 27B is ``Qwen3_5ForConditionalGeneration`` -- a leaf
+    check that only knew the flat name would pass this test and still admit
+    ``language_model.lm_head``.
+    """
+    with pytest.raises(EmbeddingFormatError, match="output projection"):
+        parse_declaration(
+            {SCHEMA_KEY: {"version": 1, "units": {head: "nvfp4"}}},
+            canonicalize=_identity)
+
+
 def test_parallel_lm_head_is_refused_by_the_embedding_method():
     """ParallelLMHead subclasses VocabParallelEmbedding. It is not a lookup.
 
