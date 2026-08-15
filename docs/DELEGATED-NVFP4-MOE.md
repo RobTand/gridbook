@@ -12,12 +12,13 @@ model releases.
 ## Version scope
 
 The NVFP4 MoE oracle is an internal vLLM interface and changes quickly. The
-claims below were source-checked against both:
+claims below were source-checked against:
 
 | Build | Role |
 |---|---|
 | `0.23.1rc1.dev764+g54b16d8a9.d20260703` | gridbook's measured reference image |
-| `0.24.0` | current review image |
+| `0.24.0` | review image |
+| `0.26.1rc1.dev693+g7f7a32cfe` | current serving image (**dense NVFP4 linear only** — see "Dense linear re-audit, 0.26" below; the MoE entries have NOT been re-checked against this build) |
 
 The capability predicate, compressed-tensors scheme dispatch, automatic backend
 order, Marlin conversion, and Marlin warning described here are the same in
@@ -164,6 +165,32 @@ is not in the audited table — UNKNOWN fails closed rather than becoming a fals
 pass. The error names the resolved backend class, the group, and the declared
 contract. There is no environment-variable bypass. Extending the tables is the
 supported way to admit a newly audited backend.
+
+### Dense linear re-audit, 0.26 (2026-08-14)
+
+On `0.26.1rc1.dev693+g7f7a32cfe` the dense NVFP4 linear ladder no longer
+selects `CutlassNvFp4LinearKernel`. It selects
+**`FlashInferCutlassNvFp4LinearKernel`**
+(`vllm/model_executor/kernels/linear/nvfp4/flashinfer.py:97`). That name was
+absent from the allowlist, so **every** delegated dense NVFP4 W4A4 group
+resolved UNKNOWN and failed closed — the policy behaving exactly as designed,
+and a total block on serving any stock W4A4 Linear from a mixed artifact.
+
+Audited on the two properties this policy protects, and admitted:
+
+| Property | Finding |
+|---|---|
+| Activation contract | `input_quant_key()` returns `kNvfp4Dynamic`; `apply_weights` quantizes the input through `scaled_fp4_quant(..., layer.input_global_scale_inv)` and passes a real `x_blockscale` into the GEMM. The declared W4A4 is **honored**, not rewritten weight-only the way the Marlin path rewrites it. |
+| Operator lane | `flashinfer_scaled_fp4_mm(..., backend="cutlass")`. FlashInfer is the **wrapper**; CUTLASS is the operator. No `triton` token on the class, its module path, or its MRO. |
+
+Verified end-to-end rather than by table edit: an artifact with every Linear at
+NVFP4 — the configuration that previously raised `DelegatedBackendError` — loads,
+captures CUDA graphs, and serves bit-exactly
+(`dq-runs/embed-smoke/`, `smoke_nvfp4.log`).
+
+**The MoE entries below are still 0.23/0.24-audited.** They may have drifted the
+same way on 0.26; a routed-MoE recipe on this build must re-audit before it can
+assume a PASS.
 
 A useful preflight has three outcomes:
 

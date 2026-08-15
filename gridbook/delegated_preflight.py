@@ -66,8 +66,10 @@ class DelegatedBackendError(ValueError):
 
 # --- versioned backend tables ------------------------------------------------
 #
-# Audited against the two vLLM builds named in docs/DELEGATED-NVFP4-MOE.md
-# (`0.23.1rc1.dev764+g54b16d8a9` and `0.24.0`).  Names are matched against both
+# Audited against the vLLM builds named in docs/DELEGATED-NVFP4-MOE.md
+# (`0.23.1rc1.dev764+g54b16d8a9` and `0.24.0`; plus `0.26.1rc1.dev693+g7f7a32cfe`
+# for the DENSE LINEAR entries only -- the MoE entries have not been re-checked
+# against 0.26 and may have drifted the same way the dense ladder did).  Names are matched against both
 # the fully-qualified ``module.QualName`` and the bare ``QualName`` so that a
 # module move upstream does not silently defeat the table; a genuine *rename*
 # is meant to fall through to the UNKNOWN branch and be re-audited.
