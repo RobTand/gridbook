@@ -187,6 +187,74 @@ def test_parallel_lm_head_is_refused_by_the_embedding_method():
         method.create_weights(head, 128, [64], 128, 64, torch.bfloat16)
 
 
+def test_create_weights_makes_it_an_instance_of_QuantizeMethodBase():
+    """The bug this exists for shipped once and cost a load smoke to find.
+
+    vLLM's post-load sweep picks the modules to finalize with
+    ``isinstance(quant_method, QuantizeMethodBase)`` -- NOMINAL, not
+    structural.  Implementing the full surface without being a subclass meant
+    ``process_weights_after_loading`` was never called: weights loaded, the
+    dispatch was right, the artifact inspected clean, and the model died on its
+    first forward with a missing derived attribute.
+
+    Stubbed rather than skipped.  The obvious spelling of this test is
+    ``importorskip('vllm')``, but vLLM is not installed in the build venv where
+    this suite runs, so that spelling would SKIP here and guard nothing -- the
+    precise condition under which the original bug survived to a container.  A
+    local ABC reproduces the only thing the sweep relies on.
+    """
+    import abc
+    import sys
+    import types
+
+    base_mod = "vllm.model_executor.layers.quantization.base_config"
+    created = []
+    for name in ("vllm", "vllm.model_executor", "vllm.model_executor.layers",
+                 "vllm.model_executor.layers.quantization", base_mod):
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+            created.append(name)
+
+    class _Base(abc.ABC):
+        @abc.abstractmethod
+        def create_weights(self): ...
+        @abc.abstractmethod
+        def apply(self): ...
+
+    mod = sys.modules[base_mod]
+    had = getattr(mod, "QuantizeMethodBase", None)
+    mod.QuantizeMethodBase = _Base
+    try:
+        from gridbook.embedding import _bind_to_quantize_method_base
+
+        assert not isinstance(
+            GridbookNVFP4EmbeddingMethod(FORMATS["nvfp4"], "e"), _Base), (
+            "precondition: not a subclass before binding")
+        _bind_to_quantize_method_base()
+        assert isinstance(
+            GridbookNVFP4EmbeddingMethod(FORMATS["nvfp4"], "e"), _Base), (
+            "vLLM's post-load sweep would skip this method, and the model "
+            "would fail on its first forward rather than at load")
+        _bind_to_quantize_method_base()      # idempotent
+
+        # The mechanism working is not the same as it being INVOKED. Binding
+        # has to happen before the sweep, and create_weights is the only hook
+        # that always runs first; exercising create_weights itself needs a
+        # real vLLM, so the call site is asserted directly. Crude, but it
+        # fails if someone deletes the one line that makes this work.
+        import inspect
+        src = inspect.getsource(
+            GridbookNVFP4EmbeddingMethod.create_weights)
+        assert "_bind_to_quantize_method_base()" in src, (
+            "create_weights no longer binds the base class; the post-load "
+            "sweep will skip this method again")
+    finally:
+        if had is not None:
+            mod.QuantizeMethodBase = had
+        for name in created:
+            sys.modules.pop(name, None)
+
+
 def test_apply_refuses_rather_than_faking_a_gemm():
     method = GridbookNVFP4EmbeddingMethod(FORMATS["nvfp4"], "model.embed_tokens")
     with pytest.raises(EmbeddingFormatError, match="no GEMM path"):

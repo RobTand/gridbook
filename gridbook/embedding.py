@@ -264,13 +264,47 @@ def nvfp4_gather_dequant(
     return out.to(out_dtype).reshape(*rows.shape, cols)
 
 
+def _bind_to_quantize_method_base() -> None:
+    """Make this a VIRTUAL subclass of vLLM's ``QuantizeMethodBase``.
+
+    Not decoration -- load-bearing.  vLLM's post-load sweep
+    (``model_loader/utils.process_weights_after_loading``) selects the modules
+    to finalize with ``isinstance(quant_method, QuantizeMethodBase)``.  That is
+    a NOMINAL check, so a class that implements the whole surface structurally
+    is skipped in silence: the weights load, dispatch is correct, every
+    inspection of the artifact looks right, and the model dies on its FIRST
+    forward with a missing derived attribute.  That is exactly how this was
+    found (2026-08-15 load smoke), and no unit test in either repository could
+    have found it, because the sweep only exists inside vLLM.
+
+    Virtual registration rather than real inheritance because the base's
+    ``apply`` is a Linear's GEMM: inheriting it would give this class a
+    plausible-looking answer to a question a lookup table must refuse.  We
+    implement every member the base declares, so the ABC contract holds; what
+    we decline is the semantics of being a Linear.
+
+    Bound from ``create_weights`` rather than at import: this module must stay
+    importable without vLLM (the declaration half is parsed in the build venv,
+    which has no vLLM), and every path that reaches the sweep passes through
+    ``create_weights`` first, so this is always in time.
+    """
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizeMethodBase,
+    )
+
+    if not issubclass(GridbookNVFP4EmbeddingMethod, QuantizeMethodBase):
+        QuantizeMethodBase.register(GridbookNVFP4EmbeddingMethod)
+
+
 class GridbookNVFP4EmbeddingMethod:
     """Serve a ``VocabParallelEmbedding`` whose table is NVFP4 on disk.
 
-    Implements the ``QuantizeMethodBase`` embedding surface directly rather
-    than subclassing it: the base class is an ABC whose ``apply`` is meant for
-    Linears, and an embedding that silently answered ``apply`` would be
-    claiming a GEMM it does not implement.
+    A VIRTUAL subclass of ``QuantizeMethodBase`` -- see
+    ``_bind_to_quantize_method_base`` for why it must be a subclass at all
+    (vLLM's post-load sweep is an isinstance check) and why the subclassing is
+    virtual rather than real (the base's ``apply`` is a Linear's GEMM, and an
+    embedding that answered it would be claiming an operation it does not
+    implement).
     """
 
     def __init__(self, fmt: EmbeddingFormat, prefix: str) -> None:
@@ -293,6 +327,10 @@ class GridbookNVFP4EmbeddingMethod:
             ParallelLMHead,
         )
         from vllm.model_executor.utils import set_weight_attrs
+
+        # Must happen before the post-load sweep, which is the only thing that
+        # calls process_weights_after_loading. Idempotent.
+        _bind_to_quantize_method_base()
 
         if isinstance(layer, ParallelLMHead):
             raise EmbeddingFormatError(
