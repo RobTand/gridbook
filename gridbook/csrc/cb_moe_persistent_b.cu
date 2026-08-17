@@ -174,13 +174,29 @@
 // ===========================================================================
 // FORMAT SCOPE
 // ===========================================================================
-// FP4-CB two-tier v2, product mode n_sub=2, `type_size == 4*k + 9`, k in
-// [1,24], K % 256 == 0.  This is the quality path that has no fused
-// alternative at any M.  The decode stage is factored behind
-// `cb_decode_codeword` + a format descriptor so an FP8-CB payload (a flat
-// e4m3 plane plus a per-(expert,row) fp32 scale) can be slotted in later
-// without touching the schedule; that is deliberately NOT implemented here
-// (ROADMAP K1.2 owns the FP8 rung surface).
+// Two payload families share the ONE schedule above, selected by the format
+// descriptor the mainloop is templated over:
+//
+// * FP4-CB two-tier v2 (`CbFp4V2Fmt`): product mode n_sub=2,
+//   `type_size == 4*k + 9`, k in [1,24].  This is the original K1.1 surface
+//   and the quality path that has no fused alternative at any M.
+// * FP8-CB (`CbFp8Fmt`, ROADMAP K1.2): product mode n_sub=4,
+//   `type_size == 4*k`, k in [1,48] — a flat e4m3 plane (converted ONCE at
+//   load to an exact FP32 table by torch, so e4m3->f32 is torch's own
+//   conversion by construction) plus a per-(expert, output-row) FP32 scale.
+//   `cb_decode_codeword_fp8` is a line-by-line transcription of
+//   `cb_gemv.cu::cb_expand_fp8_kernel`'s inner body (the same SubSplit<4,2>
+//   ceil-first ragged split, the same aligned-u32 window) followed by the
+//   BF16 bridge's exact value chain `bf16_rn(f32(e4m3) * row_scale)`
+//   (`moe.py::_expand_native_bf16_slice`, FP8 branch).  Note k%4 is NOT
+//   required: that law binds only the TMA-based fused mid-M collective, and
+//   this kernel is hand-assembled (K1.2's resolution note).  There is no FP8
+//   D2R variant; the pair helper is an FP4-only experiment.
+//
+// Both families: K % 256 == 0, stacked stock books only (per-row codebook
+// offsets are uniformly zero for a stacked stock prefill —
+// `moe_routing.cb_cached_row_offsets`; per-role w13 splits are rejected at
+// model load by the lane's supports_fp8()).
 //
 // ===========================================================================
 // EXPERIMENTAL DIRECT-TO-REGISTER B VARIANT
@@ -224,6 +240,7 @@
 #include <cstdint>
 #include <limits>
 #include <mutex>
+#include <type_traits>
 #include <vector>
 
 #define DEVINL __device__ __forceinline__
@@ -295,19 +312,98 @@ struct CbFp4V2Fmt {
 // read from, never what they are.
 DEVINL uint64_t cb_extract_code(const uint32_t* __restrict__ s32,
                                int c,
-                               const CbFp4V2Fmt& f) {
-  const int bitpos = c * f.k_bits;
+                               const int k_bits) {
+  const int bitpos = c * k_bits;
   const int b0 = bitpos >> 3;
   const int rem = ((b0 & 3) << 3) + (bitpos & 7);
   const int widx = b0 >> 2;
   const uint32_t wa = s32[widx];
   const uint32_t wb = s32[widx + 1];
   uint64_t code = (((uint64_t)wb << 32) | (uint64_t)wa) >> rem;
-  if (rem + f.k_bits > 64) {
+  if (rem + k_bits > 64) {
     code |= (uint64_t)s32[widx + 2] << (64 - rem);
   }
-  code &= (f.k_bits >= 64) ? ~0ull : ((1ull << f.k_bits) - 1ull);
+  code &= (k_bits >= 64) ? ~0ull : ((1ull << k_bits) - 1ull);
   return code;
+}
+
+// ---------------------------------------------------------------------------
+// FP8-CB format descriptor.  `SubSplit<4, 2>` from cb_gemv.cu, host-built and
+// carried by value like `CbFp4V2Fmt` so the decode stage stays one
+// self-contained device function.  `k_bits`/`type_size` are the two members
+// the SCHEDULE reads, and both descriptors expose them under the same names —
+// that is the whole template contract.
+//
+// Ceil-first ragged 4-way split (== the producer's bit_split(k, 4)): sub i
+// holds w_i = k/4 + (i < k%4) bits at codeword offset off[i] = sum_{j<i} w_j;
+// its table begins elt[i] = 2 * sum_{j<i} 2^{w_j} ELEMENTS into the flat
+// codebook (SUBDIM=2 e4m3 values per entry).  Worst case (k=48): elt totals
+// 4*(2<<12) = 32,768 elements, comfortably int.
+// ---------------------------------------------------------------------------
+struct CbFp8Fmt {
+  int k_bits;
+  int type_size;   // 4 * k_bits: no per-superblock scale plane in FP8-CB
+  int off[4];
+  uint32_t mask[4];
+  int elt[4];
+
+  __host__ __device__ CbFp8Fmt() = default;
+
+  __host__ explicit CbFp8Fmt(int k, int ts) {
+    k_bits = k;
+    type_size = ts;
+    const int base = k / 4, extra = k % 4;
+    int o = 0;
+    int e = 0;
+    for (int i = 0; i < 4; ++i) {
+      const int w = base + (i < extra ? 1 : 0);
+      off[i] = o;
+      mask[i] = (1u << w) - 1u;
+      elt[i] = e;
+      o += w;
+      e += 2 << w;
+    }
+  }
+};
+
+// One FP8-CB codeword -> 8 consecutive BF16 weights.  The bit window and the
+// four ragged sub-index extractions transcribe cb_expand_fp8_kernel; the value
+// chain `bf16_rn(f32(e4m3) * row_scale)` transcribes the BF16 bridge's python
+// (`value.float() * scale[:, None] -> bf16`).  `lutf` is the flat e4m3
+// codebook ALREADY converted to FP32 by torch at model load, so e4m3->f32 here
+// is definitionally torch's own conversion — NaN payload bytes included —
+// rather than a device intrinsic asserted to agree with it.  `sc` is this
+// output row's scale (per (expert, n); FP8-CB has no per-superblock scale, so
+// unlike the FP4 decode nothing is read from the staged scale plane — there
+// is none).  Each sub-entry is 2 consecutive floats and every base is even,
+// so the float2 gathers stay 8-byte aligned.
+DEVINL uint4 cb_decode_codeword_fp8(const uint32_t* __restrict__ s32,
+                                    int c,
+                                    const CbFp8Fmt& f,
+                                    const float* __restrict__ lutf,
+                                    const float sc) {
+  const uint64_t code = cb_extract_code(s32, c, f.k_bits);
+
+  float v[8];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t idx = (uint32_t)(code >> f.off[i]) & f.mask[i];
+    const float2 q = __ldg(reinterpret_cast<const float2*>(
+        lutf + f.elt[i] + (int64_t)idx * 2));
+    v[2 * i] = q.x;
+    v[2 * i + 1] = q.y;
+  }
+  uint16_t o[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    o[j] = f32_to_bf16_rn(v[j] * sc);
+  }
+  uint4 out;
+  out.x = (uint32_t)o[0] | ((uint32_t)o[1] << 16);
+  out.y = (uint32_t)o[2] | ((uint32_t)o[3] << 16);
+  out.z = (uint32_t)o[4] | ((uint32_t)o[5] << 16);
+  out.w = (uint32_t)o[6] | ((uint32_t)o[7] << 16);
+  return out;
 }
 
 template <bool LutSmem>
@@ -317,7 +413,7 @@ DEVINL uint4 cb_decode_codeword(const uint32_t* __restrict__ s32,
                                 const CbFp4V2Fmt& f,
                                 const uint16_t* lut,
                                 const float* __restrict__ compose) {
-  const uint64_t code = cb_extract_code(s32, c, f);
+  const uint64_t code = cb_extract_code(s32, c, f.k_bits);
 
   // Two-tier scale: one uint8 super exponent per superblock, then 8 bytes of
   // nibbles, one nibble per group of two codewords (== per 16 output columns).
@@ -385,8 +481,8 @@ DEVINL uint2 cb_decode_k16_pairs(const uint32_t* __restrict__ s32,
   uint32_t packed_idx1 = 0;
   uint32_t scale_bits = 0;
   if (pair == 0) {
-    const uint64_t code0 = cb_extract_code(s32, c0, f);
-    const uint64_t code1 = cb_extract_code(s32, c0 + 1, f);
+    const uint64_t code0 = cb_extract_code(s32, c0, f.k_bits);
+    const uint64_t code1 = cb_extract_code(s32, c0 + 1, f.k_bits);
     const uint32_t i00 = (uint32_t)code0 & f.m0;
     const uint32_t i01 = (uint32_t)(code0 >> f.w0) & f.m1;
     const uint32_t i10 = (uint32_t)code1 & f.m0;
@@ -498,19 +594,29 @@ DEVINL uint16_t* tile_at(uint16_t* base, int row, int kcol) {
 // N slice.  Both arrangements hold exactly 32 accumulator registers/thread
 // for every compiled config.
 // ---------------------------------------------------------------------------
-template <int TM, int TN, int WARPS, bool D2R = false>
+// `Fmt` selects the payload family.  For FP4 (`CbFp4V2Fmt`) `lut` is the BF16
+// flat product codebook and `compose` the two-tier table; `scale` is unused
+// (nullptr).  For FP8 (`CbFp8Fmt`) `lut` carries the FP32 codebook pointer
+// (reinterpreted below — internal launch plumbing only, both host entries are
+// typed), `compose` is unused (nullptr) and `scale` is the [E, N] FP32
+// per-output-row table, staged once per (expert, N-tile) work unit.
+template <int TM, int TN, int WARPS, bool D2R = false, class Fmt = CbFp4V2Fmt>
 __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
     const uint16_t* __restrict__ a,          // [P, K] bf16 (routed, sorted)
     const uint8_t* __restrict__ qw,          // [E, N, row_bytes] packed CB
-    const uint16_t* __restrict__ lut,        // flat product codebook (bf16)
+    const uint16_t* __restrict__ lut,        // flat product codebook
     const float* __restrict__ compose,       // [256*16] two-tier compose
+    const float* __restrict__ scale,         // [E, N] fp8 row scales
     const int32_t* __restrict__ expert_ends, // [E] cumulative routed rows
     uint16_t* __restrict__ y,                // [P, N] bf16
     const int64_t P, const int64_t N, const int64_t K,
-    const CbFp4V2Fmt fmt,
+    const Fmt fmt,
     const int ts_pad,
     const int n_tiles,
     const int64_t total_wu) {
+  constexpr bool kFp8 = std::is_same<Fmt, CbFp8Fmt>::value;
+  static_assert(!(D2R && kFp8),
+                "the direct-to-register experiment is FP4-CB-only");
   constexpr int kThreads = WARPS * 32;
   constexpr int WN = D2R ? WARPS : TN / 32;
   constexpr int WM = WARPS / WN;
@@ -532,6 +638,15 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
   uint16_t* sB = sA + 2 * TM * kTK;
   uint8_t* sPk = reinterpret_cast<uint8_t*>(
       D2R ? sB : sB + TN * kTK);
+  // FP8 only: TN staged row scales after the packed plane.  `ts_pad` is a
+  // multiple of 4, so the float view stays aligned.  (FP4 does not request
+  // that region, so it does not form the address either.)
+  float* sScale = kFp8
+      ? reinterpret_cast<float*>(sPk + (int64_t)TN * ts_pad)
+      : nullptr;
+  // FP8 carries the FP32 codebook through the u16 `lut` slot (see the launch
+  // note above); typed back exactly once here.
+  const float* lutf = reinterpret_cast<const float*>(lut);
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -569,6 +684,18 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
     }
 
     const uint8_t* qw_e = qw + (int64_t)e * N * row_bytes;
+
+    // FP8: stage this work unit's TN row scales ONCE, before the M loop.  The
+    // first reader is the decode stage, which sits behind stage 0's barrier
+    // (1); the previous work unit's last reader sits behind its epilogue's
+    // __syncthreads.  Out-of-range rows stage 0.0f — their decoded bytes are
+    // already zero-filled and the epilogue masks the columns regardless.
+    if constexpr (kFp8) {
+      for (int n = tid; n < TN; n += kThreads) {
+        const int gn = n0 + n;
+        sScale[n] = (gn < N) ? __ldg(scale + (int64_t)e * N + gn) : 0.0f;
+      }
+    }
 
     // ---- the in-kernel M loop: stream this expert's rows through B --------
     for (int m0 = m_lo; m0 < m_hi; m0 += TM) {
@@ -697,7 +824,12 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
               const uint32_t* r32 =
                   reinterpret_cast<const uint32_t*>(rowb);
               const int cw = t * kChunks + cc;
-              v = cb_decode_codeword<false>(r32, rowb, cw, fmt, lut, compose);
+              if constexpr (kFp8) {
+                v = cb_decode_codeword_fp8(r32, cw, fmt, lutf, sScale[n]);
+              } else {
+                v = cb_decode_codeword<false>(r32, rowb, cw, fmt, lut,
+                                              compose);
+              }
             } else {
               v = make_uint4(0u, 0u, 0u, 0u);
             }
@@ -909,6 +1041,47 @@ void cb_moe_persistent_b_d2r_decode_pairs_kernel(
   }
 }
 
+// FP8 decode probe: the FP8 mainloop's decode stage, standalone, on the exact
+// model of `cb_moe_persistent_b_decode_kernel` — same 4-byte-aligned staged
+// superblock, same u32 window path under test.  `scale` is one FP32 per
+// ABSOLUTE row (the [E, N] table flattened), read once per row like the
+// mainloop's per-work-unit stage.
+template <int WARPS>
+__global__ __launch_bounds__(WARPS * 32)
+void cb_moe_persistent_b_decode_fp8_kernel(
+    const uint8_t* __restrict__ qw,
+    const float* __restrict__ lutf,
+    const float* __restrict__ scale,
+    uint16_t* __restrict__ w,
+    const int64_t row0, const int64_t nrows, const int64_t K,
+    const CbFp8Fmt fmt, const int ts_pad) {
+  const int n_sb = (int)(K / kSuperblock);
+  const int64_t row_bytes = (int64_t)n_sb * fmt.type_size;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  uint8_t* sPk = smem_raw;
+
+  const int64_t r = row0 + blockIdx.x;
+  if (r >= row0 + nrows) return;
+  const uint8_t* row = qw + r * row_bytes;
+  const float sc = __ldg(scale + r);
+
+  for (int s = warp; s < n_sb; s += WARPS) {
+    uint8_t* dst = sPk + (int64_t)warp * ts_pad;
+    const uint8_t* src = row + (int64_t)s * fmt.type_size;
+    for (int b = lane; b < fmt.type_size; b += 32) dst[b] = __ldg(src + b);
+    for (int b = fmt.type_size + lane; b < ts_pad; b += 32) dst[b] = 0;
+    __syncwarp();
+    const uint4 v = cb_decode_codeword_fp8(
+        reinterpret_cast<const uint32_t*>(dst), lane, fmt, lutf, sc);
+    *reinterpret_cast<uint4*>(w + (r - row0) * K + ((int64_t)s << 8) +
+                              (lane << 3)) = v;
+    __syncwarp();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Host side.
 // ---------------------------------------------------------------------------
@@ -936,11 +1109,15 @@ constexpr TileCfg kCfgs[] = {
 constexpr int kNumCfgs = int(sizeof(kCfgs) / sizeof(kCfgs[0]));
 
 // Shared-memory floor of a config: A stages + (baseline-only) decoded B + the
-// packed staging.  D2R removes exactly `TN * TK * sizeof(bf16)` bytes.
-int64_t cfg_smem_bytes(TileCfg c, int type_size, bool d2r = false) {
+// packed staging + (FP8-only) the TN staged row scales.  D2R removes exactly
+// `TN * TK * sizeof(bf16)` bytes.  The FP8 term is small but it is REQUESTED
+// memory, so the occupancy checks must count it.
+int64_t cfg_smem_bytes(TileCfg c, int type_size, bool d2r = false,
+                       bool fp8 = false) {
   return (int64_t)2 * c.tm * kTK * 2 +
          (d2r ? 0 : (int64_t)c.tn * kTK * 2) +
-         (int64_t)c.tn * ts_padded(type_size);
+         (int64_t)c.tn * ts_padded(type_size) +
+         (fp8 ? (int64_t)c.tn * 4 : 0);
 }
 
 // GB10 / sm_120 shared memory per SM.  Two CTAs is the occupancy floor every
@@ -958,6 +1135,92 @@ constexpr int64_t kSmemPerSm = 102400;
 // binding constraint on this device.  The budget check below counts the
 // reservation so no future config can repeat the mistake silently.
 constexpr int64_t kSmemReservedPerCta = 1024;
+
+// The 2-CTAs/SM floor as a per-config predicate.  For FP4 (type_size <= 105)
+// every compiled config passes at every legal rung, so this changes nothing
+// there; FP8's wider packed superblocks (type_size = 4k, k up to 48) push the
+// TN=64/TN=128 tiles past the floor above k=33/k=31 respectively, and a
+// config that would slip to one CTA per SM must be unselectable — auto
+// selection filters on this, the launcher TORCH_CHECKs it, and the python
+// lane consults it at MODEL LOAD via `cb_moe_persistent_b_fp8_cfg_eligible`
+// so an explicit override naming an ineligible tile fails the load, not the
+// first routed request.
+bool cfg_eligible(int i, int type_size, bool d2r, bool fp8) {
+  const int64_t smem = cfg_smem_bytes(kCfgs[i], type_size, d2r, fp8);
+  return smem + kSmemReservedPerCta <= kSmemPerSm / 2 &&
+         smem <= kSm120SmemCapacity;
+}
+
+// AUTO SELECTION — a pure function of SHAPES (P, N, E) and the LAYER's static
+// format facts, never of a routing VALUE.  P is `a.size(0)` and E is
+// `qw.size(0)`, both known to the host without reading device memory, so the
+// choice is a trace-time constant and the launch stays capturable.  It is
+// deliberately NOT a function of the per-expert counts, which would need a
+// device read.
+//
+// The knob it turns is decode amortization vs wasted MMA.  `P / E` is the
+// mean routed rows per expert; a TM far above it wastes MMA on masked rows,
+// and a TM far below it re-decodes the weight tile once per extra M-tile.
+// Measured on GB10 (docs/KERNELS.md): TM=64/TN=128 wins below ~64 mean rows,
+// TM=128/TN=64 through ~192, TM=256/TN=64 above.
+//
+// `cfg_eligible` is a HARD filter over the whole selection: for FP4 every
+// compiled config passes at every legal rung, so the FP4 result is
+// byte-identical to the pre-FP8 selector; for FP8 the wide tiles fall out
+// above k=33 (TN=64 A-heavy) / k=31 (TN=128) and the TN<=64/4-warp tiles
+// carry every rung to k=48, so the filtered set is never empty.
+int pick_cfg(int64_t P, int64_t E, int64_t N, int type_size, bool d2r,
+             bool fp8) {
+  const int64_t mean_rows = P / E;
+  int idx = (mean_rows <= 64) ? 3 : 0;   // TM=64,TN=128 : TM=128,TN=64
+  // A tile wider than N decodes columns that do not exist, so step down to
+  // the widest compiled tile that fits.  The N step is purely WORK-SAVING:
+  // correctness never depends on it, because a wide TN is masked in all
+  // three places it could matter (`gn < N` in the packed staging, `n0+n < N`
+  // in the decode, `col >= N` in the epilogue).  When N is narrower than
+  // every compiled tile — a legal CB layer only needs N % 8 == 0 — the
+  // narrowest tile is kept and the masking carries it, rather than failing a
+  // shape the kernel computes correctly.
+  if (cfg_eligible(idx, type_size, d2r, fp8) && kCfgs[idx].tn <= N) {
+    return idx;
+  }
+  // Rank over the ELIGIBLE configs: prefer a tile that fits N; among those
+  // prefer the TM the rows-per-expert rule already chose (dropping it would
+  // discard the whole point of the selection at exactly the narrow shapes);
+  // then the widest TN.  If nothing fits N, take the narrowest eligible TN
+  // and let the column masking carry it.
+  const int want_tm = kCfgs[idx].tm;
+  int next = -1;
+  for (int i = 0; i < kNumCfgs; ++i) {
+    if (!cfg_eligible(i, type_size, d2r, fp8)) continue;
+    if (next < 0) {
+      next = i;
+      continue;
+    }
+    const bool fits = kCfgs[i].tn <= N;
+    const bool best_fits = kCfgs[next].tn <= N;
+    if (fits != best_fits) {
+      if (fits) next = i;
+      continue;
+    }
+    if (!fits) {
+      if (kCfgs[i].tn < kCfgs[next].tn) next = i;
+      continue;
+    }
+    const bool same_tm = kCfgs[i].tm == want_tm;
+    const bool best_same_tm = kCfgs[next].tm == want_tm;
+    if (same_tm != best_same_tm) {
+      if (same_tm) next = i;
+    } else if (kCfgs[i].tn > kCfgs[next].tn) {
+      next = i;
+    }
+  }
+  TORCH_CHECK(next >= 0,
+              "cb_moe_persistent_b: no compiled tile config holds two CTAs "
+              "per SM at type_size=", type_size,
+              " — this rung cannot be served by this build");
+  return next;
+}
 
 // ---------------------------------------------------------------------------
 // Per-device preparation, on the model of `cb_gemv_v2.cu::cb_gemv_v2_prepare`.
@@ -1001,6 +1264,13 @@ void pb_prepare_device(int device) {
   for (int i = 0; i < kNumCfgs; ++i) {
     const int64_t s = cfg_smem_bytes(kCfgs[i], 4 * 24 + 9);
     if (s > need) need = s;
+    // FP8's widest rung (k=48), counting only configs the selector can ever
+    // pick there — an ineligible tile never launches, so it must not gate
+    // the device.
+    if (cfg_eligible(i, 4 * 48, /*d2r=*/false, /*fp8=*/true)) {
+      const int64_t s8 = cfg_smem_bytes(kCfgs[i], 4 * 48, false, true);
+      if (s8 > need) need = s8;
+    }
   }
   TORCH_CHECK(prop.sharedMemPerBlockOptin >= need,
               "cb_moe_persistent_b needs ", need,
@@ -1022,6 +1292,18 @@ void pb_prepare_device(int device) {
   PB_SET_MAX_SMEM(128, 32, 4);
   PB_SET_MAX_SMEM(64, 128, 8);
 #undef PB_SET_MAX_SMEM
+  // The FP8 instantiations need the opt-in too — and unlike FP4 they can
+  // actually exceed the 48 KiB default (cfg 1 crosses it at k=31).
+#define PB_SET_MAX_SMEM_FP8(TM_, TN_, W_)                                    \
+  C10_CUDA_CHECK(cudaFuncSetAttribute(                                       \
+      reinterpret_cast<const void*>(                                         \
+          cb_moe_persistent_b_kernel<TM_, TN_, W_, false, CbFp8Fmt>),        \
+      cudaFuncAttributeMaxDynamicSharedMemorySize, kSm120SmemCapacity))
+  PB_SET_MAX_SMEM_FP8(128, 64, 8);
+  PB_SET_MAX_SMEM_FP8(64, 64, 4);
+  PB_SET_MAX_SMEM_FP8(128, 32, 4);
+  PB_SET_MAX_SMEM_FP8(64, 128, 8);
+#undef PB_SET_MAX_SMEM_FP8
 
   pb_prepared[device].store(true, std::memory_order_release);
 }
@@ -1032,16 +1314,18 @@ void cb_moe_persistent_b_prepare() {
   pb_prepare_device(device);
 }
 
-template <int TM, int TN, int WARPS, bool D2R = false>
+template <int TM, int TN, int WARPS, bool D2R = false,
+          class Fmt = CbFp4V2Fmt>
 void launch_cfg(const uint16_t* a, const uint8_t* qw, const uint16_t* lut,
-                const float* compose, const int32_t* expert_ends, uint16_t* y,
-                int64_t P, int64_t N, int64_t K, CbFp4V2Fmt fmt, int ts_pad,
+                const float* compose, const float* scale,
+                const int32_t* expert_ends, uint16_t* y,
+                int64_t P, int64_t N, int64_t K, Fmt fmt, int ts_pad,
                 int n_tiles, int64_t total_wu, int64_t smem, unsigned grid,
                 cudaStream_t stream) {
-  auto kern = cb_moe_persistent_b_kernel<TM, TN, WARPS, D2R>;
+  auto kern = cb_moe_persistent_b_kernel<TM, TN, WARPS, D2R, Fmt>;
   kern<<<grid, WARPS * 32, (size_t)smem, stream>>>(
-      a, qw, lut, compose, expert_ends, y, P, N, K, fmt, ts_pad, n_tiles,
-      total_wu);
+      a, qw, lut, compose, scale, expert_ends, y, P, N, K, fmt, ts_pad,
+      n_tiles, total_wu);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1166,60 +1450,7 @@ void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
 
   int idx = int(cfg_index) - 1;
   if (cfg_index == 0) {
-    // AUTO SELECTION — a pure function of SHAPES (P, N, E), never of a
-    // routing VALUE.  P is `a.size(0)` and E is `qw.size(0)`, both known to
-    // the host without reading device memory, so the choice is a trace-time
-    // constant and the launch stays capturable.  It is deliberately NOT a
-    // function of the per-expert counts, which would need a device read.
-    //
-    // The knob it turns is decode amortization vs wasted MMA.  `P / E` is the
-    // mean routed rows per expert; a TM far above it wastes MMA on masked
-    // rows, and a TM far below it re-decodes the weight tile once per extra
-    // M-tile.  Measured on GB10 (docs/KERNELS.md): TM=64/TN=128 wins below
-    // ~64 mean rows, TM=128/TN=64 through ~192, TM=256/TN=64 above.
-    const int64_t mean_rows = P / E;
-    idx = (mean_rows <= 64) ? 3 : 0;   // TM=64,TN=128 : TM=128,TN=64
-    // A tile wider than N decodes columns that do not exist, so step down to
-    // the widest compiled tile that fits.  This is purely a WORK-SAVING step:
-    // correctness never depends on it, because a wide TN is masked in all
-    // three places it could matter (`gn < N` in the packed staging, `n0+n < N`
-    // in the decode, `col >= N` in the epilogue).  When N is narrower than
-    // every compiled tile — a legal FP4-CB layer only needs N % 8 == 0 — the
-    // narrowest tile is kept and the masking carries it, rather than failing a
-    // shape the kernel computes correctly.
-    if (kCfgs[idx].tn > N) {
-      // Rank: prefer a tile that fits N; among those prefer the TM the
-      // rows-per-expert rule already chose (dropping it would discard the
-      // whole point of the selection at exactly the narrow shapes); then the
-      // widest TN.  If nothing fits, take the narrowest TN and let the column
-      // masking carry it.
-      const int want_tm = kCfgs[idx].tm;
-      int next = -1;
-      for (int i = 0; i < kNumCfgs; ++i) {
-        if (next < 0) {
-          next = i;
-          continue;
-        }
-        const bool fits = kCfgs[i].tn <= N;
-        const bool best_fits = kCfgs[next].tn <= N;
-        if (fits != best_fits) {
-          if (fits) next = i;
-          continue;
-        }
-        if (!fits) {
-          if (kCfgs[i].tn < kCfgs[next].tn) next = i;
-          continue;
-        }
-        const bool same_tm = kCfgs[i].tm == want_tm;
-        const bool best_same_tm = kCfgs[next].tm == want_tm;
-        if (same_tm != best_same_tm) {
-          if (same_tm) next = i;
-        } else if (kCfgs[i].tn > kCfgs[next].tn) {
-          next = i;
-        }
-      }
-      idx = next;
-    }
+    idx = pick_cfg(P, E, N, (int)type_size, d2r, /*fp8=*/false);
   }
   const TileCfg cfg = kCfgs[idx];
   const int64_t smem = cfg_smem_bytes(cfg, (int)type_size, d2r);
@@ -1253,8 +1484,8 @@ void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
 
 #define GB_LAUNCH(TM_, TN_, W_, D2R_)                                        \
   launch_cfg<TM_, TN_, W_, D2R_>(                                           \
-      ap, qp, lp, cp, ep, yp, P, N, K, fmt, ts_pad, n_tiles, total_wu,       \
-      smem, grid, stream)
+      ap, qp, lp, cp, /*scale=*/nullptr, ep, yp, P, N, K, fmt, ts_pad,       \
+      n_tiles, total_wu, smem, grid, stream)
   if (d2r) {
     switch (idx) {
       case 0: GB_LAUNCH(128, 64, 8, true); break;
@@ -1294,6 +1525,200 @@ void cb_moe_persistent_b_prefill_d2r(torch::Tensor out, torch::Tensor a,
                                      int64_t cfg) {
   run_persistent_b(out, a, qw, lut, compose, expert_ends, k_bits, type_size,
                    cfg, true);
+}
+
+// FP8-CB entry (ROADMAP K1.2).  Validation mirrors `run_persistent_b` where
+// the schedule's requirements are shared, and `cb_expand_fp8_launch` where the
+// payload's are: n_sub is structurally 4 (the SubSplit below), type_size is
+// exactly 4*k with k in [1,48] (the aligned-u32 window covers rem+48 <= 79
+// bits inside the +8-byte staging slack), and there is NO padded-qweight
+// requirement — the mainloop stages exactly `type_size` bytes per superblock
+// into its own padded shared slot, so the tight checkpoint plane is consumed
+// as-is (the standalone expander needs `codec.pad_qweight` only because its
+// 8-byte window reads run against the raw plane).
+void run_persistent_b_fp8(torch::Tensor out, torch::Tensor a,
+                          torch::Tensor qw, torch::Tensor lut_f32,
+                          torch::Tensor scale, torch::Tensor expert_ends,
+                          int64_t k_bits, int64_t type_size,
+                          int64_t cfg_index) {
+  TORCH_CHECK(a.is_cuda() && qw.is_cuda() && lut_f32.is_cuda() &&
+                  scale.is_cuda() && expert_ends.is_cuda() && out.is_cuda(),
+              "cb_moe_persistent_b_fp8: every operand must be a CUDA tensor");
+  TORCH_CHECK(a.device() == qw.device() && a.device() == lut_f32.device() &&
+                  a.device() == scale.device() &&
+                  a.device() == expert_ends.device() &&
+                  a.device() == out.device(),
+              "cb_moe_persistent_b_fp8: every operand must be on one CUDA "
+              "device");
+  TORCH_CHECK(a.scalar_type() == torch::kBFloat16,
+              "cb_moe_persistent_b_fp8: activations must be BF16 (the "
+              "quality path's QDQ payload), got ",
+              a.scalar_type());
+  TORCH_CHECK(out.scalar_type() == torch::kBFloat16,
+              "cb_moe_persistent_b_fp8: output must be BF16");
+  TORCH_CHECK(lut_f32.scalar_type() == torch::kFloat32,
+              "cb_moe_persistent_b_fp8: the flat codebook must be the FP32 "
+              "table torch converted from the E4M3 bytes at model load, got ",
+              lut_f32.scalar_type());
+  TORCH_CHECK(qw.scalar_type() == torch::kUInt8,
+              "cb_moe_persistent_b_fp8: packed CB weights must be uint8");
+  TORCH_CHECK(scale.scalar_type() == torch::kFloat32,
+              "cb_moe_persistent_b_fp8: the per-(expert,row) scale table "
+              "must be FP32");
+  TORCH_CHECK(expert_ends.scalar_type() == torch::kInt32,
+              "cb_moe_persistent_b_fp8: expert_ends must be int32");
+  TORCH_CHECK(a.dim() == 2 && out.dim() == 2 && qw.dim() == 3 &&
+                  scale.dim() == 2 && expert_ends.dim() == 1 &&
+                  lut_f32.dim() == 1,
+              "cb_moe_persistent_b_fp8: expected a [P,K], out [P,N], "
+              "qw [E,N,row_bytes], scale [E,N], expert_ends [E], lut [L]");
+  TORCH_CHECK(a.is_contiguous() && out.is_contiguous() && qw.is_contiguous() &&
+                  lut_f32.is_contiguous() && scale.is_contiguous() &&
+                  expert_ends.is_contiguous(),
+              "cb_moe_persistent_b_fp8: every operand must be contiguous");
+
+  const int64_t P = a.size(0);
+  const int64_t K = a.size(1);
+  const int64_t E = qw.size(0);
+  const int64_t N = qw.size(1);
+  const int64_t row_bytes = qw.size(2);
+
+  TORCH_CHECK(out.size(0) == P && out.size(1) == N,
+              "cb_moe_persistent_b_fp8: out must be [P,N] = [", P, ",", N,
+              "], got ", out.sizes());
+  TORCH_CHECK(scale.size(0) == E && scale.size(1) == N,
+              "cb_moe_persistent_b_fp8: scale must be [E,N] = [", E, ",", N,
+              "], got ", scale.sizes());
+  TORCH_CHECK(expert_ends.numel() == E,
+              "cb_moe_persistent_b_fp8: expert_ends must have one cumulative "
+              "count per expert (expected ",
+              E, ", got ", expert_ends.numel(), ")");
+  TORCH_CHECK(E > 0 && N > 0 && K > 0,
+              "cb_moe_persistent_b_fp8: E, N and K must be positive");
+  TORCH_CHECK(K % kSuperblock == 0,
+              "cb_moe_persistent_b_fp8: K must be a multiple of the CB "
+              "superblock (256), got ",
+              K);
+  TORCH_CHECK(N % 8 == 0,
+              "cb_moe_persistent_b_fp8: N must be a multiple of 8 BF16 "
+              "elements, got ",
+              N);
+  TORCH_CHECK(k_bits >= 1 && k_bits <= 48,
+              "cb_moe_persistent_b_fp8: FP8-CB supports k_bits in [1,48], "
+              "got ",
+              k_bits);
+  TORCH_CHECK(type_size == 4 * k_bits,
+              "cb_moe_persistent_b_fp8: FP8-CB layout requires "
+              "type_size == 4*k (n_sub=4 product mode); got type_size=",
+              type_size, " for k=", k_bits);
+  TORCH_CHECK(row_bytes == (K / kSuperblock) * type_size,
+              "cb_moe_persistent_b_fp8: packed row stride ", row_bytes,
+              " != (K/256)*type_size = ", (K / kSuperblock) * type_size);
+  TORCH_CHECK(qw.stride(2) == 1 && qw.stride(1) == row_bytes &&
+                  qw.stride(0) == N * row_bytes,
+              "cb_moe_persistent_b_fp8: the expert stack must be fully "
+              "contiguous [E,N,row_bytes]; the kernel derives the per-expert "
+              "byte-plane stride as N*row_bytes");
+  // The flat codebook holds SUBDIM=2 elements per entry over the ceil-first
+  // ragged 4-way split — the SAME loop as the device descriptor, so a book
+  // sized for a different split cannot pass.
+  {
+    const int base = (int)k_bits / 4, extra = (int)k_bits % 4;
+    int64_t need_lut = 0;
+    for (int i = 0; i < 4; ++i) {
+      need_lut += (int64_t)2 << (base + (i < extra ? 1 : 0));
+    }
+    TORCH_CHECK(lut_f32.numel() == need_lut,
+                "cb_moe_persistent_b_fp8: the flat codebook must hold "
+                "2 * sum_i 2^{w_i} FP32 values over the ceil-first 4-way "
+                "split of k=", k_bits, " (expected ", need_lut, ", got ",
+                lut_f32.numel(), ")");
+  }
+  TORCH_CHECK(P <= std::numeric_limits<int>::max() &&
+                  N <= std::numeric_limits<int>::max() &&
+                  K <= std::numeric_limits<int>::max() &&
+                  E <= std::numeric_limits<int>::max(),
+              "cb_moe_persistent_b_fp8: dimensions exceed int32");
+  TORCH_CHECK(cfg_index >= 0 && cfg_index <= kNumCfgs,
+              "cb_moe_persistent_b_fp8: cfg must be 0 (auto) or 1..",
+              kNumCfgs, ", got ", cfg_index);
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0,
+              "cb_moe_persistent_b_fp8: `a` must be 16-byte aligned (the "
+              "mainloop stages it with 16-byte cp.async); pass a fresh "
+              "contiguous tensor rather than an offset view");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 4 == 0,
+              "cb_moe_persistent_b_fp8: `out` must be 4-byte aligned (the "
+              "epilogue stores two BF16 columns per instruction)");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(lut_f32.data_ptr()) % 8 == 0,
+              "cb_moe_persistent_b_fp8: the FP32 codebook must be 8-byte "
+              "aligned (each decode gathers two floats per sub-table in one "
+              "load)");
+
+  if (P == 0) {
+    return;
+  }
+
+  const CbFp8Fmt fmt((int)k_bits, (int)type_size);
+  const int ts_pad = ts_padded((int)type_size);
+
+  int idx = int(cfg_index) - 1;
+  if (cfg_index == 0) {
+    idx = pick_cfg(P, E, N, (int)type_size, /*d2r=*/false, /*fp8=*/true);
+  }
+  const TileCfg cfg = kCfgs[idx];
+  const int64_t smem = cfg_smem_bytes(cfg, (int)type_size, false, true);
+  TORCH_CHECK(smem + kSmemReservedPerCta <= kSmemPerSm / 2,
+              "cb_moe_persistent_b_fp8: config TM=", cfg.tm, " TN=", cfg.tn,
+              " needs ", smem, " B of shared memory at type_size=", type_size,
+              ", which drops the kernel below two CTAs per SM; pick an "
+              "eligible tile (cb_moe_persistent_b_fp8_cfg_eligible)");
+  TORCH_CHECK(smem <= kSm120SmemCapacity,
+              "cb_moe_persistent_b_fp8: config TM=", cfg.tm, " TN=", cfg.tn,
+              " needs ", smem, " B of shared memory, over the sm_120 budget (",
+              kSm120SmemCapacity, ")");
+
+  const int n_tiles = int((N + cfg.tn - 1) / cfg.tn);
+  const int64_t total_wu = E * (int64_t)n_tiles;
+  const unsigned grid =
+      (unsigned)std::min<int64_t>(total_wu, 2147483647LL);
+
+  const c10::cuda::OptionalCUDAGuard guard(a.device());
+  pb_prepare_device((int)a.device().index());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  const uint16_t* ap = reinterpret_cast<const uint16_t*>(a.data_ptr());
+  const uint8_t* qp = qw.data_ptr<uint8_t>();
+  // The FP32 codebook rides the kernel's u16 `lut` slot; both host entries
+  // stay typed and the kernel casts back exactly once (see the launch note on
+  // the kernel).
+  const uint16_t* lp = reinterpret_cast<const uint16_t*>(lut_f32.data_ptr());
+  const float* sp = scale.data_ptr<float>();
+  const int32_t* ep = expert_ends.data_ptr<int32_t>();
+  uint16_t* yp = reinterpret_cast<uint16_t*>(out.data_ptr());
+
+#define GB_LAUNCH_FP8(TM_, TN_, W_)                                          \
+  launch_cfg<TM_, TN_, W_, false, CbFp8Fmt>(                                 \
+      ap, qp, lp, /*compose=*/nullptr, sp, ep, yp, P, N, K, fmt, ts_pad,     \
+      n_tiles, total_wu, smem, grid, stream)
+  switch (idx) {
+    case 0: GB_LAUNCH_FP8(128, 64, 8); break;
+    case 1: GB_LAUNCH_FP8(64, 64, 4); break;
+    case 2: GB_LAUNCH_FP8(128, 32, 4); break;
+    case 3: GB_LAUNCH_FP8(64, 128, 8); break;
+    default:
+      TORCH_CHECK(false, "cb_moe_persistent_b_fp8: unreachable config index");
+  }
+#undef GB_LAUNCH_FP8
+}
+
+void cb_moe_persistent_b_prefill_fp8(torch::Tensor out, torch::Tensor a,
+                                     torch::Tensor qw, torch::Tensor lut_f32,
+                                     torch::Tensor scale,
+                                     torch::Tensor expert_ends,
+                                     int64_t k_bits, int64_t type_size,
+                                     int64_t cfg) {
+  run_persistent_b_fp8(out, a, qw, lut_f32, scale, expert_ends, k_bits,
+                       type_size, cfg);
 }
 
 torch::Tensor run_decode_probe(torch::Tensor qw_flat,
@@ -1378,6 +1803,82 @@ torch::Tensor cb_moe_persistent_b_d2r_decode_pairs(
                           type_size, true);
 }
 
+torch::Tensor cb_moe_persistent_b_decode_fp8(
+    torch::Tensor qw_flat, torch::Tensor lut_f32, torch::Tensor scale,
+    int64_t row0, int64_t nrows, int64_t K, int64_t k_bits,
+    int64_t type_size) {
+  TORCH_CHECK(qw_flat.is_cuda() && lut_f32.is_cuda() && scale.is_cuda(),
+              "cb_moe_persistent_b_decode_fp8: operands must be CUDA tensors");
+  TORCH_CHECK(qw_flat.scalar_type() == torch::kUInt8 && qw_flat.dim() == 1 &&
+                  qw_flat.is_contiguous(),
+              "cb_moe_persistent_b_decode_fp8: qw_flat must be a contiguous "
+              "1-D uint8 byte plane");
+  TORCH_CHECK(lut_f32.scalar_type() == torch::kFloat32 &&
+                  lut_f32.is_contiguous() && lut_f32.dim() == 1,
+              "cb_moe_persistent_b_decode_fp8: lut must be the contiguous "
+              "FP32 table torch converted from the E4M3 bytes");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(lut_f32.data_ptr()) % 8 == 0,
+              "cb_moe_persistent_b_decode_fp8: the FP32 codebook must be "
+              "8-byte aligned");
+  TORCH_CHECK(scale.scalar_type() == torch::kFloat32 &&
+                  scale.is_contiguous() && scale.dim() == 1,
+              "cb_moe_persistent_b_decode_fp8: scale must be one contiguous "
+              "FP32 value per absolute row");
+  TORCH_CHECK(K % kSuperblock == 0,
+              "cb_moe_persistent_b_decode_fp8: K must be a multiple of 256");
+  TORCH_CHECK(k_bits >= 1 && k_bits <= 48 && type_size == 4 * k_bits,
+              "cb_moe_persistent_b_decode_fp8: FP8-CB requires k in [1,48] "
+              "and type_size == 4*k");
+  TORCH_CHECK(nrows >= 0 && row0 >= 0,
+              "cb_moe_persistent_b_decode_fp8: row0/nrows must be "
+              "non-negative");
+  const int64_t row_bytes = (K / kSuperblock) * type_size;
+  TORCH_CHECK(qw_flat.numel() >= (row0 + nrows) * row_bytes,
+              "cb_moe_persistent_b_decode_fp8: byte plane holds ",
+              qw_flat.numel(), " bytes, needs ", (row0 + nrows) * row_bytes);
+  TORCH_CHECK(scale.numel() >= row0 + nrows,
+              "cb_moe_persistent_b_decode_fp8: scale holds ", scale.numel(),
+              " rows, needs ", row0 + nrows);
+
+  auto out = torch::empty({nrows, K},
+                          torch::TensorOptions()
+                              .dtype(torch::kBFloat16)
+                              .device(qw_flat.device()));
+  if (nrows == 0) {
+    return out;
+  }
+  const CbFp8Fmt fmt((int)k_bits, (int)type_size);
+  const int ts_pad = ts_padded((int)type_size);
+  constexpr int kDecodeWarps = 8;
+  const int64_t smem = (int64_t)kDecodeWarps * ts_pad;
+
+  const c10::cuda::OptionalCUDAGuard guard(qw_flat.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  cb_moe_persistent_b_decode_fp8_kernel<kDecodeWarps>
+      <<<(unsigned)nrows, kDecodeWarps * 32, (size_t)smem, stream>>>(
+          qw_flat.data_ptr<uint8_t>(), lut_f32.data_ptr<float>(),
+          scale.data_ptr<float>(),
+          reinterpret_cast<uint16_t*>(out.data_ptr()), row0, nrows, K, fmt,
+          ts_pad);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+// The 2-CTAs/SM floor as a host attestation, for the python lane to consult
+// at MODEL LOAD (an explicit PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG naming a
+// tile the FP8 rung cannot hold must fail the load, not the first routed
+// request — the FP4 rungs all pass everywhere, which is why this predicate
+// arrived with FP8).  `cfg` is 1-based like the CFG override; 0 (auto) is
+// always eligible because the selector filters on this same predicate.
+bool cb_moe_persistent_b_fp8_cfg_eligible(int64_t cfg, int64_t type_size) {
+  TORCH_CHECK(cfg >= 0 && cfg <= kNumCfgs,
+              "cb_moe_persistent_b_fp8_cfg_eligible: cfg must be 0 (auto) or "
+              "1..", kNumCfgs, ", got ", cfg);
+  if (cfg == 0) return true;
+  return cfg_eligible((int)cfg - 1, (int)type_size, /*d2r=*/false,
+                      /*fp8=*/true);
+}
+
 // Host-only attestation of what was actually compiled — no launch, no device
 // needed.  Per config: [tm, tn, warps, threads, smem_at_k24, capacity].
 std::vector<std::vector<int64_t>> cb_moe_persistent_b_configs() {
@@ -1451,6 +1952,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("lut"), pybind11::arg("compose"),
         pybind11::arg("expert_ends"), pybind11::arg("k_bits"),
         pybind11::arg("type_size"), pybind11::arg("cfg") = 0);
+  m.def("cb_moe_persistent_b_prefill_fp8", &cb_moe_persistent_b_prefill_fp8,
+        "FP8-CB form of the persistent-B grouped MoE decode-in-mainloop "
+        "(ROADMAP K1.2): the SAME schedule over the exact routed segments, "
+        "decoding the n_sub=4 ragged product codewords through torch's own "
+        "e4m3->FP32 table and applying the per-(expert,row) FP32 scale "
+        "before the single BF16 round — bf16_rn(f32(e4m3) * scale), the "
+        "exact value chain of the default expand+bridge. No expanded HBM "
+        "transient. FP32 accumulate.",
+        pybind11::arg("out"), pybind11::arg("a"), pybind11::arg("qw"),
+        pybind11::arg("lut_f32"), pybind11::arg("scale"),
+        pybind11::arg("expert_ends"), pybind11::arg("k_bits"),
+        pybind11::arg("type_size"), pybind11::arg("cfg") = 0);
   m.def("cb_moe_persistent_b_decode", &cb_moe_persistent_b_decode,
         "The mainloop's decode stage, standalone: rows [row0, row0+nrows) of "
         "a flattened FP4-CB-v2 byte plane -> [nrows, K] BF16. Bit-identical "
@@ -1458,6 +1971,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("qw_flat"), pybind11::arg("lut"),
         pybind11::arg("compose"), pybind11::arg("row0"), pybind11::arg("nrows"),
         pybind11::arg("K"), pybind11::arg("k_bits"), pybind11::arg("type_size"));
+  m.def("cb_moe_persistent_b_decode_fp8", &cb_moe_persistent_b_decode_fp8,
+        "The FP8 mainloop's decode stage, standalone: rows [row0, "
+        "row0+nrows) of a flattened FP8-CB byte plane, with one FP32 scale "
+        "per absolute row -> [nrows, K] BF16. Bit-identical to "
+        "cb_expand_fp8 followed by the bridge's float()*scale->bf16 chain, "
+        "by construction and by test.",
+        pybind11::arg("qw_flat"), pybind11::arg("lut_f32"),
+        pybind11::arg("scale"), pybind11::arg("row0"), pybind11::arg("nrows"),
+        pybind11::arg("K"), pybind11::arg("k_bits"), pybind11::arg("type_size"));
+  m.def("cb_moe_persistent_b_fp8_cfg_eligible",
+        &cb_moe_persistent_b_fp8_cfg_eligible,
+        "whether a 1-based tile config holds the 2-CTAs/SM floor at this "
+        "FP8-CB type_size (0 = auto, always eligible; the selector filters "
+        "on the same predicate). Consulted by the lane at MODEL LOAD.",
+        pybind11::arg("cfg"), pybind11::arg("type_size"));
   m.def("cb_moe_persistent_b_d2r_decode_pairs",
         &cb_moe_persistent_b_d2r_decode_pairs,
         "Standalone probe of the exact cooperative pair helper used by D2R: "

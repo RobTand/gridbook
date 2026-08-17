@@ -310,6 +310,51 @@ def test_supports_mirrors_the_kernels_own_shape_checks():
                                 "type_size": 4 * k_bits + 9}) is None
 
 
+# The FP8-CB arm's twin (ROADMAP K1.2).  k=28 / type_size=112 is DSv4's
+# shipping rung — a real FP8-CB row, not an arbitrary number.
+_GOOD_FP8_LAYER = dict(is_fp4=False, n_sub=4, k_bits=28, type_size=112,
+                       hidden=4096, inter=2048, role_split=False)
+
+
+def test_supports_fp8_accepts_a_stock_fp8_cb_layer():
+    assert lane.supports_fp8(**_GOOD_FP8_LAYER) is None
+    assert _GOOD_FP8_LAYER["type_size"] == 4 * _GOOD_FP8_LAYER["k_bits"]
+
+
+@pytest.mark.parametrize("override,mentions", [
+    (dict(is_fp4=True), "FP4"),
+    (dict(role_split=True), "per-role"),
+    (dict(n_sub=2), "n_sub=2"),
+    (dict(k_bits=0, type_size=0), "k=0"),
+    (dict(k_bits=49, type_size=196), "k=49"),
+    (dict(type_size=113), "type_size"),
+    (dict(hidden=2000), "2000"),
+    (dict(inter=1000), "1000"),
+], ids=["fp4", "role-split", "n_sub-2", "k-0", "k-49", "type_size",
+        "hidden-unaligned", "inter-unaligned"])
+def test_supports_fp8_rejects_with_a_readable_reason(override, mentions):
+    """Every FP8 rejection is diagnosed at model load, never in a request —
+    and the role-split refusal in particular names the layout, because with
+    the flag set that layer now FAILS the load where pre-K1.2 builds silently
+    kept the bridge."""
+    reason = lane.supports_fp8(**{**_GOOD_FP8_LAYER, **override})
+    assert isinstance(reason, str) and reason.strip(), (
+        f"{override} must be refused with a sentence, got {reason!r}")
+    assert mentions in reason, (
+        f"the reason for {override} does not name the offending fact "
+        f"({mentions!r}): {reason!r}")
+
+
+def test_supports_fp8_mirrors_the_kernels_own_shape_checks():
+    """The k range and the 4*k row size are the FP8 entry's TORCH_CHECKs."""
+    source = open(_source_path(), encoding="utf-8").read()
+    assert "k_bits >= 1 && k_bits <= 48" in source
+    assert "type_size == 4 * k_bits," in source
+    for k_bits in (1, 28, 48):
+        assert lane.supports_fp8(**{**_GOOD_FP8_LAYER, "k_bits": k_bits,
+                                    "type_size": 4 * k_bits}) is None
+
+
 # ---------------------------------------------------------------------------
 # C. Loader identity: capability gate, digest, strict symbols, build inputs
 # ---------------------------------------------------------------------------

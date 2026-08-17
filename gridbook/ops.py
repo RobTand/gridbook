@@ -377,6 +377,57 @@ def _cb_moe_persistent_b_decode_fake(qw_flat, lut, compose, row0, nrows, K,
     return qw_flat.new_empty((nrows, K), dtype=torch.bfloat16)
 
 
+@torch.library.custom_op("prismaquant::cb_moe_persistent_b_prefill_fp8",
+                         mutates_args=("out",))
+def cb_moe_persistent_b_prefill_fp8(out: torch.Tensor, a: torch.Tensor,
+                                    qw: torch.Tensor, lut_f32: torch.Tensor,
+                                    scale: torch.Tensor,
+                                    expert_ends: torch.Tensor, k_bits: int,
+                                    type_size: int, cfg: int) -> None:
+    """FP8-CB persistent-B grouped MoE decode-in-mainloop (ROADMAP K1.2).
+
+    Same schedule and routing contract as ``cb_moe_persistent_b_prefill``;
+    the decode stage gathers the n_sub=4 ragged product codewords through the
+    FP32 table torch converted from the E4M3 codebook at model load and
+    applies the per-(expert, output-row) FP32 ``scale`` before the single
+    BF16 round — the exact value chain of the default expand + bridge.
+    """
+    from .cuda_ext import require_moe_persistent_b_ext
+    require_moe_persistent_b_ext(
+        "persistent-B grouped MoE FP8 prefill"
+    ).cb_moe_persistent_b_prefill_fp8(
+        out, a, qw, lut_f32, scale, expert_ends, k_bits, type_size, cfg)
+
+
+@cb_moe_persistent_b_prefill_fp8.register_fake
+def _cb_moe_persistent_b_prefill_fp8_fake(out, a, qw, lut_f32, scale,
+                                          expert_ends, k_bits, type_size,
+                                          cfg):
+    return None
+
+
+@torch.library.custom_op("prismaquant::cb_moe_persistent_b_decode_fp8",
+                         mutates_args=())
+def cb_moe_persistent_b_decode_fp8(qw_flat: torch.Tensor,
+                                   lut_f32: torch.Tensor,
+                                   scale: torch.Tensor, row0: int, nrows: int,
+                                   K: int, k_bits: int,
+                                   type_size: int) -> torch.Tensor:
+    """The FP8 persistent-B mainloop's decode stage, standalone (bit-exactness
+    oracle against ``cb_expand_fp8`` + the bridge's float()*scale->bf16 chain;
+    not a serving path)."""
+    from .cuda_ext import require_moe_persistent_b_ext
+    return require_moe_persistent_b_ext(
+        "persistent-B MoE FP8 decode probe").cb_moe_persistent_b_decode_fp8(
+            qw_flat, lut_f32, scale, row0, nrows, K, k_bits, type_size)
+
+
+@cb_moe_persistent_b_decode_fp8.register_fake
+def _cb_moe_persistent_b_decode_fp8_fake(qw_flat, lut_f32, scale, row0,
+                                         nrows, K, k_bits, type_size):
+    return qw_flat.new_empty((nrows, K), dtype=torch.bfloat16)
+
+
 # NOTE (2026-08-01): `prismaquant::cb_expand_fp8_into` (the out-variant of
 # cb_expand_fp8) and its `cb_expand_fp8_into_available` probe were registered
 # here with zero serving call sites — residue of the L2-pinned per-expert

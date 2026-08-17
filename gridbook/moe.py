@@ -57,6 +57,7 @@ from .moe_persistent_b_lane import (
     requested as persistent_b_requested,
     resolve_cfg as persistent_b_resolve_cfg,
     supports as persistent_b_supports,
+    supports_fp8 as persistent_b_supports_fp8,
 )
 from .moe_routing import (
     GROUPED_TILE_N,
@@ -636,12 +637,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if bf16_sm120_requested():
             layer._cb_bf16_sm120 = bf16_sm120_require_lane(
                 f"{self.prefix} routed quality prefill", device=dev)
-        # OPT-IN persistent-B grouped MoE decode-in-mainloop (ROADMAP K1.1).
-        # Resolved HERE for the same reason: an explicit lane selection this
-        # build/device/artifact cannot serve must fail the model LOAD, because
-        # silently serving expand+bridge instead would answer a different
-        # question than the operator asked. FP4-CB v2 only — an FP8-CB layer
-        # in a mixed serve keeps its own route rather than failing the load.
+        # OPT-IN persistent-B grouped MoE decode-in-mainloop (ROADMAP K1.1;
+        # the FP8-CB arm is K1.2). Resolved HERE for the same reason: an
+        # explicit lane selection this build/device/artifact cannot serve must
+        # fail the model LOAD, because silently serving expand+bridge instead
+        # would answer a different question than the operator asked. ONE flag
+        # covers both payload families — each layer engages its own family's
+        # arm and the route telemetry names the symbol that served. Since
+        # K1.2 this includes stock FP8-CB; a layer NO arm can serve (per-role
+        # FP8-CB splits) fails the load by name, where pre-K1.2 builds
+        # silently kept the bridge for every FP8 layer.
         #
         # The flag is PARSED for every layer, FP8 included: reading it only
         # inside the ``is_fp4`` guard meant a typo on an FP8-only model was
@@ -733,6 +738,58 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                       f"cfg={layer._cb_moe_persistent_b_cfg} "
                       f"schedule={pb_schedule}); no expanded "
                       f"[E,N,K] transient", flush=True)
+        elif persistent_b_on:
+            # The FP8-CB arm (ROADMAP K1.2). Same schedule, same flag; the
+            # decode stage gathers the n_sub=4 ragged codewords through the
+            # FP32 table torch converts from the E4M3 book below, and applies
+            # the per-(expert, output-row) FP32 scale before the single BF16
+            # round — the exact value chain of `_expand_native_bf16_slice`'s
+            # FP8 branch, so what changes vs the bridge is the FP32 reduction
+            # order only (reassociation-class, like the FP4 arm).
+            if persistent_b_d2r_on:
+                raise NativeKernelUnavailableError(
+                    f"{self.prefix}: persistent-B's direct-to-register "
+                    "experiment is FP4-CB-only, and this layer is FP8-CB; "
+                    "Gridbook does not label a run D2R when the shared-B "
+                    "schedule would serve part of it")
+            reason = persistent_b_supports_fp8(
+                is_fp4=self.is_fp4, n_sub=self.n_sub, k_bits=self.k,
+                type_size=self.type_size, hidden=layer._cb_hidden,
+                inter=layer._cb_inter,
+                role_split=bool(getattr(layer, "_cb_role_split", False)))
+            if reason is not None:
+                raise NativeKernelUnavailableError(
+                    f"{self.prefix}: requested the persistent-B grouped MoE "
+                    f"lane (PRISMAQUANT_CB_MOE_PERSISTENT_B=1), but this "
+                    f"FP8-CB layer cannot use it ({reason}); Gridbook does "
+                    "not substitute a different schedule behind an explicit "
+                    "lane selection")
+            layer._cb_moe_persistent_b = persistent_b_require_lane(
+                f"{self.prefix} routed quality prefill", device=dev)
+            # The FP8 rung ALSO validates the tile override against the
+            # 2-CTAs/SM occupancy floor at this layer's type_size — the wide
+            # tiles fall past it above k=33/k=31, and an ineligible explicit
+            # pick must fail the load, not the first routed request.
+            layer._cb_moe_persistent_b_cfg = persistent_b_resolve_cfg(
+                layer._cb_moe_persistent_b, fp8_type_size=self.type_size)
+            # Materialize the decode operands NOW, before any capture or
+            # first forward: the E4M3 book converted ONCE by torch to the
+            # exact FP32 table the kernel gathers from (e4m3->f32 is
+            # definitionally torch's own conversion), and the per-row scale
+            # tables as contiguous FP32.
+            layer._cb_flat_fp8_f32 = (
+                self._stock_cb_flat_fp8(layer)
+                .view(torch.float8_e4m3fn).float().contiguous())
+            for which in ("w13", "w2"):
+                setattr(layer, f"_cb_pb_{which}_scale_f32",
+                        getattr(layer, f"{which}_weight_scale")
+                        .to(torch.float32).contiguous())
+            print(f"[prismaquant-cb] moe_prefill {self.prefix} -> "
+                  f"persistent-B decode-in-mainloop FP8-CB (k={self.k} "
+                  f"type_size={self.type_size} hidden={layer._cb_hidden} "
+                  f"inter={layer._cb_inter} "
+                  f"cfg={layer._cb_moe_persistent_b_cfg}); no expanded "
+                  f"[E,N,K] transient", flush=True)
         if not self._cuda_moe_ok(layer):
             raise NativeKernelUnavailableError(
                 f"{self.prefix}: routed decode layout has no native grouped "
@@ -1381,12 +1438,15 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         owning CTAs in M-tiles inside the kernel, so skew costs a longer CTA,
         never a serialized grid or a host-visible branch.
 
-        NUMERICS. Same activations (the exact group-16 RTN QDQ, on the module
-        input and on the intermediate), weights decoded bit-identically to
-        ``cb_expand_fp4_v2`` (proven by ``torch.equal`` in the suite, not
-        asserted), FP32 accumulate, ONE bf16 round. Only the GEMM's FP32
-        reduction order and the cross-expert combine reassociate —
-        REASSOCIATION-CLASS, the suite's established contract.
+        NUMERICS. Same activations as the bridge lane, per family (the exact
+        group-16 RTN QDQ for FP4-CB, the exact e4m3 QDQ for FP8-CB, on the
+        module input and on the intermediate); weights decoded bit-identically
+        to the family's expander chain — ``cb_expand_fp4_v2``, or
+        ``cb_expand_fp8`` followed by the fp32 row-scale multiply and one
+        BF16 round — proven by ``torch.equal`` in the suite, not asserted.
+        FP32 accumulate, ONE bf16 round. Only the GEMM's FP32 reduction order
+        and the cross-expert combine reassociate — REASSOCIATION-CLASS, the
+        suite's established contract.
         """
         from . import ops as pq_ops
 
@@ -1402,8 +1462,25 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # both stages of one forward cannot disagree.
         cfg = getattr(layer, "_cb_moe_persistent_b_cfg", 0)
         d2r = bool(getattr(layer, "_cb_moe_persistent_b_d2r", False))
-        persistent_b_op = (pq_ops.cb_moe_persistent_b_prefill_d2r
-                           if d2r else pq_ops.cb_moe_persistent_b_prefill)
+        fp8 = not self.is_fp4
+        if fp8:
+            # The FP8-CB arm (K1.2): the decode operands were materialized at
+            # model load; both stages bind their own [E, N] scale table.
+            def persistent_b_op(out_, a_, qw_, ends_, k_, ts_, cfg_, *,
+                                which):
+                pq_ops.cb_moe_persistent_b_prefill_fp8(
+                    out_, a_, qw_, layer._cb_flat_fp8_f32,
+                    getattr(layer, f"_cb_pb_{which}_scale_f32"),
+                    ends_, k_, ts_, cfg_)
+        else:
+            fp4_op = (pq_ops.cb_moe_persistent_b_prefill_d2r
+                      if d2r else pq_ops.cb_moe_persistent_b_prefill)
+
+            def persistent_b_op(out_, a_, qw_, ends_, k_, ts_, cfg_, *,
+                                which):
+                del which
+                fp4_op(out_, a_, qw_, layer._cb_flat, layer._cb_compose,
+                       ends_, k_, ts_, cfg_)
 
         pair_expert = topk_ids.reshape(-1).to(torch.int64)
         order = torch.argsort(pair_expert, stable=True)
@@ -1419,7 +1496,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         counts = _expert_counts(pair_expert, E)
         expert_ends = torch.cumsum(counts, 0, dtype=torch.int32).contiguous()
 
-        xq = pq_ops.fp4_act_qdq(x)
+        xq = (pq_ops.fp4_act_qdq(x) if not fp8
+              else pq_ops.fp8_act_qdq(x))
         x_sorted = xq.index_select(0, rows).contiguous()
         del xq
         pair_count = int(x_sorted.shape[0])
@@ -1427,22 +1505,23 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         gate_up = torch.empty((pair_count, 2 * inter), dtype=torch.bfloat16,
                               device=dev)
         persistent_b_op(
-            gate_up, x_sorted, layer.w13_cb_qweight.data, layer._cb_flat,
-            layer._cb_compose, expert_ends, self.k, self.type_size, cfg)
+            gate_up, x_sorted, layer.w13_cb_qweight.data,
+            expert_ends, self.k, self.type_size, cfg, which="w13")
         del x_sorted
 
         activated = torch.empty((pair_count, inter), dtype=torch.bfloat16,
                                 device=dev)
         native_moe_activation(act, activated, gate_up)
         del gate_up
-        aq = pq_ops.fp4_act_qdq(activated)
+        aq = (pq_ops.fp4_act_qdq(activated) if not fp8
+              else pq_ops.fp8_act_qdq(activated))
         del activated
 
         pair_output = torch.empty((pair_count, hidden), dtype=torch.bfloat16,
                                   device=dev)
         persistent_b_op(
-            pair_output, aq, layer.w2_cb_qweight.data, layer._cb_flat,
-            layer._cb_compose, expert_ends, self.k, self.type_size, cfg)
+            pair_output, aq, layer.w2_cb_qweight.data,
+            expert_ends, self.k, self.type_size, cfg, which="w2")
         del aq
 
         pair_weight = topk_weights.reshape(-1).index_select(0, order) \
@@ -1453,7 +1532,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         emit_route(layer, kind="moe",
                    policy=("moe_persistent_b_d2r" if d2r
                            else "moe_persistent_b"),
-                   symbol=("cb_moe_persistent_b_prefill_d2r" if d2r
+                   symbol=("cb_moe_persistent_b_prefill_fp8" if fp8
+                           else "cb_moe_persistent_b_prefill_d2r" if d2r
                            else "cb_moe_persistent_b_prefill"),
                    tile_m=int(cfg),
                    shape=_moe_shape(layer, topk_ids),

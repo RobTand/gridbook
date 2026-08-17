@@ -1999,15 +1999,19 @@ _moe_persistent_b_lock = threading.Lock()
 # here is the whole change (tests/test_moe_persistent_b_lane.py asserts the
 # declared inputs cover every Gridbook include the source actually has).
 _MOE_PERSISTENT_B_BUILD_INPUTS = ("cb_moe_persistent_b.cu",)
-# Starts at 1: this module's identity payload is new.
-_MOE_PERSISTENT_B_ABI_SCHEMA = 1
+# Schema 2 (ROADMAP K1.2): the FP8-CB rung joined the module — three new
+# production symbols below.  (Schema 1 was the FP4-only original.)
+_MOE_PERSISTENT_B_ABI_SCHEMA = 2
 
 # Strict symbol contract.  The digest keys both the module name and the build
 # directory, so a module that loads at all was built from exactly this source;
 # a missing binding is a broken build, not an older one.
 _MOE_PERSISTENT_B_SYMBOLS = (
     "cb_moe_persistent_b_prefill",
+    "cb_moe_persistent_b_prefill_fp8",
     "cb_moe_persistent_b_decode",
+    "cb_moe_persistent_b_decode_fp8",
+    "cb_moe_persistent_b_fp8_cfg_eligible",
     "cb_moe_persistent_b_prepare",
     "cb_moe_persistent_b_configs",
     "cb_moe_persistent_b_tile_k",
