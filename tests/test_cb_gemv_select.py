@@ -440,12 +440,17 @@ def test_moe_mixed_imports_only_names_moe_gemv_select_defines():
     symbol. Parse the import statically and hold it against the real module,
     no vLLM needed."""
     import ast
+    import importlib.util
     from pathlib import Path
 
     import gridbook.moe_gemv_select as sel
 
-    src = Path(__file__).resolve().parents[1] / "gridbook" / "moe_mixed.py"
-    tree = ast.parse(src.read_text())
+    # Resolve the source through the import system, not the repo layout:
+    # the release train runs this suite against the installed wheel from a
+    # temp cwd where ../gridbook/moe_mixed.py does not exist.
+    spec = importlib.util.find_spec("gridbook.moe_mixed")
+    assert spec is not None and spec.origin, "gridbook.moe_mixed has no locatable source"
+    tree = ast.parse(Path(spec.origin).read_text())
     names = [
         alias.name
         for node in ast.walk(tree)

@@ -13,7 +13,9 @@
   runner; the file now skips only for a missing vLLM and fails loudly on
   gridbook's own import errors, and a CPU-suite guard statically parses
   `moe_mixed`'s imports from `moe_gemv_select` and holds them against the
-  real module.
+  real module (resolved through `importlib.util.find_spec`, so the guard also
+  runs in the release train's installed-wheel layout, where the repo tree is
+  not at a path relative to the test file).
 - The mixed method's FP8-v2 dispatch gate is tri-state-correct: `require`
   keeps the exact fail-load A/B-arm refusal on mixed FP8 groups, `auto` (the
   unset default) keeps the inherited kernel for them with the reason
