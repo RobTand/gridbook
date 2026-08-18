@@ -903,8 +903,12 @@ def test_the_module_has_no_dense_entry_point():
     assert ext.cb_moe_persistent_b_is_moe_only() is True
 
     routed = {"cb_moe_persistent_b_prefill",
-              "cb_moe_persistent_b_prefill_d2r"}
+              "cb_moe_persistent_b_prefill_d2r",
+              # K1.2: the FP8-CB family rides the SAME routed schedule — the
+              # binding takes expert_ends, so a dense caller cannot reach it.
+              "cb_moe_persistent_b_prefill_fp8"}
     non_gemm = {"cb_moe_persistent_b_decode",
+                "cb_moe_persistent_b_decode_fp8",
                 "cb_moe_persistent_b_d2r_decode_pairs",
                 "cb_moe_persistent_b_configs",
                 "cb_moe_persistent_b_d2r_configs",
@@ -914,7 +918,10 @@ def test_the_module_has_no_dense_entry_point():
                 # compiled tile and validates the capability. No operands, no
                 # GEMM, so it cannot be a dense entry point.
                 "cb_moe_persistent_b_prepare",
-                "cb_moe_persistent_b_d2r_prepare"}
+                "cb_moe_persistent_b_d2r_prepare",
+                # Host-only occupancy predicate for the FP8 tile configs
+                # (ints in, bool out). Consulted at model load by the lane.
+                "cb_moe_persistent_b_fp8_cfg_eligible"}
     exported = {name for name in dir(ext) if name.startswith("cb_")}
     assert exported == routed | non_gemm, (
         f"unexpected bindings {sorted(exported - (routed | non_gemm))}: a new "
@@ -926,6 +933,7 @@ def test_the_module_has_no_dense_entry_point():
             f"{name} computes a GEMM but its signature does not take the "
             f"routing; that is a dense entry point")
     for name in non_gemm - {"cb_moe_persistent_b_decode",
+                            "cb_moe_persistent_b_decode_fp8",
                             "cb_moe_persistent_b_d2r_decode_pairs"}:
         assert not getattr(ext, name).__doc__.count("Tensor"), (
             f"{name} is supposed to be a host-only attestation")
