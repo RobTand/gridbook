@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.8.10 — 2026-08-18
+
+- **0.8.9 could not load a per-expert split-format (mixed) expert bank at
+  all**: the tri-state refactor renamed `cb_fp8_gemv_v2_requested` to
+  `cb_fp8_gemv_v2_mode`, and `moe_mixed.py` still imported the old name, so
+  `config.py`'s split-bank dispatch died with an ImportError on any artifact
+  declaring `per_expert_format_groups`. Uniform stacks — every published
+  artifact — were unaffected. The break shipped green because
+  `tests/test_moe_mixed.py` used `pytest.importorskip("gridbook.moe_mixed")`,
+  which turned our own ImportError into a silent skip on every vLLM-less
+  runner; the file now skips only for a missing vLLM and fails loudly on
+  gridbook's own import errors, and a CPU-suite guard statically parses
+  `moe_mixed`'s imports from `moe_gemv_select` and holds them against the
+  real module.
+- The mixed method's FP8-v2 dispatch gate is tri-state-correct: `require`
+  keeps the exact fail-load A/B-arm refusal on mixed FP8 groups, `auto` (the
+  unset default) keeps the inherited kernel for them with the reason
+  announced per stack — a mixed FP8 group is an off-cell, not an error — and
+  `off` skips. Verified in the pinned serving container: `gridbook.moe_mixed`
+  imports and the selector resolves `auto` with vLLM present.
+
+
 ## 0.8.9 — 2026-08-18
 
 **The qualified CB kernels are now the default.** Three selectors gain a

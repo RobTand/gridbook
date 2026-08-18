@@ -430,3 +430,32 @@ def test_check_dist_native_floor_tracks_serving_not_retired_research():
     assert "gridbook/csrc/cb_bf16_grouped_gemm.cu" in mod.REQUIRED
     assert "gridbook/csrc/cb_persistent_tc.cu" not in mod.REQUIRED
     assert "gridbook/kernels.py" in mod.FORBIDDEN
+
+
+def test_moe_mixed_imports_only_names_moe_gemv_select_defines():
+    """moe_mixed imports vLLM at module scope, so on a vLLM-less box its
+    import errors are invisible and importorskip turns them into skips —
+    which is how 0.8.9 shipped `from .moe_gemv_select import
+    cb_fp8_gemv_v2_requested` after the tri-state refactor renamed that
+    symbol. Parse the import statically and hold it against the real module,
+    no vLLM needed."""
+    import ast
+    from pathlib import Path
+
+    import gridbook.moe_gemv_select as sel
+
+    src = Path(__file__).resolve().parents[1] / "gridbook" / "moe_mixed.py"
+    tree = ast.parse(src.read_text())
+    names = [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module
+        and node.module.endswith("moe_gemv_select")
+        for alias in node.names
+    ]
+    assert names, "moe_mixed no longer imports from moe_gemv_select?"
+    missing = [n for n in names if not hasattr(sel, n)]
+    assert not missing, (
+        f"moe_mixed imports names moe_gemv_select does not define: {missing}"
+    )

@@ -11,6 +11,19 @@ from gridbook.per_expert_format import parse_declaration
 from gridbook.runtime_contract import load_runtime_contract
 
 
+
+def _import_moe_mixed():
+    """Skip ONLY for a missing vLLM; our own breakage must fail, not skip.
+
+    `pytest.importorskip("gridbook.moe_mixed")` skipped this whole file when
+    moe_mixed's import of a renamed moe_gemv_select symbol broke in 0.8.9 —
+    an importorskip on an internal module hides exactly the regressions this
+    suite exists to catch.
+    """
+    pytest.importorskip("vllm")
+    import gridbook.moe_mixed as moe_mod
+    return moe_mod
+
 def _declaration():
     config = {
         "per_expert_format_groups": {
@@ -58,7 +71,7 @@ def _declaration():
 
 
 def test_registers_per_family_buffers_and_index_maps():
-    moe_mod = pytest.importorskip("gridbook.moe_mixed")
+    moe_mod = _import_moe_mixed()
     method_cls = moe_mod.PrismaQuantMixedMoEMethod
     groups, schemes = _declaration()
     method = method_cls.__new__(method_cls)
@@ -89,7 +102,7 @@ def test_registers_per_family_buffers_and_index_maps():
 
 def test_explicit_fp8_v2_refuses_mixed_fp8_groups(monkeypatch):
     """A global candidate arm must not silently inherit inside mixed groups."""
-    moe_mod = pytest.importorskip("gridbook.moe_mixed")
+    moe_mod = _import_moe_mixed()
     from gridbook import moe_gemv_select
 
     groups, schemes = _declaration()
@@ -110,7 +123,7 @@ def test_explicit_fp8_v2_refuses_mixed_fp8_groups(monkeypatch):
 
 
 def test_disabled_fp8_v2_leaves_mixed_groups_on_inherited(monkeypatch):
-    moe_mod = pytest.importorskip("gridbook.moe_mixed")
+    moe_mod = _import_moe_mixed()
     from gridbook import moe_gemv_select
 
     groups, schemes = _declaration()
@@ -130,7 +143,7 @@ def test_disabled_fp8_v2_leaves_mixed_groups_on_inherited(monkeypatch):
 
 
 def test_family_loader_copies_exact_substacks_without_legacy_transpose():
-    moe_mod = pytest.importorskip("gridbook.moe_mixed")
+    moe_mod = _import_moe_mixed()
     groups, schemes = _declaration()
     method = moe_mod.PrismaQuantMixedMoEMethod.__new__(
         moe_mod.PrismaQuantMixedMoEMethod
@@ -168,7 +181,7 @@ def test_family_loader_copies_exact_substacks_without_legacy_transpose():
 
 
 def test_static_input_scale_is_one_shared_value_per_family():
-    moe_mod = pytest.importorskip("gridbook.moe_mixed")
+    moe_mod = _import_moe_mixed()
     groups, schemes = _declaration()
     for group in groups.w13:
         schemes[group.tensor_prefix]["activation_contract"] = "k0.2"
@@ -198,7 +211,7 @@ def test_static_input_scale_is_one_shared_value_per_family():
 
 
 def test_partial_passthrough_builds_only_declared_family_delegate():
-    moe_mod = pytest.importorskip("gridbook.moe_mixed")
+    moe_mod = _import_moe_mixed()
     prefix = "model.layers.0.experts"
     config = {
         "per_expert_format_groups": {
@@ -304,7 +317,7 @@ def test_partial_passthrough_builds_only_declared_family_delegate():
 
 
 def test_split_prefixes_follow_vllm_mapper_without_losing_wire_names():
-    moe_mod = pytest.importorskip("gridbook.moe_mixed")
+    moe_mod = _import_moe_mixed()
     from gridbook.config import PrismaQuantConfig
 
     groups, schemes = _declaration()

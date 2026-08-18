@@ -24,7 +24,7 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from . import codec
 from .cb_fill_guard import mark_filled, mark_unfilled
-from .moe_gemv_select import (cb_fp8_gemv_v2_requested,
+from .moe_gemv_select import (cb_fp8_gemv_v2_mode,
                               cb_gemv_choice)
 from .per_expert_format import (
     ExpertFormatGroup,
@@ -100,17 +100,21 @@ class PrismaQuantMixedMoEMethod(FusedMoEMethodBase):
         return None
 
     def _require_fp8_v2_dispatch_supported(self) -> None:
-        """Refuse an explicit routed-FP8-v2 arm on mixed expert groups.
+        """Refuse an EXPLICIT routed-FP8-v2 arm on mixed expert groups.
 
         The uniform method owns the qualified whole-row dispatch.  Mixed
         groups have separate family-local maps and currently call the
-        inherited FP8 op directly; silently accepting the global opt-in here
-        would produce a mixed/inherited benchmark mislabeled as FP8-v2.
-        Parsing the selector even for FP4-only declarations also keeps invalid
-        spellings process-global instead of depending on which layer loads
-        first.
+        inherited FP8 op directly, so under `1`/`require` — the A/B-arm
+        contract — an FP8 mixed group must fail the load by name rather than
+        produce a mixed/inherited benchmark mislabeled as FP8-v2.  Under
+        `auto` (the 0.8.9 unset default) a mixed FP8 group is simply not a
+        qualified cell: it keeps the inherited kernel with the reason
+        announced, exactly like every other off-cell stack.  Calling mode()
+        even for FP4-only declarations also keeps invalid spellings
+        process-global instead of depending on which layer loads first.
         """
-        if not cb_fp8_gemv_v2_requested():
+        mode = cb_fp8_gemv_v2_mode()
+        if mode == "off":
             return
         fp8_groups = [
             f"{family}:{group.format_wire_id}"
@@ -119,12 +123,20 @@ class PrismaQuantMixedMoEMethod(FusedMoEMethodBase):
             if not group.is_passthrough
             and self._scheme_for(group).get("grid") == "fp8"
         ]
-        if fp8_groups:
+        if not fp8_groups:
+            return
+        if mode == "require":
             raise RuntimeError(
-                f"{self.prefix}: PRISMAQUANT_CB_FP8_GEMV_V2=1 is not "
+                f"{self.prefix}: PRISMAQUANT_CB_FP8_GEMV_V2=require is not "
                 "implemented for per-expert mixed FP8 groups "
                 f"{fp8_groups}; refusing a silently inherited candidate arm"
             )
+        print(
+            f"[prismaquant-cb] {self.prefix}: fp8_gemv_v2=auto keeps the "
+            f"inherited kernel for mixed FP8 groups {fp8_groups} (whole-row "
+            "sibling serves uniform stacks only)",
+            flush=True,
+        )
 
     def _scheme_for(self, group: ExpertFormatGroup) -> dict:
         target = self.quant_config._per_expert_serving_prefixes[
