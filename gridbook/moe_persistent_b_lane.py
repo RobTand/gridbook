@@ -1,4 +1,4 @@
-"""OPT-IN selector for the persistent-B grouped MoE decode-in-mainloop lane.
+"""Selector for the persistent-B grouped MoE decode-in-mainloop lane.
 
 Two routes serve the CB MoE quality prefill above the M<=16 GEMV band, for
 BOTH payload families (FP4-CB two-tier v2, and — since ROADMAP K1.2 — stock
@@ -15,16 +15,25 @@ FP8-CB):
 Both consume the SAME activation payload (the exact native QDQ of the family —
 group-16 RTN for FP4, e4m3 for FP8) and the same packed weights, accumulate in
 FP32 and round once to BF16.  What differs is the FP32 reduction order —
-reassociation-class, the requalification surface W4's sm12x-native BF16 lane
-and the promoted FP8 mid-M fused kernel cleared — so the lane stays opt-in
-until the served [NATIVE-PARITY](../docs/NATIVE-PARITY.md) protocol runs on
-the WHOLE routed operator.
+reassociation-class.  The lane was opt-in until that surface cleared served
+validation — the FP4 arm's same-session served A/B on the DSv4 92 GB body
+(kl_mean −0.051%, PPL −0.30% — arithmetic noise; the dated entry in
+CHANGELOG.md names the rest of the record) on top of each arm's bitwise
+decode-identity CUDA suite.  **Default is now "auto"** (0.8.9): each routed CB
+layer engages its family's arm where the load-time predicate and the extension
+attest, and keeps the expand+bridge route where they do not, with the route
+telemetry naming which.  The bridge is exactly the previous default —
+degrading is correct, only slower.
 
-ONE flag covers both families: the operator asks for "persistent-B where
-supported" and each layer engages its own family's arm, with the route
-telemetry naming the symbol that actually served.  A layer the lane cannot
-serve fails the LOAD (per-role FP8-CB splits, for example) — never a silent
-baseline run.
+ONE flag covers both families, three spellings:
+
+* unset / ``auto`` — persistent-B where supported, bridge where not (DEFAULT);
+* ``1`` / ``require`` — every routed CB layer must take the lane; a layer it
+  cannot serve (per-role FP8-CB splits, for example) fails the LOAD, never a
+  silent baseline run.  This is the A/B-integrity semantics 0.8.8 spelled as
+  ``=1``: with the lane explicitly requested, quietly serving the bridge
+  would produce a run whose numbers describe the wrong schedule;
+* ``0`` / ``off`` — the expand+bridge route everywhere.
 
 The module mirrors ``bf16_grouped_lane`` deliberately: one process-stable
 selector, resolution at model load and never at first forward, and a failure
@@ -39,17 +48,34 @@ from . import lane_select
 _FLAG = "PRISMAQUANT_CB_MOE_PERSISTENT_B"
 _D2R_FLAG = "PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R"
 
+_MODE_SPELLINGS = {
+    "": "auto",
+    "auto": "auto",
+    "1": "require",
+    "require": "require",
+    "0": "off",
+    "off": "off",
+}
 
-def requested() -> bool:
-    """Whether the operator asked for the persistent-B MoE lane.
+
+def mode() -> str:
+    """The lane's process-wide mode: ``"auto"`` | ``"require"`` | ``"off"``.
 
     Process-stable like every other Gridbook dispatch selector: a value that
     changed after dispatch was fixed would mix two reduction orders inside one
     run and make an A/B unreadable.  A typo raises rather than quietly
-    selecting the baseline.
+    selecting a mode.  Unset means ``auto`` (the default since 0.8.9); ``1``
+    keeps its 0.8.8 meaning exactly — an explicit lane REQUIREMENT that fails
+    the load rather than substituting the bridge.
     """
-    return lane_select.latched_bool(
-        _FLAG, meaning="the persistent-B grouped MoE decode-in-mainloop lane")
+    return lane_select.latched_choice(
+        _FLAG, spellings=_MODE_SPELLINGS,
+        meaning="the persistent-B grouped MoE decode-in-mainloop lane")
+
+
+def requested() -> bool:
+    """Whether the lane may engage at all (any mode but ``off``)."""
+    return mode() != "off"
 
 
 def d2r_requested() -> bool:
@@ -102,6 +128,22 @@ def require_lane(operation: str = "this operation", *, device=None):
         buildable=moe_persistent_b_buildable,
         device=device,
         prepare="cb_moe_persistent_b_prepare")
+
+
+def probe_lane(operation: str = "this operation", *, device=None):
+    """``require_lane``'s degrade sibling for ``mode() == "auto"``.
+
+    Returns ``(ext, None)`` when the lane attests on this device, or
+    ``(None, why)`` when it cannot — the caller keeps the expand+bridge route
+    and SAYS so.  Auto must never fail a load the bridge can serve: the
+    bridge is exactly the pre-0.8.9 default, only slower, so degrading is
+    correct (the same posture as the GEMV v2 availability probe).
+    """
+    try:
+        return require_lane(operation, device=device), None
+    except Exception as exc:  # noqa: BLE001 — any attestation failure means
+        # the bridge serves; the reason is surfaced by the caller's telemetry.
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 def require_d2r_lane(operation: str = "this operation", *, device=None):

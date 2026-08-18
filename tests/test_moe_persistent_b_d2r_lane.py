@@ -68,9 +68,15 @@ def test_d2r_is_one_nested_symbol_contract_not_a_loader_family():
     assert dict(cuda_ext._PRELOAD_FAMILIES)["moe_persistent_b"] == \
         "get_moe_persistent_b_ext"
 
-    # Production ABI schema/symbol tuple stays exactly the established v1
-    # contract. D2R has a separate opt-in attestation tuple in the same image.
-    assert cuda_ext._MOE_PERSISTENT_B_ABI_SCHEMA == 1
+    # Production ABI schema 2 (ROADMAP K1.2): the FP8-CB rung joined the
+    # production tuple — prefill/decode FP8 entry points plus the cfg
+    # eligibility probe. D2R remains a separate opt-in attestation tuple in
+    # the same image, still outside the production ABI.
+    assert cuda_ext._MOE_PERSISTENT_B_ABI_SCHEMA == 2
+    assert "cb_moe_persistent_b_prefill_fp8" in \
+        cuda_ext._MOE_PERSISTENT_B_SYMBOLS
+    assert "cb_moe_persistent_b_fp8_cfg_eligible" in \
+        cuda_ext._MOE_PERSISTENT_B_SYMBOLS
     assert "cb_moe_persistent_b_prefill_d2r" not in \
         cuda_ext._MOE_PERSISTENT_B_SYMBOLS
     assert set(cuda_ext._MOE_PERSISTENT_B_D2R_SYMBOLS) == {
@@ -117,18 +123,27 @@ def test_public_d2r_require_helper_fails_closed_without_substitution(
 
 
 def test_full_and_pair_decoders_share_one_bit_window_law():
+    # Since K1.2 there are THREE decoders over the packed code stream — the
+    # FP4 full codeword, the FP8 full codeword, and the cooperative K16 pair
+    # path — and the law is that every one of them routes the bit-window
+    # arithmetic through the single ``cb_extract_code`` helper.
     source = _source()
     assert source.count("DEVINL uint64_t cb_extract_code(") == 1
-    full = source[source.index("DEVINL uint4 cb_decode_codeword"):
+    fp8 = source[source.index("DEVINL uint4 cb_decode_codeword_fp8("):
+                 source.index("DEVINL uint4 cb_decode_codeword(")]
+    full = source[source.index("DEVINL uint4 cb_decode_codeword("):
                   source.index("DEVINL uint32_t cb_scale_pair")]
     pair = source[source.index("DEVINL uint2 cb_decode_k16_pairs"):
                   source.index("// PTX helpers")]
-    assert "cb_extract_code(s32, c, f)" in full
-    assert "cb_extract_code(s32, c0, f)" in pair
-    assert "cb_extract_code(s32, c0 + 1, f)" in pair
-    # The copied shift/window sequence must not survive in either caller.
-    assert "const int bitpos" not in full
-    assert "const int bitpos" not in pair
+    assert "cb_extract_code(s32, c, f.k_bits)" in fp8
+    assert "cb_extract_code(s32, c, f.k_bits)" in full
+    assert "cb_extract_code(s32, c0, f.k_bits)" in pair
+    assert "cb_extract_code(s32, c0 + 1, f.k_bits)" in pair
+    # The copied shift/window sequence must not survive in any caller: the
+    # single legitimate occurrence is inside the extractor itself.
+    assert source.count("const int bitpos") == 1
+    for body in (fp8, full, pair):
+        assert "const int bitpos" not in body
 
 
 def test_cooperative_pair_helper_is_the_exact_mma_b_mapping():
@@ -198,7 +213,7 @@ def test_model_load_wiring_rejects_an_orphan_d2r_flag_and_hot_path_is_latched():
     path = os.path.join(os.path.dirname(cuda_ext.__file__), "moe.py")
     with open(path, encoding="utf-8") as handle:
         source = handle.read()
-    assert "persistent_b_d2r_on and not persistent_b_on" in source
+    assert 'persistent_b_d2r_on and pb_mode != "require"' in source
     assert "persistent_b_require_d2r_lane" in source
     method = source[source.index(
         "def _apply_prefill_native_bf16_persistent_b"):

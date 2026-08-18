@@ -38,12 +38,16 @@ import threading
 # v2's ascending rowpack reduction and may reassociate against inherited.
 #
 # Selector (resolve once per process, whitelist, fail loud, one log line):
-#   inherited  — the SHIPPING DEFAULT, kill switch and A/B control. Never
-#                probes or builds the v2 extension and reproduces the pre-PR
-#                dispatch exactly.
-#   auto       — EXPLICIT experimental opt-in. Uses v2 only on supported GB10
-#                devices and where the compiled predicate says it wins.
-#   v2         — same guarded policy, with an explicit A/B-arm label in logs.
+#   auto       — the SHIPPING DEFAULT since 0.8.9. Uses v2 only on supported
+#                GB10 devices and where the compiled predicate says it wins;
+#                degrades LOUDLY to inherited when the extension is
+#                unavailable (correct, only slower). On the DSV4 release
+#                widths K=2048/4096 the selection is bit-for-bit the
+#                inherited kernel's output by construction.
+#   inherited  — kill switch and A/B control. Never probes or builds the v2
+#                extension and reproduces the pre-0.8.9 dispatch exactly.
+#   v2         — same guarded policy as auto, with an explicit A/B-arm label
+#                in logs.
 # The switch exists so an A/B is ONE serve session per arm with an otherwise
 # byte-identical process shape — swapping plugin trees between arms would
 # confound the measurement with a rebuild.
@@ -54,36 +58,44 @@ _CB_GEMV: str | None = None
 # FP4 selector above: the two lanes own different bytes, kernels and evidence,
 # and a process must be able to attribute either change in isolation.
 _CB_FP8_GEMV_V2_ENV = "PRISMAQUANT_CB_FP8_GEMV_V2"
-_CB_FP8_GEMV_V2: bool | None = None
+_CB_FP8_GEMV_V2_SPELLINGS = {
+    "": "auto",
+    "auto": "auto",
+    "1": "require",
+    "require": "require",
+    "0": "off",
+    "off": "off",
+}
+_CB_FP8_GEMV_V2_ANNOUNCED = False
 
 
-def cb_fp8_gemv_v2_requested() -> bool:
-    """Resolve the routed K28 whole-row lane exactly once per process.
+def cb_fp8_gemv_v2_mode() -> str:
+    """The whole-row sibling's mode: ``"auto"`` | ``"require"`` | ``"off"``.
 
-    Unset means disabled.  Only the literal strings ``"0"`` and ``"1"`` are
-    accepted; whitespace and truthy aliases are refused so a benchmark arm
-    cannot silently answer a different question than its launch contract.
+    Resolved and latched once per process (a mid-serve change raises; a typo
+    raises and names the accepted spellings).  Unset means ``auto`` — the
+    default since 0.8.9: each routed FP8-CB stack that is EXACTLY the
+    qualified cell (k=28/n_sub=4/type_size=112, K in {2048, 4096} — the cell
+    the bit-exact quality gate and the served final-binary decode run
+    measured) takes the sibling, and every other stack keeps the inherited
+    kernel with the reason logged.  ``1`` keeps its pre-0.8.9 meaning exactly:
+    an A/B-arm REQUIREMENT under which any off-cell routed FP8-CB stack fails
+    the load, so a candidate arm can never silently mix kernels.  ``0``
+    disables the sibling everywhere.
     """
-    global _CB_FP8_GEMV_V2
+    global _CB_FP8_GEMV_V2_ANNOUNCED
+    from . import lane_select
+
     raw = os.environ.get(_CB_FP8_GEMV_V2_ENV)
-    val = "0" if raw is None else raw
-    if val not in ("0", "1"):
-        raise ValueError(
-            f"[prismaquant-cb] ${_CB_FP8_GEMV_V2_ENV}={raw!r} is invalid; "
-            "expected the literal '0' or '1'. Refusing to serve rather than "
-            "silently changing the routed FP8 kernel.")
-    requested = val == "1"
-    if _CB_FP8_GEMV_V2 is None:
-        _CB_FP8_GEMV_V2 = requested
-        print(f"[prismaquant-cb] cb_fp8_gemv_v2={int(requested)}"
-              + (" (env unset -> disabled)" if raw is None else ""),
+    mode = lane_select.latched_choice(
+        _CB_FP8_GEMV_V2_ENV, spellings=_CB_FP8_GEMV_V2_SPELLINGS,
+        meaning="the routed FP8-CB whole-row GEMV sibling")
+    if not _CB_FP8_GEMV_V2_ANNOUNCED:
+        _CB_FP8_GEMV_V2_ANNOUNCED = True
+        print(f"[prismaquant-cb] cb_fp8_gemv_v2={mode}"
+              + (" (env unset -> auto default)" if raw is None else ""),
               flush=True)
-    elif requested != _CB_FP8_GEMV_V2:
-        raise RuntimeError(
-            f"[prismaquant-cb] {_CB_FP8_GEMV_V2_ENV} changed mid-process: "
-            f"resolved {int(_CB_FP8_GEMV_V2)} at first use, env now says "
-            f"{raw!r}. Restart with the selector pinned.")
-    return _CB_FP8_GEMV_V2
+    return mode
 
 
 def cb_fp8_gemv_v2_choice(k_bits: int, n_sub: int, type_size: int,
@@ -91,34 +103,37 @@ def cb_fp8_gemv_v2_choice(k_bits: int, n_sub: int, type_size: int,
     """Return the load-fixed route for one routed FP8-CB stack.
 
     The sibling is value-closed to DSV4's K28 product layout and its exact
-    K2048/K4096 projection widths.  An explicit opt-in is fail-closed: every
-    routed FP8-CB stack in that process must be an exact qualified cell.
-    Silently inheriting an unsupported stack would turn a supposedly
-    attributed experiment into a mixed arm.
+    K2048/K4096 projection widths.  Under the ``auto`` default an off-cell
+    stack keeps the inherited kernel with the reason logged — the qualified
+    set is the evidence boundary, not a preference.  Under an explicit ``1``
+    (require) the pre-0.8.9 A/B-arm contract holds: every routed FP8-CB stack
+    in the process must be an exact qualified cell, because silently
+    inheriting an unsupported stack would turn a supposedly attributed
+    experiment into a mixed arm.
     """
-    if not cb_fp8_gemv_v2_requested():
-        return False, "selector=0 (disabled/default)"
-    if (k_bits, n_sub, type_size) != (28, 4, 112):
+    mode = cb_fp8_gemv_v2_mode()
+    if mode == "off":
+        return False, "selector=off (kill switch)"
+    on_cell = ((k_bits, n_sub, type_size) == (28, 4, 112)
+               and in_features in (2048, 4096))
+    if on_cell:
+        return True, f"mode={mode}, exact K28 production cell"
+    if mode == "require":
         raise RuntimeError(
             f"[prismaquant-cb] ${_CB_FP8_GEMV_V2_ENV}=1 cannot serve "
             f"routed FP8 cell k={k_bits}/n_sub={n_sub}/"
             f"type_size={type_size}/K={in_features}; the whole-row sibling "
             "is qualified only for K28/4/112 at K in {2048,4096}. "
             "Refusing a silently mixed candidate arm.")
-    if in_features not in (2048, 4096):
-        raise RuntimeError(
-            f"[prismaquant-cb] ${_CB_FP8_GEMV_V2_ENV}=1 cannot serve "
-            f"routed FP8 cell k={k_bits}/n_sub={n_sub}/"
-            f"type_size={type_size}/K={in_features}; the whole-row sibling "
-            "is qualified only for K28/4/112 at K in {2048,4096}. "
-            "Refusing a silently mixed candidate arm.")
-    return True, "selector=1, exact K28 production cell"
+    return False, (
+        f"auto: cell k={k_bits}/n_sub={n_sub}/type_size={type_size}/"
+        f"K={in_features} is outside the qualified K28 set")
 
 
 def cb_gemv_mode() -> str:
     """The process-wide CB GEMV kernel selection ("auto" | "v2" |
     "inherited"), resolved once from ``PRISMAQUANT_CB_GEMV``
-    (unset -> "inherited").
+    (unset -> "auto" since 0.8.9; "inherited" is the kill switch).
 
     Raises ``ValueError`` on an unknown spelling and ``RuntimeError`` on a
     mid-process change. Both matter: under mixed dispatch one model runs BOTH
@@ -129,7 +144,7 @@ def cb_gemv_mode() -> str:
     """
     global _CB_GEMV
     raw = os.environ.get("PRISMAQUANT_CB_GEMV")
-    val = (raw if raw is not None else "inherited").strip().lower()
+    val = (raw if raw is not None else "auto").strip().lower()
     if _CB_GEMV is None:
         if val not in _CB_GEMV_VALUES:
             raise ValueError(
@@ -139,7 +154,7 @@ def cb_gemv_mode() -> str:
                 f"inherited kernel and be read as a null result.")
         _CB_GEMV = val
         print(f"[prismaquant-cb] cb_gemv={val}"
-              + (" (env unset -> inherited default)" if raw is None else ""),
+              + (" (env unset -> auto default)" if raw is None else ""),
               flush=True)
     elif val != _CB_GEMV:
         raise RuntimeError(

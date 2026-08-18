@@ -30,46 +30,60 @@ def _isolate(monkeypatch):
     The selector caches into module globals ON PURPOSE (resolve-once is the
     contract), so the fixture — not the test — owns the reset.
     """
+    from gridbook import lane_select
+
     monkeypatch.delenv(ENV, raising=False)
     monkeypatch.delenv(FP8_ENV, raising=False)
     monkeypatch.setattr(sel, "_CB_GEMV", None, raising=False)
-    monkeypatch.setattr(sel, "_CB_FP8_GEMV_V2", None, raising=False)
+    monkeypatch.setattr(sel, "_CB_FP8_GEMV_V2_ANNOUNCED", False, raising=False)
     monkeypatch.setattr(sel, "_CB_GEMV_V2_OK", {}, raising=False)
     monkeypatch.setattr(sel, "_CB_GEMV_V2_WARNED", set(), raising=False)
+    lane_select.reset_for_tests(FP8_ENV)
     yield
+    lane_select.reset_for_tests(FP8_ENV)
 
 
 # --- the selector -----------------------------------------------------------
 
-def test_fp8_v2_defaults_off(monkeypatch):
-    assert sel.cb_fp8_gemv_v2_requested() is False
-    assert sel.cb_fp8_gemv_v2_choice(28, 4, 112, 4096)[0] is False
+def test_fp8_v2_defaults_to_auto(monkeypatch):
+    """Unset means AUTO since 0.8.9: the exact qualified cell takes the
+    sibling, everything else keeps the inherited kernel — no raise."""
+    assert sel.cb_fp8_gemv_v2_mode() == "auto"
+    use, why = sel.cb_fp8_gemv_v2_choice(28, 4, 112, 4096)
+    assert use is True
+    assert "exact K28" in why
 
 
-@pytest.mark.parametrize(("value", "expected"), [("0", False), ("1", True)])
-def test_fp8_v2_accepts_only_literal_binary_values(monkeypatch, value, expected):
+@pytest.mark.parametrize(("value", "expected"),
+                         [("0", "off"), ("off", "off"),
+                          ("1", "require"), ("require", "require"),
+                          ("", "auto"), ("auto", "auto"),
+                          (" 1", "require"), ("1 ", "require")])
+def test_fp8_v2_spellings(monkeypatch, value, expected):
     monkeypatch.setenv(FP8_ENV, value)
-    assert sel.cb_fp8_gemv_v2_requested() is expected
+    assert sel.cb_fp8_gemv_v2_mode() == expected
 
 
-@pytest.mark.parametrize("value", ["", "true", "yes", " 1", "1 ", "2", "v2"])
+@pytest.mark.parametrize("value", ["true", "yes", "2", "v2"])
 def test_fp8_v2_rejects_ambiguous_or_misspelled_values(monkeypatch, value):
     monkeypatch.setenv(FP8_ENV, value)
     with pytest.raises(ValueError, match=FP8_ENV):
-        sel.cb_fp8_gemv_v2_requested()
+        sel.cb_fp8_gemv_v2_mode()
 
 
 def test_fp8_v2_rejects_mid_process_mutation(monkeypatch):
     monkeypatch.setenv(FP8_ENV, "1")
-    assert sel.cb_fp8_gemv_v2_requested() is True
+    assert sel.cb_fp8_gemv_v2_mode() == "require"
     monkeypatch.setenv(FP8_ENV, "0")
-    with pytest.raises(RuntimeError, match="mid-process"):
-        sel.cb_fp8_gemv_v2_requested()
+    with pytest.raises(RuntimeError, match="changed after Gridbook dispatch"):
+        sel.cb_fp8_gemv_v2_mode()
 
 
 @pytest.mark.parametrize("width", [2048, 4096])
-def test_fp8_v2_exact_production_cells_select(width, monkeypatch):
-    monkeypatch.setenv(FP8_ENV, "1")
+@pytest.mark.parametrize("spelling", ["1", None])
+def test_fp8_v2_exact_production_cells_select(width, spelling, monkeypatch):
+    if spelling is not None:
+        monkeypatch.setenv(FP8_ENV, spelling)
     use, why = sel.cb_fp8_gemv_v2_choice(28, 4, 112, width)
     assert use is True
     assert "exact K28" in why
@@ -98,10 +112,25 @@ def test_fp8_v2_disabled_arm_keeps_generic_cells_inherited(
     use, why = sel.cb_fp8_gemv_v2_choice(
         k_bits, n_sub, type_size, width)
     assert use is False
-    assert "disabled/default" in why
+    assert "kill switch" in why
 
-def test_mode_defaults_to_inherited_when_unset():
-    assert sel.cb_gemv_mode() == "inherited"
+
+@pytest.mark.parametrize(
+    ("k_bits", "n_sub", "type_size", "width"),
+    [(27, 4, 108, 4096), (28, 2, 112, 4096),
+     (28, 4, 111, 4096), (28, 4, 112, 1024), (28, 4, 112, 8192)],
+)
+def test_fp8_v2_auto_keeps_off_cells_inherited_without_raising(
+        monkeypatch, k_bits, n_sub, type_size, width):
+    """Auto's evidence boundary: an off-cell stack is a REASONED inherited
+    decision, not a load failure — that failure mode belongs to ``1``."""
+    use, why = sel.cb_fp8_gemv_v2_choice(
+        k_bits, n_sub, type_size, width)
+    assert use is False
+    assert "outside the qualified" in why
+
+def test_mode_defaults_to_auto_when_unset():
+    assert sel.cb_gemv_mode() == "auto"
 
 
 @pytest.mark.parametrize("val", ["auto", "v2", "inherited"])
@@ -286,14 +315,27 @@ def test_kill_switch_never_probes_the_extension(monkeypatch):
     assert "kill switch" in why
 
 
-def test_unset_default_never_probes_or_builds(monkeypatch):
-    """The regression guard for the submitted rollout: an absent variable is
-    the inherited path, not an implicit experimental ``auto`` opt-in."""
-    monkeypatch.delenv(ENV, raising=False)
+def test_inherited_kill_switch_never_probes_or_builds(monkeypatch):
+    """The kill switch's contract: ``inherited`` reproduces the pre-0.8.9
+    dispatch exactly and must not touch the probe or the JIT loader.  (The
+    unset default is ``auto`` since 0.8.9, so the guard now rides the
+    explicit spelling.)"""
+    monkeypatch.setenv(ENV, "inherited")
     monkeypatch.setattr(sel, "cb_gemv_v2_available", _explode)
     use_v2, why = sel.cb_gemv_choice(16, 2, 73, 4096, "cuda:0")
     assert use_v2 is False
     assert "kill switch" in why
+
+
+def test_unset_auto_default_shortcircuits_before_the_probe_off_plane(
+        monkeypatch):
+    """Under the auto default a non-fp4-v2 plane must still be answered from
+    python ints alone — no probe, no build — exactly as before."""
+    monkeypatch.delenv(ENV, raising=False)
+    monkeypatch.setattr(sel, "cb_gemv_v2_available", _explode)
+    use_v2, why = sel.cb_gemv_choice(16, 4, 73, 4096, "cuda:0")
+    assert use_v2 is False
+    assert "n_sub=4" in why
 
 
 @pytest.mark.parametrize("n_sub", [1, 4])

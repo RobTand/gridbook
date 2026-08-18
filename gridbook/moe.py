@@ -43,7 +43,7 @@ from .cb_fill_guard import (
 )
 from .fp8_fused_lane import rung_eligible as fp8_fused_rung_eligible
 from .moe_gemv_select import (cb_fp8_gemv_v2_choice,
-                              cb_fp8_gemv_v2_requested,
+                              cb_fp8_gemv_v2_mode,
                               cb_gemv_choice)
 from .bf16_grouped_lane import (pack_expert_blocks,
                                 require_lane as bf16_sm120_require_lane,
@@ -52,9 +52,10 @@ from .bf16_grouped_lane import (pack_expert_blocks,
                                 tile_m as bf16_sm120_tile_m)
 from .moe_persistent_b_lane import (
     d2r_requested as persistent_b_d2r_requested,
+    mode as persistent_b_mode,
+    probe_lane as persistent_b_probe_lane,
     require_d2r_lane as persistent_b_require_d2r_lane,
     require_lane as persistent_b_require_lane,
-    requested as persistent_b_requested,
     resolve_cfg as persistent_b_resolve_cfg,
     supports as persistent_b_supports,
     supports_fp8 as persistent_b_supports_fp8,
@@ -577,7 +578,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # Parse the independent routed-FP8 selector for every artifact type so
         # an invalid spelling cannot hide merely because the first layers are
         # FP4.  Its per-stack decision remains separate from FP4-v2 below.
-        cb_fp8_gemv_v2_requested()
+        cb_fp8_gemv_v2_mode()
         for which, in_f in (("w13", layer._cb_hidden), ("w2", layer._cb_inter)):
             if self.is_fp4 and self.is_v2:
                 use_v2, why = cb_gemv_choice(
@@ -637,47 +638,81 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if bf16_sm120_requested():
             layer._cb_bf16_sm120 = bf16_sm120_require_lane(
                 f"{self.prefix} routed quality prefill", device=dev)
-        # OPT-IN persistent-B grouped MoE decode-in-mainloop (ROADMAP K1.1;
-        # the FP8-CB arm is K1.2). Resolved HERE for the same reason: an
-        # explicit lane selection this build/device/artifact cannot serve must
-        # fail the model LOAD, because silently serving expand+bridge instead
-        # would answer a different question than the operator asked. ONE flag
+        # Persistent-B grouped MoE decode-in-mainloop (ROADMAP K1.1; the
+        # FP8-CB arm is K1.2), DEFAULT-ON as "auto" since 0.8.9. Resolved
+        # HERE, at load, for the same reason as every lane above. ONE flag
         # covers both payload families — each layer engages its own family's
-        # arm and the route telemetry names the symbol that served. Since
-        # K1.2 this includes stock FP8-CB; a layer NO arm can serve (per-role
-        # FP8-CB splits) fails the load by name, where pre-K1.2 builds
-        # silently kept the bridge for every FP8 layer.
+        # arm and the route telemetry names the symbol that served. Under
+        # auto, a layer whose family arm cannot attest (per-role FP8-CB
+        # splits, a missing extension) keeps the expand+bridge route and the
+        # fallback line names why. Under an explicit "require" (=1) the
+        # pre-0.8.9 A/B-integrity semantics hold exactly: a layer no arm can
+        # serve fails the model LOAD by name, because silently serving
+        # expand+bridge would answer a different question than the operator
+        # asked.
         #
         # The flag is PARSED for every layer, FP8 included: reading it only
         # inside the ``is_fp4`` guard meant a typo on an FP8-only model was
         # never seen, so the operator got a silent baseline run instead of an
         # error. Parsing is separated from acting on the value.
-        persistent_b_on = persistent_b_requested()
+        pb_mode = persistent_b_mode()          # "auto" | "require" | "off"
         persistent_b_d2r_on = persistent_b_d2r_requested()
-        if persistent_b_d2r_on and not persistent_b_on:
+        if persistent_b_d2r_on and pb_mode != "require":
             raise NativeKernelUnavailableError(
                 f"{self.prefix}: "
                 "PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R=1 is a nested "
-                "experiment and requires "
-                "PRISMAQUANT_CB_MOE_PERSISTENT_B=1; Gridbook does not "
-                "ignore an explicitly requested kernel")
+                "experiment and requires the lane to be explicitly required "
+                "(PRISMAQUANT_CB_MOE_PERSISTENT_B=1); the default 'auto' "
+                "may keep the bridge per layer, which would leave a run "
+                "labelled D2R partially served by another schedule")
         fused_fp4_moe_mode = _requested_fused_fp4_moe_mode()
         layer._cb_moe_persistent_b = None
         layer._cb_moe_persistent_b_d2r = False
-        if persistent_b_on and self.is_fp4:
+
+        def _pb_auto_bridge(why: str) -> None:
+            # Auto keeps the expand+bridge route for THIS layer and says so:
+            # the bridge is exactly the pre-0.8.9 default, only slower, and a
+            # fallback nothing announces is a dispatch log an A/B cannot be
+            # read from.
+            print(f"[prismaquant-cb] moe_prefill {self.prefix} -> expand + "
+                  f"grouped bridge (persistent-B auto fallback: {why})",
+                  flush=True)
+
+        if pb_mode == "auto" and fused_fp4_moe_mode and self.is_fp4:
+            # An explicit fused NVFP4 MoE mode CHANGES THE SERVED ACTIVATION
+            # CONTRACT and outranks this lane (the precedence rule below), and
+            # the fused path announces its own route. Under auto there is
+            # nothing to attest for a layer the fused mode will serve — and no
+            # bridge-fallback line either, because the bridge will not serve
+            # it. Under an explicit "require" the lane is still resolved
+            # (the elif below) so an unserveable explicit selection fails the
+            # load.
+            pass
+        elif pb_mode != "off" and self.is_fp4:
             reason = persistent_b_supports(
                 is_fp4=self.is_fp4, is_v2=self.is_v2, n_sub=self.n_sub,
                 k_bits=self.k, type_size=self.type_size,
                 hidden=layer._cb_hidden, inter=layer._cb_inter)
-            if reason is not None:
+            if reason is not None and pb_mode == "require":
                 raise NativeKernelUnavailableError(
                     f"{self.prefix}: requested the persistent-B grouped MoE "
                     f"lane (PRISMAQUANT_CB_MOE_PERSISTENT_B=1), but this "
                     f"layer cannot use it ({reason}); Gridbook does not "
                     "substitute a different schedule behind an explicit lane "
                     "selection")
-            layer._cb_moe_persistent_b = persistent_b_require_lane(
-                f"{self.prefix} routed quality prefill", device=dev)
+            if reason is not None:
+                _pb_auto_bridge(reason)
+            elif pb_mode == "require":
+                layer._cb_moe_persistent_b = persistent_b_require_lane(
+                    f"{self.prefix} routed quality prefill", device=dev)
+            else:
+                pb_ext, pb_why = persistent_b_probe_lane(
+                    f"{self.prefix} routed quality prefill", device=dev)
+                if pb_ext is None:
+                    _pb_auto_bridge(pb_why)
+                else:
+                    layer._cb_moe_persistent_b = pb_ext
+        if layer._cb_moe_persistent_b is not None and self.is_fp4:
             # The tile override is resolved HERE too, against what this build
             # actually compiled: a bad index must fail the load, not the first
             # request that happens to carry routed rows.
@@ -738,7 +773,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                       f"cfg={layer._cb_moe_persistent_b_cfg} "
                       f"schedule={pb_schedule}); no expanded "
                       f"[E,N,K] transient", flush=True)
-        elif persistent_b_on:
+        if pb_mode != "off" and not self.is_fp4:
             # The FP8-CB arm (ROADMAP K1.2). Same schedule, same flag; the
             # decode stage gathers the n_sub=4 ragged codewords through the
             # FP32 table torch converts from the E4M3 book below, and applies
@@ -757,15 +792,26 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 type_size=self.type_size, hidden=layer._cb_hidden,
                 inter=layer._cb_inter,
                 role_split=bool(getattr(layer, "_cb_role_split", False)))
-            if reason is not None:
+            if reason is not None and pb_mode == "require":
                 raise NativeKernelUnavailableError(
                     f"{self.prefix}: requested the persistent-B grouped MoE "
                     f"lane (PRISMAQUANT_CB_MOE_PERSISTENT_B=1), but this "
                     f"FP8-CB layer cannot use it ({reason}); Gridbook does "
                     "not substitute a different schedule behind an explicit "
                     "lane selection")
-            layer._cb_moe_persistent_b = persistent_b_require_lane(
-                f"{self.prefix} routed quality prefill", device=dev)
+            if reason is not None:
+                _pb_auto_bridge(reason)
+            elif pb_mode == "require":
+                layer._cb_moe_persistent_b = persistent_b_require_lane(
+                    f"{self.prefix} routed quality prefill", device=dev)
+            else:
+                pb_ext, pb_why = persistent_b_probe_lane(
+                    f"{self.prefix} routed quality prefill", device=dev)
+                if pb_ext is None:
+                    _pb_auto_bridge(pb_why)
+                else:
+                    layer._cb_moe_persistent_b = pb_ext
+        if layer._cb_moe_persistent_b is not None and not self.is_fp4:
             # The FP8 rung ALSO validates the tile override against the
             # 2-CTAs/SM occupancy floor at this layer's type_size — the wide
             # tiles fall past it above k=33/k=31, and an ineligible explicit

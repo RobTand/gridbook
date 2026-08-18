@@ -174,19 +174,59 @@ def _source_path():
 # ---------------------------------------------------------------------------
 
 
-def test_flag_defaults_to_the_expand_plus_bridge_route(monkeypatch):
-    assert lane.requested() is False
-    lane._reset_for_tests()
-    monkeypatch.setenv(_FLAG, "0")
-    assert lane.requested() is False
+def test_flag_defaults_to_auto(monkeypatch):
+    """Unset (and the empty string, which is how an unset env arrives through
+    ``docker -e FLAG=``) means AUTO — the 0.8.9 default: engage per layer
+    where the family arm attests, keep the bridge where it does not."""
+    assert lane.mode() == "auto"
+    assert lane.requested() is True
     lane._reset_for_tests()
     monkeypatch.setenv(_FLAG, "")
+    assert lane.mode() == "auto"
+    lane._reset_for_tests()
+    monkeypatch.setenv(_FLAG, "auto")
+    assert lane.mode() == "auto"
+
+
+def test_flag_off_keeps_the_expand_plus_bridge_route(monkeypatch):
+    monkeypatch.setenv(_FLAG, "0")
+    assert lane.mode() == "off"
+    assert lane.requested() is False
+    lane._reset_for_tests()
+    monkeypatch.setenv(_FLAG, "off")
+    assert lane.mode() == "off"
     assert lane.requested() is False
 
 
-def test_flag_enables_the_lane(monkeypatch):
+def test_flag_one_keeps_its_prezero89_require_meaning(monkeypatch):
+    """``1`` is the A/B-integrity spelling: an explicit REQUIREMENT under
+    which a layer no arm can serve fails the load, never a silent bridge."""
     monkeypatch.setenv(_FLAG, "1")
+    assert lane.mode() == "require"
     assert lane.requested() is True
+    lane._reset_for_tests()
+    monkeypatch.setenv(_FLAG, "require")
+    assert lane.mode() == "require"
+
+
+def test_probe_lane_returns_the_extension_when_it_attests(monkeypatch):
+    stub = _complete_stub()
+    monkeypatch.setattr("gridbook.cuda_ext.get_moe_persistent_b_ext",
+                        lambda: stub)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    got, why = lane.probe_lane("unit probe")
+    assert got is stub
+    assert why is None
+
+
+def test_probe_lane_reports_the_reason_instead_of_raising(monkeypatch):
+    """Auto's per-layer fallback needs the WHY for its telemetry line; a
+    probe that swallowed it would print an unreadable dispatch log."""
+    monkeypatch.setattr("gridbook.cuda_ext.get_moe_persistent_b_ext",
+                        lambda: None)
+    got, why = lane.probe_lane("unit probe")
+    assert got is None
+    assert why is not None and "cb_moe_persistent_b.cu" in why
 
 
 @pytest.mark.parametrize("value",
@@ -568,9 +608,11 @@ def test_moe_dispatch_reads_this_exact_selector():
     """The gating in moe.py is this module's functions, not a second copy."""
     from gridbook import moe
 
-    assert moe.persistent_b_requested is lane.requested
+    assert moe.persistent_b_mode is lane.mode
+    assert moe.persistent_b_probe_lane is lane.probe_lane
     assert moe.persistent_b_require_lane is lane.require_lane
     assert moe.persistent_b_supports is lane.supports
+    assert moe.persistent_b_supports_fp8 is lane.supports_fp8
 
 
 # The tile override is resolved at MODEL LOAD against what the build actually

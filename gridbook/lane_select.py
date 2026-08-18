@@ -89,6 +89,27 @@ def latched_bool(flag: str, *, default: bool = False,
     return value in _TRUE
 
 
+def latched_choice(flag: str, *, spellings: dict[str, str],
+                   meaning: str = "this lane") -> str:
+    """A strictly parsed, process-stable multi-way selector.
+
+    ``spellings`` maps each accepted raw spelling (surrounding whitespace
+    stripped, lowercased; ``''`` is the unset default) to the mode string it
+    selects.  Anything else raises and names the accepted spellings — the
+    ``latched_bool`` contract, for flags whose answer is a mode rather than a
+    bit.  Latched like every dispatch selector: a mode that moved mid-process
+    would mix two dispatch behaviours inside one run.
+    """
+    current = os.environ.get(flag, "").strip().lower()
+    if current not in spellings:
+        accepted = sorted(k for k in spellings if k)
+        raise ValueError(
+            f"invalid {flag}={current!r} for {meaning}; expected one of "
+            f"{accepted}, or leave it unset for the default "
+            f"({spellings['']!r})")
+    return spellings[_latch(flag, current)]
+
+
 def latched_int(flag: str, *, default: int, minimum: int = 1,
                 meaning: str = "this value") -> int:
     """A strictly parsed, process-stable integer knob.
