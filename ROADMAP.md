@@ -209,23 +209,30 @@ Two things banked from an attempt that was reverted before it shipped:
 
 #### P1 — close the remaining native-parity gaps
 
-- [ ] **K1.1 — Build large-M grouped MoE decode-in-mainloop.** Decode an expert
+- [x] **K1.1 — Build large-M grouped MoE decode-in-mainloop. RESOLVED
+  (0.8.9) — default `auto`, both payload families.** Decode an expert
   weight tile once, stream its routed/padded M rows through it, and time the
   whole routed operator. It must preserve the selected activation payload,
   avoid an expanded `[E,N,K]` HBM tile, handle empty/uneven routing, and remain
   stream- and graph-safe. This is a new MoE schedule, not a revival of the
   measured-negative dense persistent-N kernel.
-  **Kernel IMPLEMENTED behind `PRISMAQUANT_CB_MOE_PERSISTENT_B=1`**
-  (`csrc/cb_moe_persistent_b.cu`, FP4-CB v2, cc 12.0/12.1): a CTA owns one
-  (expert, N-tile), decodes that tile from packed CB bytes into shared memory
-  once and streams the expert's exact routed segment through it, with the
-  M-loop inside the kernel. No `[E,N,K]` transient, no padded rows, no host
-  read; launch geometry is a function of `(E, N)` alone. Decode bit-identical
-  to `cb_expand_v2` by test; only the FP32 reduction order changes. The
-  whole-routed-operator microbenchmark is proposal data only —
-  **what remains open on this item is the served
-  [NATIVE-PARITY](docs/NATIVE-PARITY.md) gate, not the kernel.** See
-  [KERNELS](docs/KERNELS.md#persistent-b-decode-in-mainloop-opt-in-prismaquant_cb_moe_persistent_b).
+  **Kernel implemented and DEFAULT since 0.8.9**
+  (`csrc/cb_moe_persistent_b.cu`, FP4-CB v2 + stock FP8-CB, cc 12.0/12.1;
+  `PRISMAQUANT_CB_MOE_PERSISTENT_B` unset means `auto` — engage per layer
+  where the family arm attests, expand+bridge announced where not; `1` keeps
+  the fail-load A/B-integrity semantics): a CTA owns one (expert, N-tile),
+  decodes that tile from packed CB bytes into shared memory once and streams
+  the expert's exact routed segment through it, with the M-loop inside the
+  kernel. No `[E,N,K]` transient, no padded rows, no host read; launch
+  geometry is a function of `(E, N)` alone. Decode bit-identical to the
+  expanders by test; only the FP32 reduction order changes. The served
+  [NATIVE-PARITY](docs/NATIVE-PARITY.md) gate that held this open has run:
+  the FP4 arm's same-session served A/B on the DSv4 92 GB body (kl_mean
+  −0.051 %, PPL −0.30 %) and the 0.8.9 default-state served KL/PPL leg on
+  the shipped clean 87 GB body; the FP8 arm's whole-routed-operator
+  microbenchmark measures 15.8–18.4× at DSv4 shapes. Per-role FP8-CB split
+  books remain outside the FP8 arm (bridge under auto, announced). See
+  [KERNELS](docs/KERNELS.md#persistent-b-decode-in-mainloop-default-auto-prismaquant_cb_moe_persistent_b).
 - [x] **K1.2 — Cover the complete FP8-CB mid-M production rung surface.
   RESOLVED (2026-08-02) — second arm.** Production does permit every K28–K48,
   but the first arm ("instantiate and test every product rung") is **closed by a

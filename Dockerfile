@@ -386,6 +386,25 @@ else:
           f"which is sm_120-family only. The exact native FP8 expansion path "
           f"is unaffected; FP4 model load remains gated by v2 device prepare.")
 
+# Persistent-B grouped MoE decode-in-mainloop. Blackwell-only and default-AUTO
+# at runtime since 0.8.9 — without this prewarm the first routed CB model load
+# in the container burns the JIT build on the request path. Soft: under auto
+# an unavailable module keeps the expand+bridge route (announced per layer),
+# which is the pre-0.8.9 default — a supported fallback, not an error.
+if "12.0" in arch or "12.1" in arch:
+    t = time.time()
+    if load_for_build(cuda_ext.get_moe_persistent_b_ext) is None:
+        print("[gridbook] NOTE: persistent-B grouped MoE extension did not "
+              "prewarm; routed CB quality prefill will keep the expand+bridge "
+              "route (the announced auto fallback, not an error).")
+    else:
+        print(f"[gridbook] prewarmed persistent-B grouped MoE extension in "
+              f"{time.time() - t:.1f}s")
+else:
+    print(f"[gridbook] NOTE: TORCH_CUDA_ARCH_LIST={arch!r} is not Blackwell "
+          f"sm_120/sm_121 — skipping the persistent-B grouped MoE prewarm, "
+          f"which is sm_120-family only; auto keeps the expand+bridge route.")
+
 # Native-NVFP4 fused prefill is experimental and runtime-default-off. Build it
 # only when explicitly requested; unlike the soft FP8 specialization, an
 # explicit prewarm request is a build contract and therefore fails closed.

@@ -1,8 +1,8 @@
 """Selector for the persistent-B grouped MoE decode-in-mainloop lane.
 
 Two routes serve the CB MoE quality prefill above the M<=16 GEMV band, for
-BOTH payload families (FP4-CB two-tier v2, and — since ROADMAP K1.2 — stock
-FP8-CB):
+BOTH payload families (FP4-CB two-tier v2, and — since K1.1's FP8-CB arm —
+stock FP8-CB):
 
 * the DEFAULT one — the native expander (``cb_expand_fp4_v2`` /
   ``cb_expand_fp8`` + the fp32 row-scale multiply) materializes each expert

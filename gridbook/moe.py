@@ -638,8 +638,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         if bf16_sm120_requested():
             layer._cb_bf16_sm120 = bf16_sm120_require_lane(
                 f"{self.prefix} routed quality prefill", device=dev)
-        # Persistent-B grouped MoE decode-in-mainloop (ROADMAP K1.1; the
-        # FP8-CB arm is K1.2), DEFAULT-ON as "auto" since 0.8.9. Resolved
+        # Persistent-B grouped MoE decode-in-mainloop (ROADMAP K1.1, both
+        # payload families), DEFAULT-ON as "auto" since 0.8.9. Resolved
         # HERE, at load, for the same reason as every lane above. ONE flag
         # covers both payload families — each layer engages its own family's
         # arm and the route telemetry names the symbol that served. Under
@@ -774,7 +774,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                       f"schedule={pb_schedule}); no expanded "
                       f"[E,N,K] transient", flush=True)
         if pb_mode != "off" and not self.is_fp4:
-            # The FP8-CB arm (ROADMAP K1.2). Same schedule, same flag; the
+            # The FP8-CB arm (K1.1's second payload family). Same schedule,
+            # same flag; the
             # decode stage gathers the n_sub=4 ragged codewords through the
             # FP32 table torch converts from the E4M3 book below, and applies
             # the per-(expert, output-row) FP32 scale before the single BF16
@@ -1510,7 +1511,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         d2r = bool(getattr(layer, "_cb_moe_persistent_b_d2r", False))
         fp8 = not self.is_fp4
         if fp8:
-            # The FP8-CB arm (K1.2): the decode operands were materialized at
+            # The FP8-CB arm: the decode operands were materialized at
             # model load; both stages bind their own [E, N] scale table.
             def persistent_b_op(out_, a_, qw_, ends_, k_, ts_, cfg_, *,
                                 which):

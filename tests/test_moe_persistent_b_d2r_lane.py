@@ -68,7 +68,7 @@ def test_d2r_is_one_nested_symbol_contract_not_a_loader_family():
     assert dict(cuda_ext._PRELOAD_FAMILIES)["moe_persistent_b"] == \
         "get_moe_persistent_b_ext"
 
-    # Production ABI schema 2 (ROADMAP K1.2): the FP8-CB rung joined the
+    # Production ABI schema 2 (K1.1's FP8-CB arm): the FP8-CB rung joined the
     # production tuple — prefill/decode FP8 entry points plus the cfg
     # eligibility probe. D2R remains a separate opt-in attestation tuple in
     # the same image, still outside the production ABI.
@@ -123,7 +123,8 @@ def test_public_d2r_require_helper_fails_closed_without_substitution(
 
 
 def test_full_and_pair_decoders_share_one_bit_window_law():
-    # Since K1.2 there are THREE decoders over the packed code stream — the
+    # Since K1.1's FP8-CB arm there are THREE decoders over the packed code
+    # stream — the
     # FP4 full codeword, the FP8 full codeword, and the cooperative K16 pair
     # path — and the law is that every one of them routes the bit-window
     # arithmetic through the single ``cb_extract_code`` helper.

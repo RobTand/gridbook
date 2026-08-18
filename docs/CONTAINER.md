@@ -12,12 +12,15 @@ expander module, the required grouped-BF16 quality bridge, and the optional
 FP8 fused specialization on Blackwell. Experimental fused FP4 remains an
 explicit, default-off build option.
 
-**Two opt-in lanes are not prewarmed at all**: the fused FP4-CB v2 mid-M lane
-(`PRISMAQUANT_CB_FP4_FUSED_MIDM`) and the persistent-B grouped MoE lane
-(`PRISMAQUANT_CB_MOE_PERSISTENT_B`). Neither has a prewarm step or a build-arg
-in the Dockerfile, so there are five prewarm targets for seven build-cache
-modules. Operationally: "resolved at model load" means that if you set either
-flag, the **first model load in that container runs `nvcc` in-image and pays a
+**One opt-in lane is not prewarmed at all**: the fused FP4-CB v2 mid-M lane
+(`PRISMAQUANT_CB_FP4_FUSED_MIDM`). The persistent-B grouped MoE lane
+(`PRISMAQUANT_CB_MOE_PERSISTENT_B`) gained a soft Blackwell-gated prewarm in
+0.8.9 when its default became `auto` — an image built before that, or one
+whose prewarm failed, keeps the expand+bridge route per layer (announced)
+until the JIT build lands in the extension cache. So there are six prewarm
+targets for seven build-cache modules. Operationally: "resolved at model
+load" means that if you set the remaining flag,
+the **first model load in that container runs `nvcc` in-image and pays a
 cold CUTLASS/CUDA build inside the load**, not at image-build time — several
 minutes, on the request path, with the model already being read. It is a
 one-time cost per cache, so the mitigation is the usual one: mount a persistent
@@ -100,8 +103,8 @@ serving image, using [`docker/Dockerfile.gridbook-pinned`](../docker/Dockerfile.
 docker build \
   -f docker/Dockerfile.gridbook-pinned \
   --build-arg BASE_IMAGE=gridbook:local \
-  --build-arg GRIDBOOK_REF=v0.8.6 \
-  -t gridbook:v0.8.6-pinned .
+  --build-arg GRIDBOOK_REF=v0.8.9 \
+  -t gridbook:v0.8.9-pinned .
 ```
 
 `GRIDBOOK_REF` is parameterized so the same recipe works for a release tag or,

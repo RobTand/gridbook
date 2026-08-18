@@ -591,8 +591,8 @@ and
 These are source-tree qualification results, not the final clean-wheel served
 graph/throughput gate; that gate remains open.
 
-**Routed FP8-CB whole-row sibling (opt-in,
-`PRISMAQUANT_CB_FP8_GEMV_V2=1`).** This is independent of the FP4 selector
+**Routed FP8-CB whole-row sibling (default `auto` since 0.8.9,
+`PRISMAQUANT_CB_FP8_GEMV_V2`).** This is independent of the FP4 selector
 above and lives in the main `csrc/cb_gemv.cu` extension. The inherited FP8
 grouped kernel assigns one CTA to one `(routed pair, output row)` and one
 physical warp to each of its eight accumulator chains. The sibling stages the
@@ -604,13 +604,16 @@ before each FMA, and v2 still applies the row scale once after the inherited
 lane reductions and serial eight-chain sum.
 
 The release surface is intentionally closed to
-`k=28/n_sub=4/type_size=112` and K in `{2048,4096}`. Unset or literal `0`
-keeps the inherited FP8 grouped GEMV; only literal `1` opts in. The selector
-resolves once per process and each `w13`/`w2` decision is fixed at model load.
-With the opt-in set, any other uniform FP8-CB cell fails the load instead of
-creating a partly inherited candidate arm. Per-expert mixed FP8-CB groups also
-fail because their family-local dispatch has not implemented this sibling;
-FP4-CB layers and source-passthrough groups are outside its scope. The main
+`k=28/n_sub=4/type_size=112` and K in `{2048,4096}` — the qualified cell the
+evidence below measured. **Unset means `auto` since 0.8.9**: exactly that
+cell takes the sibling and every other routed FP8-CB stack keeps the
+inherited kernel with the reason logged per stack; `1`/`require` keeps the
+pre-0.8.9 A/B-arm contract, under which any off-cell uniform FP8-CB stack
+(or per-expert mixed FP8-CB group, whose family-local dispatch has not
+implemented this sibling) fails the load instead of creating a partly
+inherited candidate arm; `0`/`off` disables it. The selector resolves once
+per process and each `w13`/`w2` decision is fixed at model load. FP4-CB
+layers and source-passthrough groups are outside its scope. The main
 extension's strict symbol set includes `cb_moe_gemv_fp8_v2`, so a cached
 pre-sibling module is rejected before a forward can reach it.
 
@@ -627,10 +630,17 @@ generation-digest, and router-route delta over 240 scored positions. Its main
 extension SHA256 is
 `8f1f287e906562f152d9935deace4149dee3f0eb555d781a6400fe56e29d1104`.
 An earlier served A/B/A2 using a different main binary showed an approximately
-7.2% cycle-throughput signal, but generated-content and speculative-acceptance
-integrity differed across arms. It is held, not promoted. The selector remains
-default-off pending the final-binary served rerun and graph, concurrency, soak,
-long-prefill, and memory gates.
+7.2% cycle-throughput signal but failed cross-arm content/acceptance
+integrity, so it was held. **The final-binary served rerun (B-v3,
+2026-08-14) closed it**: on a quiesced host with `cudagraph_mode=
+FULL_DECODE_ONLY` and a route census confirming 16 stacks on `whole-row-v2`,
+decode measured **18.442 vs 16.979 tok/s (+8.62 %)** with acceptance-rate
+parity, and the earlier arm's memory cliff was attributed to host
+interference (B-v3 bottomed at 5,228 MiB free over 3,532 samples). On that
+record the selector defaults to `auto` on the qualified cell since 0.8.9.
+Soak and high-concurrency protocols have not run as named gates; the sibling
+serves only the routed `M ≤ 16` GEMV band, so long-prefill scheduling is
+outside its reach.
 
 MoE **prefill** used to be that per-expert loop, whose launch storm dominated
 TTFT. The production quality lane now expands bounded expert chunks with native
@@ -796,7 +806,7 @@ file above); kernel-level speed target — **met on all cells at `T=128` and
 [NATIVE-PARITY](NATIVE-PARITY.md) protocol — **not run**.
 `scripts/bench_bf16_grouped_sm120.py` produces proposal data only.
 
-### Persistent-B decode-in-mainloop (opt-in, `PRISMAQUANT_CB_MOE_PERSISTENT_B`)
+### Persistent-B decode-in-mainloop (default auto, `PRISMAQUANT_CB_MOE_PERSISTENT_B`)
 
 ROADMAP **K1.1**, audit §3 **P2b**. Both lanes above still *materialize* the
 decoded weights: `cb_expand_fp4_v2` writes an `[E,N,K]` BF16 tile to HBM and
@@ -872,6 +882,25 @@ without touching device memory, so the choice stays a trace-time constant and
 the launch is capturable as-is. Measured crossover: cfg 4 below ~64 mean rows,
 cfg 1 above.
 
+**The FP8-CB arm (K1.1's second payload family).** The same schedule serves
+stock FP8-CB routed layers, behind the same flag: the decode stage gathers the
+`n_sub=4` ragged codewords through the exact FP32 table torch converts from
+the E4M3 book at load (`e4m3->f32` is definitionally torch's own conversion),
+applies the per-(expert, output-row) FP32 scale, and rounds once to BF16 —
+the exact value chain of the bridge expander's FP8 branch, so here too only
+the FP32 reduction order changes. Eligibility at this device's shared-memory
+budget: cfg 1 to k≤33, cfg 4 to k≤31, cfgs 2/3 to k=48 (every compiled config
+must hold the 2-CTAs/SM floor at the layer's `type_size`); layers whose `w13`
+splits gate/up into **two per-role books** are outside the arm — the decode
+consumes one stacked stock book per projection — and under `auto` such layers
+keep the bridge with the reason announced (the shipped DSv4 87 GB body's 11
+FP8-CB expert layers are exactly this case), while an explicit `require`
+fails the load by name. Bitwise decode identity against `cb_expand_fp8` is
+tested across the rung set, and the whole-routed-operator microbenchmark at
+DSv4 shapes (E=256, K28, topk 6) measures **15.8–18.4×** the expand+bridge
+operator with rel-L2 ≤ 6.2e-04 (reduction order only). There is no FP8 D2R
+variant.
+
 **Requalification surface.** Activations are untouched — the same exact
 group-16 RTN QDQ payload, before FC1 and between FC1 and FC2. The decode is
 **bit-identical to `cb_expand_v2`**, and that is a tested fact rather than an
@@ -882,22 +911,32 @@ with one BF16 round. What changes is the FP32 **reduction order** —
 reassociation-class, the same surface the sm12x lane and the promoted FP8
 mid-M fused kernel cleared.
 
-**Status: OPT-IN** behind `PRISMAQUANT_CB_MOE_PERSISTENT_B=1`, resolved at
-model load (never at first forward), FP4-CB-v2 layers only, and failing the
-load if the flag is on where the lane cannot serve — including the tile
-override `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG`, which is validated against
-what this build actually compiled. With the flag unset the dispatch is
-byte-for-byte what it was. **Promotion checklist:** decode bit-exactness gate
-— **done**; whole-operator numerics under the reduction-order discipline —
-**done**; routing breadth (empty / single / one-row / skewed) — **done**;
-graph capture-replay and non-default-stream — **done**; whole-routed-operator
-microbenchmark — **done, wins every cell**: 1.05–3.36× over the default bridge
-and 1.04–3.02× over the pingpong bridge across nine whole-operator cells, with
-the eliminated expansion measuring 20.9–46.7% of the default operator
+**Status: DEFAULT (`auto`) since 0.8.9**, both payload families, resolved at
+model load (never at first forward). Auto engages each routed CB layer's
+family arm where the load-time predicate and the extension attest, and keeps
+the expand+bridge route where they do not, with a per-layer fallback line
+naming why — the bridge is exactly the pre-0.8.9 default, so degrading is
+correct, only slower. `1`/`require` keeps the pre-0.8.9 explicit semantics:
+a layer no arm can serve fails the load by name (the A/B-integrity
+contract), including the tile override `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG`,
+which is validated against what this build actually compiled. `0`/`off` is
+the kill switch, byte-for-byte the pre-lane dispatch. **Promotion record:**
+decode bit-exactness gate — **done**; whole-operator numerics under the
+reduction-order discipline — **done**; routing breadth (empty / single /
+one-row / skewed) — **done**; graph capture-replay and non-default-stream —
+**done**; whole-routed-operator microbenchmark — **done, wins every cell**:
+1.05–3.36× over the default bridge and 1.04–3.02× over the pingpong bridge
+across nine whole-operator cells, with the eliminated expansion measuring
+20.9–46.7% of the default operator
 ([table](BENCHMARKS.md#2026-08-02-persistent-b-grouped-moe-decode-in-mainloop-microbenchmark-proposal-data));
-whole-routed-operator served [NATIVE-PARITY](NATIVE-PARITY.md) protocol —
-**not run**, and that is what stands between this lane and a default.
-`scripts/bench_moe_persistent_b.py` produces proposal data only.
+served [NATIVE-PARITY](NATIVE-PARITY.md) on the whole routed operator —
+**run**: the FP4 arm's same-session served A/B on the DSv4 92 GB body
+(kl_mean −0.051 %, direct PPL −0.30 % — arithmetic noise), and the 0.8.9
+default-state served KL/PPL leg on the shipped clean 87 GB body against its
+gold record (32 FP4-CB layers on the lane, 11 per-role FP8-CB layers on the
+announced bridge fallback: kl_mean +0.17 %, kl_p99 −0.03 %, direct PPL
+−0.06 % — inside the ±0.7 % cross-session KL envelope). `scripts/bench_moe_persistent_b.py` produces
+proposal data only.
 
 The ratio narrows as mean routed rows per expert grows — the kernel decodes a
 weight tile once per `TM`-row M-tile, so at `P/E = 512` it decodes four times
@@ -907,13 +946,13 @@ losing the second CTA per SM is the identified next step, and it is a change of
 tile, not of schedule.
 
 MoE dispatch is separate from the dense M boundary: `M≤16` uses the owned
-grouped CUDA GEMV. Above 16, FP8-CB first attempts its quality-green fused
-CUTLASS path and otherwise uses exact BF16 expansion plus the owned CUTLASS
-grouped bridge; FP4-CB uses exact BF16 expansion plus that bridge, or — behind
-`PRISMAQUANT_CB_MOE_PERSISTENT_B=1` — the decode-in-mainloop schedule above,
-which replaces both halves of that pair. Only expert chunk size /
-transient-byte-budget overrides remain—there is no stock/loop/ batched/L2
-production selector.
+grouped CUDA GEMV. Above 16, each routed CB layer runs the decode-in-mainloop
+schedule above wherever its family arm attests (the 0.8.9 `auto` default,
+which replaces both halves of the expand+bridge pair); a layer the lane
+cannot serve falls back to exact BF16 expansion plus the owned CUTLASS
+grouped bridge — for FP8-CB via its quality-green fused CUTLASS path first
+where that contract applies. Only expert chunk size / transient-byte-budget
+overrides remain—there is no stock/loop/ batched/L2 production selector.
 
 The predecessor native chunk-expander path measured **293 → 1,821 tok/s at 8k**
 and **207 → 1,822 tok/s at 63k** on Laguna-S-2.1 (117B MoE). Those numbers are
@@ -928,9 +967,9 @@ promoted on kernel parity or raw speed alone; see the
 [fused-NVFP4 enablement audit](audits/fused_nvfp4_enablement_2026-07-31.md).
 
 The activation-contract-preserving decode-in-mainloop schedule that target
-called for is now implemented behind `PRISMAQUANT_CB_MOE_PERSISTENT_B=1` (the
-section above); what remains open on [`K1.1`](../ROADMAP.md#kernel-todo-canonical)
-is the served promotion gate, not the kernel.
+called for is implemented and, since 0.8.9, the default (`auto`) route for
+routed CB quality prefill (the section above); the served promotion gate that
+kept [`K1.1`](../ROADMAP.md#kernel-todo-canonical) open has run.
 
 ---
 
@@ -1020,13 +1059,13 @@ too.
 | FP8-CB decode (dense) | **Shipped**, at/above native parity |
 | FP4-CB v2 decode (dense) | **Shipped**: bit-matched CUDA GEMV (13/13 parity against the historical Triton result plus the independent expansion reference). The decode chain is compute-bound at GEMV shapes (ncu SM 71%/mem 44%) under the bit-exact contract — the measured ceiling, not a staging problem |
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
-| MoE grouped decode GEMV, smem-resident dictionary | **Opt-in** (`PRISMAQUANT_CB_GEMV=v2`), never the global default. On DSV4 K=2048/4096 with all `PRISMAQUANT_CB_W2_*` overrides absent, the virtual-warp specialization is bit-exact to inherited for k12/k16/k18 and measured 1.8175–1.9977x in the final-source captured v1 direct-op benchmark; the same-process DSV4 quality gate produced zero full-vocabulary KL/NLL/PPL/target-logprob delta over 240 positions. Other widths retain rowpack order and may reassociate. The compiled predicate still routes k24 at K≥2048 to inherited. Historical Laguna validation measured +5.97%; final clean-wheel served graph/throughput qualification remains open |
-| MoE grouped decode GEMV, routed FP8 whole-row sibling | **Default-off opt-in** (`PRISMAQUANT_CB_FP8_GEMV_V2=1`) for only K28/4/112 at K=2048/4096. The final-source operator gate passed 17/17 and the exact-artifact eager same-engine gate produced zero full-vocabulary and router-route delta over 240 positions. Unsupported uniform FP8 cells and per-expert mixed FP8-CB groups fail closed. A prior ~7.2% served cycle-throughput signal used a different binary and failed cross-arm content/acceptance integrity, so it is held pending the final-binary rerun plus graph, concurrency, soak, long-prefill, and memory gates |
+| MoE grouped decode GEMV, smem-resident dictionary | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_GEMV`; `inherited` is the kill switch and never probes or builds): v2 engages only where the compiled occupancy predicate says it wins, and an unavailable extension degrades loudly to inherited. On the K=2048/4096 shapes (8/16 superblocks) the compile-time virtual-warp specialization is bit-exact to the inherited default for every rung — with all `PRISMAQUANT_CB_W2_*` overrides absent — and measured 1.8175–1.9977x in the final-source captured v1 direct-op benchmark; the same-process DSV4 quality gate produced zero full-vocabulary KL/NLL/PPL/target-logprob delta over 240 positions. Other widths retain rowpack order and may reassociate against inherited — on those the predicate is the only gate and no served A/B exists. The compiled predicate still routes k24 at K≥2048 to inherited. Historical Laguna validation measured +5.97% |
+| MoE grouped decode GEMV, routed FP8 whole-row sibling | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_FP8_GEMV_V2`) for exactly K28/4/112 at K=2048/4096 — off-cell stacks keep the inherited kernel with the reason logged; `1`/`require` is the strict A/B-arm spelling under which unsupported uniform FP8 cells and per-expert mixed FP8-CB groups fail closed. The final-source operator gate passed 17/17; the exact-artifact eager same-engine gate produced zero full-vocabulary and router-route delta over 240 positions; the final-binary served rerun (B-v3, 2026-08-14, FULL_DECODE_ONLY graphs, route census, quiesced host) measured **+8.62% decode** with acceptance parity, attributing the earlier held signal's integrity failure to host interference. Soak and high-concurrency protocols have not run as named gates |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
 | FP8-CB fused decode-in-prologue prefill | **Bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128**; native transient expansion + CUTLASS serves ineligible and large-M shapes. **Rung surface: `k ∈ {28,32,36,40,44,48}` — the multiples of 4 in the product range, which is the complete set the packed-B TMA box (`type_size = 4k` must be 16-byte aligned) and the mainloop's uniform `CbSubW = k/4` sub-table width admit.** The other 15 integer rungs are served (decode GEMV + expand/CUTLASS bridge), just not by this lane; the compiled set is reported by `cb_fused_kbits()` and dispatch derives eligibility from it rather than from a literal ladder |
 | FP4-CB v2 fused mid-M prefill (dense) | **Opt-in** (`PRISMAQUANT_CB_FP4_FUSED_MIDM`), contract-preserving. The in-prologue decode is proven **bit-identical to `cb_expand_v2` for the whole decoded tile at all 13 K12–K24 rungs** (one-hot read-out, no tolerance), so only the FP32 reduction order moves. Measured 1.06–4.37× the shipping expand + bridge route at M ∈ {9,16,32,64,128} on 27B/DSV4-class shapes, every cell bit-equal to the same-config oracle — a wider band than the fp8 twin because the fp4 quality expand writes BF16 (4× the fp8 expand's transient bytes). Served NATIVE-PARITY protocol **not run**; an unexplained M ≤ 12 latency cliff is open. Ineligible shapes (M ≤ 8, M > 128, multi-dictionary fused modules, uncompiled rungs) fall through to today's exact path unchanged |
 | NVFP4-CB fused native-FP4 prefill (dense and MoE) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, MoE routed-quality, and p95 served gates remain open |
-| MoE persistent-B decode-in-mainloop prefill (FP4-CB v2) | **Opt-in** (`PRISMAQUANT_CB_MOE_PERSISTENT_B=1`), ROADMAP K1.1. Decodes each expert weight tile once and streams that expert's exact routed segment through it, eliminating the `[E,N,K]` BF16 transient and all work for unrouted experts. Weight decode bit-identical to `cb_expand_v2` (`torch.equal`); reduction-order-class output difference vs the bridge, gated at parity with per-segment `F.linear`. Whole-routed-operator microbenchmark wins; served protocol **not run** |
+| MoE persistent-B decode-in-mainloop prefill (FP4-CB v2 + stock FP8-CB) | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_MOE_PERSISTENT_B`; `1`/`require` keeps the fail-load A/B-integrity semantics, `0`/`off` the kill switch), ROADMAP K1.1 both payload families. Decodes each expert weight tile once and streams that expert's exact routed segment through it, eliminating the `[E,N,K]` BF16 transient and all work for unrouted experts. Weight decode bit-identical to the expanders (`torch.equal`); reduction-order-class output difference vs the bridge. Whole-routed-operator microbenchmark wins every cell (FP4 1.05–3.36×; FP8 15.8–18.4× at DSv4 shapes); served: FP4 same-session A/B kl_mean −0.051% / PPL −0.30%, plus the 0.8.9 default-state served KL/PPL leg on the shipped clean 87 GB body. Per-role FP8-CB split books are outside the FP8 arm and keep the bridge under auto (announced) |
 | Persistent-N large-M dense prefill | **RETIRED FROM SERVING; MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. The serving selector, custom op, package loader, and switch are deleted. The `.cu` remains accessible only to the explicit direct research test. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
-| MoE prefill | **Native-only production lane**: grouped CUDA GEMV at M≤16; above 16, eligible quality-green FP8 fused CUTLASS or exact CUDA expansion + owned CUTLASS grouped GEMM. The current generic SM80-compatible grouped bridge is not Blackwell-optimized and measured 6–17% slower than segmented BF16 matmuls on warm synthetic DSV4 shapes; an sm12x-native CUTLASS 3.x collective for the same bridge exists **opt-in** (`PRISMAQUANT_CB_BF16_SM120`, pingpong 64×128×64, in-mainloop A-row gather + swizzle-group-aligned expert order): measured 1.13–1.37× that bridge and **1.03–1.05× segmented matmuls at T=128, 1.10–1.15× at T=512** on the DSV4/Laguna cells — the ragged row-padding tax the tile-indexed construction previously paid (0.83–0.92× segmented at T=512) is closed at the construction level; bit-gated (the gather mode is bit-identical to the padded-copy mode), served protocol not run. Historical Laguna-S-2.1 measurements for the predecessor native chunk-expander path were 293 → 1,821 tok/s @8k and 207 → 1,822 @63k; they must not be relabelled as measurements of the new bridge. The v0.4.2 fused native-NVFP4 route remains an explicit A/B opt-in without MoE quality qualification |
+| MoE prefill | **Native-only production lane**: grouped CUDA GEMV at M≤16; above 16, the persistent-B decode-in-mainloop lane wherever its family arm attests (the 0.8.9 `auto` default), else eligible quality-green FP8 fused CUTLASS or exact CUDA expansion + owned CUTLASS grouped GEMM. The current generic SM80-compatible grouped bridge is not Blackwell-optimized and measured 6–17% slower than segmented BF16 matmuls on warm synthetic DSV4 shapes; an sm12x-native CUTLASS 3.x collective for the same bridge exists **opt-in** (`PRISMAQUANT_CB_BF16_SM120`, pingpong 64×128×64, in-mainloop A-row gather + swizzle-group-aligned expert order): measured 1.13–1.37× that bridge and **1.03–1.05× segmented matmuls at T=128, 1.10–1.15× at T=512** on the DSV4/Laguna cells — the ragged row-padding tax the tile-indexed construction previously paid (0.83–0.92× segmented at T=512) is closed at the construction level; bit-gated (the gather mode is bit-identical to the padded-copy mode), served protocol not run. Historical Laguna-S-2.1 measurements for the predecessor native chunk-expander path were 293 → 1,821 tok/s @8k and 207 → 1,822 @63k; they must not be relabelled as measurements of the new bridge. The v0.4.2 fused native-NVFP4 route remains an explicit A/B opt-in without MoE quality qualification |
 | Missing required native kernel | **Fails closed** with an operation-specific diagnostic; no Triton dependency or serving fallback |

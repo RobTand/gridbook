@@ -426,7 +426,7 @@ decodes once, and the two costs nearly cancel (1.05×). The production-shaped
 answers this with a shape-driven tile choice (cfg 4 below ~64 mean rows, cfg 1
 above, selected from `P` and `E` alone so it stays capture-safe), and a
 kernel-level sweep of the alternatives is recorded in
-[KERNELS](KERNELS.md#persistent-b-decode-in-mainloop-opt-in-prismaquant_cb_moe_persistent_b):
+[KERNELS](KERNELS.md#persistent-b-decode-in-mainloop-default-auto-prismaquant_cb_moe_persistent_b):
 a `256×64` tile halves the decode repetition in exactly this regime and still
 lost, because it falls to one CTA per SM. Raising `TM` past 128 without losing
 occupancy is the identified next step, and it is a change of *tile*, not of

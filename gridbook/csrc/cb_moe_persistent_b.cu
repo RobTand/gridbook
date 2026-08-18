@@ -180,7 +180,7 @@
 // * FP4-CB two-tier v2 (`CbFp4V2Fmt`): product mode n_sub=2,
 //   `type_size == 4*k + 9`, k in [1,24].  This is the original K1.1 surface
 //   and the quality path that has no fused alternative at any M.
-// * FP8-CB (`CbFp8Fmt`, ROADMAP K1.2): product mode n_sub=4,
+// * FP8-CB (`CbFp8Fmt`, K1.1's second payload family): product mode n_sub=4,
 //   `type_size == 4*k`, k in [1,48] — a flat e4m3 plane (converted ONCE at
 //   load to an exact FP32 table by torch, so e4m3->f32 is torch's own
 //   conversion by construction) plus a per-(expert, output-row) FP32 scale.

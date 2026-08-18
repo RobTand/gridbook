@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.8.9 — 2026-08-18
+
+**The qualified CB kernels are now the default.** Three selectors gain a
+tri-state with `auto` as the unset meaning; every previous explicit spelling
+keeps its exact prior semantics, so no launch contract changes out from under
+an operator — what changes is what an UNSET flag serves.
+
+- **`PRISMAQUANT_CB_MOE_PERSISTENT_B` unset now means `auto`** (was: the
+  expand+bridge route everywhere). Each routed CB layer engages its family's
+  persistent-B decode-in-mainloop arm — FP4-CB two-tier v2 (ROADMAP K1.1) or
+  stock FP8-CB (K1.1's second payload family) — where the load-time predicate
+  and the extension attest, and keeps the expand+bridge route where they do
+  not, with a per-layer fallback line naming why. `1`/`require` keeps the
+  0.8.8 A/B-integrity semantics exactly: a layer no arm can serve fails the
+  LOAD by name — on the shipped DSv4 87 GB body that is every FP8-CB expert
+  layer (per-role split books), which is precisely why the default is `auto`
+  and not `1`. `0`/`off` is the kill switch. Promotion record: bitwise decode
+  identity per arm; whole-routed-operator microbenchmark wins every cell
+  (FP4 1.05–3.36× over the bridge; FP8 15.8–18.4× at DSv4 E=256/K28/topk6
+  shapes, rel-L2 ≤ 6.2e-04); served NATIVE-PARITY — the FP4 arm's
+  same-session served A/B on the DSv4 92 GB body (kl_mean −0.051 %, direct
+  PPL −0.30 % — arithmetic noise) and the 0.8.9 default-state served KL/PPL
+  leg on the shipped clean 87 GB body against its gold record — env fully
+  unset, 32 FP4-CB layers on the lane, 11 per-role FP8-CB layers on the
+  announced bridge fallback: kl_mean +0.17 %, kl_p99 −0.03 %, direct PPL
+  −0.06 % (inside the ±0.7 % cross-session KL envelope). The container build gains a soft Blackwell-gated prewarm for
+  the module so the first routed CB load does not pay the JIT build on the
+  request path.
+
+- **`PRISMAQUANT_CB_GEMV` unset now means `auto`** (was `inherited`). The
+  smem-resident-dictionary v2 decode GEMV engages only where the compiled
+  occupancy predicate (`cb_gemv_v2_prefers_inherited` — the arithmetic of
+  the binary that launches) says it wins; an unavailable extension degrades
+  LOUDLY to the inherited kernel, which is exactly the pre-0.8.9 default.
+  On K=2048/4096 shapes the compile-time virtual-warp specialization is
+  bit-exact to the inherited kernel for every rung (all
+  `PRISMAQUANT_CB_W2_*` overrides absent); other widths retain rowpack
+  reduction order, may reassociate, and carry no served A/B — the predicate
+  is the only gate there. `inherited` remains the kill switch and never
+  probes or builds.
+
+- **`PRISMAQUANT_CB_FP8_GEMV_V2` unset now means `auto`** (was disabled;
+  the flag also gains the `require`/`off` word spellings). Exactly the
+  qualified cell — `k=28/n_sub=4/type_size=112` at K in {2048, 4096} — takes
+  the routed FP8-CB whole-row sibling; every other routed FP8-CB stack keeps
+  the inherited kernel with the reason logged per stack. `1` keeps its
+  strict pre-0.8.9 contract: an A/B-arm requirement under which any off-cell
+  stack fails the load. Promotion record: 17/17 final-source operator gate;
+  zero full-vocabulary and router-route delta over 240 scored positions on
+  the exact artifact; the final-binary served rerun (B-v3, 2026-08-14,
+  FULL_DECODE_ONLY graphs, route census, quiesced host) measured **+8.62 %
+  decode throughput** with acceptance parity and attributed the earlier held
+  signal's cross-arm integrity failure to host interference. Soak and
+  high-concurrency protocols have not run as named gates; the sibling serves
+  only the routed `M ≤ 16` GEMV band.
+
+- `lane_select` grows `latched_choice` — the tri-state sibling of
+  `latched_bool`, same strict-parse/latch/mid-process rules — and the
+  persistent-B lane module gains `mode()` and `probe_lane()` (the
+  non-raising resolution `auto` needs so its fallback telemetry can name
+  the reason).
+
+- Two d2r contract tests broken by the FP8 arm's ABI bump at `d9dfe53`
+  (schema 1→2, three FP8 production symbols, the fp8 full-codeword decoder)
+  are repaired; the persistent-B FP8 arm's stray "ROADMAP K1.2" comment
+  labels are corrected to "K1.1's second payload family" (ROADMAP K1.2
+  proper is the closed fused mid-M rung-surface item).
+
 ## 0.8.8 — 2026-08-15
 
 - **The quantized embedding shipped in 0.8.7 could never be reached on

@@ -1999,8 +1999,10 @@ _moe_persistent_b_lock = threading.Lock()
 # here is the whole change (tests/test_moe_persistent_b_lane.py asserts the
 # declared inputs cover every Gridbook include the source actually has).
 _MOE_PERSISTENT_B_BUILD_INPUTS = ("cb_moe_persistent_b.cu",)
-# Schema 2 (ROADMAP K1.2): the FP8-CB rung joined the module — three new
-# production symbols below.  (Schema 1 was the FP4-only original.)
+# Schema 2 (K1.1's FP8-CB arm): the FP8-CB rung joined the module — three
+# new production symbols below.  (Schema 1 was the FP4-only original.
+# ROADMAP K1.2 proper is the CLOSED fused mid-M rung-surface item; the
+# persistent-B FP8 arm extends K1.1 to the second payload family.)
 _MOE_PERSISTENT_B_ABI_SCHEMA = 2
 
 # Strict symbol contract.  The digest keys both the module name and the build
