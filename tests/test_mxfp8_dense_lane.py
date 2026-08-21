@@ -110,3 +110,103 @@ def test_audited_and_broken_sets_stay_disjoint_for_fp8_source_entries():
     for wire in (WIRE_FP8_BLOCK128, WIRE_MXFP8_G32):
         fmt = sp.FORMATS[wire]
         assert not (fmt.audited_backends & set(fmt.known_broken_backends))
+
+
+# --- A-side offset pre-warm: the CUDA-graph capture prerequisite ------------
+#
+# ``_SfOffsetCache.get`` computes offsets on the host and moves them with an
+# unpinned ``.to(device)``. Inside a CUDA graph capture that copy is a hard
+# error, so every key must already exist before capture starts. The B side was
+# always resolved at load from weight dimensions; the A side is keyed by the
+# runtime row count, which under FULL_DECODE_ONLY is first seen INSIDE the
+# capture region. These cover the reader and the pre-warm on CPU; the served
+# proof is a graph capture on the GPU image.
+
+class _FakeExt:
+    """Records the offset requests the lane makes."""
+
+    def __init__(self):
+        self.calls = []
+
+    def mxfp8_sf_offsets(self, rows, k, is_b):
+        self.calls.append((int(rows), int(k), bool(is_b)))
+        return torch.zeros(4, dtype=torch.int32)
+
+
+def test_capture_sizes_reader_is_silent_without_vllm():
+    """No vLLM in the CPU tier: the reader must degrade to (), not raise --
+    a load must never fail for a compilation-config schema reason."""
+    from gridbook.mxfp8_dense_lane import _cudagraph_capture_sizes
+    assert _cudagraph_capture_sizes() == ()
+
+
+def test_capture_sizes_reader_dedups_sorts_and_drops_nonpositive(monkeypatch):
+    """Exercise the REAL reader against a stub config.
+
+    ``monkeypatch.setitem`` on ``sys.modules`` is deliberate: it restores the
+    entries afterwards, so this does not leak stub ``vllm`` modules into later
+    files the way CONTRIBUTING.md warns about.
+    """
+    import sys
+    import types
+
+    import gridbook.mxfp8_dense_lane as lane
+
+    config = types.SimpleNamespace(
+        compilation_config=types.SimpleNamespace(
+            cudagraph_capture_sizes=[8, 2, 2, 0, 4, 1, -3]))
+    stub = types.ModuleType("vllm.config")
+    stub.get_current_vllm_config = lambda: config
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.config", stub)
+
+    assert lane._cudagraph_capture_sizes() == (1, 2, 4, 8)
+
+
+def test_capture_sizes_reader_degrades_to_silence_on_a_hostile_config(
+        monkeypatch):
+    """Schema drift must not fail a load -- the reason ops.py warns instead of
+    raising. A config whose accessor explodes yields (), not an exception."""
+    import sys
+    import types
+
+    import gridbook.mxfp8_dense_lane as lane
+
+    def boom():
+        raise RuntimeError("compilation_config moved again")
+
+    stub = types.ModuleType("vllm.config")
+    stub.get_current_vllm_config = boom
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.config", stub)
+
+    assert lane._cudagraph_capture_sizes() == ()
+
+
+def test_prewarm_populates_a_side_for_every_capture_size(monkeypatch):
+    """The fix proper: one A-side entry per capture size, at the layer's K."""
+    import gridbook.mxfp8_dense_lane as lane
+
+    monkeypatch.setattr(lane, "_OFFSETS", lane._SfOffsetCache())
+    monkeypatch.setattr(lane, "_cudagraph_capture_sizes", lambda: (1, 2, 4, 8))
+    ext = _FakeExt()
+    lane._prewarm_activation_offsets(ext, 4096, torch.device("cpu"))
+
+    assert ext.calls == [(1, 4096, False), (2, 4096, False),
+                         (4, 4096, False), (8, 4096, False)]
+    # and a subsequent forward-time lookup is a cache HIT, i.e. no host copy
+    # would be issued inside a capture
+    before = len(ext.calls)
+    lane._OFFSETS.get(ext, 4, 4096, is_b=False, device=torch.device("cpu"))
+    assert len(ext.calls) == before
+
+
+def test_prewarm_is_a_noop_when_capture_sizes_are_unknown(monkeypatch):
+    """Eager serving (or an unreadable config) must not pay for this."""
+    import gridbook.mxfp8_dense_lane as lane
+
+    monkeypatch.setattr(lane, "_OFFSETS", lane._SfOffsetCache())
+    monkeypatch.setattr(lane, "_cudagraph_capture_sizes", tuple)
+    ext = _FakeExt()
+    lane._prewarm_activation_offsets(ext, 4096, torch.device("cpu"))
+    assert ext.calls == []
