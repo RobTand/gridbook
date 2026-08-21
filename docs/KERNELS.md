@@ -1005,8 +1005,10 @@ data-dependent control flow. The kernels follow these rules:
    recomputes the tensor but keeps the captured host value — the padded grouped
    routing's optional trim count is exactly such a read, so under capture
    `_padded_route` launches the data-independent static-capacity layout instead,
-   and the expert-chunked BF16 bridge (whose launch bounds are irreducibly
-   routing-dependent host values) refuses capture outright.
+   and the opt-in sm12x expert-chunked BF16 bridge (`PRISMAQUANT_CB_BF16_SM120`,
+   whose launch bounds are irreducibly routing-dependent host values) refuses
+   capture outright. The default expand + grouped bridge and the persistent-B
+   lane never take a host read and capture as-is.
 3. **All device-side constants and per-device kernel setup happen once, at model
    load.** A real bug this caught: an activation-QDQ kernel built its FP4/E2M1
    grid on the CPU and H2D-copied it *every call* — a hidden sync in eager mode

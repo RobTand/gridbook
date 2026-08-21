@@ -167,6 +167,9 @@ def test_capture_refuses_the_bridge_offsets(monkeypatch):
             trim=True, block_offsets=True, pack_group=8)
     message = str(err.value)
     assert "BF16 grouped bridge" in message
+    # The refusal is scoped to the ONE consumer of block_offsets -- the
+    # opt-in sm12x lane -- so the operator knows which flag to unset.
+    assert "PRISMAQUANT_CB_BF16_SM120" in message
     assert "FULL_DECODE_ONLY" in message
     assert "--enforce-eager" in message
     assert str(moe.MOE_PREFILL_M_THRESHOLD) in message

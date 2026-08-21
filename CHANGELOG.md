@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- **Corrected: the scope of the 0.8.11 capture refusal, and the end-to-end
+  evidence the 0.8.11 entry lacked.** The 0.8.11 note said "artifacts
+  carrying BF16-bridge layers still refuse `FULL_AND_PIECEWISE`". That is
+  wrong for the DEFAULT bridge: `block_offsets` has exactly one consumer,
+  the OPT-IN sm12x-native BF16 bridge (`PRISMAQUANT_CB_BF16_SM120=1`), and
+  neither the default expand + grouped bridge nor the persistent-B lane
+  calls `_padded_route` at all (they route with `_expert_counts`/`cumsum`,
+  no host read). The refusal message now names the flag. Measured
+  2026-08-21 on the published DSv4-Flash 87 GB body (32 persistent-B + 11
+  announced-bridge layers, `gridbook:0.8.11-clean-187c721`, vLLM 0.26.1
+  eugr build): `FULL_AND_PIECEWISE` with `cudagraph_capture_sizes` up to 64
+  (`--max-num-seqs 32`) captures 11 piecewise + 7 full graphs and serves;
+  single-stream decode 20.56–20.64 tok/s, identical to the card command's
+  `FULL_DECODE_ONLY [1,2]` arm (20.53–20.61 on 0.8.11, 20.54–20.63 on
+  0.8.10) because batch-1 decode is a full graph in both modes. The
+  throughput consequence of capturing grouped decode sizes is reported in
+  the PrismaQuant benchmark record, not here.
+
 ## 0.8.11 — 2026-08-21
 
 - **Fixed: the padded grouped MoE routing host-synced inside CUDA-graph

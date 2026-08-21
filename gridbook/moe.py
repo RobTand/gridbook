@@ -212,20 +212,32 @@ def _padded_route(topk_ids, topk_weights, E: int, tile_m: int, *,
     control arm of the trim A/B — and REFUSES ``block_offsets``, because
     per-expert chunk boundaries are routing-dependent host values no static
     shape can stand in for. Eager calls are unchanged.
+
+    SCOPE OF THE REFUSAL. ``block_offsets`` has exactly one consumer: the
+    OPT-IN sm12x-native BF16 bridge (``PRISMAQUANT_CB_BF16_SM120=1``,
+    ``_apply_prefill_native_bf16_sm120``). The DEFAULT expand + grouped
+    bridge and the persistent-B lane never call this function — they route
+    with ``_expert_counts``/``cumsum`` and have no host read — so an
+    artifact whose layers announce "expand + grouped bridge" at load
+    captures fine; only an operator who selected the sm12x lane sees this
+    error. Measured 2026-08-21 on the DSv4-Flash 87 GB body (32 persistent-B
+    + 11 bridge layers): ``FULL_AND_PIECEWISE`` with capture sizes up to 64
+    starts and serves on 0.8.11.
     """
     if _capturing_now(topk_ids):
         if block_offsets:
             raise RuntimeError(
-                "the BF16 grouped bridge cannot run inside CUDA-graph "
+                "the opt-in sm12x-native BF16 grouped bridge "
+                "(PRISMAQUANT_CB_BF16_SM120=1) cannot run inside CUDA-graph "
                 "capture: its expert-chunk launches slice by per-expert "
                 "block offsets, which are routing-dependent host reads — a "
                 "captured graph would bake one capture-time routing's "
-                "boundaries into every replay. Keep graph capture in the "
-                "grouped-GEMV decode regime (capture sizes <= "
-                f"MOE_PREFILL_M_THRESHOLD = {MOE_PREFILL_M_THRESHOLD} "
+                "boundaries into every replay. Unset the flag (the default "
+                "bridge and the persistent-B lane capture), keep graph "
+                "capture in the grouped-GEMV decode regime (capture sizes "
+                f"<= MOE_PREFILL_M_THRESHOLD = {MOE_PREFILL_M_THRESHOLD} "
                 "tokens, e.g. vLLM cudagraph_mode=FULL_DECODE_ONLY), or "
-                "serve this artifact with --enforce-eager. "
-                "RobTand/gridbook#47")
+                "serve with --enforce-eager. RobTand/gridbook#47")
         trim = False
     T = int(topk_ids.shape[0])
     top_k = int(topk_ids.shape[-1])
