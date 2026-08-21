@@ -1000,7 +1000,13 @@ data-dependent control flow. The kernels follow these rules:
    serving produce identical output.
 2. **No host-side branching on tensor values inside a captured region**, and fixed
    shapes. Bit-exactness with capture **off** must always hold (capture-on ==
-   capture-off logits).
+   capture-off logits). The #47 corollary: a data-dependent host *read* is wrong
+   under capture even where the runtime would permit it, because a replay
+   recomputes the tensor but keeps the captured host value — the padded grouped
+   routing's optional trim count is exactly such a read, so under capture
+   `_padded_route` launches the data-independent static-capacity layout instead,
+   and the expert-chunked BF16 bridge (whose launch bounds are irreducibly
+   routing-dependent host values) refuses capture outright.
 3. **All device-side constants and per-device kernel setup happen once, at model
    load.** A real bug this caught: an activation-QDQ kernel built its FP4/E2M1
    grid on the CPU and H2D-copied it *every call* — a hidden sync in eager mode

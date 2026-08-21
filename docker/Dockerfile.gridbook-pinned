@@ -4,7 +4,7 @@
 ARG BASE_IMAGE=gridbook:local
 FROM ${BASE_IMAGE}
 
-ARG GRIDBOOK_REF=v0.8.10
+ARG GRIDBOOK_REF=v0.8.11
 
 USER root
 RUN test -n "${GRIDBOOK_REF}" \

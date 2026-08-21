@@ -153,6 +153,17 @@ class _PaddedRoute(NamedTuple):
     block_offsets: "list[int] | None"
 
 
+def _capturing_now(t: "torch.Tensor") -> bool:
+    """True when ``t``'s stream is inside CUDA-graph capture.
+
+    The seam every capture-conditional routing decision goes through, so the
+    CPU test tier can assert both arms by patching one name. ``is_cuda`` is
+    checked first: the capture query is a CUDA runtime call and must not be
+    issued for CPU tensors (CPU-only torch builds have no current stream).
+    """
+    return t.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
 def _padded_route(topk_ids, topk_weights, E: int, tile_m: int, *,
                   trim: bool, block_offsets: bool = False,
                   pack_group: int | None = None) -> _PaddedRoute:
@@ -185,7 +196,37 @@ def _padded_route(topk_ids, topk_weights, E: int, tile_m: int, *,
     chunk covers every expert — then the only range any loop takes is
     ``[0, n_blocks)``, which is invariant under the permutation. Passing
     ``pack_group`` requires ``block_offsets=True``; it is ignored otherwise.
+
+    CUDA-GRAPH CAPTURE (RobTand/gridbook#47). Every host read here is
+    routing-dependent, and a captured graph replays with NEW routing each
+    step — so under capture a trim count is not merely forbidden by the
+    runtime ("operation not permitted when stream is capturing", which is how
+    vLLM 0.27's default ``FULL_AND_PIECEWISE`` mode surfaced this at engine
+    start), it could never be correct: the capture-time count would be baked
+    into every replay. The only layout a captured graph can launch is the one
+    whose shape is data-independent, and that layout exists: the static
+    capacity ``cap_blocks`` (known from shapes alone — see
+    :func:`cb_grouped_pad_routing`). Under capture this function therefore
+    forces ``trim=False`` and launches the full static-capacity tail — the
+    same layout ``PRISMAQUANT_CB_GROUPED_TRIM=0`` selects, measured as the
+    control arm of the trim A/B — and REFUSES ``block_offsets``, because
+    per-expert chunk boundaries are routing-dependent host values no static
+    shape can stand in for. Eager calls are unchanged.
     """
+    if _capturing_now(topk_ids):
+        if block_offsets:
+            raise RuntimeError(
+                "the BF16 grouped bridge cannot run inside CUDA-graph "
+                "capture: its expert-chunk launches slice by per-expert "
+                "block offsets, which are routing-dependent host reads — a "
+                "captured graph would bake one capture-time routing's "
+                "boundaries into every replay. Keep graph capture in the "
+                "grouped-GEMV decode regime (capture sizes <= "
+                f"MOE_PREFILL_M_THRESHOLD = {MOE_PREFILL_M_THRESHOLD} "
+                "tokens, e.g. vLLM cudagraph_mode=FULL_DECODE_ONLY), or "
+                "serve this artifact with --enforce-eager. "
+                "RobTand/gridbook#47")
+        trim = False
     T = int(topk_ids.shape[0])
     top_k = int(topk_ids.shape[-1])
     dev = topk_ids.device
@@ -2034,10 +2075,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
         # ---- routing (device-side; static shapes) --------------------------
         # The padded layout is the shared one (``_padded_route``); the TRIM
-        # read is kept intentionally: a host-read-free replacement must either
-        # launch the full static-capacity tail (a performance change) or teach
-        # the grouped kernel to consume n_blocks on device. A tensor slice
-        # bound still performs this same host conversion implicitly.
+        # read is kept intentionally in eager: a host-read-free replacement
+        # must either launch the full static-capacity tail (a performance
+        # change) or teach the grouped kernel to consume n_blocks on device.
+        # A tensor slice bound still performs this same host conversion
+        # implicitly. Under CUDA-graph capture ``_padded_route`` takes the
+        # first option itself — the trim count is routing-dependent, so no
+        # captured constant could be right (gridbook#47).
         route = _padded_route(
             topk_ids, topk_weights, E, tile_m,
             trim=_grouped_trim())

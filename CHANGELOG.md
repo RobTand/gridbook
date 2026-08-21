@@ -1,6 +1,45 @@
 # Changelog
 
-## Unreleased
+## 0.8.11 — 2026-08-21
+
+- **Fixed: the padded grouped MoE routing host-synced inside CUDA-graph
+  capture (#47).** `_padded_route`'s two host reads — the optional trim count
+  (`n_blocks.item()`) and the per-expert `block_offsets` (`.tolist()`) — are
+  routing-dependent, so on vLLM 0.27, whose default `cudagraph_mode` is
+  `FULL_AND_PIECEWISE` and captures routed prefill sizes, a stock
+  `vllm serve` of any CB MoE artifact died at engine start with `operation
+  not permitted when stream is capturing`. The crash was protective: even a
+  permitted read would bake one capture-time routing's block count into
+  every replay, so no captured trim can be correct. Under capture
+  `_padded_route` now forces `trim=False` and launches the full
+  static-capacity tail — the layout is data-independent (`cap_blocks =
+  P//tile_m + E`, known from shapes alone) and is exactly the arm
+  `PRISMAQUANT_CB_GROUPED_TRIM=0` already selects, so replays recompute the
+  routing on device and stay correct for any token mix. The BF16 grouped
+  bridge, whose expert-chunk launches slice by per-expert host boundaries no
+  static shape can stand in for, now refuses capture with an error naming
+  the remediation (capture sizes within the grouped-GEMV decode regime,
+  `<= MOE_PREFILL_M_THRESHOLD = 16` tokens — e.g.
+  `cudagraph_mode=FULL_DECODE_ONLY` — or `--enforce-eager`) instead of the
+  runtime's opaque abort. Eager dispatch is unchanged, decode GEMVs were
+  already sync-free, and fused-lane numerics are unchanged in both arms
+  (padding rows scatter into the throwaway row; pad tiles carry expert id
+  −1). Gated by `tests/test_padded_route_capture.py`: a real
+  capture-and-replay of `_padded_route` against rewritten routing, host-read
+  poisoning on the capture arm, bit-identity of the static-capacity layout
+  with the eager `trim=False` arm, and a negative control proving the trim
+  read still aborts capture on this torch.
+
+  Verification scope: this is an operator-level fix with operator-level
+  evidence — a real `torch.cuda.CUDAGraph` capture and replay of
+  `_padded_route` on torch 2.11.0+cu130 (GB10, sm121), plus the contract tier
+  against a stubbed vLLM surface. No end-to-end serve under stock vLLM 0.27
+  defaults was run, so "the engine starts on 0.27 defaults" is the expected
+  consequence, not a measured one. Artifacts whose layers all take the fused
+  lanes are expected to capture; artifacts carrying BF16-bridge layers still
+  refuse `FULL_AND_PIECEWISE` by design, now with the remediation named
+  instead of the runtime's abort. Confirmation on a 0.27 stack is requested
+  in #47.
 
 - **Fixed: `FULL_DECODE_ONLY` capture aborted the load in the MXFP8 dense
   lane.** `_SfOffsetCache` computes swizzled-plane offsets on the host and
