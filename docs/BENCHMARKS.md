@@ -764,8 +764,8 @@ recorded. k≥16 cells were within noise (+0.4…+1.5%), which does not rescue
 k=12; not merged.
 
 **B2-S3 — FP8-family-only staging vectorization (`ox/pb-salvage-s3`,
-SHIP consensus 2026-08-22 — coordinator + adversarial Ox Alpha; merged to
-local master `f457de2`).** The rejected B2's copy,
+SHIP consensus 2026-08-22 — coordinator + adversarial Ox Alpha; `f457de2`).**
+The rejected B2's copy,
 salvaged for the one family where it pays and gated at COMPILE TIME: both
 mainloop staging sites dispatch on the kernel's existing `kFp8` trait; the
 FP8 arm takes an aligned-u32 word copy (byte-loop fallback for odd `qw` base

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.12 — 2026-08-22
+
 - **Added: dense FP4-CB v2 GEMV round-2 backport behind
   `PRISMAQUANT_CB_FP4V2_DENSE_R2` (default off).** The grouped MoE kernel's
   three load-path optimizations — predicated spill-word read (the window
@@ -27,8 +29,7 @@
   dumps of the built binaries (the inlined build allocates FEWER registers
   than the byte-loop baseline). Not merged; the byte-granular staging
   remains.
-- **SHIP consensus 2026-08-22 (coordinator + adversarial Ox Alpha), merged
-  to local master: FP8-family-only persistent-B
+- **SHIP consensus 2026-08-22 (coordinator + adversarial Ox Alpha): FP8-family-only persistent-B
   staging vectorization (B2-S3)** — the rejected B2's copy salvaged behind a
   compile-time family dispatch: at both mainloop staging sites, FP8-CB takes
   u32 words when the source plane is runtime word-aligned (the byte loop
