@@ -709,7 +709,17 @@ K2048/N12288/M2 k20 96.46→79.89 (−17.2%); K4096/N4096/M2 k20 57.40→45.84
 (−20.2%); smallest win −0.9% (K2048/N12288/M1 k16). Gains grow with k —
 consistent with the compute-bound decode profile (fewer issued load
 instructions per codeword). Opt-in flag; served NATIVE-PARITY required before
-any default flip.
+any default flip. Consensus re-measurement (2026-08-21, two independent
+harnesses, fresh tree-private builds, `torch.equal` every cell): 32/32 on
+this grid, **64/64** on the shipped Qwen3.8-27B dense shapes × k∈{12,14,16,18}
+× M∈{1,2,4,8} (k12 −1…−8% … k18 −5…−16%), 47/48 on a small-K/untiled-N grid
+(K∈{1024,1536}, N∈{4097,5000}) and 4/4 at M=16; the one losing cell,
+**k=12 / K=1536 / M=1, +1.7…+2.4%**, reproduced three times on an idle GPU
+— a known corner for the NATIVE-PARITY evaluation. The `R2=false`
+instantiations are SASS-identical to the pre-commit build (20/20), and
+`compute-sanitizer` memcheck is clean on the gate, the shipped shapes and
+ten edge layouts (N=1/K=256, N=97, all-byte-fallback rows, fused two-role
+`row_off`, M=16, decode-contract v2).
 
 **B7 — sm12x grouped-BF16 per-chunk packing (K1.5), isolated stage-one gather
 GEMM, median of 7/5.** Cell: E=64 mildly-skewed experts, w13 K=N=4096,
@@ -720,14 +730,29 @@ natural order 16.11/16.39 ms ⇒ packed/natural **0.890 / 0.897**. Two-chunk
 cost vs one launch ≈1.07×. Uniform-router control cell: packing inert
 (1.001×) — the win appears exactly when segments straddle.
 
-**B2 — persistent-B staging vectorization.** Byte-neutral by construction
-(staging theorem preconditions P1–P5 asserted in-source; decode-probe
-`torch.equal` suites green). No isolated staging-share cell was recorded in
-this pass — the vectorized copy's contribution is to be attached to the next
-persistent-B A/B run rather than claimed standalone; the load-bearing
-measurement here is the NEGATIVE one that shaped the implementation:
-inlining the helpers cost ~26 registers/thread and measured a ~23%
-whole-operator regression at k=12, hence the `__noinline__` scoping.
+**B2 — persistent-B staging vectorization (REJECTED on measurement).**
+Byte-neutral by construction (staging theorem preconditions P1–P5 asserted
+in-source; decode-probe `torch.equal` suites green), but whole-operator A/B
+on DSV4 h4096/i2048 E=32 top_k=8 (`bench_moe_persistent_b.py`, warm ms,
+median of 3) rejected it: at the DSv4-dominant k=12 the committed
+(`DEVINL`) build runs +7…+11% slower than the byte-granular baseline
+(pb T=512: 8.859/8.946/8.941 → 9.819/9.914; T=2048:
+25.863/26.262/26.343 → 27.896/28.151), and the `__noinline__` spelling the
+design called for is slower still (+14.1%). The recorded rationale —
+inlining cost ~26 registers/thread and a ~23% whole-operator regression,
+hence `__noinline__` scoping — is contradicted by `cuobjdump
+--dump-resource-usage` of the built binaries: the inlined build allocates
+FEWER registers than baseline on every fp4 instantiation — including
+`<128,64,8>`, the tile `pick_cfg` actually selects at DSV4 shapes (112 → 80;
+`<128,32,4>` 128 → 120, `<64,64,4>` 126 → 72) — and the noinline build more
+(128/125). SASS of `<128,64,8>`: the mainloop is unchanged (32 HMMA, 16 LDSM,
+8 LDGSTS in both builds; occupancy smem-capped at 2 CTAs/SM in both); the
+baseline staging is one compiler-unrolled burst of 8 independent `LDG.E.U8`
++ 8 `STS.U8`, the replacement five `unroll 1` loops per row each carrying
+`VOTE.ANY`/`WARPSYNC`/`SHFL.DOWN` and a reconvergent branch — a dependent
+chain per word where the byte loop had memory-level parallelism. No isolated staging-share cell was
+recorded. k≥16 cells were within noise (+0.4…+1.5%), which does not rescue
+k=12; not merged.
 
 ---
 

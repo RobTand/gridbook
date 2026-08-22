@@ -4,7 +4,8 @@
 vectorization and its gate test are uncommitted at the time of writing).
 **Scope:** research + proofs only — no repository file is modified by this
 document. **Verification:** pure python/numpy integer simulation under
-`/tmp/opencode/matheval/gridbook_newmath/` (`part1_rho.py`,
+`/tmp/opencode/matheval/gridbook_newmath/` (volatile; snapshot at
+`/home/rob/dq-runs/review-watch-2026-08-21/opencode-evidence/matheval/gridbook_newmath/`) (`part1_rho.py`,
 `part1_profile.py`, `part2_window.py`, `part3_empty.py`,
 `part4_staging.py`); every lemma below that admits an exhaustive or
 Monte-Carlo check was checked, and the check is named where it is used.
@@ -349,12 +350,13 @@ two-word window for every rung/phase) is asserted in the same script.
 ### 2.2 Lemma 11 (the predicate exactly characterizes spill)
 
 *Let `code₃` denote the masked three-word assembly and `code₂` the masked
-two-word assembly. Then for every `(k, v, off8)`:
-`code₂ == code₃ == ground truth` iff `rem + k ≤ 64`; if `rem + k > 64` the
-bits `[64 − rem, rem + k − 64)` of the codeword live only in `w2`, so
-`code₂ ≠ ground truth`. Consequently zeroing `w2` when the predicate is
-false (or not loading it at all) is bit-neutral in ALL cases, and required
-in none.*
+two-word assembly. Then for every `(k, v, off8)`: `code₂ == code₃ ==
+ground truth` **for every payload** iff `rem + k ≤ 64`; if `rem + k > 64`
+the bits `[64 − rem, rem + k − 64)` of the codeword live only in `w2`, so
+`code₂ ≠ ground truth` for some payloads (they can still coincide on a
+payload whose spilled bits happen to be zero). Consequently zeroing `w2`
+when the predicate is false (or not loading it at all) is bit-neutral in ALL
+cases, and required in none.*
 
 *Proof.* If `rem + k ≤ 64`, every kept bit lies in `lo`, and the spilled
 term `w2 << (64−rem)` contributes only at bit positions `≥ 64 − rem ≥ k`,
@@ -440,7 +442,7 @@ Under uniform routing `P(empty) = (1 − 1/256)^{6T} ≈ e^{−ρ}`:
 | 32 | 0.75 | cfg4/128 | 120.7 | 3 864 | 30.9 KB | 113 ns |
 | 128 | 3 | cfg4/128 | 12.7 | 406 | 3.2 KB | 11.9 ns |
 | 256 | 6 | cfg4/128 | **0.63** | 20 | 161 B | **0.59 ns** |
-| 512 | 12 | cfg4/128 | 2.0e−3 | 0.06 | 2 B | ~0 |
+| 512 | 12 | cfg4/128 | 1.5e−3 | 0.05 | 0.4 B | ~0 |
 | 2048 | 48 | cfg4/128 | ~e^{−48} | 0 | 0 | 0 |
 
 At the task's named operating point (`T = 256`, `topk = 6`, `ρ = 6`):
@@ -470,7 +472,10 @@ loop (byte-granular `dst[b] = __ldg(src+b)` over `[0, type_size)`, then
 zero-fill of `[type_size, ts_pad)`) with u32 vector copies
 (`pb_stage_row` / `pb_stage_row_zero`, working tree,
 cb_moe_persistent_b.cu:629-691; call sites :840-855 baseline mainloop,
-:898-917 D2R variant, decode probes :1078/:1120/:1168). The bit-neutrality
+:898-917 D2R variant, decode probes :1078/:1120/:1168). **Status: B2 was
+subsequently REJECTED on performance (independent A/B: +7…+11% whole-
+operator at k=12); this part concerns byte-neutrality only and does not
+depend on that implementation landing.** The bit-neutrality
 contract is stated as P1–P5 at cb_moe_persistent_b.cu:588-625 and gated by
 `tests/test_persistent_b_stage_vectorization.py` (torch.equal A/B across
 byte phases). Here is the theorem that contract restates, with the proof

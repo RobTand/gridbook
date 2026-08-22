@@ -14,14 +14,19 @@
   gate); on GB10 the flag wins all 32 measured points, gains growing with k
   (−7%…−20% at k20), consistent with the decode chain's compute-bound ncu
   profile. Opt-in until the served NATIVE-PARITY protocol runs.
-- **Changed: persistent-B packed-superblock staging vectorized** from
-  byte-granular to u32-interior copies with funnel-shift edges for the odd
-  `4k+9` source phases and whole-slot zeroing; staging helpers are
-  deliberately `__noinline__` because inlining raised ptxas register
-  allocation by ~26/thread and measured a ~23% whole-operator regression.
-  Byte-neutrality preconditions (P1–P5) documented in-source per the
-  staging-vectorization theorem; decode-probe `torch.equal` suites green
-  (150 passed / 28 skipped).
+- **Proposed and REJECTED: persistent-B packed-superblock staging
+  vectorization (B2)** — byte-granular to u32-interior copies with
+  funnel-shift edges for the odd `4k+9` source phases and whole-slot zeroing.
+  Byte-neutrality held (preconditions P1–P5 documented in-source per the
+  staging-vectorization theorem; decode-probe `torch.equal` suites green),
+  but independent A/B measurement on the DSv4-dominant k=12 rung showed the
+  vectorized build +7…+11% whole-operator slower than the byte loop (the
+  `__noinline__` spelling slower still, +14%), and the recorded rationale —
+  that `__noinline__` scoping is load-bearing because inlining cost ~26
+  registers/thread and a ~23% regression — is contradicted by `cuobjdump`
+  dumps of the built binaries (the inlined build allocates FEWER registers
+  than the byte-loop baseline). Not merged; the byte-granular staging
+  remains.
 - **Changed: sm12x grouped-BF16 lane packs expert blocks WITHIN each chunk**
   (ROADMAP K1.5): multi-chunk layers now get the swizzle-group tile-order win
   that previously required one chunk to cover every expert. Per-expert
