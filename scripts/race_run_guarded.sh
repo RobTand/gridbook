@@ -45,7 +45,7 @@ pip install pytest -q 2>/dev/null 1>&2
 export PYTHONPATH=/src:/prismaquant
 python3 scripts/bench_grouped_tile_m_sweep.py --json /tmp/ext-rho/rho_sweep_cells.json "$@"
 ' _ "$@" >> "$LOG" 2>&1
-  ) 9>/home/rob/dq-runs/gpu.lock 8>/tmp/claude-1000/gpu-bench.lock
+  ) 9>/home/rob/dq-runs/gpu.lock 8</tmp/claude-1000/gpu-bench.lock
   rc=$?
   echo "=== attempt $attempt exit $rc at $(date) ===" >> "$LOG"
   [ "$rc" = "0" ] && exit 0
