@@ -763,6 +763,49 @@ chain per word where the byte loop had memory-level parallelism. No isolated sta
 recorded. k≥16 cells were within noise (+0.4…+1.5%), which does not rescue
 k=12; not merged.
 
+**B2-S3 — FP8-family-only staging vectorization (`ox/pb-salvage-s3`,
+PROPOSED 2026-08-22, consensus review pending).** The rejected B2's copy,
+salvaged for the one family where it pays and gated at COMPILE TIME: both
+mainloop staging sites dispatch on the kernel's existing `kFp8` trait; the
+FP8 arm takes an aligned-u32 word copy (byte-loop fallback for odd `qw` base
+pointers — `type_size == 4k` keeps every superblock offset 0 mod 4, so only
+the base pointer can misalign) with word-granular slot zeroing, and the FP4
+arm keeps the baseline loops verbatim. b2's ptxas mechanism (any text change
+to shared inlined staging re-tunes the whole fp4 kernel schedule) is treated
+as a gate, not a claim: against a fresh baseline build (`464d27f`, identity
+`1546441…`) all 8 fp4 mainloop instantiations are instruction-stream- AND
+resource-identical (hot `<128,64,8>` tile reads **112** registers, not 80),
+and the three decode kernels are identical. Bit-neutrality: 25/25
+`torch.equal` probe cells — fp4 decode/prefill k∈{12,14,16} × rows/expert
+{4,128}, fp8 prefill at every shipped rung k∈{28,36,44,48} × E∈{256,32} ×
+rows/expert {4,128}; plus a new `tests/test_persistent_b_fp8_staging.py`
+that reads the entire staged plane bitwise through prefill via one-hot
+activations at the four shipped FP8 rungs, on aligned and deliberately
+misaligned sources (signed-zero-only pairs excepted: the epilogue turns
+−0.0 weights into +0.0). Whole-operator A/B, DSV4 h4096/i2048 E=256
+top_k=6, warm ms, iters 30/warmup 10, interleaved A/S3/A/S3 under clean
+single-process GPU windows (baseline `1546441…`, S3 `5e193c33…`):
+
+| lane | T | baseline (×2) | S3 (×2) | Δ |
+|---|---|---|---|---|
+| fp8-CB k=28 E=256 | 128 | 35.417 / 35.938 | 31.324 / 31.608 | −11.6…−12.0% |
+| fp8-CB k=28 E=256 | 512 | 38.465 / 38.850 | 34.180 / 34.308 | −11.1…−11.7% |
+| fp8-CB k=28 E=256 | 2048 | 41.910 / 42.288 | 37.650 / 37.837 | −10.2…−10.5% |
+| fp8-CB k=36 E=256 | 512 | 89.097 | 76.141 | −14.5% |
+| fp8-CB k=48 E=256 | 512 | 131.711 | 116.913 | −11.2% |
+| fp4-CB k=12 E=32 | 512 | 8.975 | 8.972 | −0.03% (noise, as SASS identity demands) |
+
+Small-E control (DSV4sm, E=32): k=28 −8.3…−10.9% across tokens; k=36 −7.3%;
+k=48 −2.3%. An intermediate S3 build that kept the baseline byte zero-passes
+inside the FP8 arm measured only −2.4…−3.0% at k=28 despite passing every
+correctness gate — matching S1's word-granular slot zeroing recovers the
+full win; that build (`9184bc59…`) was discarded and its logs preserved
+outside the repo. Scope caveat: unchanged from the rejected-B2 entry above —
+on the shipped DSv4 body the 11 FP8-CB routed layers run the bridge
+(per-role split books), so this win reaches DSv4 only after the pooled-books
+reburn; today it applies to any MoE artifact whose FP8-CB routed layers take
+the persistent-B arm.
+
 ---
 
 ## Retired Triton path: historical cost

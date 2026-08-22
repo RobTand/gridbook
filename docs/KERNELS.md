@@ -901,6 +901,32 @@ DSv4 shapes (E=256, K28, topk 6) measures **15.8–18.4×** the expand+bridge
 operator with rel-L2 ≤ 6.2e-04 (reduction order only). There is no FP8 D2R
 variant.
 
+**FP8 staging dispatch (2026-08-22 salvage of the rejected B2).** The two
+mainloop superblock-staging sites dispatch on the payload family at compile
+time (`if constexpr` on the kernel's existing `CbFp8Fmt` trait): the FP8
+instantiation stages as u32 words when the source plane is runtime
+word-aligned — always true for `type_size == 4k` planes from allocator-fresh
+tensors, with the byte loop kept as a correctness fallback so no host check
+refuses a layout that serves today — and zeroes empty slots word-granularly;
+the FP4 instantiation's executed statements remain the baseline byte loops,
+verbatim. The dispatch exists because on this toolchain (nvcc/ptxas
+sm_121a, torch 2.13/cu130) ANY text change to the inlined staging re-tunes
+ptxas's whole-kernel schedule for the fp4 kernels — measured three times
+(the rejected B2 and its S1/S2 salvage variants: 112 → 80 registers on the
+hot `<128,64,8>` tile, +7…+14% whole-operator at k=12/14/16) — so here the
+fp4 kernels' compiled form is a GATE rather than a claim: all eight
+`cb_moe_persistent_b_kernel<…, CbFp4V2Fmt>` instantiations are
+instruction-stream- and resource-identical to the pre-change build under
+`cuobjdump` (the hot tile reads 112 registers), and the decode kernels are
+untouched. Whole-routed-operator FP8 A/B at DSv4 shapes measures
+−10.2…−12.0% at k=28 and −14.5%/−11.2% at k=36/k=48
+([BENCHMARKS](BENCHMARKS.md#2026-08-21-kernel-eval-branch-b1b2b7-measurements),
+B2-S3 paragraph); fp4 k=12 sits at run-to-run noise. Scope caveat unchanged:
+the shipped DSv4 body's 11 FP8-CB routed layers ride per-role split books
+and keep the bridge until the pooled-books reburn, so this win reaches DSv4
+serving only then; today it applies to any MoE artifact whose FP8-CB routed
+layers take the persistent-B arm.
+
 **Requalification surface.** Activations are untouched — the same exact
 group-16 RTN QDQ payload, before FC1 and between FC1 and FC2. The decode is
 **bit-identical to `cb_expand_v2`**, and that is a tested fact rather than an

@@ -586,6 +586,55 @@ DEVINL uint16_t* tile_at(uint16_t* base, int row, int kcol) {
 }
 
 // ---------------------------------------------------------------------------
+// FP8-only vectorized packed-superblock staging (ox/pb-salvage-s3), dispatched
+// on the payload family at COMPILE TIME via the kernel's existing `kFp8`
+// trait (`std::is_same<Fmt, CbFp8Fmt>`).  Precondition contract, restated
+// from the B2 audit and the b6e9dd2 / S1 / S2 salvage reviews:
+//
+//   P1. Staging is a PURE BYTE MOVE into a shared row slot that later readers
+//       index by ABSOLUTE BYTE OFFSET (`cb_decode_codeword`'s u32 windows are
+//       anchored at codeword starts inside the slot).  A shifted destination
+//       would change every index the decoder computes, so the copy preserves
+//       each payload byte's absolute position; only the LOAD side may exploit
+//       alignment.
+//   P2. The staged slot image must be bit-identical to the byte-granular loop
+//       it replaces: payload bytes [0, type_size) value-exact, and
+//       [type_size, ts_pad) zero-filled exactly as before (the 8-byte decode
+//       window legitimately reads into that slack and consumes the zeros).
+//   P3. `dst` is always 4-byte aligned: `sPk` comes from `extern __shared__
+//       __align__(16)` at a multiple-of-16 byte offset, and every slot stride
+//       `ts_pad` is a multiple of 4 (`ts_padded()` rounds type_size up to 4,
+//       then adds 8).  For FP8-CB type_size == 4*k_bits, so superblock s
+//       starts at byte offset s*type_size == 0 mod 4 for every s; the only
+//       remaining misalignment source is the `qw` base pointer, which no host
+//       check pins (the torch caching allocator returns >=256-byte-aligned
+//       data pointers in practice, but that is not a contract).  The runtime
+//       branch below therefore falls back to the baseline byte loop whenever
+//       `src` is not 4-byte aligned; the fallback exists so the kernel stays
+//       CORRECT for any base pointer, not to serve a known layout.
+//   P4. `__ldg` semantics are preserved: every global read goes through
+//       `__ldg` (read-only/non-coherent path), u32 body and byte edges alike.
+//   P5. Race structure is unchanged: each row slot has exactly ONE producing
+//       warp (baseline: warp owns rows n, n+WARPS, ...; D2R: its private N
+//       slice), and publication still happens through the same
+//       __syncthreads/__syncwarp as the byte loop.
+//
+// WHY FAMILY DISPATCH AND NOT A SHARED HELPER: on this toolchain (nvcc/
+// ptxas sm_121a, torch 2.13/cu130) ANY text change in the inlined staging of
+// the FP4 instantiation re-tunes ptxas's whole-kernel schedule (112 -> 80
+// registers on the hot <128,64,8> tile) and costs +7...+14% whole-operator at
+// k=12/14/16 -- measured three times on b6e9dd2, ox/pb-salvage-s1 and
+// ox/pb-salvage-s2 (review-watch 2026-08-21, agent b2).  So this edit does
+// NOT touch a shared helper at all: the FP8 instantiation takes an aligned
+// u32-word copy (byte loop as runtime fallback, then the baseline zero pass),
+// while the FP4 instantiation's executed statements stay the baseline loops,
+// verbatim.  That the compiled FP4 kernels did not move is enforced by gate
+// G1 -- a cuobjdump SASS/resource-usage identity check against the baseline
+// build on every CbFp4V2Fmt instantiation -- which is a MEASURED property of
+// each shipped binary pair, not a claim about ptxas.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // The persistent-B mainloop.
 //
 // Template parameters are the tile shape and whether B is decoded directly
@@ -733,17 +782,59 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
             for (int n = warp; n < TN; n += WARPS) {
               const int gn = n0 + n;
               uint8_t* dst = sPk + (int64_t)n * ts_pad;
-              if (gn < N) {
-                const uint8_t* src = qw_e + (int64_t)gn * row_bytes +
-                                     (int64_t)sbi * fmt.type_size;
-                for (int b = lane; b < fmt.type_size; b += 32) {
-                  dst[b] = __ldg(src + b);
+              if constexpr (kFp8) {
+                // FP8-CB only: u32 words when `src` is 4-byte aligned at
+                // runtime, the baseline byte loop otherwise, then the
+                // baseline single zero pass (see the staging contract above).
+                if (gn < N) {
+                  const uint8_t* src = qw_e + (int64_t)gn * row_bytes +
+                                       (int64_t)sbi * fmt.type_size;
+                  if ((reinterpret_cast<uintptr_t>(src) & 3) == 0) {
+                    const uint32_t* wsrc =
+                        reinterpret_cast<const uint32_t*>(src);
+                    uint32_t* wdst =
+                        reinterpret_cast<uint32_t*>(dst);
+                    const int nw = fmt.type_size >> 2;
+#pragma unroll 1
+                    for (int j = lane; j < nw; j += 32) {
+                      wdst[j] = __ldg(wsrc + j);
+                    }
+#pragma unroll 1
+                    for (int b = (nw << 2) + lane; b < fmt.type_size;
+                         b += 32) {
+                      dst[b] = __ldg(src + b);
+                    }
+                  } else {
+#pragma unroll 1
+                    for (int b = lane; b < fmt.type_size; b += 32) {
+                      dst[b] = __ldg(src + b);
+                    }
+                  }
+                } else {
+                  // Whole-slot zero, word-granular (S1's pb_stage_row_zero).
+                  uint32_t* wdst_z = reinterpret_cast<uint32_t*>(dst);
+#pragma unroll 1
+                  for (int j = lane; j < (ts_pad >> 2); j += 32) {
+                    wdst_z[j] = 0u;
+                  }
+                }
+#pragma unroll 1
+                for (int b = fmt.type_size + lane; b < ts_pad; b += 32) {
+                  dst[b] = 0;
                 }
               } else {
-                for (int b = lane; b < fmt.type_size; b += 32) dst[b] = 0;
-              }
-              for (int b = fmt.type_size + lane; b < ts_pad; b += 32) {
-                dst[b] = 0;
+                if (gn < N) {
+                  const uint8_t* src = qw_e + (int64_t)gn * row_bytes +
+                                       (int64_t)sbi * fmt.type_size;
+                  for (int b = lane; b < fmt.type_size; b += 32) {
+                    dst[b] = __ldg(src + b);
+                  }
+                } else {
+                  for (int b = lane; b < fmt.type_size; b += 32) dst[b] = 0;
+                }
+                for (int b = fmt.type_size + lane; b < ts_pad; b += 32) {
+                  dst[b] = 0;
+                }
               }
             }
           }
@@ -795,17 +886,60 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_persistent_b_kernel(
             for (int n = n_begin; n < n_begin + kNPerWarp; ++n) {
               const int gn = n0 + n;
               uint8_t* dst = sPk + (int64_t)n * ts_pad;
-              if (gn < N) {
-                const uint8_t* src = qw_e + (int64_t)gn * row_bytes +
-                                     (int64_t)sbi * fmt.type_size;
-                for (int b = lane; b < fmt.type_size; b += 32) {
-                  dst[b] = __ldg(src + b);
+              if constexpr (kFp8) {
+                // FP8-CB only: u32 words when `src` is 4-byte aligned at
+                // runtime, the baseline byte loop otherwise, then the
+                // baseline single zero pass (see the staging contract above).
+                // Unreachable today: the kernel static_asserts !(D2R && FP8).
+                if (gn < N) {
+                  const uint8_t* src = qw_e + (int64_t)gn * row_bytes +
+                                       (int64_t)sbi * fmt.type_size;
+                  if ((reinterpret_cast<uintptr_t>(src) & 3) == 0) {
+                    const uint32_t* wsrc =
+                        reinterpret_cast<const uint32_t*>(src);
+                    uint32_t* wdst =
+                        reinterpret_cast<uint32_t*>(dst);
+                    const int nw = fmt.type_size >> 2;
+#pragma unroll 1
+                    for (int j = lane; j < nw; j += 32) {
+                      wdst[j] = __ldg(wsrc + j);
+                    }
+#pragma unroll 1
+                    for (int b = (nw << 2) + lane; b < fmt.type_size;
+                         b += 32) {
+                      dst[b] = __ldg(src + b);
+                    }
+                  } else {
+#pragma unroll 1
+                    for (int b = lane; b < fmt.type_size; b += 32) {
+                      dst[b] = __ldg(src + b);
+                    }
+                  }
+                } else {
+                  // Whole-slot zero, word-granular (S1's pb_stage_row_zero).
+                  uint32_t* wdst_z = reinterpret_cast<uint32_t*>(dst);
+#pragma unroll 1
+                  for (int j = lane; j < (ts_pad >> 2); j += 32) {
+                    wdst_z[j] = 0u;
+                  }
+                }
+#pragma unroll 1
+                for (int b = fmt.type_size + lane; b < ts_pad; b += 32) {
+                  dst[b] = 0;
                 }
               } else {
-                for (int b = lane; b < fmt.type_size; b += 32) dst[b] = 0;
-              }
-              for (int b = fmt.type_size + lane; b < ts_pad; b += 32) {
-                dst[b] = 0;
+                if (gn < N) {
+                  const uint8_t* src = qw_e + (int64_t)gn * row_bytes +
+                                       (int64_t)sbi * fmt.type_size;
+                  for (int b = lane; b < fmt.type_size; b += 32) {
+                    dst[b] = __ldg(src + b);
+                  }
+                } else {
+                  for (int b = lane; b < fmt.type_size; b += 32) dst[b] = 0;
+                }
+                for (int b = fmt.type_size + lane; b < ts_pad; b += 32) {
+                  dst[b] = 0;
+                }
               }
             }
             __syncwarp();

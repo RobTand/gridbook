@@ -27,6 +27,23 @@
   dumps of the built binaries (the inlined build allocates FEWER registers
   than the byte-loop baseline). Not merged; the byte-granular staging
   remains.
+- **Proposed (consensus review pending): FP8-family-only persistent-B
+  staging vectorization (B2-S3)** — the rejected B2's copy salvaged behind a
+  compile-time family dispatch: at both mainloop staging sites, FP8-CB takes
+  u32 words when the source plane is runtime word-aligned (the byte loop
+  stays as a fallback so no host check refuses a currently-served layout)
+  with word-granular slot zeroing, while the FP4 instantiation's statements
+  remain the baseline loops verbatim. The fp4 kernels' compiled form is
+  proven, not asserted: all eight fp4 mainloop instantiations are
+  SASS- and resource-identical to baseline under `cuobjdump` (hot tile stays
+  at 112 registers — the register cliff that killed B2 is avoided by
+  construction). Bit-neutral on 25 `torch.equal` probe cells including every
+  shipped FP8 rung (k∈{28,36,44,48}); whole-operator FP8-CB on DSv4 shapes
+  measures −10.2…−12.0% at k=28 (T=128/512/2048), −14.5% at k=36 and −11.2%
+  at k=48, with fp4 k=12 at noise (−0.03%). Reaches DSv4 serving only after
+  the pooled-books reburn — today its FP8-CB routed layers use per-role
+  split books and keep the bridge; the win applies now to any MoE artifact
+  whose FP8-CB layers take the persistent-B arm.
 - **Changed: sm12x grouped-BF16 lane packs expert blocks WITHIN each chunk**
   (ROADMAP K1.5): multi-chunk layers now get the swizzle-group tile-order win
   that previously required one chunk to cover every expert. Per-expert
