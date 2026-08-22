@@ -83,6 +83,15 @@
   0.8.10) because batch-1 decode is a full graph in both modes. The
   throughput consequence of capturing grouped decode sizes is reported in
   the PrismaQuant benchmark record, not here.
+- **Testing: repaired three pre-existing test failures (all failing at
+  0.8.11; no runtime behavior changed).** Two `test_moe_mixed.py` cases reset
+  the FP8-GEMV-v2 dispatch flag via `moe_gemv_select._CB_FP8_GEMV_V2`, an
+  attribute the lane-select latch refactor removed, and raised
+  `AttributeError`; they now reset it through `lane_select.reset_for_tests`.
+  One `test_nvfp4_static_runtime.py` case asserted a fused-fp4 layer was
+  ineligible with "no loaded kernel state" but never forced the compiled
+  extension absent, so it passed only where native fp4 never built and failed
+  on the sm121 build host; it now forces `get_fused_fp4_ext` to return `None`.
 
 ## 0.8.11 — 2026-08-21
 

@@ -103,7 +103,7 @@ def test_registers_per_family_buffers_and_index_maps():
 def test_explicit_fp8_v2_refuses_mixed_fp8_groups(monkeypatch):
     """A global candidate arm must not silently inherit inside mixed groups."""
     moe_mod = _import_moe_mixed()
-    from gridbook import moe_gemv_select
+    from gridbook import lane_select
 
     groups, schemes = _declaration()
     method = moe_mod.PrismaQuantMixedMoEMethod.__new__(
@@ -115,7 +115,7 @@ def test_explicit_fp8_v2_refuses_mixed_fp8_groups(monkeypatch):
         target_scheme=schemes,
         _per_expert_serving_prefixes={name: name for name in schemes},
     )
-    monkeypatch.setattr(moe_gemv_select, "_CB_FP8_GEMV_V2", None)
+    lane_select.reset_for_tests("PRISMAQUANT_CB_FP8_GEMV_V2")
     monkeypatch.setenv("PRISMAQUANT_CB_FP8_GEMV_V2", "1")
 
     with pytest.raises(RuntimeError, match="silently inherited candidate arm"):
@@ -124,7 +124,7 @@ def test_explicit_fp8_v2_refuses_mixed_fp8_groups(monkeypatch):
 
 def test_disabled_fp8_v2_leaves_mixed_groups_on_inherited(monkeypatch):
     moe_mod = _import_moe_mixed()
-    from gridbook import moe_gemv_select
+    from gridbook import lane_select
 
     groups, schemes = _declaration()
     method = moe_mod.PrismaQuantMixedMoEMethod.__new__(
@@ -136,7 +136,7 @@ def test_disabled_fp8_v2_leaves_mixed_groups_on_inherited(monkeypatch):
         target_scheme=schemes,
         _per_expert_serving_prefixes={name: name for name in schemes},
     )
-    monkeypatch.setattr(moe_gemv_select, "_CB_FP8_GEMV_V2", None)
+    lane_select.reset_for_tests("PRISMAQUANT_CB_FP8_GEMV_V2")
     monkeypatch.setenv("PRISMAQUANT_CB_FP8_GEMV_V2", "0")
 
     method._require_fp8_v2_dispatch_supported()

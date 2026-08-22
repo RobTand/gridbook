@@ -487,7 +487,8 @@ def test_dense_cb_grouped_bmm_fails_closed_at_load():
         method.process_weights_after_loading(layer)
 
 
-def test_dense_contracted_scale_load_is_fail_closed_and_merged_exact(tmp_path):
+def test_dense_contracted_scale_load_is_fail_closed_and_merged_exact(
+        tmp_path, monkeypatch):
     targets = [
         "model.layers.0.self_attn.q_proj",
         "model.layers.0.self_attn.k_proj",
@@ -513,6 +514,12 @@ def test_dense_contracted_scale_load_is_fail_closed_and_merged_exact(tmp_path):
     assert layer._cb_fp4_input_global_scale_f32 == 2.5
     layer._cb_N = 24
     layer._cb_row_offset = torch.zeros(24, dtype=torch.int32)
+    # Fail closed without the loaded fused-fp4 kernel. The build host has native
+    # fp4 present, so force the compiled extension absent to keep this a
+    # host-independent assertion about "no loaded kernel state" rather than a
+    # check that silently passes only where the kernel never built.
+    from gridbook import cuda_ext
+    monkeypatch.setattr(cuda_ext, "get_fused_fp4_ext", lambda: None)
     assert method._fused_fp4_ok(layer, 256) is False  # no loaded kernel state
 
     layer.input_global_scale.data[1] = 2.0
