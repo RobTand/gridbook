@@ -694,6 +694,43 @@ family failures shared by all three builds — scenario churn at the quality pla
 
 ---
 
+## 2026-08-21 kernel-eval branch: B1/B2/B7 measurements
+
+All cells: GB10 (sm_121), `gridbook:0.8.11-clean-187c721` container, tree
+sources JIT-built fresh, median-of-N CUDA-event timing, bit-equality asserted
+per point before timing. Raw scripts kept outside the repo; branch
+`perf/kernel-eval-2026-08-21`.
+
+**B1 — dense FP4-v2 GEMV, round-2 backport (`PRISMAQUANT_CB_FP4V2_DENSE_R2`),
+median of 5×100 after 50 warm, µs/call.** Legacy → R2 deltas across
+K∈{2048,4096} × N∈{4096,12288} × M∈{1,2,4,8} × k∈{16,20}: R2 wins **32/32
+points**. Representative cells: K2048/N4096/M1 k20 27.95→24.15 (−13.6%);
+K2048/N12288/M2 k20 96.46→79.89 (−17.2%); K4096/N4096/M2 k20 57.40→45.84
+(−20.2%); smallest win −0.9% (K2048/N12288/M1 k16). Gains grow with k —
+consistent with the compute-bound decode profile (fewer issued load
+instructions per codeword). Opt-in flag; served NATIVE-PARITY required before
+any default flip.
+
+**B7 — sm12x grouped-BF16 per-chunk packing (K1.5), isolated stage-one gather
+GEMM, median of 7/5.** Cell: E=64 mildly-skewed experts, w13 K=N=4096,
+T=1024×top_k=8, tile_m=64, swizzle group 8, chunks=2 with tiles/chunk
+[126,34] (natural-order straddle tax 75 groups vs 64 minimum = 1.17×
+B-fetches): global-pack 13.39/13.63 ms; per-chunk pack **14.33/14.70 ms**;
+natural order 16.11/16.39 ms ⇒ packed/natural **0.890 / 0.897**. Two-chunk
+cost vs one launch ≈1.07×. Uniform-router control cell: packing inert
+(1.001×) — the win appears exactly when segments straddle.
+
+**B2 — persistent-B staging vectorization.** Byte-neutral by construction
+(staging theorem preconditions P1–P5 asserted in-source; decode-probe
+`torch.equal` suites green). No isolated staging-share cell was recorded in
+this pass — the vectorized copy's contribution is to be attached to the next
+persistent-B A/B run rather than claimed standalone; the load-bearing
+measurement here is the NEGATIVE one that shaped the implementation:
+inlining the helpers cost ~26 registers/thread and measured a ~23%
+whole-operator regression at k=12, hence the `__noinline__` scoping.
+
+---
+
 ## Retired Triton path: historical cost
 
 Current Gridbook has no Triton dependency or serving fallback. If a required

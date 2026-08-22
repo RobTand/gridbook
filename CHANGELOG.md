@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **Added: dense FP4-CB v2 GEMV round-2 backport behind
+  `PRISMAQUANT_CB_FP4V2_DENSE_R2` (default off).** The grouped MoE kernel's
+  three load-path optimizations — predicated spill-word read (the window
+  lemma proves `rem+k > 64` is exactly the spill condition, live only at
+  persistent-B k=44 among shipped rungs), packed `uint2` codebook gathers
+  with the per-element bf16→f32 chains unchanged, and aligned-down u64 burst
+  staging with last-superblock byte fallback — ported to the dense kernel as
+  a second template instantiation; the legacy path text is untouched.
+  Bit-exact in both modes (full `test_cuda_gemv.py` + a 15-case dual-mode
+  gate); on GB10 the flag wins all 32 measured points, gains growing with k
+  (−7%…−20% at k20), consistent with the decode chain's compute-bound ncu
+  profile. Opt-in until the served NATIVE-PARITY protocol runs.
+- **Changed: persistent-B packed-superblock staging vectorized** from
+  byte-granular to u32-interior copies with funnel-shift edges for the odd
+  `4k+9` source phases and whole-slot zeroing; staging helpers are
+  deliberately `__noinline__` because inlining raised ptxas register
+  allocation by ~26/thread and measured a ~23% whole-operator regression.
+  Byte-neutrality preconditions (P1–P5) documented in-source per the
+  staging-vectorization theorem; decode-probe `torch.equal` suites green
+  (150 passed / 28 skipped).
+- **Changed: sm12x grouped-BF16 lane packs expert blocks WITHIN each chunk**
+  (ROADMAP K1.5): multi-chunk layers now get the swizzle-group tile-order win
+  that previously required one chunk to cover every expert. Per-expert
+  operands and reduction order are chunk-boundary-independent, so outputs are
+  bit-identical (`torch.equal` end-to-end at top_k=1; atomicAdd-combine
+  envelope respected at top_k>1); graph-capture refusal semantics preserved.
+  Isolated stage-one gather measures −10.3…−11.0% on straddling segments and
+  1.001× on a uniform-router control. Landed unconditional.
+- **Added: `docs/audits/math_review_2026-08-21.md`** — byte-law triple
+  agreement, decode-window containment/spill characterization theorems, the
+  ρ-threshold tightness proof (with the residue-premise correction and the
+  non-monotone advantage profile any calibration sweep must clear),
+  empty-expert cost bound (~0.59 ns vs ms cells), staging byte-neutrality
+  theorem, and the K1.3 roofline memo (conditional-GO shape: TM=256/TN=32,
+  honest payoff band TTFT 1.05–1.17×, gates G0–G3 before any new schedule).
+
 - **Corrected: the scope of the 0.8.11 capture refusal, and the end-to-end
   evidence the 0.8.11 entry lacked.** The 0.8.11 note said "artifacts
   carrying BF16-bridge layers still refuse `FULL_AND_PIECEWISE`". That is

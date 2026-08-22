@@ -189,8 +189,15 @@ Two things banked from an attempt that was reverted before it shipped:
   existing 0.4.2 dense mechanism rather than adding a parallel one, plus
   selector provenance so a tile choice is auditable offline. See
   [KERNELS](docs/KERNELS.md#grouped-moe-tilem-selection-k04). The calibrated
-  `ρ > 512` threshold remains proposal data for the grouped lanes until a routed
-  sweep pins it.
+  `ρ > 512` threshold remains proposal data for the grouped lanes until a
+  routed sweep pins it — but the math review of 2026-08-21
+  (`docs/audits/math_review_2026-08-21.md` §3) proved the analytic family
+  `ρ > 128(1+256/x)` TIGHT rather than conservative, corrected what `q`
+  counts (residues in [1,128]), showed the advantage profile NON-MONOTONE
+  (uniform routing loses again over ρ≈261–373 at x=75 after first winning
+  near 133), and derived that 512 certifies the win only for x̂ ≥ 85.3. Any
+  validating sweep must run Thm 7's three-item acceptance test past first
+  crossings.
 - [ ] **K0.5 — Profile and close the fused-NVFP4 raw operator gap.** Split
   activation quantization, packed-B decode, synchronization, MMA, epilogue,
   and launch costs and compare against the matching stock
