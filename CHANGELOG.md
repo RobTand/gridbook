@@ -33,8 +33,12 @@
   operands and reduction order are chunk-boundary-independent, so outputs are
   bit-identical (`torch.equal` end-to-end at top_k=1; atomicAdd-combine
   envelope respected at top_k>1); graph-capture refusal semantics preserved.
-  Isolated stage-one gather measures −10.3…−11.0% on straddling segments and
-  1.001× on a uniform-router control. Landed unconditional.
+  Isolated stage-one gather measures −10.3…−11.0% on straddling segments
+  (consensus re-measurement 2026-08-22: −9.1% and −11.1% on two independent
+  draws); the author's "1.001× on a uniform-router control" has no recorded
+  construction and a random-uniform router with ragged counts still measured
+  −10.4%, so inertness is a property of no-straddle count vectors, not of
+  router uniformity. Landed unconditional.
 - **Added: `docs/audits/math_review_2026-08-21.md`** — byte-law triple
   agreement, decode-window containment/spill characterization theorems, the
   ρ-threshold tightness proof (with the residue-premise correction and the

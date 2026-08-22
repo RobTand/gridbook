@@ -728,7 +728,16 @@ T=1024×top_k=8, tile_m=64, swizzle group 8, chunks=2 with tiles/chunk
 B-fetches): global-pack 13.39/13.63 ms; per-chunk pack **14.33/14.70 ms**;
 natural order 16.11/16.39 ms ⇒ packed/natural **0.890 / 0.897**. Two-chunk
 cost vs one launch ≈1.07×. Uniform-router control cell: packing inert
-(1.001×) — the win appears exactly when segments straddle.
+(1.001×) — the win appears exactly when segments straddle. *Consensus
+re-measurement (2026-08-22, independent harness, three GPU runs):*
+packed/natural 0.889 on the skewed cell and **0.896 on a random-uniform
+router** (T=1024×top_k=8 over E=64, tiles/expert 2/3, natural-fetch factor
+75 vs 64 minimum — the same straddle excess as the skewed cell), two-chunk
+vs one-chunk 1.068; top_k=1 `torch.equal` gates chunks2-packed vs
+chunks2-unpacked, vs chunks1-packed, and chunks4 vs chunks2 all True; the
+1.001× control's construction is not recorded in the repo or the evidence
+snapshot, so read "inert" as "no segment straddles a group boundary", not
+as "uniform router".
 
 **B2 — persistent-B staging vectorization (REJECTED on measurement).**
 Byte-neutral by construction (staging theorem preconditions P1–P5 asserted
