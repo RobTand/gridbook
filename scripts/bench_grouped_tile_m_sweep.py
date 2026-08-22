@@ -59,8 +59,22 @@ def _other_compute_apps() -> list[str]:
     except Exception:  # noqa: BLE001 — cannot attest means report and stop
         return ["<nvidia-smi unavailable>"]
     me = str(os.getpid())
-    return [line for line in out.splitlines()
-            if line.strip() and line.split(",", 1)[0].strip() != me]
+    others: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid, _, name = line.partition(",")
+        if pid.strip() == me or name.strip() == "[Not Found]":
+            # "[Not Found]" = the pid exited between nvidia-smi's query and
+            # its name resolution.  Across PID namespaces that includes this
+            # sweep's own just-torn-down host pid, which os.getpid() can
+            # never match — a dead process holds no compute, so skipping it
+            # stops a clean run condemning itself; named foreign pids stay
+            # fatal.
+            continue
+        others.append(line)
+    return others
 
 
 def _sm_clocks() -> str:
