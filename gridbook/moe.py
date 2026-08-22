@@ -45,7 +45,7 @@ from .fp8_fused_lane import rung_eligible as fp8_fused_rung_eligible
 from .moe_gemv_select import (cb_fp8_gemv_v2_choice,
                               cb_fp8_gemv_v2_mode,
                               cb_gemv_choice)
-from .bf16_grouped_lane import (pack_expert_blocks,
+from .bf16_grouped_lane import (pack_expert_blocks_chunked,
                                 require_lane as bf16_sm120_require_lane,
                                 requested as bf16_sm120_requested,
                                 swizzle_group as bf16_sm120_swizzle_group,
@@ -166,7 +166,8 @@ def _capturing_now(t: "torch.Tensor") -> bool:
 
 def _padded_route(topk_ids, topk_weights, E: int, tile_m: int, *,
                   trim: bool, block_offsets: bool = False,
-                  pack_group: int | None = None) -> _PaddedRoute:
+                  pack_group: int | None = None,
+                  pack_chunks: "tuple[int, int] | None" = None) -> _PaddedRoute:
     """Build the padded routing layout shared by every grouped CUTLASS lane.
 
     Extracted from the promoted FP8/FP4 fused routed paths, which had it
@@ -189,13 +190,24 @@ def _padded_route(topk_ids, topk_weights, E: int, tile_m: int, *,
     it is bit-neutral for the GEMM, because it permutes segments only and never
     rows within an expert, so every padded row's operands are unchanged.
 
-    CALLER CONTRACT for ``pack_group``: the expert-chunk loops downstream index
-    blocks as ``block_offsets[c0] .. block_offsets[c1]`` and so assume
-    EXPERT-MAJOR contiguity. A permuted order breaks that assumption for any
-    chunk narrower than ``E``, which is why packing is only offered when one
-    chunk covers every expert — then the only range any loop takes is
-    ``[0, n_blocks)``, which is invariant under the permutation. Passing
-    ``pack_group`` requires ``block_offsets=True``; it is ignored otherwise.
+    CALLER CONTRACT for ``pack_group``/``pack_chunks``: the expert-chunk loops
+    downstream index blocks as ``block_offsets[c0] .. block_offsets[c1]``, so
+    EVERY chunk's block range must keep holding exactly that chunk's own
+    experts' blocks. The reason is NOT the combine — the closing
+    ``index_add_`` scatters by ``dest``, which moves with its row, and is
+    order-agnostic — but the chunk loop itself: each launch multiplies the
+    range's rows by a weight stack expanded in EXPERT-ID order for ``[c0, c1)``
+    and remaps blocks to local ids as ``expert_ids - c0``, which is correct
+    only while the range contains no foreign expert's block. ``pack_group``
+    alone packs the WHOLE layer, which respects that contract only when one
+    chunk covers every expert (then the only range any loop takes is
+    ``[0, n_blocks)``, invariant under the permutation).
+    ``pack_chunks=(width, group)`` is the K1.5 generalization: the experts are
+    packed WITHIN each consecutive ``width``-expert range — the same ranges
+    the caller loops over — so a multi-chunk layer gets the aligned order per
+    chunk and every range boundary ``block_off[c0]``/``block_off[c1]`` stays
+    put. Offer one spelling or the other, never both. Either requires
+    ``block_offsets=True`` and is ignored without it.
 
     CUDA-GRAPH CAPTURE (RobTand/gridbook#47). Every host read here is
     routing-dependent, and a captured graph replays with NEW routing each
@@ -262,24 +274,35 @@ def _padded_route(topk_ids, topk_weights, E: int, tile_m: int, *,
         row_src = row_src[:nb * tile_m]
         is_pad = is_pad[:nb * tile_m]
 
+    chunk_width = None
+    if pack_chunks is not None:
+        if pack_group is not None:
+            raise ValueError(
+                "pass pack_group (whole-layer packing) or pack_chunks="
+                "(per-chunk packing), never both")
+        chunk_width, pack_group = pack_chunks
     if pack_group and pack_group > 1 and offsets is not None:
         # NOTE the returned ``block_offsets`` stay in EXPERT-ID order and are
-        # therefore only meaningful at 0 and E once this runs — which is
-        # exactly the caller contract above. They are deliberately not
-        # "repaired" into packed order: ``block_offsets[e]`` is indexed by
-        # expert id, and in packed order an id no longer names a contiguous
-        # block range, so any rewrite would be a differently-wrong answer
-        # rather than a right one.
+        # therefore meaningful only at 0, E, and — with per-chunk packing —
+        # the caller's own chunk boundaries once this runs, which is exactly
+        # the caller contract above: within a packed chunk the order is
+        # permuted, so ``block_offsets[e]`` for an expert INSIDE a chunk no
+        # longer names where that expert's blocks sit. They are deliberately
+        # not "repaired" into packed order: any rewrite would be a
+        # differently-wrong answer rather than a right one.
         # Per-expert PADDED ROW counts, straight from the host read above —
         # pack_expert_blocks re-derives block counts as ceil(rows/tile_m), and
-        # blocks*tile_m rows round-trips to exactly those blocks.
+        # blocks*tile_m rows round-trips to exactly those blocks. With
+        # per-chunk packing each chunk's subrange is packed on its own, so
+        # every range the downstream loop slices keeps exactly its own
+        # experts' blocks (see the caller contract above).
         # NOT `order` — that name already holds the stable-argsort permutation
         # this function built above, and `ptok_sorted`/`pw_sorted` are taken
         # from it. Rebinding it here would work today only because those two
         # reads happen earlier, which is one line-move from a silent bug.
-        expert_order, _touched, _minimum = pack_expert_blocks(
+        expert_order, _touched, _minimum = pack_expert_blocks_chunked(
             [(int(offsets[e + 1]) - int(offsets[e])) * tile_m
-             for e in range(E)], tile_m, pack_group)
+             for e in range(E)], tile_m, pack_group, chunk_width)
         if expert_order:
             # Build the BLOCK permutation on device from the host segment
             # ranges. Concatenating whole [start, stop) block ranges is what
@@ -1288,12 +1311,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         or routing-dependent Python control flow enters the hot path.
 
         BOTH KNOBS ARE PROCESS-STABLE, like every other dispatch selector, and
-        for a sharper reason than most: this chunk gates the swizzle-group
-        PACKED EXPERT ORDER on the sm12x lane (``chunk >= E``, see
+        for a sharper reason than most: the chunk fixes the per-chunk
+        swizzle-group PACKING partition on the sm12x lane (see
         ``_apply_prefill_native_bf16_sm120``), so a value that changed between
-        two forwards of one run would silently change the FP32 reduction order
-        mid-run and make the run's numbers describe neither setting. They were
-        read from the environment on EVERY call until 2026-08-02.
+        two forwards of one run would silently serve two different tile
+        schedules mid-run — the outputs stay bit-invariant (an order-only
+        change), but an A/B would describe neither setting. They were read
+        from the environment on EVERY call until 2026-08-02.
         """
         from .lane_select import latched_int
 
@@ -1679,15 +1703,22 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         THROWAWAY row ``T`` that is sliced off — so their GEMM output never
         reaches a token even if it were non-finite.
 
-        EXPERT ORDER. When one chunk covers every expert, the block order is
-        SWIZZLE-GROUP PACKED (``bf16_grouped_lane.pack_expert_blocks``) so an
-        expert's weight slice is fetched from DRAM once per group its tiles
-        touch rather than twice where a segment straddles a boundary. Whole
-        segments move, never rows within an expert, and the packing is derived
-        from the block-offset host read already taken — no extra sync. It is
-        gated on ``chunk >= E`` because a narrower chunk indexes blocks as
-        ``block_off[c0]..block_off[c1]`` and therefore assumes expert-major
-        contiguity.
+        EXPERT ORDER. The block order is SWIZZLE-GROUP PACKED
+        (``bf16_grouped_lane.pack_expert_blocks``) so an expert's weight slice
+        is fetched from DRAM once per group its tiles touch rather than twice
+        where a segment straddles a boundary. Whole segments move, never rows
+        within an expert, and the packing is derived from the block-offset
+        host read already taken — no extra sync. K1.5: a layer CHUNKED over
+        experts (``_native_bf16_chunk``) packs WITHIN EACH CHUNK's own block
+        range (``pack_chunks``), so the production E=128-at-chunks=2 cells get
+        the same ordering win the single-chunk E=32 cells measured. What the
+        order must never do is move a block ACROSS a chunk boundary: each
+        launch below multiplies its range's rows by the weight stack expanded
+        in expert-id order for ``[c0, c1)`` and remaps blocks as
+        ``expert_ids - c0``, which stays correct exactly while
+        ``[block_off[c0], block_off[c1])`` holds that chunk's own blocks (the
+        combine is order-agnostic — it scatters by ``dest``). Per-chunk
+        packing preserves that by construction.
         """
         from . import ops as pq_ops
 
@@ -1699,10 +1730,12 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         inter = int(layer._cb_inter)
         dev = x.device
         chunk = self._native_bf16_chunk(layer)
+        group = bf16_sm120_swizzle_group(ext)
 
         route = _padded_route(
             topk_ids, topk_weights, E, tile_m, trim=True, block_offsets=True,
-            pack_group=bf16_sm120_swizzle_group(ext) if chunk >= E else None)
+            pack_group=group if chunk >= E else None,
+            pack_chunks=None if chunk >= E else (chunk, group))
         expert_ids, dest = route.expert_ids, route.dest
         block_off = route.block_offsets
         n_rows = int(expert_ids.numel()) * tile_m

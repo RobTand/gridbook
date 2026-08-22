@@ -193,3 +193,44 @@ def pack_expert_blocks(counts, tile_m, group):
         minimum += (b + group - 1) // group
         pos += b
     return order, touched, minimum
+
+
+def pack_expert_blocks_chunked(counts, tile_m, group, chunk):
+    """``pack_expert_blocks`` over each consecutive ``chunk``-wide subrange.
+
+    A layer whose experts do not fit ONE decode chunk is served as several
+    grouped launches, each over its own contiguous block range
+    ``[block_off[c0], block_off[c1])`` with the weight stack expanded in
+    EXPERT-ID order for ``[c0, c1)`` and blocks remapped to local ids as
+    ``expert_ids - c0``. A globally packed order would hand a chunk blocks of
+    FOREIGN experts — rows multiplied by the wrong weight slice — so the
+    constraint the packing must respect is range membership, not row order:
+    each chunk packs ITS OWN experts only. Every ``[c0, c1)`` range then keeps
+    exactly the blocks it started with, merely reordered, and the alignment
+    win applies per chunk (ROADMAP K1.5).
+
+    ``chunk=None`` (or ``chunk >= len(counts)``) is the whole-layer packing
+    and delegates to :func:`pack_expert_blocks` unchanged. Pure host math like
+    the single-range version: the counts arrive as Python ints from the
+    block-offset host read the caller already paid for, so nothing here may
+    touch a device tensor. Returns ``(order, touched, minimum)`` with the
+    order concatenated across chunks (original expert ids) and the telemetry
+    summed.
+    """
+    if chunk is None:
+        return pack_expert_blocks(counts, tile_m, group)
+    chunk = int(chunk)
+    if chunk < 1:
+        raise ValueError(f"chunk width must be >= 1, got {chunk}")
+    experts = len(counts)
+    if chunk >= experts:
+        return pack_expert_blocks(counts, tile_m, group)
+    order, touched, minimum = [], 0, 0
+    for c0 in range(0, experts, chunk):
+        c1 = min(experts, c0 + chunk)
+        sub_order, sub_touched, sub_minimum = pack_expert_blocks(
+            counts[c0:c1], tile_m, group)
+        order.extend(e + c0 for e in sub_order)
+        touched += sub_touched
+        minimum += sub_minimum
+    return order, touched, minimum
