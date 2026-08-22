@@ -461,8 +461,12 @@ def main() -> int:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--warmup", type=int, default=None)
     parser.add_argument("--reps", type=int, default=None)
-    parser.add_argument("--json",
-                        default="/tmp/opencode/reports/rho_sweep_cells.json")
+    parser.add_argument(
+        "--json",
+        default=os.environ.get(
+            "PRISMAQUANT_SWEEP_STATE",
+            "/tmp/opencode/reports/rho_sweep_cells.json"),
+        help="cell checkpoint; PRISMAQUANT_SWEEP_STATE overrides the default")
     parser.add_argument("--resume", action="store_true",
                         help="skip cells already present in --json")
     opts = parser.parse_args()
