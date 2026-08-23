@@ -3,7 +3,7 @@
 Since the shard-aware loading wave, dense CB Linears construct above one
 tensor-parallel rank under structural shard-alignment gates, while every
 other surface refuses by name at a numeric TP=1 ceiling.  As of schema
-``gridbook.runtime-contract.v6`` the packaged contract publishes exactly
+``gridbook.runtime-contract.v7`` the packaged contract publishes exactly
 that split as machine-readable per-unit rows, so a producer gate can branch
 on fields instead of prose (principle: an attested claim, never an asserted
 one).
@@ -121,9 +121,9 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
 
 def test_schema_and_contract_version_move_together():
     contract = load_runtime_contract()
-    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v6"
+    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v7"
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 6
+    assert contract["contract_version"] == 7
 
 
 # --- 2. Closed-world reading: absence means REFUSED ---------------------------
@@ -470,7 +470,10 @@ def test_config_dispatch_policy_matches_the_published_split():
         assert parts, f"refusal at line {node.lineno} must name its surface"
         fragments.extend(parts)
     joined = "\n".join(fragments)
-    assert len(refusals) == 6
+    # Five, not six: the stacked whole-tensor CB MoE lane moved off the TP=1
+    # helper onto the expert-parallel gate below. The MIXED per-expert-format
+    # MoE site stays, which is why "CB MoE expert stacks" still appears here.
+    assert len(refusals) == 5
     for surface in (
             "source-passthrough unit format",
             "delegated stock compressed-tensors groups",
@@ -482,6 +485,10 @@ def test_config_dispatch_policy_matches_the_published_split():
             f"no refusal site names the {surface!r} surface"
     assert "dense CB" not in joined and "CB Linear" not in joined, \
         "no refusal site may name the admitted dense CB surface"
+    # T6: the surviving MoE refusal must say what DOES serve above one rank,
+    # or an operator reads it as "no multi-rank MoE at all".
+    assert "--enable-expert-parallel" in joined, \
+        "the mixed-MoE refusal must name the mode that does serve"
 
     # And the admitted surface really is dispatched: the fused, mixed-role,
     # and plain dense CB arms all construct PrismaQuantCBLinearMethod (the

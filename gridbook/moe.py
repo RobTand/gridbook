@@ -42,6 +42,11 @@ from .cb_fill_guard import (
     mark_unfilled,
 )
 from .fp8_fused_lane import rung_eligible as fp8_fused_rung_eligible
+from .moe_ep import (ExpertParallelError,
+                     ep_shape_note,
+                     gather_expert_major,
+                     local_expert_gather_index,
+                     remap_local_expert_ids)
 from .moe_gemv_select import (cb_fp8_gemv_v2_choice,
                               cb_fp8_gemv_v2_mode,
                               cb_gemv_choice)
@@ -453,10 +458,49 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         inter = intermediate_size_per_partition
         layer._cb_hidden = hidden_size
         layer._cb_inter = inter
+        # -- expert parallelism -------------------------------------------
+        # vLLM passes num_experts = moe_config.num_local_experts and puts the
+        # global count in extra_weight_attrs; under EP those differ and the
+        # stacks built below are this rank's SUBSET. RoutedExperts.__init__
+        # registers the expert_map buffer before it calls create_weights, so
+        # the placement is already readable here and the gather index can be
+        # stamped on each param — which is what keeps the top-level loader
+        # (moe_toplevel_loader) free of any module lookup.
+        e_global = int(extra_weight_attrs.get("global_num_experts", E) or E)
+        expert_map = getattr(layer, "expert_map", None)
+        local_declared = int(getattr(layer, "local_num_experts", E) or E)
+        if local_declared != E:
+            raise ExpertParallelError(
+                f"{self.prefix}: CB MoE expert stacks: vLLM built this layer "
+                f"with local_num_experts={local_declared} but asked for "
+                f"{E}-expert weights. Gridbook allocates exactly the resident "
+                "expert subset; a mismatch would size the stacks wrong.")
+        ep_gather = local_expert_gather_index(
+            expert_map, E,
+            surface="CB MoE expert stacks (stacked whole-tensor loader)",
+            prefix=self.prefix)
+        layer._cb_ep_gather = ep_gather
+        layer._cb_ep_global_experts = e_global
+        if ep_gather is not None and int(ep_gather.numel()) != E:
+            raise ExpertParallelError(
+                f"{self.prefix}: CB MoE expert stacks: expert_map yields "
+                f"{int(ep_gather.numel())} resident experts but the stacks "
+                f"hold {E}.")
         # extra_weight_attrs already carries the weight_loader; ONE
         # set_weight_attrs per param (a second call trips vLLM's
         # "Overwriting existing tensor attribute" assert — 35B first serve).
         attrs = dict(extra_weight_attrs)
+
+        def _stamp_ep(param):
+            # Expert-major params only. Plain setattr, not set_weight_attrs:
+            # that helper asserts on overwriting an existing attribute and has
+            # already run for this param (the mark_unfilled precedent below).
+            # A whole-stack checkpoint tensor is gathered down to this rank's
+            # rows by these two facts alone, so neither loader needs to find
+            # its way back to the module.
+            param._gridbook_ep_gather = ep_gather
+            param._gridbook_ep_global_experts = e_global
+
         # w13 = gate_up: out=2*inter, in=hidden.  w2 = down: out=hidden, in=inter.
         w13 = torch.nn.Parameter(torch.empty(
             E, 2 * inter, _row_bytes(hidden_size, self.type_size),
@@ -468,6 +512,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         # uninitialised memory. Set AFTER set_weight_attrs — that helper asserts
         # on overwriting an existing attribute.
         mark_unfilled(w13)
+        _stamp_ep(w13)
         layer.register_parameter("w13_cb_qweight", w13)
 
         w2 = torch.nn.Parameter(torch.empty(
@@ -475,6 +520,7 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             dtype=torch.uint8), requires_grad=False)
         set_weight_attrs(w2, {**attrs, "is_transposed": False})
         mark_unfilled(w2)
+        _stamp_ep(w2)
         layer.register_parameter("w2_cb_qweight", w2)
 
         if not self.is_fp4:                       # fp8: per-(expert, out) scale
@@ -482,11 +528,13 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                 torch.empty(E, 2 * inter, dtype=torch.float32),
                 requires_grad=False)
             set_weight_attrs(w13s, dict(attrs))
+            _stamp_ep(w13s)
             layer.register_parameter("w13_weight_scale", w13s)
             w2s = torch.nn.Parameter(
                 torch.empty(E, hidden_size, dtype=torch.float32),
                 requires_grad=False)
             set_weight_attrs(w2s, dict(attrs))
+            _stamp_ep(w2s)
             layer.register_parameter("w2_weight_scale", w2s)
 
         if getattr(self, "has_static_fp4_activation", False):
@@ -528,11 +576,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                     pname = cb_map.get(name)
                     if pname is not None and hasattr(layer, pname):
                         p = getattr(layer, pname)
+                        # Under expert parallelism the checkpoint ships all
+                        # E_global experts and this rank keeps a subset; the
+                        # gather is a no-op at world size 1.
+                        w = gather_expert_major(p, w)
                         if tuple(p.shape) != tuple(w.shape):
                             raise ValueError(
                                 f"{prefix}.{name}: checkpoint shape "
                                 f"{tuple(w.shape)} != param {tuple(p.shape)}"
-                                f" — stacked (E, out, bytes) contract violated")
+                                f" — stacked (E, out, bytes) contract violated"
+                                f"{ep_shape_note(p)}")
                         p.data.copy_(w.to(p.dtype))
                         if pname.endswith("cb_qweight"):
                             mark_filled(p)      # fill path 1 of 2 (per-layer)
@@ -556,6 +609,16 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
         assert_cb_experts_filled(layer, self.prefix)
         dev = layer.w13_cb_qweight.device
         E = layer.w13_cb_qweight.shape[0]
+        # -- expert-parallel placement snapshot ----------------------------
+        # Taken once at load, on the stack's device. layer.expert_map is a
+        # property over a registered buffer that vLLM materialises on CPU in
+        # __init__; the forward path must not depend on when the module was
+        # moved. _cb_ep_map_src keeps the identity of the buffer this snapshot
+        # came from so a re-registration (update_expert_map) is caught in eager
+        # instead of silently serving a stale placement.
+        ep_map = getattr(layer, "expert_map", None)
+        layer._cb_ep_map = None if ep_map is None else ep_map.to(dev)
+        layer._cb_ep_map_src = ep_map
         codebooks = self.quant_config.get_codebooks()
         if getattr(self, "has_static_fp4_activation", False):
             stage_targets = self.quant_config.moe_activation_stage_targets(
@@ -984,6 +1047,29 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
     def _apply_inline(self, layer, x, topk_weights, topk_ids):
         act = getattr(layer, "_cb_native_activation", layer.activation.value)
+        # -- expert parallelism: global router ids -> local slots -----------
+        # INSIDE the opaque custom op, deliberately: the remap is routing
+        # arithmetic, and the whole point of the cb_moe_forward boundary is
+        # that Dynamo/Inductor never sees routing ATen. Doing it in apply()
+        # would put gather/where/amin in the traced graph.
+        #
+        # It runs before EVERY path branch — decode, all prefill lanes, the
+        # padded-route layout — so no path can be reached with global ids. The
+        # rewrite is a pure relabelling plus an exact 0.0 on remote pairs; no
+        # downstream code learns about EP.
+        ep_map = getattr(layer, "_cb_ep_map", None)
+        if ep_map is not None:
+            src = getattr(layer, "_cb_ep_map_src", None)
+            live = getattr(layer, "expert_map", None)
+            if src is not None and live is not None and live is not src:
+                raise ExpertParallelError(
+                    f"{self.prefix}: CB MoE expert stacks: expert placement "
+                    "was re-registered after load. Gridbook snapshots the "
+                    "expert_map at load and holds whole expert stacks that "
+                    "cannot follow a live re-placement; serve without elastic "
+                    "expert-parallel reconfiguration.")
+            topk_ids, topk_weights = remap_local_expert_ids(
+                ep_map, topk_ids, topk_weights, layer._cb_E)
         num_tokens = x.shape[0]
 
         if num_tokens <= MOE_PREFILL_M_THRESHOLD:

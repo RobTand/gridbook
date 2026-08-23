@@ -119,6 +119,7 @@ from typing import Any
 import torch
 
 from .cb_fill_guard import mark_filled
+from .moe_ep import ep_shape_note, gather_expert_major
 
 # vLLM module paths this process actually installed the wrap on — diagnostics
 # for the serve-time fill assertion (cb_fill_guard), which prints them so an
@@ -977,12 +978,19 @@ def install_toplevel_cb_expert_loader(model_cls: type) -> None:
                 mapped = resolve_cb_expert_param(res_name, param_names)
                 if mapped is not None:
                     param = params_dict[mapped]
+                    # Under expert parallelism the checkpoint ships all
+                    # E_global experts and this rank keeps a subset. The gather
+                    # rule reads only what create_weights stamped on the param
+                    # (moe_ep.gather_expert_major), so this loader still needs
+                    # no module lookup, and it is a no-op at world size 1.
+                    w = gather_expert_major(param, w)
                     if tuple(param.shape) != tuple(w.shape):
                         raise ValueError(
                             f"prismaquant CB expert '{name}' -> '{mapped}': "
                             f"checkpoint shape {tuple(w.shape)} != param "
                             f"shape {tuple(param.shape)} — stacked "
-                            "(E, out, bytes) contract violated")
+                            "(E, out, bytes) contract violated"
+                            f"{ep_shape_note(param)}")
                     incoming = w.to(param.dtype)
                     if mapped.endswith("_input_global_scale") \
                             and not torch.isnan(param.data).all():
