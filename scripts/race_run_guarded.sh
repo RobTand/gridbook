@@ -23,11 +23,15 @@ set -u
 LOG=$1; shift
 MOUNT=${PRISMAQUANT_SWEEP_MOUNT:-/home/rob/dq-runs/sweep-rho/ext}
 BENCH_LOCK=/home/rob/dq-runs/gpu-bench.lock
-SRC=/home/rob/gridbook/.claude/worktrees/ox-sweepfix
+# Bench the tree this script is IN, derived from its own location, with an
+# override for driving another checkout. A hardcoded worktree path would
+# outlive the worktree: this script ships on master, and the scratch tree it
+# was written in gets pruned.
+SRC=${PRISMAQUANT_SWEEP_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 
-if [ ! -d "$SRC" ]; then
-  echo "race_run_guarded: source tree $SRC is missing" \
-       "(expected the ox/sweep-hygiene worktree)" >&2
+if [ ! -d "$SRC/gridbook" ]; then
+  echo "race_run_guarded: $SRC is not a gridbook checkout" \
+       "(set PRISMAQUANT_SWEEP_SRC to one)" >&2
   exit 4
 fi
 mkdir -p "$(dirname "$BENCH_LOCK")" "$MOUNT"
