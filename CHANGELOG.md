@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### Contract schema v6: dense CB tensor-parallel admission is attested as laws, not a cap
+
+The shard-aware loading lift above removed the blanket TP=1 gate that schema
+v5's `tensor_parallel` section attested, so the table is reconciled with what
+the code now enforces — and because the honest claim changes SHAPE, the schema
+bumps to `gridbook.runtime-contract.v6` (`contract_version` 6) in the same
+commit. Readers match the schema string exactly: a producer pinned to v5 must
+refuse a v6 contract whole until its pin is bumped deliberately.
+
+- Dense CB format families (`NVFP4_CB_K`, `NVFP4_CB_S`, `FP8_CB_K`) publish
+  `shard_admission` instead of a numeric cap: `input_axis_group` 256
+  (`codec.SUPERBLOCK`), `output_axis_quantum` 8 (fp4) / 16 (fp8) (the native
+  kernel row quanta), and `merged_roles: "even_division"`. No dispatch path
+  enforces a numeric ceiling for these units any more, so publishing any
+  number would be an assertion; above one rank, admission IS these laws,
+  evaluated per rank at weight construction (`ShardGroupAlignmentError`,
+  derived from `gridbook/linear.py`). The validator now REFUSES a numeric cap
+  on a CB row and pins every admission value to the enforcement site.
+- Source-passthrough rows are unchanged and still capped at 1: MoE expert
+  stacks, delegated stock compressed-tensors groups, source-passthrough units
+  (FP8-source W8A16 dense release gate and pinned BMM geometry G=8/N=1024/
+  K=4096/TP=1; MXFP8 BMM audited TP=1 only) keep refusing by name at their
+  own sites.
+- The root whole-model `max_world_size` field is removed: no single number is
+  true of every dispatch path after the lift, and the closed-world reading
+  never needed it (it was publisher-side symmetry only). Restoring one is a
+  validator error.
+
+`tests/test_runtime_contract_tp.py` derives every row from its enforcement
+site's source text as before — the config-level derivation now pins the
+per-surface split (blanket gate absent; all six refusal sites name non-dense
+surfaces; dense CB arms construct without one) and a new derivation reads the
+admission constants out of `codec.py`/`linear.py`.
+
 ### Contract schema v5: tensor-parallel capability is ATTESTED, not asserted
 
 `runtime_contract.json` now carries a `tensor_parallel` section (schema

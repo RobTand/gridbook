@@ -11,7 +11,7 @@ from importlib.resources import files
 from typing import Any, Mapping
 
 
-RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v5"
+RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v6"
 _RESOURCE_NAME = "runtime_contract.json"
 
 #: The vLLM package roots a ``top_level_loader_modules`` entry may name. The
@@ -66,6 +66,24 @@ _TP_REQUIRED_GEOMETRY: dict[tuple[str, str], dict[str, int]] = {
         "k": 4096,
     },
 }
+
+#: The shard-admission laws every ``cb_format_family`` unit publishes instead
+#: of a numeric cap, pinned from the dense-CB enforcement site
+#: ``gridbook/linear.py``.  ``_TP_CB_INPUT_AXIS_GROUP`` is ``codec.SUPERBLOCK``
+#: (gridbook/codec.py:21): a row-parallel K-shard must contain whole packed
+#: superblocks, checked in
+#: ``PrismaQuantCBLinearMethod._require_shard_group_alignment``.  The output-
+#: axis quanta are the native kernel row-alignment quanta (fp4: 8-wide rows,
+#: fp8: 16-wide) that a column-parallel logical shard must not cut, enforced
+#: by the same method for sharded layers.  ``_TP_CB_MERGED_ROLES`` restates
+#: that a merged checkpoint role must divide evenly across ranks
+#: (``PrismaQuantCBLinearMethod._rank_local_role_widths``).  Dense CB units
+#: publish NO numeric cap because no dispatch path enforces one: above one
+#: rank, admission IS these laws, evaluated per rank at weight construction
+#: and raised as ``ShardGroupAlignmentError`` before any buffer exists.
+_TP_CB_INPUT_AXIS_GROUP = 256
+_TP_CB_OUTPUT_AXIS_QUANTA: dict[str, int] = {"fp4": 8, "fp8": 16}
+_TP_CB_MERGED_ROLES = "even_division"
 
 
 class RuntimeContractError(ValueError):
@@ -136,37 +154,43 @@ def _validate_version_set(value: Any, path: str) -> set[int]:
 
 
 def _validate_tensor_parallel(root: Mapping[str, Any],
-                              families: set[str]) -> None:
+                              family_grids: Mapping[str, str]) -> None:
     """Validate the tensor-parallel capability table.
 
     The table is ATTESTATION, not aspiration: every row must restate what a
     refusal site in this package actually enforces, and the closed-world
     reading makes absence a refusal.  A consumer serving unit *U* at tensor-
     parallel size *t* looks up exactly one row named ``U`` (and, for an armed
-    unit, the row for the arm it will execute); no match, or ``t`` above the
-    matched claim, or a pinned geometry that does not match exactly is a
-    REFUSAL.  There is no default, wildcard, or inheritance anywhere in this
-    section.
+    unit, the row for the arm it will execute); no match, or a numeric claim
+    that does not cover *t*, or a pinned geometry that does not match exactly
+    is a REFUSAL.  There is no default, wildcard, or inheritance anywhere in
+    this section.
+
+    Two claim shapes exist, matching the two enforcement shapes in the
+    runtime:
+
+    * ``source_passthrough_format`` units (and every Gridbook-owned lane
+      behind them) are gated by a NUMERIC world-size ceiling, so their rows
+      carry ``max_world_size`` — pinned to 1 below.
+    * ``cb_format_family`` units are the dense CB Linears lifted above one
+      rank by the shard-aware loading wave.  No dispatch path enforces a
+      numeric ceiling for them, so publishing a number would assert more
+      than the code stands behind; their rows instead carry
+      ``shard_admission`` — the structural laws per-rank geometry must
+      satisfy, enforced at weight construction by
+      ``ShardGroupAlignmentError``.  A shard that violates them is refused
+      by the runtime regardless of what any table says; the row exists so a
+      producer can pre-check the same laws.
     """
 
     tp = _object(root["tensor_parallel"], "contract.tensor_parallel")
-    _keys(tp, "contract.tensor_parallel",
-          {"axis", "semantics", "max_world_size", "units"})
+    _keys(tp, "contract.tensor_parallel", {"axis", "semantics", "units"})
     if tp["axis"] != _TP_AXIS:
         _fail("contract.tensor_parallel.axis", f"must be {_TP_AXIS!r}")
     if tp["semantics"] != "closed_world":
         _fail("contract.tensor_parallel.semantics",
               "must be 'closed_world': an unclaimed unit is refused, never "
               "permitted by default")
-    root_cap = _positive_int(
-        tp["max_world_size"], "contract.tensor_parallel.max_world_size")
-    # Pinned to the enforced fact: every dispatch path through
-    # PrismaQuantConfig.get_quant_method refuses a live world size above 1,
-    # so a wider number here would be a claim no code stands behind.  Widening
-    # is a schema-version event, made together with the lifting commit.
-    if root_cap != 1:
-        _fail("contract.tensor_parallel.max_world_size",
-              "must be 1; no dispatch path in this build enforces more")
 
     units = tp["units"]
     if not isinstance(units, list) or not units:
@@ -178,30 +202,60 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
     for index, item in enumerate(units):
         path = f"contract.tensor_parallel.units[{index}]"
         row = _object(item, path)
-        expected = {"unit", "kind", "max_world_size"}
-        if "arms" in row:
-            expected = expected | {"arms"}
-        _keys(row, path, expected)
         unit_id = _string(row["unit"], f"{path}.unit")
         kind = _string(row["kind"], f"{path}.kind")
         if kind == "cb_format_family":
             cb_units.add(unit_id)
+            expected = {"unit", "kind", "shard_admission"}
         elif kind == "source_passthrough_format":
             passthrough_units.add(unit_id)
+            expected = {"unit", "kind", "max_world_size"}
+            if "arms" in row:
+                expected = expected | {"arms"}
         else:
             _fail(f"{path}.kind",
                   "must be 'cb_format_family' or 'source_passthrough_format'")
+        _keys(row, path, expected)
         if unit_id in seen:
             _fail("contract.tensor_parallel.units",
                   f"duplicate unit {unit_id!r}")
         seen.add(unit_id)
+
+        if kind == "cb_format_family":
+            grid = family_grids.get(unit_id)
+            quantum = (_TP_CB_OUTPUT_AXIS_QUANTA.get(grid)
+                       if grid is not None else None)
+            if quantum is None:
+                _fail(f"{path}.unit",
+                      f"no CB format family {unit_id!r} in contract.formats")
+            admission_path = f"{path}.shard_admission"
+            admission = _object(row["shard_admission"], admission_path)
+            _keys(admission, admission_path,
+                  {"input_axis_group", "output_axis_quantum", "merged_roles"})
+            if (_positive_int(admission["input_axis_group"],
+                              f"{admission_path}.input_axis_group")
+                    != _TP_CB_INPUT_AXIS_GROUP):
+                _fail(f"{admission_path}.input_axis_group",
+                      f"must equal {_TP_CB_INPUT_AXIS_GROUP} "
+                      "(codec.SUPERBLOCK; linear.py refuses a K-shard that "
+                      "cuts a packed superblock)")
+            if (_positive_int(admission["output_axis_quantum"],
+                              f"{admission_path}.output_axis_quantum")
+                    != quantum):
+                _fail(f"{admission_path}.output_axis_quantum",
+                      f"must equal {quantum} for grid {grid!r} "
+                      "(linear.py native kernel row-alignment quantum)")
+            if admission["merged_roles"] != _TP_CB_MERGED_ROLES:
+                _fail(f"{admission_path}.merged_roles",
+                      f"must be {_TP_CB_MERGED_ROLES!r} "
+                      "(linear.py refuses merged checkpoint roles that do "
+                      "not divide evenly across ranks)")
+            continue
+
         cap = _positive_int(row["max_world_size"], f"{path}.max_world_size")
         if cap != 1:
             _fail(f"{path}.max_world_size",
                   "must be 1; no enforcement site in this build allows more")
-        if cap > root_cap:
-            _fail(f"{path}.max_world_size",
-                  "exceeds contract.tensor_parallel.max_world_size")
 
         required_arms = _TP_ARMED_UNITS.get(unit_id)
         if "arms" not in row:
@@ -254,12 +308,12 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
         if missing:
             _fail(f"{path}.arms", f"missing arm claim(s): {missing}")
 
-    if cb_units != families:
+    if cb_units != set(family_grids):
         _fail("contract.tensor_parallel.units",
               f"every CB format family must carry exactly one "
               f"'cb_format_family' claim; missing "
-              f"{sorted(families - cb_units)}, unknown "
-              f"{sorted(cb_units - families)}")
+              f"{sorted(set(family_grids) - cb_units)}, unknown "
+              f"{sorted(cb_units - set(family_grids))}")
     if passthrough_units != set(_PASSTHROUGH_TP_UNITS):
         _fail("contract.tensor_parallel.units",
               f"source-passthrough claims must equal {sorted(_PASSTHROUGH_TP_UNITS)}; "
@@ -280,8 +334,8 @@ def validate_runtime_contract(contract: Any) -> None:
         _fail("contract.schema", f"must be {RUNTIME_CONTRACT_SCHEMA!r}")
     contract_version = _positive_int(
         root["contract_version"], "contract.contract_version")
-    if contract_version != 5:
-        _fail("contract.contract_version", "must be 5 for this schema")
+    if contract_version != 6:
+        _fail("contract.contract_version", "must be 6 for this schema")
 
     features = _object(root["abi_features"], "contract.abi_features")
     _keys(features, "contract.abi_features", {
@@ -415,7 +469,7 @@ def validate_runtime_contract(contract: Any) -> None:
     formats = root["formats"]
     if not isinstance(formats, list) or not formats:
         _fail("contract.formats", "must be a non-empty JSON array")
-    families: set[str] = set()
+    family_grids: dict[str, str] = {}
     for index, item in enumerate(formats):
         path = f"contract.formats[{index}]"
         fmt = _object(item, path)
@@ -424,9 +478,9 @@ def validate_runtime_contract(contract: Any) -> None:
             "layout_versions", "moe_layout_versions",
         })
         family = _string(fmt["family"], f"{path}.family")
-        if family in families:
+        if family in family_grids:
             _fail("contract.formats", f"duplicate family {family!r}")
-        families.add(family)
+        family_grids[family] = _string(fmt["grid"], f"{path}.grid")
         pattern = _string(fmt["name_pattern"], f"{path}.name_pattern")
         if pattern.count("{k}") != 1:
             _fail(f"{path}.name_pattern", "must contain exactly one '{k}'")
@@ -455,7 +509,7 @@ def validate_runtime_contract(contract: Any) -> None:
         if not moe_layouts <= family_layouts:
             _fail(path, "moe_layout_versions must be a subset of layout_versions")
 
-    _validate_tensor_parallel(root, families)
+    _validate_tensor_parallel(root, family_grids)
 
     profiles = _object(root["producer_profiles"],
                        "contract.producer_profiles")

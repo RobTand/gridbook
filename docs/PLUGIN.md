@@ -129,45 +129,58 @@ second runtime tree or maintain a parallel loader table.
 
 ## Tensor-parallel capability
 
-As of contract schema `gridbook.runtime-contract.v5`, the packaged contract
+As of contract schema `gridbook.runtime-contract.v6`, the packaged contract
 carries a `tensor_parallel` section that publishes, per serving unit, what the
 runtime actually enforces. The table is an attestation: each row restates a
-refusal site in this package, and `tests/test_runtime_contract_tp.py` checks
-every row against the source text of that site.
+refusal or admission site in this package, and
+`tests/test_runtime_contract_tp.py` checks every row against the source text
+of that site.
 
 - `axis` names the measured quantity: vLLM's live tensor-parallel world size,
   read from the running worker at model construction — not a CLI argument.
-- `max_world_size` is the whole-model cap. `PrismaQuantConfig.get_quant_method`
-  refuses a live world size above it before any format-specific decision, so it
-  binds every unit the plugin dispatches, including stock compressed-tensors
-  delegated groups and BF16 passthrough.
+- There is no whole-model cap. The v5 blanket pre-dispatch gate is gone, so no
+  single number is true of every dispatch path; publishing one would assert
+  more than any site enforces.
 - Each entry in `units` names one producer-addressable unit: a CB format family
   (`NVFP4_CB_K`, `NVFP4_CB_S`, `FP8_CB_K`) or one source-passthrough format id.
-  A unit whose method branches on an execution arm carries per-arm rows; the
-  `fp8_e4m3_ue8m0_block128` BMM arm additionally pins the only qualified
-  grouped geometry (`bmm_groups` 8, `rows_per_group` 1024, `k` 4096).
+  Two claim shapes exist, matching the two enforcement shapes in the runtime:
+  - **Dense CB families** publish `shard_admission` instead of a cap, because
+    no dispatch path enforces a numeric ceiling for them — above one rank,
+    admission IS the laws, evaluated per rank at weight construction and
+    raised as `ShardGroupAlignmentError`: `input_axis_group` (256; a
+    row-parallel K-shard must contain whole packed superblocks),
+    `output_axis_quantum` (8 fp4 / 16 fp8; a column-parallel logical shard
+    must not cut the native kernel row quantum), and `merged_roles`
+    (`even_division`; merged checkpoint roles divide across ranks). A shard
+    that violates them is refused by the runtime regardless of the table; the
+    row exists so a producer can pre-check the same laws.
+  - **Source-passthrough formats** keep numeric `max_world_size` rows pinned
+    to 1. A unit whose method branches on an execution arm carries per-arm
+    rows; the `fp8_e4m3_ue8m0_block128` BMM arm additionally pins the only
+    qualified grouped geometry (`bmm_groups` 8, `rows_per_group` 1024,
+    `k` 4096).
 - `semantics` is `closed_world`. A consumer must read the table with the same
   rule the validator enforces for publishers:
 
   Serving unit *U* at world size *t* is permitted only if the table contains
-  exactly one row named *U*, the claim on that row (and on the exact arm row,
-  when the unit has arms) covers *t*, and any pinned geometry matches exactly.
-  Every other outcome — no row, two rows, an unknown arm name, a larger *t*,
-  a different geometry — is a refusal. There is no default, wildcard, or
-  inheritance.
+  exactly one row named *U* and the exact arm row when the unit has arms; a
+  numeric claim must cover *t*, and any pinned geometry must match exactly;
+  a dense CB row defers to its published laws at weight construction. Every
+  other outcome — no row, two rows, an unknown arm name, a larger *t* than a
+  numeric claim, a different geometry — is a refusal. There is no default,
+  wildcard, or inheritance.
 
 The completeness direction is enforced too: the packaged validator rejects any
-contract that omits a shipped unit, invents one, drops a mandatory field, or
-publishes a number no enforcement site stands behind. Widening a cap beyond 1
-is therefore impossible without lifting the gate in code and bumping the schema
-in the same commit.
+contract that omits a shipped unit, invents one, drops a mandatory field,
+caps the capless dense CB surface with a number, or publishes a numeric claim
+no enforcement site stands behind.
 
-**Compatibility rule:** `schema` and `contract_version` move together (v5 / 5),
+**Compatibility rule:** `schema` and `contract_version` move together (v6 / 6),
 and readers match the schema string exactly. A producer pinned to
-`gridbook.runtime-contract.v4` must refuse a v5 contract whole — no partial
+`gridbook.runtime-contract.v5` must refuse a v6 contract whole — no partial
 parsing, no field-by-field salvage across versions — and keep producing against
-its pinned runtime until its pin is deliberately bumped. Reading a v4 contract
-with a v5 reader fails the same way.
+its pinned runtime until its pin is deliberately bumped. Reading a v5 contract
+with a v6 reader fails the same way.
 
 ## Layout / registration
 
