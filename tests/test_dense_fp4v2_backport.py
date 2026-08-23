@@ -222,3 +222,35 @@ def test_r2_flag_rejects_invalid_spelling(monkeypatch):
     with pytest.raises(RuntimeError, match=R2_FLAG):
         _run(p, xq)
     monkeypatch.delenv(R2_FLAG, raising=False)
+
+
+def test_unpadded_weights_fail_loud(monkeypatch):
+    """The R2 burst stage overruns a superblock's last byte by up to 7 bytes;
+    on a row's final superblock that lands in the row's pad slack, so the
+    launcher requires pad_qweight's >= 8-byte read slack for BOTH arms and
+    raises naming it instead of silently reading out of bounds. Exact-size
+    rows (stride == n_sb*type_size) must be rejected; the padded tensor from
+    the same bytes must be accepted."""
+    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
+    k, K, N = 16, 512, 32
+    cb = pq._resolve_codebook(k, "fp4", "product", None, torch.device(DEV))
+    packed, ts = _encode_dense(pq, k, N, K, cb, seed=321)
+    assert packed.stride(0) == (K // codec.SUPERBLOCK) * ts, "exact-size rows"
+    torch.manual_seed(11)
+    x = torch.randn(1, K, dtype=torch.bfloat16, device=DEV)
+    xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
+    base = dict(cb_flat=codec.build_flat_codebook(list(cb)),
+                compose=codec.build_compose_table(
+                    codec.TWO_TIER_SUB_TABLE).to(DEV),
+                row_off=torch.zeros(N, dtype=torch.int32, device=DEV),
+                N=N, K=K, k=k, n_sub=2, ts=ts)
+    monkeypatch.setenv(R2_FLAG, "1")
+    with pytest.raises(RuntimeError, match="pad_qweight"):
+        ext.cb_gemv_fp4_v2(xq, packed.contiguous(), base["cb_flat"],
+                           base["row_off"], base["compose"], N, K, k,
+                           base["n_sub"], ts)
+    padded = codec.pad_qweight(packed)
+    y = ext.cb_gemv_fp4_v2(xq, padded, base["cb_flat"], base["row_off"],
+                           base["compose"], N, K, k, base["n_sub"], ts)
+    assert y.shape == torch.Size([1, N])
+    monkeypatch.delenv(R2_FLAG, raising=False)
