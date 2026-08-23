@@ -18,7 +18,11 @@ histogram family, expert count and DSV4-class shapes.  For every cell it
 
 Run on an IDLE GPU:
 
-    flock /tmp/gpu-bench.lock python3 scripts/bench_grouped_tile_m_sweep.py
+    flock /home/rob/dq-runs/gpu-bench.lock \
+        python3 scripts/bench_grouped_tile_m_sweep.py
+
+or race for a window with scripts/race_run_guarded.sh, which holds both GPU
+locks exclusively for the docker job.
 
 ``--smoke`` runs tiny cells (also what warms the JIT extension cache).
 Cells are written as JSON to --json for downstream analysis.
@@ -465,7 +469,7 @@ def main() -> int:
         "--json",
         default=os.environ.get(
             "PRISMAQUANT_SWEEP_STATE",
-            "/tmp/opencode/reports/rho_sweep_cells.json"),
+            "/home/rob/dq-runs/sweep-rho/rho_sweep_cells.json"),
         help="cell checkpoint; PRISMAQUANT_SWEEP_STATE overrides the default")
     parser.add_argument("--resume", action="store_true",
                         help="skip cells already present in --json")
