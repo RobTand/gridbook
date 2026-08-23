@@ -628,6 +628,35 @@ def test_live_tensor_parallel_size_above_one_fails_before_dispatch(monkeypatch):
     assert cfg._tp_world_size == 1
 
 
+def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
+    """The packaged TP table claims only what the dispatch gate enforces.
+
+    All rows — root, unit, and arm — publish max world size 1, and a live
+    world size of 2 is refused by ``get_quant_method`` itself, which every
+    dispatched unit passes through before any format-specific decision.
+    """
+    import json
+    from importlib.resources import files as resource_files
+
+    contract = json.loads(resource_files("gridbook").joinpath(
+        "runtime_contract.json").read_text(encoding="utf-8"))
+    table = contract["tensor_parallel"]
+    assert table["axis"] == "vllm_tensor_parallel_world_size"
+    assert table["semantics"] == "closed_world"
+    assert table["max_world_size"] == 1
+    assert all(row["max_world_size"] == 1 for row in table["units"])
+    assert all(arm["max_world_size"] == 1
+               for row in table["units"] for arm in row.get("arms", ()))
+
+    import gridbook.config as config_mod
+
+    cfg = PrismaQuantConfig(_config())
+    monkeypatch.setattr(config_mod, "_initialized_tensor_parallel_world_size",
+                        lambda: 2)
+    with pytest.raises(ValueError, match=r"TP=2"):
+        cfg.get_quant_method(object(), "model.layers.0.mlp.down_proj")
+
+
 def test_fp8_cb_rejects_sm80_before_the_first_prefill(monkeypatch):
     import gridbook.config as config_mod
 

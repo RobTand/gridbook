@@ -11,7 +11,7 @@ from importlib.resources import files
 from typing import Any, Mapping
 
 
-RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v4"
+RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v5"
 _RESOURCE_NAME = "runtime_contract.json"
 
 #: The vLLM package roots a ``top_level_loader_modules`` entry may name. The
@@ -26,6 +26,46 @@ _RESOURCE_NAME = "runtime_contract.json"
 #: serving process, which is exactly what ``tests/test_no_triton_runtime.py``
 #: pins against a reviewed allow-list.
 _LOADER_MODULE_ROOTS = ("vllm.model_executor.models.", "vllm.models.")
+
+#: The one parallelism axis this contract makes claims about.  The value is
+#: vLLM's live tensor-parallel world size as read by
+#: ``gridbook.config._initialized_tensor_parallel_world_size`` — not a CLI
+#: argument, which can disagree with the running worker.
+_TP_AXIS = "vllm_tensor_parallel_world_size"
+
+#: Serving-unit ids that are NOT CB format families, i.e. the keys of
+#: ``FORMATS`` in ``gridbook/source_passthrough.py``.  Every unit a producer
+#: can address needs an explicit tensor-parallel row: the completeness checks
+#: below refuse a table that omits or invents one.
+_PASSTHROUGH_TP_UNITS = frozenset({
+    "fp8_e4m3_ue8m0_block128",
+    "mxfp4_e2m1_ue8m0_g32",
+    "mxfp8_e4m3_e8m0_g32",
+})
+
+#: Units whose serving method branches on an execution arm with its own TP
+#: refusal site: the FP8-source W8A16 lane gates dense and grouped-BMM arms
+#: separately (``gridbook/fp8_source_w8a16.py``), and the MXFP8 lane audits its
+#: BMM arm separately (``gridbook/mxfp8_dense_lane.py``).  A unit not listed
+#: here must publish ONE flat claim and must not carry ``arms``.
+_TP_ARMED_UNITS: dict[str, tuple[str, ...]] = {
+    "fp8_e4m3_ue8m0_block128": ("dense", "bmm"),
+    "mxfp8_e4m3_e8m0_g32": ("dense", "bmm"),
+}
+
+#: The exact grouped-BMM geometry each armed unit qualifies, keyed by
+#: (unit, arm).  Today only the FP8-source W8A16 BMM arm is pinned, to the
+#: constants in ``gridbook/fp8_source_w8a16.py`` (``_DSV4_BMM_GROUPS``,
+#: ``_DSV4_BMM_ROWS``, ``_DSV4_BMM_K``, enforced alongside
+#: ``_DSV4_RELEASE_TP``).  An arm without an entry here must omit
+#: ``requires_geometry`` entirely.
+_TP_REQUIRED_GEOMETRY: dict[tuple[str, str], dict[str, int]] = {
+    ("fp8_e4m3_ue8m0_block128", "bmm"): {
+        "bmm_groups": 8,
+        "rows_per_group": 1024,
+        "k": 4096,
+    },
+}
 
 
 class RuntimeContractError(ValueError):
@@ -95,20 +135,153 @@ def _validate_version_set(value: Any, path: str) -> set[int]:
     return supported
 
 
+def _validate_tensor_parallel(root: Mapping[str, Any],
+                              families: set[str]) -> None:
+    """Validate the tensor-parallel capability table.
+
+    The table is ATTESTATION, not aspiration: every row must restate what a
+    refusal site in this package actually enforces, and the closed-world
+    reading makes absence a refusal.  A consumer serving unit *U* at tensor-
+    parallel size *t* looks up exactly one row named ``U`` (and, for an armed
+    unit, the row for the arm it will execute); no match, or ``t`` above the
+    matched claim, or a pinned geometry that does not match exactly is a
+    REFUSAL.  There is no default, wildcard, or inheritance anywhere in this
+    section.
+    """
+
+    tp = _object(root["tensor_parallel"], "contract.tensor_parallel")
+    _keys(tp, "contract.tensor_parallel",
+          {"axis", "semantics", "max_world_size", "units"})
+    if tp["axis"] != _TP_AXIS:
+        _fail("contract.tensor_parallel.axis", f"must be {_TP_AXIS!r}")
+    if tp["semantics"] != "closed_world":
+        _fail("contract.tensor_parallel.semantics",
+              "must be 'closed_world': an unclaimed unit is refused, never "
+              "permitted by default")
+    root_cap = _positive_int(
+        tp["max_world_size"], "contract.tensor_parallel.max_world_size")
+    # Pinned to the enforced fact: every dispatch path through
+    # PrismaQuantConfig.get_quant_method refuses a live world size above 1,
+    # so a wider number here would be a claim no code stands behind.  Widening
+    # is a schema-version event, made together with the lifting commit.
+    if root_cap != 1:
+        _fail("contract.tensor_parallel.max_world_size",
+              "must be 1; no dispatch path in this build enforces more")
+
+    units = tp["units"]
+    if not isinstance(units, list) or not units:
+        _fail("contract.tensor_parallel.units",
+              "must be a non-empty JSON array")
+    seen: set[str] = set()
+    cb_units: set[str] = set()
+    passthrough_units: set[str] = set()
+    for index, item in enumerate(units):
+        path = f"contract.tensor_parallel.units[{index}]"
+        row = _object(item, path)
+        expected = {"unit", "kind", "max_world_size"}
+        if "arms" in row:
+            expected = expected | {"arms"}
+        _keys(row, path, expected)
+        unit_id = _string(row["unit"], f"{path}.unit")
+        kind = _string(row["kind"], f"{path}.kind")
+        if kind == "cb_format_family":
+            cb_units.add(unit_id)
+        elif kind == "source_passthrough_format":
+            passthrough_units.add(unit_id)
+        else:
+            _fail(f"{path}.kind",
+                  "must be 'cb_format_family' or 'source_passthrough_format'")
+        if unit_id in seen:
+            _fail("contract.tensor_parallel.units",
+                  f"duplicate unit {unit_id!r}")
+        seen.add(unit_id)
+        cap = _positive_int(row["max_world_size"], f"{path}.max_world_size")
+        if cap != 1:
+            _fail(f"{path}.max_world_size",
+                  "must be 1; no enforcement site in this build allows more")
+        if cap > root_cap:
+            _fail(f"{path}.max_world_size",
+                  "exceeds contract.tensor_parallel.max_world_size")
+
+        required_arms = _TP_ARMED_UNITS.get(unit_id)
+        if "arms" not in row:
+            if required_arms is not None:
+                _fail(path,
+                      f"unit {unit_id!r} has per-arm TP refusal sites; it "
+                      f"must declare arms {sorted(required_arms)}")
+            continue
+        if required_arms is None:
+            _fail(f"{path}.arms",
+                  f"unit {unit_id!r} has one flat TP refusal site; publish "
+                  "one flat claim without 'arms'")
+        arms = row["arms"]
+        if not isinstance(arms, list) or not arms:
+            _fail(f"{path}.arms", "must be a non-empty JSON array")
+        arm_names: list[str] = []
+        for arm_index, arm_item in enumerate(arms):
+            arm_path = f"{path}.arms[{arm_index}]"
+            arm = _object(arm_item, arm_path)
+            arm_expected = {"arm", "max_world_size"}
+            if "requires_geometry" in arm:
+                arm_expected = arm_expected | {"requires_geometry"}
+            _keys(arm, arm_path, arm_expected)
+            arm_name = _string(arm["arm"], f"{arm_path}.arm")
+            if arm_name not in required_arms:
+                _fail(f"{arm_path}.arm",
+                      f"must be one of {sorted(required_arms)}")
+            if arm_name in arm_names:
+                _fail(f"{path}.arms", f"duplicate arm {arm_name!r}")
+            arm_names.append(arm_name)
+            arm_cap = _positive_int(arm["max_world_size"],
+                                    f"{arm_path}.max_world_size")
+            if arm_cap != 1:
+                _fail(f"{arm_path}.max_world_size",
+                      "must be 1; no enforcement site in this build allows "
+                      "more")
+            if arm_cap > cap:
+                _fail(f"{arm_path}.max_world_size", "exceeds the unit claim")
+            geometry_key = (unit_id, arm_name)
+            if geometry_key in _TP_REQUIRED_GEOMETRY:
+                pinned = _TP_REQUIRED_GEOMETRY[geometry_key]
+                if arm.get("requires_geometry") != pinned:
+                    _fail(f"{arm_path}.requires_geometry",
+                          f"must equal {pinned}")
+            elif "requires_geometry" in arm:
+                _fail(f"{arm_path}.requires_geometry",
+                      f"is not pinned for {unit_id!r} arm {arm_name!r}; "
+                      "omit it rather than under-specifying")
+        missing = sorted(set(required_arms) - set(arm_names))
+        if missing:
+            _fail(f"{path}.arms", f"missing arm claim(s): {missing}")
+
+    if cb_units != families:
+        _fail("contract.tensor_parallel.units",
+              f"every CB format family must carry exactly one "
+              f"'cb_format_family' claim; missing "
+              f"{sorted(families - cb_units)}, unknown "
+              f"{sorted(cb_units - families)}")
+    if passthrough_units != set(_PASSTHROUGH_TP_UNITS):
+        _fail("contract.tensor_parallel.units",
+              f"source-passthrough claims must equal {sorted(_PASSTHROUGH_TP_UNITS)}; "
+              f"missing "
+              f"{sorted(set(_PASSTHROUGH_TP_UNITS) - passthrough_units)}, "
+              f"unknown {sorted(passthrough_units - set(_PASSTHROUGH_TP_UNITS))}")
+
+
 def validate_runtime_contract(contract: Any) -> None:
     """Raise :class:`RuntimeContractError` unless *contract* is self-consistent."""
 
     root = _object(contract, "contract")
     _keys(root, "contract", {
         "schema", "contract_version", "abi_features", "quant_method",
-        "packing", "layout", "formats", "producer_profiles",
+        "packing", "layout", "formats", "tensor_parallel", "producer_profiles",
     })
     if root["schema"] != RUNTIME_CONTRACT_SCHEMA:
         _fail("contract.schema", f"must be {RUNTIME_CONTRACT_SCHEMA!r}")
     contract_version = _positive_int(
         root["contract_version"], "contract.contract_version")
-    if contract_version != 4:
-        _fail("contract.contract_version", "must be 4 for this schema")
+    if contract_version != 5:
+        _fail("contract.contract_version", "must be 5 for this schema")
 
     features = _object(root["abi_features"], "contract.abi_features")
     _keys(features, "contract.abi_features", {
@@ -281,6 +454,8 @@ def validate_runtime_contract(contract: Any) -> None:
             _fail(path, "layout_versions contains an unsupported ABI layout")
         if not moe_layouts <= family_layouts:
             _fail(path, "moe_layout_versions must be a subset of layout_versions")
+
+    _validate_tensor_parallel(root, families)
 
     profiles = _object(root["producer_profiles"],
                        "contract.producer_profiles")

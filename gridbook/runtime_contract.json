@@ -1,6 +1,6 @@
 {
-  "schema": "gridbook.runtime-contract.v4",
-  "contract_version": 4,
+  "schema": "gridbook.runtime-contract.v5",
+  "contract_version": 5,
   "abi_features": {
     "dspark_construction_physical_bridge": 1,
     "routed_moe_per_role_codebook_lut": 1,
@@ -151,6 +151,68 @@
       ]
     }
   ],
+  "tensor_parallel": {
+    "axis": "vllm_tensor_parallel_world_size",
+    "semantics": "closed_world",
+    "max_world_size": 1,
+    "units": [
+      {
+        "unit": "FP8_CB_K",
+        "kind": "cb_format_family",
+        "max_world_size": 1
+      },
+      {
+        "unit": "NVFP4_CB_K",
+        "kind": "cb_format_family",
+        "max_world_size": 1
+      },
+      {
+        "unit": "NVFP4_CB_S",
+        "kind": "cb_format_family",
+        "max_world_size": 1
+      },
+      {
+        "unit": "fp8_e4m3_ue8m0_block128",
+        "kind": "source_passthrough_format",
+        "max_world_size": 1,
+        "arms": [
+          {
+            "arm": "dense",
+            "max_world_size": 1
+          },
+          {
+            "arm": "bmm",
+            "max_world_size": 1,
+            "requires_geometry": {
+              "bmm_groups": 8,
+              "rows_per_group": 1024,
+              "k": 4096
+            }
+          }
+        ]
+      },
+      {
+        "unit": "mxfp4_e2m1_ue8m0_g32",
+        "kind": "source_passthrough_format",
+        "max_world_size": 1
+      },
+      {
+        "unit": "mxfp8_e4m3_e8m0_g32",
+        "kind": "source_passthrough_format",
+        "max_world_size": 1,
+        "arms": [
+          {
+            "arm": "dense",
+            "max_world_size": 1
+          },
+          {
+            "arm": "bmm",
+            "max_world_size": 1
+          }
+        ]
+      }
+    ]
+  },
   "producer_profiles": {
     "supported_ids": [
       "deepseek_v4",
