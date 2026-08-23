@@ -857,8 +857,9 @@ DEVINL int fp4v2_stage_r2(uint8_t* __restrict__ dst,
   return 0;
 }
 
-// R2BACKPORT (round-2 backport from the grouped MoE fp4-v2 kernel, opt-in via
-// PRISMAQUANT_CB_FP4V2_DENSE_R2, default OFF): selects a SECOND instantiation
+// R2BACKPORT (round-2 backport from the grouped MoE fp4-v2 kernel, DEFAULT ON
+// since 0.8.13; set PRISMAQUANT_CB_FP4V2_DENSE_R2=0 to opt OUT): selects a
+// SECOND instantiation
 // of the dense kernel with the grouped kernel's round-2 load schedule —
 //   (a) the third stage-word read s32[widx+2] is predicated on rem + k_bits
 //       > 64 (it contributes nothing otherwise), one fewer smem load per
@@ -870,8 +871,10 @@ DEVINL int fp4v2_stage_r2(uint8_t* __restrict__ dst,
 // The dense fp4-v2 GEMV is compute-bound (ncu SM 71% / mem 44%), so the goal
 // is fewer issued load instructions per codeword. BIT-EXACTNESS IS THE GATE:
 // every schedule x flag combination must produce identical bits, which tests/
-// test_dense_fp4v2_backport.py asserts across both sched settings. The legacy
-// instantiation below is byte-for-byte the shipping path.
+// test_dense_fp4v2_backport.py asserts across both sched settings. Because the
+// two instantiations are bit-identical, the default flip is a PERF-ONLY change:
+// no shipped artifact's outputs, KL or PPL can move, and the legacy
+// instantiation below stays reachable (=0) as the bisection arm.
 template <int MT, int WARPS, bool DB, bool R2BACKPORT>
 __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
     const uint16_t* __restrict__ x,        // [M, K] bf16 (as u16), QDQ'd
@@ -1084,15 +1087,19 @@ void launch_gemv_fp4_v2(const torch::Tensor& xq, const torch::Tensor& qw,
   // switch and only defaulted on after a served-KL-safe A/B (bit-identical).
   const bool fp4v2_db = pq_env_is("PRISMAQUANT_CB_FP4V2_SCHED", "db");
   const int v2 = pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2") ? 1 : 0;
-  // Round-2 backport (opt-in, default OFF): PRISMAQUANT_CB_FP4V2_DENSE_R2=1
-  // selects the R2BACKPORT instantiation — the grouped MoE fp4-v2 kernel's
-  // round-2 load schedule (predicated third stage-word read, packed uint2
-  // codebook gathers, aligned-down u64 burst staging) ported onto the dense
-  // kernel's DB/single-buffer structure. Outputs are BIT-IDENTICAL to the
-  // legacy instantiation; the switch exists so a serving run can bisect the
-  // two arms. Strict {0,1} read per call: host-only, CUDA-graph-capture-safe.
+  // Round-2 backport (DEFAULT ON since 0.8.13; =0 opts out): selects the
+  // R2BACKPORT instantiation — the grouped MoE fp4-v2 kernel's round-2 load
+  // schedule (predicated third stage-word read, packed uint2 codebook
+  // gathers, aligned-down u64 burst staging) ported onto the dense kernel's
+  // DB/single-buffer structure. Outputs are BIT-IDENTICAL to the legacy
+  // instantiation; the switch stays so a serving run can bisect the two arms.
+  // Strict {0,1} read per call: host-only, CUDA-graph-capture-safe.
+  // Default flipped on 2026-08-23 evidence (dq-runs/r2-kernel-2026-08-23): on
+  // the Qwen3.8-27B CB gold artifact's four REAL fp4 rungs (K12/14/16/18) at
+  // their true (N,K), all 40 (shape x M) points over M in {1,2,4,8,16} are
+  // bit-identical AND faster — worst per-M aggregate -3.44%, best -10.17%.
   const bool fp4v2_r2 =
-      pq_env_bool01("PRISMAQUANT_CB_FP4V2_DENSE_R2", false);
+      pq_env_bool01("PRISMAQUANT_CB_FP4V2_DENSE_R2", true);
 #define PQ_LAUNCH_FP4V2(W, DBFLAG, R2FLAG)                                  \
   cb_gemv_fp4_v2_kernel<MT, W, DBFLAG, R2FLAG>                              \
       <<<(unsigned)N, (W)*32, 0, stream>>>(                                 \

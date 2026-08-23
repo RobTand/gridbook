@@ -708,8 +708,12 @@ points**. Representative cells: K2048/N4096/M1 k20 27.95→24.15 (−13.6%);
 K2048/N12288/M2 k20 96.46→79.89 (−17.2%); K4096/N4096/M2 k20 57.40→45.84
 (−20.2%); smallest win −0.9% (K2048/N12288/M1 k16). Gains grow with k —
 consistent with the compute-bound decode profile (fewer issued load
-instructions per codeword). Opt-in flag; served NATIVE-PARITY required before
-any default flip. Consensus re-measurement (2026-08-21, two independent
+instructions per codeword). **Default ON since 0.8.13** (2026-08-23). The originally-recorded
+gate here — served NATIVE-PARITY before any default flip — was NOT met;
+the flip rests on a real-shape M-sweep (40/40 points bit-identical and
+faster on the Qwen3.8-27B CB gold artifact's true fp4 geometry) plus a
+no-regression served A/B, with bit-identity removing the quality axis.
+See CHANGELOG 0.8.13. Consensus re-measurement (2026-08-21, two independent
 harnesses, fresh tree-private builds, `torch.equal` every cell): 32/32 on
 this grid, **64/64** on the shipped Qwen3.8-27B dense shapes × k∈{12,14,16,18}
 × M∈{1,2,4,8} (k12 −1…−8% … k18 −5…−16%), 47/48 on a small-K/untiled-N grid

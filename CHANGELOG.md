@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+## 0.8.13 — 2026-08-23
+
+- **Changed: the dense FP4-CB v2 GEMV round-2 backport
+  (`PRISMAQUANT_CB_FP4V2_DENSE_R2`) is now ON by default.** Set the flag to
+  `0` to opt out; the legacy instantiation stays reachable as the bisection
+  arm. Because the two instantiations are **bit-identical**, this is a
+  perf-only change: no shipped artifact's outputs, KL or PPL can move, and no
+  artifact needs re-validation.
+
+  Evidence (`dq-runs/r2-kernel-2026-08-23`), measured on the Qwen3.8-27B CB
+  gold artifact's four REAL fp4 rungs (`NVFP4_CB_K12/K14/K16/K18`) at their
+  true `(N, K)` and true target multiplicities, A/B/A-interleaved per point:
+
+  | M | R2 delta on its own kernel | projected end-to-end | bit-identical |
+  |---|---|---|---|
+  | 1 | −7.83% | −0.591% | yes |
+  | 2 | −10.17% | −0.768% | yes |
+  | 4 | −5.89% | −0.445% | yes |
+  | 8 | −7.29% | −0.551% | yes |
+  | 16 | −3.44% | −0.260% | yes |
+
+  All **40** (shape × M) points are bit-identical AND faster; zero regressions
+  at any M, covering every `launch_gemv_fp4_v2` instantiation (so MTP /
+  spec-decode verify batches at M∈{2,4,8} benefit too, not just M=1 decode).
+  Unit gate `tests/test_dense_fp4v2_backport.py` 15 passed / 1 skipped (the
+  skip is the deleted fp4 signed mode).
+
+  **Deviation from the recorded promotion gate, stated plainly:** `docs/
+  BENCHMARKS.md` required a served **NATIVE-PARITY** run before any default
+  flip. That protocol was **NOT** run — no wrapper for it exists. The
+  substitute evidence is (a) bit-identity, which removes the quality axis by
+  construction, leaving only perf; (b) per-shape, per-M kernel timing at the
+  artifact's real geometry, which is where B2's whole-operator regression
+  would have shown; and (c) a served A/B on the Qwen3.8-27B CB gold artifact
+  showing no regression (−0.77% warm-to-warm, matching the −0.664% read-byte
+  projection). That served A/B was itself **underpowered** — R2's kernel is
+  only 7.55% of that artifact's checkpoint bytes, so even a −20% kernel win
+  projects to ≤1.51% against a ±1.29% noise band — and is reported as
+  corroborating, not as the promotion evidence.
+
 ## 0.8.12 — 2026-08-22
 
 - **Added: dense FP4-CB v2 GEMV round-2 backport behind
