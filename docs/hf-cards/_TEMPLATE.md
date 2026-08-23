@@ -57,7 +57,7 @@ build.
 | **Memory** | {{MEM_REQ}} |
 | **vLLM** | {{VLLM_LINE}} |
 | **Toolchain** | CUDA toolkit with `nvcc` on `PATH` **in the serving container** — the plugin JIT-builds its kernels on first model load (~30 s, cached). `nvcc` 13.0 is the tested toolchain. |
-| **Parallelism** | Single GPU (`tp=1`). Tensor parallelism is not implemented in the plugin. |
+| **Parallelism** | Single GPU (`tp=1`) for MoE and delegated groups; dense CB Linears shard at load time above one rank (group-boundary violations are refused). No cross-node speedup is claimed. |
 
 ```bash
 {{INSTALL_LINE}}

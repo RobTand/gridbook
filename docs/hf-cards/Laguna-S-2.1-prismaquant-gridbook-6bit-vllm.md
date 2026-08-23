@@ -44,7 +44,7 @@ tags:
 | **Memory** | 89.4 GB of weights on disk = **83.2 GiB** resident. Needs a ~128 GB unified/VRAM pool: measured on one DGX Spark at `--gpu-memory-utilization 0.85`. Only 12 of 48 layers are full-attention (the rest slide at w=512), so a full 256k request costs ~6 GiB of fp8 KV — model + 256k cache fit the Spark's pool. |
 | **vLLM** | Version used for these measurements is not recorded on this card. |
 | **Toolchain** | CUDA toolkit with `nvcc` on `PATH` **in the serving container** — the plugin JIT-builds its kernels on first model load (~30 s, cached). `nvcc` 13.0 is the tested toolchain. |
-| **Parallelism** | Single GPU (`tp=1`). Tensor parallelism is not implemented in the plugin. |
+| **Parallelism** | Single GPU (`tp=1`) for MoE and delegated groups; dense CB Linears shard at load time above one rank (group-boundary violations are refused). No cross-node speedup is claimed. |
 
 ```bash
 pip install gridbook

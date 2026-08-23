@@ -562,18 +562,42 @@ class PrismaQuantConfig(QuantizationConfig):
             )
         return self._sidecar_source
 
-    def _require_supported_tensor_parallel(self) -> None:
+    def _tensor_parallel_world_size(self) -> int | None:
+        """Live vLLM TP size; ``None`` until model parallelism initializes.
+
+        Latched only once it resolves to 1 (the overwhelmingly common serve),
+        so repeated ``get_quant_method`` calls do not re-enter vLLM's
+        distributed module. A resolved value above one is never latched,
+        which keeps the retry behaviour of the previous TP=1-only gate.
+        """
         if self._tp_world_size == 1:
-            return
+            return 1
         world_size = _initialized_tensor_parallel_world_size()
-        if world_size is None:
+        if world_size == 1:
+            self._tp_world_size = 1
+        return world_size
+
+    def _require_tp1_serving(self, surface: str,
+                             prefix: str | None = None) -> None:
+        """Fail closed for every serving surface that is still TP=1-only.
+
+        Dense CB Linears are the ONE admitted surface above a single rank:
+        their shard laws (whole-superblock K windows, kernel-aligned N rows,
+        replicated sidecar tables, rank-local role geometry) are enforced
+        structurally at weight construction and load finalization. Every
+        other surface names ITSELF here — at method construction, before any
+        parameter exists — instead of failing later against a generic shape
+        mismatch or, worse, serving unattested sharding.
+        """
+        world_size = self._tensor_parallel_world_size()
+        if world_size is None or world_size == 1:
             return
-        if world_size != 1:
-            raise ValueError(
-                "Gridbook currently supports tensor-parallel size 1 only; "
-                f"the live vLLM worker reports TP={world_size}"
-            )
-        self._tp_world_size = world_size
+        where = f" at {prefix!r}" if prefix else ""
+        raise ValueError(
+            f"Gridbook serves {surface}{where} at tensor-parallel size 1 "
+            f"only; the live vLLM worker reports TP={world_size}. Dense CB "
+            "Linears are the only supported tensor-parallel surface."
+        )
 
     def _has_mixed_fused_loader(self) -> bool:
         """Whether the class constructing this layer has Gridbook's loader ABI.
@@ -1385,8 +1409,15 @@ class PrismaQuantConfig(QuantizationConfig):
            ``self.mxfp4_backend`` / ``self.experts_cls``), so the check happens
            the moment the constructor returns — still model-load time, still
            before any weights are processed.
+        3. **Tensor parallel.**  Every passthrough lane is a Gridbook-owned
+           kernel contract attested at TP=1 only (the source-FP8 lane pins
+           TP=1 in its own release gate; the MXFP8 dense lane has no sharded
+           audit at all), so the lane refuses above one HERE rather than
+           discovering it after weights are copied.
         """
 
+        self._require_tp1_serving(
+            f"the source-passthrough unit format {fmt.id!r}", prefix)
         _require_passthrough_device(
             fmt, prefix=prefix, capability=_live_device_capability())
         method = _build_passthrough_method(fmt, layer, prefix)
@@ -1409,8 +1440,17 @@ class PrismaQuantConfig(QuantizationConfig):
         fact rather than a prediction, and it is still model-load time.
         Checking here (rather than in ``moe.py``/``linear.py``, which never see
         a delegated layer) also keeps every delegated layer class on one rule.
+
+        The stock compressed-tensors ladder IS tensor-parallel-capable in
+        vLLM, but Gridbook's audited delegation contract (backend preflight,
+        MXFP8 lane, NVFP4/FP8-DYNAMIC menu) was measured at TP=1 only, so a
+        delegated group refuses above one at this same choke point instead of
+        serving an unaudited sharding combination.
         """
 
+        self._require_tp1_serving(
+            "delegated stock compressed-tensors groups"
+            + (" (MoE)" if moe else ""), prefix)
         method = self.ct_config.get_quant_method(layer, prefix)
         group_name, group = self._stock_group_for_prefix(layer, prefix, moe=moe)
         require_native_delegated_backend(
@@ -1421,7 +1461,12 @@ class PrismaQuantConfig(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> "QuantizeMethodBase | None":
-        self._require_supported_tensor_parallel()
+        # Tensor-parallel policy is resolved PER ARM below, not as a blanket
+        # pre-gate: dense CB Linears admit TP>1 under their structured
+        # shard-alignment gates (``linear.ShardGroupAlignmentError``), while
+        # every other surface calls ``_require_tp1_serving`` with its own
+        # name at method construction. The delegated/passthrough choke
+        # points carry their own gates so every caller shares one rule.
         self._ensure_resolved()
         from .linear import PrismaQuantCBLinearMethod
 
@@ -1440,11 +1485,23 @@ class PrismaQuantConfig(QuantizationConfig):
             if owners:
                 if self._fused_owners_share_single_method(owners):
                     if owners[0].kind == "cb":
+                        # DENSE CB, single legacy merged method: the admitted
+                        # TP>1 surface. Shard legality is enforced per layer
+                        # by PrismaQuantCBLinearMethod.create_weights.
                         scheme = owners[0].payload
                         self._require_cb_device_capability(scheme, prefix)
                         return PrismaQuantCBLinearMethod(self, scheme, prefix)
                     return self._delegate_passthrough(
                         layer, prefix, owners[0].payload)
+
+                # The composite's loads ride the top-level mixed router, whose
+                # transaction copies are whole-checkpoint-plane; nothing in it
+                # narrows a rank's slice yet. This precedes the loader-ABI
+                # check because at TP>1 the surface is unsupported regardless
+                # of whether the wrapper is installed.
+                self._require_tp1_serving(
+                    "mixed-format fused projections (the top-level mixed "
+                    "loader copies whole checkpoint planes)", prefix)
 
                 if not self._has_mixed_fused_loader():
                     roles = ", ".join(
@@ -1490,6 +1547,9 @@ class PrismaQuantConfig(QuantizationConfig):
                       f"{'CB' if scheme is not None else 'no-scheme'}",
                       file=sys.stderr, flush=True)
             if scheme is not None:
+                # DENSE CB target: the admitted TP>1 surface (see the fused
+                # arm above). Unsupported CB LAYOUTS keep refusing at model
+                # load through the same format gates as TP=1.
                 self._require_cb_device_capability(scheme, prefix)
                 return PrismaQuantCBLinearMethod(self, scheme, prefix)
             # 1c) SOURCE-format passthrough -> vLLM's own native method for
@@ -1499,7 +1559,11 @@ class PrismaQuantConfig(QuantizationConfig):
             fmt = self._passthrough_format(prefix)
             if fmt is not None:
                 return self._delegate_passthrough(layer, prefix, fmt)
-            # 2) explicitly-ignored -> BF16 passthrough.
+            # 2) explicitly-ignored -> BF16 passthrough. This is vLLM-native
+            #    surface (stock UnquantizedLinearMethod with engine-owned
+            #    partitioning), not a Gridbook kernel contract, so no TP gate
+            #    belongs here; every shipped artifact carries ignored Linears
+            #    (e.g. the sub-quantum GDN scaler projections).
             if self._is_ignored(prefix):
                 return UnquantizedLinearMethod()
             # 3) stock NVFP4 / FP8_DYNAMIC -> compressed-tensors delegation
@@ -1516,6 +1580,9 @@ class PrismaQuantConfig(QuantizationConfig):
             embed_fmt = (None if isinstance(layer, ParallelLMHead)
                          else self._embedding_format(prefix))
             if embed_fmt is not None:
+                # Gridbook-owned packed-embedding kernel contract, attested
+                # only with whole-vocab replicated weights.
+                self._require_tp1_serving("quantized embedding units", prefix)
                 from .embedding import GridbookNVFP4EmbeddingMethod
                 return GridbookNVFP4EmbeddingMethod(embed_fmt, prefix)
             if self.ct_config is not None:
@@ -1554,12 +1621,27 @@ class PrismaQuantConfig(QuantizationConfig):
                         "per_expert_format_groups declares a partition of "
                         f"{mixed_groups.num_experts} experts"
                     )
+                # Out of scope by campaign decision (moetp.md): expert stacks
+                # need expert-id remap plus shard-aware stacked copies; EP is
+                # the right first target there. Refuse before any buffer is
+                # sized with per-rank geometry the loaders cannot fill.
+                self._require_tp1_serving(
+                    "CB MoE expert stacks (per-expert format groups)", prefix)
                 from .moe_mixed import PrismaQuantMixedMoEMethod
                 return PrismaQuantMixedMoEMethod(
                     self, layer.moe_config, mixed_groups, prefix
                 )
             if scheme is not None:
                 self._require_cb_device_capability(scheme, prefix)
+                # Out of scope by campaign decision (moetp.md): the stacked
+                # CB loaders copy whole (E, rows, bytes) checkpoint tensors
+                # under a strict shape-equality contract while vLLM's FusedMoE
+                # allocates intermediate-sharded buffers at TP>1, so serving
+                # would die mid-load even with the dense gates lifted. The
+                # refusal stays here, naming the surface.
+                self._require_tp1_serving(
+                    "CB MoE expert stacks (stacked whole-tensor loader)",
+                    prefix)
                 from .moe import PrismaQuantCBMoEMethod
                 return PrismaQuantCBMoEMethod(
                     self, layer.moe_config, scheme, prefix)

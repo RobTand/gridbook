@@ -93,11 +93,26 @@ second runtime tree or maintain a parallel loader table.
   vanilla-FP8 Linears this way, and the 27B's vision tower is a stock NVFP4
   W4A16 group. **Consequence:** an artifact's hardware requirements are the union
   of gridbook's and those of its delegated groups.
-- **Single-GPU (`tp=1`) only** — there is no tensor-parallel handling for CB
-  weights, and a live TP size above one fails during model construction. The
-  fact is published, not prose: every serving unit carries a
-  `tensor_parallel` row in the contract (see
-  [Tensor-parallel capability](#tensor-parallel-capability)).
+- **Tensor parallel: dense CB Linears only, above one rank.** Since the
+  shard-aware loading wave (2026-08-23), dense CB Linears load correctly at
+  TP>1 with no change to any exported byte: vLLM's stock declared-dim
+  narrowing slices whole packed rows on column-parallel layers and
+  superblock-aligned byte windows on row-parallel layers; codebooks and
+  compose tables replicate per rank from the immutable sidecar; and merged
+  GDN-style roles recover rank-local boundaries. A shard that would split a
+  CB group is refused at weight construction as a structured
+  `ShardGroupAlignmentError` (qname / axis / group_size / tp_degree /
+  shard_size fields — input axis requires whole 256-weight superblocks;
+  output axis requires the native kernel's 8-wide (fp4) or 16-wide (fp8) row
+  quantum). Everything else keeps refusing at construction, naming itself:
+  MoE expert stacks (EP-first, `moetp.md`), delegated compressed-tensors
+  groups, source-passthrough units (the FP8 lane pins TP=1 in its own
+  release gate), quantized embedding units and mixed-format fused
+  projections. Ignored (BF16) Linears stay on vLLM-native sharding. Dense
+  TP>1 remains **correctness-only**: no two-node serve has been measured on
+  this hardware yet, so nothing here claims a decode win. The fact is
+  published, not prose: every serving unit carries a `tensor_parallel` row
+  in the contract (see [Tensor-parallel capability](#tensor-parallel-capability)).
   `--enforce-eager` is the published-model configuration; mode-0
   `FULL_DECODE_ONLY` is also capture-correct with the permanent opaque dispatch
   and is being promoted through the model-size performance gates

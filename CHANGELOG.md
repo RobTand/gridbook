@@ -27,6 +27,52 @@ Compatibility rule: readers match the schema string exactly. A producer pinned
 to `gridbook.runtime-contract.v4` must refuse a v5 contract whole and keep
 serving against its pinned runtime until its pin is bumped deliberately.
 
+### Shard-aware loading for dense CB Linears at TP>1 (2026-08-23)
+
+Dense CB Linears now load correctly above one tensor-parallel rank with **no
+change to any exported byte** — the campaign analysis (`tp-support-2026-08-22`)
+established that CB artifacts shard purely at load time, and this wave
+implements the loader side of that finding.
+
+**What changed.**
+
+- `config.py` no longer raises a blanket "TP=1 only" at method construction.
+  The gate is replaced by per-surface policy: dense CB Linears construct at
+  TP>1 under structured alignment gates; every other surface refuses AT
+  CONSTRUCTION naming itself — MoE expert stacks (EP-first per `moetp.md`),
+  delegated stock compressed-tensors groups, source-passthrough units,
+  quantized embedding units and mixed-format fused projections. Ignored
+  (BF16) targets keep vLLM-native sharding.
+- New `linear.ShardGroupAlignmentError(ValueError)` with structured fields
+  (`qname`, `axis`, `group_size`, `tp_degree`, `shard_size`, `detail`),
+  raised at weight construction when a shard boundary would split a group:
+  the input axis requires whole 256-weight superblocks; the output axis
+  requires the native kernel row quantum (8 for fp4, 16 for fp8). The
+  unsharded artifact error (`in_features % 256`) keeps its exact previous
+  form.
+- Merged GDN-style roles (`in_proj_qkvz` class) recover RANK-LOCAL role
+  boundaries: checkpoint role rows are divided across ranks instead of being
+  compared against local sums, which is true only at TP=1. A role whose
+  checkpoint rows do not divide evenly is a structured refusal.
+
+**What did not change.**
+
+- The single-device path: TP=1 construction errors, load sequence and apply
+  dispatch are byte-for-byte identical (the N-quantum check stays at its
+  post-load home when unsharded).
+- MoE stacked-expert loading, MXFP8 lane and FP8_SOURCE BMM remain refused
+  at TP>1 by their own named gates.
+- Unsupported CB layouts (legacy v1 fp4, signed rungs) refuse exactly as at
+  TP=1, through the same model-load format gates.
+
+**Honest scope.** Correctness only. No two-node serve has been measured on
+this hardware (10 GbE Realtek, no RDMA), nothing here argues decode speed,
+and per-token dynamic FP8 activation scales on row-parallel layers are
+computed over each rank's local K window at TP>1 (as with stock W8A8
+schemes), so served logits are not bit-identical to TP=1; quality claims
+belong to the standing same-session KL gate. Loader-contract tests simulate
+vLLM's attested narrowing in-process; no distributed run exists yet.
+
 ### Measured negative result: the R2 default flip was attempted and REVERTED
 
 `PRISMAQUANT_CB_FP4V2_DENSE_R2` stays **default OFF**. A flip to default-ON was
