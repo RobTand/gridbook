@@ -807,6 +807,24 @@ file above); kernel-level speed target — **met on all cells at `T=128` and
 [NATIVE-PARITY](NATIVE-PARITY.md) protocol — **not run**.
 `scripts/bench_bf16_grouped_sm120.py` produces proposal data only.
 
+**Diagnostic swizzle pin (`PRISMAQUANT_CB_BF16_SWIZZLE`).** The lane's tile
+scheduler picks swizzle `{1, 8}` by padded M-tile count with threshold 64 — the
+MIDPOINT of the two measured grids (32 and 80 tiles), so the crossover itself
+is unmeasured. `PRISMAQUANT_CB_BF16_SWIZZLE in {auto, 1, 8}` pins that choice
+for measurement. It is **latched**: read once per process and applied to every
+launch, because a selector that moved mid-process would mix tile orders across
+one run. Unset or `auto` keeps `sm120_swizzle_for()` exactly; an unrecognized
+value raises and names the accepted spellings. Swizzle is tile ORDER only —
+every output tile's accumulation is independent of it — so a pin **cannot move
+a bit**, and that is gated rather than asserted: `scripts/bench_bf16_swizzle_-
+crossover.py` compares `sw1`/`sw8`/`auto` outputs with `torch.equal` and the
+gate **fails closed when it compares zero cells** (reference outputs are saved
+only for `EQUALITY_TILES = (24, 64, 96)`, so a `--tiles` set that misses them
+used to report a silent pass). Verified 2026-08-23 in `gridbook:0.8.12-r2ab` on
+sm_121: 24/24 cells bit-identical, `auto` equal to the policy arm at every tile
+count. This is a diagnostic knob, not a policy change — the shipped threshold
+is untouched.
+
 ### Persistent-B decode-in-mainloop (default auto, `PRISMAQUANT_CB_MOE_PERSISTENT_B`)
 
 ROADMAP **K1.1**, audit §3 **P2b**. Both lanes above still *materialize* the

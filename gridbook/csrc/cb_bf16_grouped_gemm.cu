@@ -43,6 +43,10 @@
 #include "cutlass/epilogue/thread/linear_combination.h"
 
 #if defined(PRISMAQUANT_CB_BF16_SM120)
+#include <cctype>
+#include <cstdlib>
+#include <string>
+
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -417,6 +421,34 @@ constexpr int sm120_swizzle_for(int64_t m_tiles) {
                                                : kSm120SwizzleSmallGrid;
 }
 
+// DIAGNOSTIC override, latched (measurement A/B only): $PRISMAQUANT_CB_BF16_SWIZZLE
+// accepts "" (unset), "auto", "1" or "8" — "" / "auto" keep sm120_swizzle_for()
+// exactly; "1" / "8" pin that scheduler swizzle for EVERY launch of the
+// process. Parsed strictly (a typo raises and names the accepted spellings)
+// and read ONCE, latched to its first value: a selector that moved mid-process
+// would mix tile orders across launches of one run — the same class of drift
+// gridbook/lane_select.py exists to prevent. The shipped policy is unchanged
+// when the variable is unset, and a pin cannot move a bit (tile ORDER only).
+int sm120_swizzle_launch_choice(int64_t m_tiles) {
+  static const int pinned = [] {
+    const char* raw = std::getenv("PRISMAQUANT_CB_BF16_SWIZZLE");
+    if (raw == nullptr) return 0;
+    std::string v(raw);
+    const char* ws = " \t\n\r\f\v";
+    v.erase(0, v.find_first_not_of(ws));
+    v.erase(v.find_last_not_of(ws) + 1);
+    for (char& c : v) c = char(std::tolower(static_cast<unsigned char>(c)));
+    if (v.empty() || v == "auto") return 0;
+    if (v == "1") return kSm120SwizzleSmallGrid;
+    if (v == "8") return kSm120SwizzleLargeGrid;
+    TORCH_CHECK(false, "invalid PRISMAQUANT_CB_BF16_SWIZZLE=", raw,
+                "; expected 'auto' (the measured grid policy), '1' or '8' "
+                "(diagnostic pin), or leave it unset");
+    return 0;
+  }();
+  return pinned != 0 ? pinned : sm120_swizzle_for(m_tiles);
+}
+
 using GroupedCfg = Cfg<GroupedTile>;
 static_assert(gridbook::grouped::AssertSmemFits<
                   typename GroupedCfg::GemmKernel>::value);
@@ -503,7 +535,7 @@ void run_sm120_launch(torch::Tensor output, torch::Tensor a,
       cutlass::KernelHardwareInfo{},
       // Tile ORDER only — every output tile's accumulation is independent of
       // it, so this cannot move a bit.
-      {sm120_swizzle_for(mp / tile_m),
+      {sm120_swizzle_launch_choice(mp / tile_m),
        cutlass::gemm::kernel::detail::RasterOrderOptions::Heuristic}};
 
   Gemm gemm;
