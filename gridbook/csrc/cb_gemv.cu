@@ -1095,10 +1095,29 @@ void launch_gemv_fp4_v2(const torch::Tensor& xq, const torch::Tensor& qw,
   // DB/single-buffer structure. Outputs are BIT-IDENTICAL to the legacy
   // instantiation; the switch stays so a serving run can bisect the two arms.
   // Strict {0,1} read per call: host-only, CUDA-graph-capture-safe.
-  // Default flipped on 2026-08-23 evidence (dq-runs/r2-kernel-2026-08-23): on
-  // the Qwen3.8-27B CB gold artifact's four REAL fp4 rungs (K12/14/16/18) at
-  // their true (N,K), all 40 (shape x M) points over M in {1,2,4,8,16} are
-  // bit-identical AND faster — worst per-M aggregate -3.44%, best -10.17%.
+  // MEASURED SHAPE DEPENDENCE (2026-08-23, dq-runs/r2-kernel-2026-08-23) --
+  // this is why the default is still OFF. R2's win is real but CONDITIONAL.
+  // Wins: on the Qwen3.8-27B CB gold artifact's four real fp4 rungs
+  // (K12/14/16/18, n_sb 20 and 68) all 40 (shape x M) points over
+  // M in {1,2,4,8,16} are bit-identical AND faster, per-M aggregate -3.44%
+  // to -10.17%. Loses: at M=1 with a small or warp-IMBALANCED n_sb, where the
+  // aligned-down u64 burst staging never amortizes --
+  //     k=12 K= 768 (n_sb=3)  M=1: +9.14%  (control spread 0.36%)
+  //     k=12 K=1280 (n_sb=5)  M=1: +4.50%  (control spread 1.33%)
+  //     k=12 K=2304 (n_sb=9)  M=1: +2.43%  (control spread 1.38%)
+  // An n_sb sweep {1..24} x k in {12,16} shows the crossover is RAGGED, not a
+  // threshold: the use4 branch (n_sb 4,12,20) never loses, and n_sb 8/16/24
+  // are fine because every warp does an equal number of iterations -- but
+  // n_sb 9/10 lose at k=12, where one or two warps do TWO iterations while
+  // the rest do one, so the straggler carries R2's un-amortized setup on the
+  // critical path. It is k-dependent and non-monotone, so a use4-style
+  // dispatch cannot express it; a fix belongs in the KERNEL (early-exit or
+  // cheaper staging when a warp's iteration count is 1, or the block is
+  // imbalanced), not in this launcher. M=2 wins essentially everywhere.
+  // A default flip was attempted on 2026-08-23 and REVERTED when this was
+  // found. All 60 crossover cells were bit-identical; correctness is not the
+  // issue, and tests/test_dense_fp4v2_r2_edge_geometry.py gates it at 1728
+  // configs.
   const bool fp4v2_r2 =
       pq_env_bool01("PRISMAQUANT_CB_FP4V2_DENSE_R2", false);
 #define PQ_LAUNCH_FP4V2(W, DBFLAG, R2FLAG)                                  \

@@ -37,10 +37,38 @@ never perf-tested. The lesson is the B2 lesson again in a new costume: a grid
 chosen from the shipping artifact's geometry cannot clear a kernel for
 geometry the artifact does not contain.
 
-**What a future flip needs:** either a kernel early-exit for the
-`n_sb < WARPS`/M=1 regime, or an explicit measured `n_sb` crossover in the
-launcher (the `use4` heuristic is the existing precedent for a measured
-shape-based dispatch) — plus the served leg that the reverted attempt lacked.
+**The crossover is RAGGED — a simple `n_sb >= X` dispatch would be fitting
+noise.** Swept n_sb∈{1..24} at k∈{12,16}, N=4096, 4 interleaved A/B/A repeats:
+
+| n_sb (M=1) | k=12 | k=16 | warps |
+|---|---|---|---|
+| 1, 2, 3 | LOSS +8.9…+11.8% | LOSS +7.5…+13.0% | 8 |
+| 4 | ~ | win | **4** (`use4`) |
+| 5, 6 | LOSS | LOSS(5) / ~(6) | 8 |
+| 7, 8 | ~ | win | 8 |
+| **9, 10** | **LOSS +2.4%** | win | 8 |
+| 12, 20 | win | win | **4** (`use4`) |
+| 16, 24 | ~ | win | 8 |
+
+Two structural facts, and they point at the kernel rather than the launcher:
+
+- **M=2 wins essentially everywhere** (only n_sb=1/k=16 loses, +1.08%). This
+  is an M=1 problem.
+- **The `use4` branch never loses** (n_sb∈{4,12,20}). The 8-warp branch is
+  ragged: n_sb=8/16/24 are fine — every warp does equal iterations — but
+  n_sb=9/10 LOSE at k=12, where one or two warps do TWO iterations and the
+  rest do one. The straggler carries R2's un-amortized setup on the critical
+  path.
+
+So the mechanism is **warp-load imbalance at M=1**, not a size threshold, and
+it is k-dependent (k=12 loses at n_sb=9,10 where k=16 wins). A `use4`-style
+dispatch cannot express it cleanly.
+
+**What a future flip needs:** a kernel-side fix for the M=1 imbalanced-tail
+case — early-exit or a cheaper staging path when a warp's iteration count is 1
+or the block is imbalanced — not a launcher threshold. Plus the served leg the
+reverted attempt lacked. All 60 crossover cells were bit-identical, so the
+correctness story is unchanged throughout.
 
 Bit-identity itself is NOT in question and is now permanently gated:
 `tests/test_dense_fp4v2_r2_edge_geometry.py` sweeps 1728 configs over
