@@ -50,12 +50,14 @@ gated activations are attested during model load and invoke their registered
 
 The producer/runtime boundary is machine-readable at
 `gridbook/runtime_contract.json` and loadable without torch or vLLM through
-`gridbook.runtime_contract.load_runtime_contract()`. Closed schema v4 also
-attests `abi_features.source_fp8_block128_w8a16 = 1` and
-`abi_features.dspark_construction_physical_bridge = 1`, so a producer can
-require the BF16-activation source route or the complete DSpark sidecar loader
-and construction/physical namespace ABI (including weight-only drafts) without
-inferring semantics from the package version. It
+`gridbook.runtime_contract.load_runtime_contract()`. Closed schema v5 also
+attests `abi_features.source_fp8_block128_w8a16 = 1`,
+`abi_features.dspark_construction_physical_bridge = 1`, and a per-unit
+tensor-parallel capability table, so a producer can require the BF16-activation
+source route, the complete DSpark sidecar loader
+and construction/physical namespace ABI (including weight-only drafts), or a
+specific tensor-parallel size for a specific format without inferring
+semantics from the package version. It
 declares accepted quantization names, serialized packing/type-size
 rules, supported CB rung
 families, and producer-profile loader coverage. The plugin derives its own
@@ -92,7 +94,10 @@ second runtime tree or maintain a parallel loader table.
   W4A16 group. **Consequence:** an artifact's hardware requirements are the union
   of gridbook's and those of its delegated groups.
 - **Single-GPU (`tp=1`) only** — there is no tensor-parallel handling for CB
-  weights, and a live TP size above one now fails during model construction.
+  weights, and a live TP size above one fails during model construction. The
+  fact is published, not prose: every serving unit carries a
+  `tensor_parallel` row in the contract (see
+  [Tensor-parallel capability](#tensor-parallel-capability)).
   `--enforce-eager` is the published-model configuration; mode-0
   `FULL_DECODE_ONLY` is also capture-correct with the permanent opaque dispatch
   and is being promoted through the model-size performance gates
@@ -106,6 +111,48 @@ second runtime tree or maintain a parallel loader table.
   does not expose a Gridbook-owned biased kernel, so 0.5 does not hide a
   framework bias add behind the serving boundary. Delegated non-CB groups keep
   their upstream method's contract.
+
+## Tensor-parallel capability
+
+As of contract schema `gridbook.runtime-contract.v5`, the packaged contract
+carries a `tensor_parallel` section that publishes, per serving unit, what the
+runtime actually enforces. The table is an attestation: each row restates a
+refusal site in this package, and `tests/test_runtime_contract_tp.py` checks
+every row against the source text of that site.
+
+- `axis` names the measured quantity: vLLM's live tensor-parallel world size,
+  read from the running worker at model construction — not a CLI argument.
+- `max_world_size` is the whole-model cap. `PrismaQuantConfig.get_quant_method`
+  refuses a live world size above it before any format-specific decision, so it
+  binds every unit the plugin dispatches, including stock compressed-tensors
+  delegated groups and BF16 passthrough.
+- Each entry in `units` names one producer-addressable unit: a CB format family
+  (`NVFP4_CB_K`, `NVFP4_CB_S`, `FP8_CB_K`) or one source-passthrough format id.
+  A unit whose method branches on an execution arm carries per-arm rows; the
+  `fp8_e4m3_ue8m0_block128` BMM arm additionally pins the only qualified
+  grouped geometry (`bmm_groups` 8, `rows_per_group` 1024, `k` 4096).
+- `semantics` is `closed_world`. A consumer must read the table with the same
+  rule the validator enforces for publishers:
+
+  Serving unit *U* at world size *t* is permitted only if the table contains
+  exactly one row named *U*, the claim on that row (and on the exact arm row,
+  when the unit has arms) covers *t*, and any pinned geometry matches exactly.
+  Every other outcome — no row, two rows, an unknown arm name, a larger *t*,
+  a different geometry — is a refusal. There is no default, wildcard, or
+  inheritance.
+
+The completeness direction is enforced too: the packaged validator rejects any
+contract that omits a shipped unit, invents one, drops a mandatory field, or
+publishes a number no enforcement site stands behind. Widening a cap beyond 1
+is therefore impossible without lifting the gate in code and bumping the schema
+in the same commit.
+
+**Compatibility rule:** `schema` and `contract_version` move together (v5 / 5),
+and readers match the schema string exactly. A producer pinned to
+`gridbook.runtime-contract.v4` must refuse a v5 contract whole — no partial
+parsing, no field-by-field salvage across versions — and keep producing against
+its pinned runtime until its pin is deliberately bumped. Reading a v4 contract
+with a v5 reader fails the same way.
 
 ## Layout / registration
 

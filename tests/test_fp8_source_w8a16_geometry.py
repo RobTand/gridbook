@@ -149,3 +149,44 @@ def test_dense_tp_near_miss_refuses_before_native_resolution(monkeypatch):
     assert calls == []
     assert not hasattr(layer, dsv4_woa.DSV4_FP8_SOURCE_W8A16_BMM_ATTR)
     assert not hasattr(layer, lane._READY_ATTR)
+
+
+def test_contract_tp_rows_match_this_gate_at_the_pinned_geometry(
+        monkeypatch):
+    """The contract's rows for ``fp8_e4m3_ue8m0_block128`` restate THIS gate.
+
+    The packaged table pins the BMM arm to grouped geometry G=8, N=1024,
+    K=4096 at TP=1 and the dense arm to TP=1. Feed the lane's own
+    finalization hook the CONTRACT'S OWN numbers with TP bumped to 2: it must
+    refuse before any native resolution or marker install. If the gate and
+    the table ever drift apart, one of the two halves of this test fails.
+    """
+    import json
+    from importlib.resources import files as resource_files
+
+    contract = json.loads(resource_files("gridbook").joinpath(
+        "runtime_contract.json").read_text(encoding="utf-8"))
+    row = next(unit for unit in contract["tensor_parallel"]["units"]
+               if unit["unit"] == "fp8_e4m3_ue8m0_block128")
+    assert row["max_world_size"] == 1
+    arms = {arm["arm"]: arm for arm in row["arms"]}
+    assert arms["dense"] == {"arm": "dense", "max_world_size": 1}
+    assert arms["bmm"]["max_world_size"] == 1
+    geometry = arms["bmm"]["requires_geometry"]
+    assert geometry == {"bmm_groups": 8, "rows_per_group": 1024, "k": 4096}
+
+    lane, method = _method(monkeypatch)
+    dsv4_woa, calls = _patch_load_edges(monkeypatch, lane)
+    layer = _layer(
+        groups=geometry["bmm_groups"],
+        rows=geometry["rows_per_group"],
+        k=geometry["k"],
+        tp_size=2,
+    )
+
+    with pytest.raises(ValueError, match=r"qualified only.*TP=2"):
+        method.process_weights_after_loading(layer)
+
+    assert calls == []
+    assert not hasattr(layer, dsv4_woa.DSV4_FP8_SOURCE_W8A16_BMM_ATTR)
+    assert not hasattr(layer, lane._READY_ATTR)

@@ -136,3 +136,55 @@ def test_bmm_apply_refuses_unfinalized_planes(
     )
     with pytest.raises(RuntimeError, match="scale planes were not finalized"):
         method.apply(layer, torch.zeros(1, 2, 128, dtype=torch.bfloat16))
+
+
+def test_contract_tp_row_matches_the_bmm_refusal_at_tp2(
+    monkeypatch, isolated_gridbook_runtime_imports
+):
+    """The contract's MXFP8 BMM row restates THIS refusal.
+
+    The packaged contract says the ``mxfp8_e4m3_e8m0_g32`` BMM arm serves at
+    tensor-parallel size 1 only; driving the lane's own finalization hook at
+    TP=2 must raise before any scale plane is built. If the gate and the row
+    ever disagree, this fails.
+    """
+    import json
+    from importlib.resources import files as resource_files
+
+    del isolated_gridbook_runtime_imports
+    _install_vllm_method_stubs(monkeypatch)
+
+    contract = json.loads(resource_files("gridbook").joinpath(
+        "runtime_contract.json").read_text(encoding="utf-8"))
+    row = next(unit for unit in contract["tensor_parallel"]["units"]
+               if unit["unit"] == "mxfp8_e4m3_e8m0_g32")
+    assert row["max_world_size"] == 1
+    bmm = next(arm for arm in row["arms"] if arm["arm"] == "bmm")
+    dense = next(arm for arm in row["arms"] if arm["arm"] == "dense")
+    assert bmm["max_world_size"] == 1
+    assert dense["max_world_size"] == 1
+
+    from gridbook import dsv4_woa
+    from gridbook import mxfp8_dense_lane as lane
+
+    extension = _IdentitySfExtension()
+    lane._OFFSETS._cache.clear()
+    monkeypatch.setattr(lane, "_require_lane_ext", lambda device=None: extension)
+    monkeypatch.setattr(dsv4_woa, "install_dsv4_woa_adapter", lambda: None)
+
+    groups, rows, k = 2, 128, 128
+    layer = torch.nn.Module()
+    layer.tp_size = 2
+    method = lane.build_mxfp8_dense_method(lane.WIRE_MXFP8_G32)
+    method.create_weights(
+        layer, k, [groups * rows], k, groups * rows, torch.bfloat16)
+    layer.is_bmm = True
+    layer.bmm_batch_size = groups
+
+    with pytest.raises(ValueError, match=r"audited only for TP=1"):
+        method.process_weights_after_loading(layer)
+
+    # The refusal precedes finalization: no scale plane was built or
+    # registered. (The lane drops its staging ``weight_scale`` parameter
+    # before the gate, so its absence is expected here.)
+    assert not hasattr(layer, "weight_sf_planes")

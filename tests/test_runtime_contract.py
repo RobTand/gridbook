@@ -34,7 +34,7 @@ def test_packaged_contract_loads_and_validates():
     contract = load_runtime_contract()
     assert contract == raw
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 4
+    assert contract["contract_version"] == 5
     assert contract["abi_features"] == {
         "dspark_construction_physical_bridge": 1,
         "routed_moe_per_role_codebook_lut": 1,

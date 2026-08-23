@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Contract schema v5: tensor-parallel capability is ATTESTED, not asserted
+
+`runtime_contract.json` now carries a `tensor_parallel` section (schema
+`gridbook.runtime-contract.v5`, `contract_version` 5): per-serving-unit rows —
+CB format families and source-passthrough format ids, with per-arm rows and the
+pinned grouped-BMM geometry for `fp8_e4m3_ue8m0_block128` — that restate what
+the runtime's TP refusal sites actually enforce. Today that is a whole-model cap
+of 1, enforced at `PrismaQuantConfig.get_quant_method` before dispatch, with
+narrower arm-level gates in `fp8_source_w8a16.py` (dense release gate; BMM
+geometry pin G=8, N=1024, K=4096, TP=1) and `mxfp8_dense_lane.py` (BMM audited
+TP=1 only). The TP=1 behaviour itself is UNCHANGED — this change publishes the
+fact, it does not lift the gate.
+
+Reading is closed-world (`semantics: "closed_world"`): no matching row, an
+unknown arm, a world size above the claim, or an off-pin geometry is a REFUSAL;
+absence of a claim is never a clean bill. The packaged validator enforces the
+publishing direction symmetrically: it refuses a contract that drops the table,
+omits or invents a unit, drops a mandatory field, or publishes any number above
+1. `tests/test_runtime_contract_tp.py` derives every row from the enforcement
+sites' source text.
+
+Compatibility rule: readers match the schema string exactly. A producer pinned
+to `gridbook.runtime-contract.v4` must refuse a v5 contract whole and keep
+serving against its pinned runtime until its pin is bumped deliberately.
+
 ## Unreleased
 
 ### Measured negative result: the R2 default flip was attempted and REVERTED
