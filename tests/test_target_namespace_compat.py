@@ -612,28 +612,47 @@ def test_config_advertises_only_the_bf16_runtime_contract():
     assert torch.float16 not in cfg.get_supported_act_dtypes()
 
 
-def test_live_tensor_parallel_size_above_one_fails_before_dispatch(monkeypatch):
+def test_live_tp2_admits_dense_cb_and_refuses_delegation(monkeypatch):
+    """The blanket pre-dispatch TP=1 raise was replaced by per-surface gates
+    (campaign 2026-08-23): a dense CB Linear constructs at TP=2 under the
+    structured shard-alignment gates, while delegated stock compressed-
+    tensors groups refuse at their choke point, naming themselves and the
+    live degree. A TP=1 worker still latches after its first read."""
     import gridbook.config as config_mod
+    from vllm.model_executor.layers.linear import LinearBase
 
     cfg = PrismaQuantConfig(_config())
     monkeypatch.setattr(config_mod, "_initialized_tensor_parallel_world_size",
                         lambda: 2)
-    with pytest.raises(ValueError, match=r"TP=2"):
-        # The gate precedes config resolution and method/weight construction.
-        cfg.get_quant_method(object(), "model.layers.0.mlp.down_proj")
+    method = cfg.get_quant_method(object.__new__(LinearBase),
+                                  "model.layers.0.mlp.down_proj")
+    assert type(method).__name__ == "PrismaQuantCBLinearMethod"
+
+    class _CT:
+        packed_modules_mapping = None
+
+        @staticmethod
+        def get_quant_method(layer, prefix):
+            return object()
+
+    cfg.ct_config = _CT()
+    with pytest.raises(ValueError, match="compressed-tensors.*TP=2"):
+        cfg.get_quant_method(object.__new__(LinearBase),
+                             "model.layers.0.mlp.unclaimed")
 
     monkeypatch.setattr(config_mod, "_initialized_tensor_parallel_world_size",
                         lambda: 1)
-    cfg._require_supported_tensor_parallel()
+    assert cfg._tensor_parallel_world_size() == 1
     assert cfg._tp_world_size == 1
 
 
 def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
-    """The packaged TP table claims only what the dispatch gate enforces.
+    """The packaged TP table claims only what the dispatch gates enforce.
 
-    All rows — root, unit, and arm — publish max world size 1, and a live
-    world size of 2 is refused by ``get_quant_method`` itself, which every
-    dispatched unit passes through before any format-specific decision.
+    Schema v6: dense CB rows publish shard-admission laws and no numeric cap
+    (dispatch admits them above one rank), while every passthrough row keeps
+    its numeric cap of 1 — and a live world size of 2 still refuses a
+    delegated stock compressed-tensors group at its choke point.
     """
     import json
     from importlib.resources import files as resource_files
@@ -643,18 +662,44 @@ def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
     table = contract["tensor_parallel"]
     assert table["axis"] == "vllm_tensor_parallel_world_size"
     assert table["semantics"] == "closed_world"
-    assert table["max_world_size"] == 1
-    assert all(row["max_world_size"] == 1 for row in table["units"])
-    assert all(arm["max_world_size"] == 1
-               for row in table["units"] for arm in row.get("arms", ()))
+    assert "max_world_size" not in table
+    for row in table["units"]:
+        if row["kind"] == "cb_format_family":
+            assert "max_world_size" not in row
+            assert row["shard_admission"] == {
+                "input_axis_group": 256,
+                "output_axis_quantum": 8 if row["unit"].startswith("NVFP4")
+                else 16,
+                "merged_roles": "even_division",
+            }
+        else:
+            assert row["max_world_size"] == 1
+        assert all(arm["max_world_size"] == 1
+                   for arm in row.get("arms", ()))
 
     import gridbook.config as config_mod
 
     cfg = PrismaQuantConfig(_config())
     monkeypatch.setattr(config_mod, "_initialized_tensor_parallel_world_size",
                         lambda: 2)
-    with pytest.raises(ValueError, match=r"TP=2"):
-        cfg.get_quant_method(object(), "model.layers.0.mlp.down_proj")
+    # Dense CB: what the table defers to construction, dispatch admits...
+    from vllm.model_executor.layers.linear import LinearBase
+
+    method = cfg.get_quant_method(object.__new__(LinearBase),
+                                  "model.layers.0.mlp.down_proj")
+    assert type(method).__name__ == "PrismaQuantCBLinearMethod"
+    # ...and every capped surface still refuses, naming itself.
+    class _CT:
+        packed_modules_mapping = None
+
+        @staticmethod
+        def get_quant_method(layer, prefix):
+            return object()
+
+    cfg.ct_config = _CT()
+    with pytest.raises(ValueError, match="compressed-tensors.*TP=2"):
+        cfg.get_quant_method(object.__new__(LinearBase),
+                             "model.layers.0.mlp.unclaimed")
 
 
 def test_fp8_cb_rejects_sm80_before_the_first_prefill(monkeypatch):

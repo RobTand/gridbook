@@ -44,7 +44,7 @@ tags:
 | **Memory** | ~106 GB resident weights (including the CB-quantized MTP drafter) on a ~121 GB usable unified pool — one 128 GB DGX Spark. `--gpu-memory-utilization 0.90` is the **validated** setting; higher values OOM'd under long-prefill activation spikes. |
 | **vLLM** | **≥ 0.23** with `HYV3ForCausalLM` (stock — no fork). Speed numbers on this card were measured on vLLM 0.23. |
 | **Toolchain** | CUDA toolkit with `nvcc` on `PATH` **in the serving container** — the plugin JIT-builds its kernels on first model load (~30 s, cached). `nvcc` 13.0 is the tested toolchain. |
-| **Parallelism** | Single GPU (`tp=1`). Tensor parallelism is not implemented in the plugin. |
+| **Parallelism** | Single GPU (`tp=1`) for MoE and delegated groups; dense CB Linears shard at load time above one rank (group-boundary violations are refused). No cross-node speedup is claimed. |
 
 ```bash
 pip install gridbook

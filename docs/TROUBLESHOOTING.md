@@ -458,10 +458,28 @@ your versions and numbers is genuinely useful — that table is how it gets wide
 
 ## Tensor parallel (`tp > 1`)
 
-Unsupported and rejected during model construction. The plugin contains no
-tensor-parallel handling for the packed index stream, per-role codebook offsets
-or scale planes. Serve with `tp=1`. Multi-GPU support is not currently on the
-roadmap; if you need it, say so on an issue.
+Scoped since the 2026-08-23 shard-aware loading wave. **Dense CB Linears**
+load correctly above one rank with no change to any exported byte: packed
+rows are independent streams (column split), and row splits land on
+superblock boundaries only — a degree whose K-shard or N-shard would break a
+group boundary is refused at weight construction with a structured
+`ShardGroupAlignmentError` naming the target, axis, group size and degree.
+
+Everything else still refuses at construction, naming itself: MoE expert
+stacks (expert parallelism is the planned first target there), delegated
+compressed-tensors groups, source-passthrough units, quantized embedding
+units and mixed-format fused projections. An artifact mixing those surfaces
+with dense CB therefore fails on its first unsupported layer. Ignored
+(BF16) Linears keep vLLM's own sharding.
+
+Two honest caveats: no two-node serve has been measured yet (the reference
+hardware is single-GPU DGX Spark; cross-node TP over 10 GbE without RDMA is
+expected to lose at batch-1 decode), so dense TP>1 is a correctness feature
+for models that do not fit one box, not a measured speedup. And per-token
+dynamic FP8 activation scales are computed over each rank's local K window
+on row-parallel layers at TP>1, exactly as stock W8A8 schemes behave — so
+served logits are not bit-identical to TP=1; quality comparison belongs to
+the standing same-session KL gate.
 
 ---
 

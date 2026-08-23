@@ -527,11 +527,14 @@ published artifact.
   Gridbook owns the serving contract, decoder, and conformance fixtures. Copying
   the producer's search, packer, or exporter here would create two sources of
   truth.
-- **General tensor parallel.** No `tp > 1` support exists today and broad TP
-  support is not committed. D0.1 established that DSV4 does **not** need a
-  narrowly scoped implementation — the model fits one GB10 at the planned
-  92 GB, and every TP guard in vLLM's DSV4 class is satisfied at `tp_size == 1`
-  — so no TP work is accepted on its account.
+- **General tensor parallel.** Broad TP support is not committed. The
+  2026-08-23 wave delivered the narrow, load-time slice: **dense CB Linears**
+  shard correctly above one rank (superblock-aligned windows, structured
+  group-boundary refusals, replicated sidecars) with no exported-byte change.
+  MoE expert stacks remain refused — expert parallelism is the right first
+  target there — as do delegated groups and passthrough units. No cross-node
+  decode win is claimed; on this hardware (10 GbE, no RDMA) TP>1 is for
+  models that do not fit one box.
 - **A vLLM fork or core patches.** Running on stock vLLM is the point.
 
 ---

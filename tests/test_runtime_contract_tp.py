@@ -1,23 +1,29 @@
 """The tensor-parallel capability table in the packaged runtime contract.
 
-Gridbook refuses a live tensor-parallel world size above 1 on every dispatch
-path.  As of schema ``gridbook.runtime-contract.v5`` the packaged contract
-publishes that fact as machine-readable per-unit rows, so a producer gate can
-branch on fields instead of prose (principle: an attested claim, never an
-asserted one).
+Since the shard-aware loading wave, dense CB Linears construct above one
+tensor-parallel rank under structural shard-alignment gates, while every
+other surface refuses by name at a numeric TP=1 ceiling.  As of schema
+``gridbook.runtime-contract.v6`` the packaged contract publishes exactly
+that split as machine-readable per-unit rows, so a producer gate can branch
+on fields instead of prose (principle: an attested claim, never an asserted
+one).
 
 What is pinned here, without importing anything beyond the standard library,
 pytest, and the stdlib-only contract loader:
 
-1. The packaged table matches what the enforcement sites actually refuse.
-   Each row is checked against the SOURCE TEXT of its refusal site — the AST
-   of ``gridbook/config.py``, ``gridbook/fp8_source_w8a16.py``, and
-   ``gridbook/mxfp8_dense_lane.py`` — so a row nobody enforces cannot ship.
+1. The packaged table matches what the enforcement sites actually enforce.
+   Each row is checked against the SOURCE TEXT of its site — the AST of
+   ``gridbook/config.py`` and ``gridbook/linear.py`` for the dense CB
+   admission laws and the per-surface refusals, plus
+   ``gridbook/fp8_source_w8a16.py``, ``gridbook/mxfp8_dense_lane.py``, and
+   ``gridbook/source_passthrough.py`` for the numeric TP=1 lanes — so a row
+   nobody enforces cannot ship.
 2. Absence means REFUSED.  The documented closed-world lookup never defaults
-   to permitted, and the packaged validator rejects a table that drops a
-   mandatory field, omits or invents a unit, or widens a claim past the
-   enforced maximum.  A vacuous pass is unrepresentable in both directions:
-   publishing and reading.
+   to permitted where the runtime refuses, and the packaged validator rejects
+   a table that drops a mandatory field, omits or invents a unit, publishes a
+   numeric cap for the capless dense CB surface, or widens a numeric claim
+   past the enforced maximum.  A vacuous pass is unrepresentable in both
+   directions: publishing and reading.
 
 Run: ``python -m pytest tests/test_runtime_contract_tp.py -q``.
 """
@@ -61,9 +67,10 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
     tp = _tp_table(_packaged_contract())
     assert tp["axis"] == "vllm_tensor_parallel_world_size"
     assert tp["semantics"] == "closed_world"
-    # Every dispatch path refuses a live world size above 1 today; the root
-    # cap states that whole-model fact.
-    assert tp["max_world_size"] == 1
+    # No whole-model cap exists to publish: dense CB dispatch paths no longer
+    # refuse above 1, so a single scalar would claim more than any one number
+    # enforces.  v6 removed the field; its presence is a validator error.
+    assert "max_world_size" not in tp
 
     units = _units_by_id(load_runtime_contract())
     assert set(units) == {
@@ -74,14 +81,27 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
         "mxfp4_e2m1_ue8m0_g32",
         "mxfp8_e4m3_e8m0_g32",
     }
-    for family in ("FP8_CB_K", "NVFP4_CB_K", "NVFP4_CB_S"):
+    # Dense CB units admit TP>1 subject to structural shard laws, so they
+    # publish those laws instead of a numeric cap.  A cap here would be a
+    # number no enforcement site stands behind.
+    expected_admission = {
+        "FP8_CB_K": {"input_axis_group": 256, "output_axis_quantum": 16,
+                     "merged_roles": "even_division"},
+        "NVFP4_CB_K": {"input_axis_group": 256, "output_axis_quantum": 8,
+                       "merged_roles": "even_division"},
+        "NVFP4_CB_S": {"input_axis_group": 256, "output_axis_quantum": 8,
+                       "merged_roles": "even_division"},
+    }
+    for family, admission in expected_admission.items():
         assert units[family]["kind"] == "cb_format_family"
-        assert units[family]["max_world_size"] == 1
+        assert units[family]["shard_admission"] == admission
+        assert "max_world_size" not in units[family]
         assert "arms" not in units[family]
     for fmt in ("fp8_e4m3_ue8m0_block128", "mxfp4_e2m1_ue8m0_g32",
                 "mxfp8_e4m3_e8m0_g32"):
         assert units[fmt]["kind"] == "source_passthrough_format"
         assert units[fmt]["max_world_size"] == 1
+        assert "shard_admission" not in units[fmt]
     # The two Gridbook-owned lanes branch on an execution arm with its own
     # refusal site; the vLLM-native MXFP4 route does not.
     assert "arms" not in units["mxfp4_e2m1_ue8m0_g32"]
@@ -104,9 +124,9 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
 
 def test_schema_and_contract_version_move_together():
     contract = load_runtime_contract()
-    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v5"
+    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v6"
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 5
+    assert contract["contract_version"] == 6
 
 
 # --- 2. Closed-world reading: absence means REFUSED ---------------------------
@@ -117,13 +137,20 @@ def _permitted(table: dict, unit: str, world_size: int, *, arm=None,
     """The documented consumer lookup, verbatim from docs/PLUGIN.md.
 
     Exactly one row named *unit* must exist (and the exact *arm* row for an
-    armed unit); the claim must cover *world_size* and any pinned geometry
-    must match exactly.  Anything else is a refusal.  There is no default.
+    armed unit); a numeric claim must cover *world_size*, any pinned geometry
+    must match exactly, and a ``cb_format_family`` row publishes no numeric
+    claim at all — admission above one rank is decided by its published
+    shard-admission laws at the runtime's weight construction, which fail
+    closed.  Anything else is a refusal.  There is no default.
     """
     rows = [row for row in table["units"] if row["unit"] == unit]
     if len(rows) != 1:
         return False
     row = rows[0]
+    if "shard_admission" in row:
+        # Dense CB: no numeric cap exists to compare against; the table
+        # defers to the construction-time alignment gates for any size.
+        return geometry is None and "max_world_size" not in row
     if world_size > row["max_world_size"]:
         return False
     if "arms" not in row:
@@ -146,6 +173,10 @@ def test_closed_world_lookup_refuses_what_the_table_does_not_claim():
 
     # Positive controls: the claims the runtime stands behind.
     assert _permitted(table, "NVFP4_CB_K", 1)
+    # The lifted surface: dense CB above one rank is admitted by the table
+    # (the runtime's construction-time shard laws decide the rest).
+    assert _permitted(table, "NVFP4_CB_K", 2)
+    assert _permitted(table, "FP8_CB_K", 4)
     assert _permitted(
         table, "fp8_e4m3_ue8m0_block128", 1, arm="bmm",
         geometry={"bmm_groups": 8, "rows_per_group": 1024, "k": 4096})
@@ -153,9 +184,14 @@ def test_closed_world_lookup_refuses_what_the_table_does_not_claim():
     # An unknown unit id has no row -> REFUSED.
     assert not _permitted(table, "NVFP4_CB_K99", 1)
     assert not _permitted(table, "fp8_e4m3_ue8m0_block128_extra", 1)
-    # A world size no row covers -> REFUSED.
-    assert not _permitted(table, "NVFP4_CB_K", 2)
-    assert not _permitted(table, "NVFP4_CB_K", 8)
+    # A world size no numeric claim covers -> REFUSED.  Every passthrough
+    # unit is still capped at 1; only the dense CB rows defer.
+    for capped in ("fp8_e4m3_ue8m0_block128", "mxfp4_e2m1_ue8m0_g32",
+                   "mxfp8_e4m3_e8m0_g32"):
+        assert not _permitted(table, capped, 2)
+        assert not _permitted(table, capped, 8)
+    assert not _permitted(
+        table, "fp8_e4m3_ue8m0_block128", 2, arm="dense")
     # An armed unit consulted without naming the arm -> REFUSED.
     assert not _permitted(table, "mxfp8_e4m3_e8m0_g32", 1)
     # An arm name the unit does not publish -> REFUSED.
@@ -200,20 +236,41 @@ def _relabel_kind(contract):
     units["mxfp4_e2m1_ue8m0_g32"]["kind"] = "cb_format_family"
 
 
-def _drop_root_cap(contract):
-    del contract["tensor_parallel"]["max_world_size"]
-
-
-def _widen_root_cap(contract):
+def _restore_removed_root_cap(contract):
     contract["tensor_parallel"]["max_world_size"] = 2
 
 
-def _widen_unit_cap(contract):
-    _units_by_id(contract)["FP8_CB_K"]["max_world_size"] = 2
+def _widen_passthrough_cap(contract):
+    _units_by_id(contract)["mxfp4_e2m1_ue8m0_g32"]["max_world_size"] = 2
 
 
-def _drop_unit_cap(contract):
-    del _units_by_id(contract)["FP8_CB_K"]["max_world_size"]
+def _drop_passthrough_cap(contract):
+    del _units_by_id(contract)["mxfp4_e2m1_ue8m0_g32"]["max_world_size"]
+
+
+def _cap_a_cb_row(contract):
+    # Dense CB publishes no numeric cap because no code enforces one; adding
+    # one asserts a number nothing stands behind.
+    _units_by_id(contract)["NVFP4_CB_K"]["max_world_size"] = 8
+
+
+def _drop_cb_admission(contract):
+    del _units_by_id(contract)["FP8_CB_K"]["shard_admission"]
+
+
+def _corrupt_input_axis_group(contract):
+    _units_by_id(contract)["FP8_CB_K"]["shard_admission"][
+        "input_axis_group"] = 128
+
+
+def _corrupt_output_axis_quantum(contract):
+    _units_by_id(contract)["NVFP4_CB_K"]["shard_admission"][
+        "output_axis_quantum"] = 4
+
+
+def _relax_merged_roles(contract):
+    _units_by_id(contract)["NVFP4_CB_S"]["shard_admission"][
+        "merged_roles"] = "best_effort"
 
 
 def _strip_arms_from_pinned_lane(contract):
@@ -260,13 +317,17 @@ def _invent_geometry_pin(contract):
     ("mutate", "message"),
     [
         (_drop_tensor_parallel, "tensor_parallel"),
-        (_drop_one_unit, "missing.*mxfp4_e2m1_ue8m0_g32"),
-        (_rename_unit, "unknown.*NOT_A_REAL_FAMILY"),
-        (_relabel_kind, "unknown \\['mxfp4"),
-        (_drop_root_cap, "max_world_size"),
-        (_widen_root_cap, "no dispatch path"),
-        (_widen_unit_cap, "no enforcement site"),
-        (_drop_unit_cap, "max_world_size"),
+        (_drop_one_unit, "missing.*mxfp4"),
+        (_rename_unit, "no CB format family.*NOT_A_REAL_FAMILY"),
+        (_relabel_kind, "missing field.*shard_admission"),
+        (_restore_removed_root_cap, "unknown field.*max_world_size"),
+        (_widen_passthrough_cap, "no enforcement site"),
+        (_drop_passthrough_cap, "max_world_size"),
+        (_cap_a_cb_row, "unknown field.*max_world_size"),
+        (_drop_cb_admission, "missing field.*shard_admission"),
+        (_corrupt_input_axis_group, "must equal 256"),
+        (_corrupt_output_axis_quantum, "must equal 8 for grid 'fp4'"),
+        (_relax_merged_roles, "must be 'even_division'"),
         (_strip_arms_from_pinned_lane, "per-arm TP refusal sites"),
         (_add_arms_to_flat_unit, "one flat TP refusal site"),
         (_drop_bmm_arm_claim, "missing arm claim"),
@@ -300,28 +361,135 @@ def _source(path: str) -> tuple[str, ast.Module]:
     return text, ast.parse(text, filename=str(full))
 
 
-def test_general_gate_refuses_above_one_before_dispatch():
-    """Every dispatched unit passes through the config-level gate first."""
+def test_dense_cb_admission_rows_match_the_linear_gates():
+    """The shard-admission laws restate linear.py's construction gates.
+
+    Derives each published constant from the enforcement site instead of
+    asserting it: ``codec.SUPERBLOCK`` for the input axis, the kernel
+    row-alignment conditional (``8 if self.is_fp4 else 16``) for the output
+    axis, and the merged-role even-division refusal in
+    ``_rank_local_role_widths``.
+    """
+    _text, codec_tree = _source("gridbook/codec.py")
+    superblock = None
+    for node in codec_tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "SUPERBLOCK"
+                and isinstance(node.value, ast.Constant)):
+            superblock = node.value.value
+    assert superblock == 256, "codec.SUPERBLOCK must stay the input law"
+
+    source, tree = _source("gridbook/linear.py")
+    error_cls = next((node for node in ast.walk(tree)
+                      if isinstance(node, ast.ClassDef)
+                      and node.name == "ShardGroupAlignmentError"), None)
+    assert error_cls is not None, \
+        "the structured shard refusal must exist"
+    assert any(isinstance(base, ast.Name) and base.id == "ValueError"
+               for base in error_cls.bases), \
+        "callers may catch the structured refusal as ValueError"
+
+    create_weights = _function(tree, "create_weights")
+    assert any(isinstance(node, ast.Call)
+               and isinstance(node.func, ast.Attribute)
+               and node.func.attr == "_require_shard_group_alignment"
+               for node in ast.walk(create_weights)), \
+        "weight construction must run the shard-legality gate first"
+    gate = _function(tree, "_require_shard_group_alignment")
+    gate_source = ast.get_source_segment(source, gate) or ""
+    assert "codec.SUPERBLOCK" in gate_source, \
+        "the input-axis law must be the packed superblock"
+    assert "8 if self.is_fp4 else 16" in gate_source, \
+        "the output-axis law must be the native kernel row quantum"
+    role_gate = _function(tree, "_rank_local_role_widths")
+    assert any(isinstance(node, ast.Raise) for node in ast.walk(role_gate)), \
+        "uneven merged-role division must refuse"
+
+    units = _units_by_id(load_runtime_contract())
+    quanta = {"fp4": 8, "fp8": 16}
+    for family, grid in (("FP8_CB_K", "fp8"), ("NVFP4_CB_K", "fp4"),
+                         ("NVFP4_CB_S", "fp4")):
+        admission = units[family]["shard_admission"]
+        assert admission["input_axis_group"] == superblock
+        assert admission["output_axis_quantum"] == quanta[grid]
+        assert admission["merged_roles"] == "even_division"
+
+
+def test_config_dispatch_policy_matches_the_published_split():
+    """config.py refuses every non-dense surface by name; dense CB defers.
+
+    The v5 blanket pre-dispatch gate is gone: no single statement refuses
+    before dispatch, which is why CB rows publish laws instead of a cap.
+    Every remaining ``_require_tp1_serving`` site must name ITS OWN non-dense
+    surface, and together they must cover exactly the surfaces that stay
+    closed.
+    """
     source, tree = _source("gridbook/config.py")
 
-    helper = _function(tree, "_require_supported_tensor_parallel")
-    comparisons = [node for node in ast.walk(helper) if
-                   isinstance(node, ast.Compare)]
-    assert any(isinstance(cmp.ops[0], ast.NotEq)
-               and isinstance(cmp.comparators[0], ast.Constant)
-               and cmp.comparators[0].value == 1
-               for cmp in comparisons), "gate must refuse world sizes != 1"
+    # The blanket gate is gone outright.
+    names = {node.name for node in ast.walk(tree)
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert "_require_supported_tensor_parallel" not in names
+    assert "supports tensor-parallel size 1 only" not in source
+
+    # Its replacement raises, names the surface, and states the split.
+    # The message literals are line-wrapped, so derive the sentence from the
+    # raise site's string constants rather than raw source text.
+    helper = _function(tree, "_require_tp1_serving")
     assert any(isinstance(node, ast.Raise) for node in ast.walk(helper)), \
         "the out-of-policy branch must raise"
-    assert "supports tensor-parallel size 1 only" in source
+    helper_text = " ".join(
+        c.value for c in ast.walk(helper)
+        if isinstance(c, ast.Constant) and isinstance(c.value, str))
+    assert "Dense CB Linears are the only supported tensor-parallel surface" \
+        in helper_text
 
+    # Dispatch does not open with a TP gate any more: policy lives per arm.
     get_quant_method = _function(tree, "get_quant_method")
     first = get_quant_method.body[0]
-    assert (isinstance(first, ast.Expr)
-            and isinstance(first.value, ast.Call)
-            and isinstance(first.value.func, ast.Attribute)
-            and first.value.func.attr == "_require_supported_tensor_parallel"
-            ), "the TP gate must fire before any dispatch decision"
+    assert not (isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Call)
+                and isinstance(first.value.func, ast.Attribute)
+                and "tensor_parallel" in first.value.func.attr), \
+        "no blanket TP gate may fire before dispatch"
+
+    # Collect the static text every refusal site passes as its own name.
+    # Surfaces may be f-strings or concatenated literals, so walk each call
+    # subtree for string constants instead of reading one argument shape.
+    refusals = [node for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_require_tp1_serving"]
+    fragments: list[str] = []
+    for node in refusals:
+        parts = [c.value for c in ast.walk(node)
+                 if isinstance(c, ast.Constant)
+                 and isinstance(c.value, str) and c.value.strip()]
+        assert parts, f"refusal at line {node.lineno} must name its surface"
+        fragments.extend(parts)
+    joined = "\n".join(fragments)
+    assert len(refusals) == 6
+    for surface in (
+            "source-passthrough unit format",
+            "delegated stock compressed-tensors groups",
+            "mixed-format fused projections",
+            "quantized embedding units",
+            "CB MoE expert stacks",
+    ):
+        assert surface in joined, \
+            f"no refusal site names the {surface!r} surface"
+    assert "dense CB" not in joined and "CB Linear" not in joined, \
+        "no refusal site may name the admitted dense CB surface"
+
+    # And the admitted surface really is dispatched: the fused, mixed-role,
+    # and plain dense CB arms all construct PrismaQuantCBLinearMethod (the
+    # mixed arm is guarded by its own named refusal above).
+    cb_arms = [node for node in ast.walk(get_quant_method)
+               if isinstance(node, ast.Call)
+               and isinstance(node.func, ast.Name)
+               and node.func.id == "PrismaQuantCBLinearMethod"]
+    assert len(cb_arms) == 3
 
 
 def test_fp8_source_geometry_rows_match_the_lane_constants():

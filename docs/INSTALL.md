@@ -29,7 +29,7 @@ serving environment and `--no-deps` when its stack is already managed (see
 | **CUDA toolchain** | `nvcc` on `PATH` (or `CUDA_HOME` set) **in the serving process** | The kernels are JIT-compiled at runtime, not at install time. Missing `nvcc` may not fail package installation, but a required native serving operation fails closed when its extension cannot build. |
 | **PyTorch** | the build your vLLM uses | Measured: `2.11.0+cu130`. Installing gridbook into a fresh environment can pull a *generic* PyPI torch that does not match your CUDA — install into the vLLM environment instead. |
 | **vLLM** | already installed | Measured against `0.23.1rc1.dev764+g54b16d8a9`. |
-| **Parallelism** | `tp=1` | The plugin has no tensor-parallel handling. |
+| **Parallelism** | `tp=1` for everything except dense CB Linears | Dense CB Linears shard at load time (superblock-aligned, structured refusal on illegal boundaries). MoE, delegated groups and passthrough units refuse above one. See [known limits](#known-limits). |
 
 ---
 
@@ -375,8 +375,15 @@ discrete GPU with its own VRAM, ordinary vLLM utilization guidance applies.
 
 ## Known limits
 
-- **`tp=1` only.** No tensor-parallel support; `--tensor-parallel-size > 1` is
-  untested and unimplemented for CB weights.
+- **Tensor parallel: dense CB Linears only above one rank.** Since
+  2026-08-23 dense CB Linears load shard-aware at `--tensor-parallel-size >
+  1` (whole packed rows on the output axis, superblock-aligned byte windows
+  on the input axis; a boundary that would split a group is a structured
+  construction-time refusal). MoE expert stacks, delegated compressed-tensors
+  groups, source-passthrough units, quantized embedding units and
+  mixed-format fused projections refuse at construction naming themselves.
+  No cross-node serve has been measured on this hardware; treat TP>1 as a
+  correctness feature for models that do not fit one box, not a speedup.
 - **Dense CB Linears are biasless.** A public dense CB call with non-`None`
   bias is rejected because the opaque native operation has no owned biased
   kernel in 0.5.

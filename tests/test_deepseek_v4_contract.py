@@ -446,26 +446,37 @@ def test_dsv4_neighbouring_layer_does_not_borrow_a_scheme(dsv4_config):
         f"model.layers.{LAYER + 1}.ffn.experts") is None
 
 
-def test_dsv4_rejects_tensor_parallel_above_one(dsv4_config, monkeypatch):
-    """D0.1 keeps TP=1: the model fits one GB10 at the planned 92 GB, and no CB
-    weight has TP handling.
-
-    The gate reads the LIVE worker's world size, not an argument string, so the
-    probe is what has to report >1 — an uninitialised model-parallel group
-    (every CPU-side config test) correctly defers rather than guessing."""
+def test_dsv4_tp_refusal_is_now_scoped_to_expert_stacks(dsv4_config,
+                                                        monkeypatch):
+    """Campaign 2026-08-23 replaced the blanket TP=1 raise with per-surface
+    gates: DENSE CB Linears construct above one rank under structured shard
+    gates (``linear.ShardGroupAlignmentError``), while the routed expert
+    stacks keep refusing AT CONSTRUCTION with their own name (moetp.md: EP
+    is the first MoE target; the stacked whole-tensor loaders cannot fill
+    intermediate-sharded buffers). A DSV4 body therefore still cannot serve
+    TP=2 — but it now fails on the arm that is actually unsupported."""
     import gridbook.config as gbconfig
 
     c = dsv4_config()
-    c._tp_world_size = 4
     monkeypatch.setattr(gbconfig, "_initialized_tensor_parallel_world_size",
-                        lambda: 4)
-    with pytest.raises(ValueError, match="tensor-parallel size 1 only"):
-        c._require_supported_tensor_parallel()
-    # A live TP=1 worker is accepted and latched.
+                        lambda: 2)
+    # Dense CB attention Linear: admitted surface.
+    from vllm.model_executor.layers.linear import LinearBase
+    method = c.get_quant_method(object.__new__(LinearBase),
+                                f"model.layers.{LAYER}.attn.wq_b")
+    assert type(method).__name__ == "PrismaQuantCBLinearMethod"
+    # Routed stack: refused by name, before any buffer exists.
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    experts = object.__new__(RoutedExperts)
+    with pytest.raises(ValueError) as exc:
+        c.get_quant_method(experts, f"model.layers.{LAYER}.ffn.experts")
+    message = str(exc.value)
+    assert "expert stacks" in message and "TP=2" in message
+    # The gate itself stays available for direct probing, with the live
+    # world size read from the worker rather than an argument string.
     monkeypatch.setattr(gbconfig, "_initialized_tensor_parallel_world_size",
                         lambda: 1)
-    c._require_supported_tensor_parallel()
-    assert c._tp_world_size == 1
+    assert c._tensor_parallel_world_size() == 1
 
 
 def test_dsv4_delegated_preflight_still_guards_a_stock_region():

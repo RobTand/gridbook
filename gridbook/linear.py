@@ -137,6 +137,58 @@ FP4_FUSED_TILE_M_WIDE = 256
 _FP4_DENSE_SM_COUNTS: dict[int, int] = {}
 
 
+def _shard_degree(full_size: int, local_size: int) -> int:
+    """The TP degree implied by vLLM's per-partition constructor arguments.
+
+    vLLM hands ``create_weights`` BOTH the whole-tensor sizes and this rank's
+    partition of them; their quotient is the serving degree, independent of
+    any distributed state (and therefore well-defined in offline construction
+    too). Non-divisible shapes cannot come from a healthy engine; the ceil
+    keeps the reported degree usable in a refusal message anyway.
+    """
+    if local_size > 0 and full_size >= local_size:
+        return max(1, -(-full_size // local_size))
+    return 1
+
+
+class ShardGroupAlignmentError(ValueError):
+    """A tensor-parallel shard boundary would cut a CB group or alignment law.
+
+    Raised at weight CONSTRUCTION — before any buffer exists and long before
+    any byte is copied — by the dense CB loader's shard-legality gate. The
+    exception IS the structured fact (walker-R5 invariant 5 as data): gates
+    and reports read the fields below; ``str(exc)`` merely renders them for
+    humans and never carries information the fields do not.
+
+    Attributes:
+        qname: quantized target (or fused role) the shard belongs to.
+        axis: ``"input"`` (row-parallel, K sharded) or ``"output"``
+            (column-parallel, N sharded).
+        group_size: the alignment quantum the shard violates — 256
+            (the packed superblock) on the input axis; the native kernel
+            row-alignment quantum (8 fp4 / 16 fp8) or the sharding degree on
+            the output axis.
+        tp_degree: live serving degree the geometry implies.
+        shard_size: this rank's extent along the offending axis.
+        detail: machine-readable reason code sentence.
+    """
+
+    def __init__(self, *, qname: str, axis: str, group_size: int,
+                 tp_degree: int, shard_size: int, detail: str) -> None:
+        self.qname = qname
+        self.axis = axis
+        self.group_size = int(group_size)
+        self.tp_degree = int(tp_degree)
+        self.shard_size = int(shard_size)
+        self.detail = detail
+        super().__init__(
+            f"{qname}: {axis}-axis shard of {shard_size} per rank at "
+            f"TP={tp_degree} would split a {group_size}-wide alignment "
+            f"group ({detail}); refusing at weight construction instead of "
+            "serving a mis-sharded CB group"
+        )
+
+
 def _fp8_fused_midm_enabled() -> bool:
     """The FP8-CB mid-M fused lane's OPT-OUT flag, parsed like every other.
 
@@ -233,16 +285,22 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
     def create_weights(self, layer, input_size_per_partition,
                        output_partition_sizes, input_size, output_size,
                        params_dtype, **extra_weight_attrs):
-        del input_size, output_size, params_dtype
+        del params_dtype
         weight_loader = extra_weight_attrs.get("weight_loader")
         K = input_size_per_partition
-        if K % codec.SUPERBLOCK != 0:
-            raise ValueError(f"{self.prefix}: in_features {K} not a multiple of "
-                             f"{codec.SUPERBLOCK}")
-        rows = sum(output_partition_sizes)
+        partitions = [int(width) for width in output_partition_sizes]
+        rows = sum(partitions)
+        self._require_shard_group_alignment(
+            K, partitions, input_size=input_size, output_size=output_size)
         row_bytes = (K // codec.SUPERBLOCK) * self.type_size
-        layer.logical_widths = list(output_partition_sizes)
+        layer.logical_widths = partitions
         layer._cb_input_size = K
+        # The serving degrees implied by vLLM's constructor arguments. Load
+        # finalization re-derives rank-local role geometry from the output
+        # degree; storing it here keeps that arithmetic on the same authority
+        # as the construction gate above.
+        layer._cb_input_tp_degree = _shard_degree(input_size, K)
+        layer._cb_output_tp_degree = _shard_degree(output_size, rows)
 
         cb_qweight = ModelWeightParameter(
             data=torch.empty(rows, row_bytes, dtype=torch.uint8),
@@ -271,6 +329,82 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 data=torch.empty(rows, dtype=torch.float32),
                 output_dim=0, weight_loader=weight_loader)
             layer.register_parameter("weight_scale", weight_scale)
+
+    def _require_shard_group_alignment(self, K, partitions, *, input_size,
+                                       output_size) -> None:
+        """Refuse, at construction, any TP shard that would split a group.
+
+        Two alignment laws, both evaluated on PER-RANK geometry (walker-R5
+        invariant 5 as a structured gate, never prose):
+
+        * ``input`` axis (row-parallel): a packed row is a chain of
+          256-weight superblocks and codewords/scale planes never straddle
+          one, so a K-shard must contain whole superblocks. When the WHOLE
+          tensor already violates the producer's ``in_features % 256`` SPEC
+          requirement, the artifact error is raised exactly as the unsharded
+          path always raised it; only a legal whole tensor with an illegal
+          shard gets the structured shard refusal.
+        * ``output`` axis (column-parallel): packed rows are independent
+          byte streams, but the native decode/prefill kernel families index
+          rows in 8-wide (fp4) / 16-wide (fp8) quanta. At TP=1 this is
+          enforced exactly where it has always lived — the post-load native
+          attestation in ``process_weights_after_loading`` — so the
+          single-device path is untouched; a sharded rank refuses HERE,
+          before any parameter exists.
+        """
+        if K % codec.SUPERBLOCK != 0:
+            if input_size % codec.SUPERBLOCK != 0:
+                # The whole tensor is out of producer SPEC — the artifact
+                # error, identical to the unsharded path (where K is the
+                # full input size).
+                raise ValueError(
+                    f"{self.prefix}: in_features {input_size} not a multiple "
+                    f"of {codec.SUPERBLOCK}")
+            raise ShardGroupAlignmentError(
+                qname=self.prefix, axis="input",
+                group_size=codec.SUPERBLOCK,
+                tp_degree=_shard_degree(input_size, K), shard_size=K,
+                detail="row-parallel K-shard would cut a packed superblock")
+        alignment = 8 if self.is_fp4 else 16
+        misaligned = [width for width in partitions if width % alignment]
+        if misaligned and sum(partitions) != output_size:
+            raise ShardGroupAlignmentError(
+                qname=self.prefix, axis="output", group_size=alignment,
+                tp_degree=_shard_degree(output_size, sum(partitions)),
+                shard_size=misaligned[0],
+                detail=("column-parallel N-shard violates the native kernel "
+                        f"row-alignment quantum; offending logical shards "
+                        f"{misaligned} of {partitions}"))
+
+    def _rank_local_role_widths(self, layer, shard_prefixes,
+                                widths, ckpt_rows) -> list[int]:
+        """Rank-local row width of every merged CB role.
+
+        Checkpoint role rows are FULL-tensor counts while this rank received
+        its ``1/t`` slice of every role independently (vLLM narrows each
+        role at ``tp_rank * shard_size`` with per-rank coordinates), so the
+        per-role boundary on THIS rank is ``checkpoint rows // output TP
+        degree``. At degree 1 this is the identity — the exact widths the
+        pre-TP code asserted.
+        """
+        full_role_rows = [self._lookup_ckpt_rows(sp, ckpt_rows)
+                          for sp in shard_prefixes]
+        degree = int(getattr(layer, "_cb_output_tp_degree", 1) or 1)
+        local_widths: list[int] = []
+        for sp, count in zip(shard_prefixes, full_role_rows):
+            if count % degree:
+                raise ShardGroupAlignmentError(
+                    qname=f"{sp} (role of {self.prefix})", axis="output",
+                    group_size=degree, tp_degree=degree, shard_size=count,
+                    detail=("merged-role checkpoint row count does not "
+                            "divide evenly across ranks; a rank-local role "
+                            "boundary would fall inside the role"))
+            local_widths.append(count // degree)
+        assert sum(local_widths) == sum(widths), (
+            f"{self.prefix}: rank-local checkpoint role rows {local_widths} "
+            f"(full {full_role_rows} at TP={degree}; "
+            f"sum {sum(local_widths)}) != logical width sum {sum(widths)}")
+        return local_widths
 
     # -- shard-role resolution for a (possibly fused) layer -----------------
     def _shard_roles(self):
@@ -405,17 +539,17 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             # Gated-DeltaNet ``in_proj_qkvz`` (logical_widths=[q,k,v,z], 4 chunks)
             # that the export packed as TWO targets ``in_proj_qkv``(=q+k+v) +
             # ``in_proj_z``(=z), each with its own codebook. logical_widths does
-            # NOT expose the per-ROLE boundary, so derive each role's row count
-            # from the checkpoint's separate ``<role>.cb_qweight`` tensor (vLLM
-            # merges them on load, but they are distinct on disk). The old code
-            # used widths[0] for the single role -> cb_row_offset was short ->
-            # illegal memory access in the decode/expand kernels.
+            # NOT expose the per-ROLE boundary, so derive each role's RANK-LOCAL
+            # row count from the checkpoint's separate ``<role>.cb_qweight``
+            # tensor (vLLM merges them on load, but they are distinct on disk),
+            # divided across ranks by this layer's output TP degree — at TP=1
+            # that division is the identity and the widths are exactly what the
+            # checkpoint holds. The old code used widths[0] for the single role
+            # -> cb_row_offset was short -> illegal memory access in the
+            # decode/expand kernels.
             ckpt_rows = self._ckpt_cb_rows()
-            shard_widths = [self._lookup_ckpt_rows(sp, ckpt_rows)
-                            for sp in shard_prefixes]
-            assert sum(shard_widths) == sum(widths), (
-                f"{self.prefix}: checkpoint role rows {shard_widths} "
-                f"(sum {sum(shard_widths)}) != logical width sum {sum(widths)}")
+            shard_widths = self._rank_local_role_widths(
+                layer, shard_prefixes, widths, ckpt_rows)
         blocks, row_offsets = [], []
         # Fused projections commonly reuse the exact same shared codebook for
         # every role.  Keep one physical block per exact reference tuple and

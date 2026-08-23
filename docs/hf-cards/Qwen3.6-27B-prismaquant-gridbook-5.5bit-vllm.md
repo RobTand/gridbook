@@ -44,7 +44,7 @@ tags:
 | **Memory** | **20.8 GiB weights** + KV cache, measured on one 128 GB unified-memory GB10 (`Model loading took 20.82 GiB`). Before gridbook 0.1.0 the same artifact loaded at **35.86 GiB** — dense codebook weights were resident twice ([issue #1](https://github.com/RobTand/gridbook/issues/1), fixed in [0.1.0](https://github.com/RobTand/gridbook/releases/tag/v0.1.0)); **use 0.1.0 or newer**. A 32 GB consumer Blackwell (RTX 5090, `sm_120`) should now fit weights plus a useful KV budget, and the issue reporter measured 20.54 GiB with 32k context using equivalent patches — but **we have not verified 0.1.0 on a 32 GB card ourselves**. |
 | **vLLM** | Served here on the `vllm-node` image used for the 0.1.0 verification; also exercised on 0.25.1 and 0.23.1rc1.dev1060 by an external reporter ([issue #1](https://github.com/RobTand/gridbook/issues/1)). The plugin surface is small but vLLM internals drift — pin a version you have tested. |
 | **Toolchain** | CUDA toolkit with `nvcc` on `PATH` **in the serving container** — the plugin JIT-builds its kernels on first model load (~30 s, cached). `nvcc` 13.0 is the tested toolchain. |
-| **Parallelism** | Single GPU (`tp=1`). Tensor parallelism is not implemented in the plugin. |
+| **Parallelism** | Single GPU (`tp=1`) for MoE and delegated groups; dense CB Linears shard at load time above one rank (group-boundary violations are refused). No cross-node speedup is claimed. |
 
 ```bash
 pip install gridbook
