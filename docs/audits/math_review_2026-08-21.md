@@ -51,9 +51,9 @@ Theorem (staging byte-neutrality): uchar4/u32 vectorized copies are byte-identic
 
 All changes bit-gated; benchmarks in-container on GB10 (median-of-N CUDA-event timing).
 
-### B1 — dense FP4-v2 GEMV round-2 backport (`PRISMAQUANT_CB_FP4V2_DENSE_R2`, **default ON since 0.8.13**)
+### B1 — dense FP4-v2 GEMV round-2 backport (`PRISMAQUANT_CB_FP4V2_DENSE_R2`, default OFF)
 
-Ports from the grouped kernel: predicated spill-word read, uint2 packed codebook gathers (per-element bf16→f32 chains unchanged — packed conversion stays unported per its recorded regression), aligned-down u64 burst staging with last-superblock fallback and a slot-bound guard. Bit-exact both modes (92 legacy gates + 15 new dual-mode tests). Benchmark: R2 wins all 32 measured points; gains grow with k (−0.9%…−13.6% @k16, −7.2%…−20.4% @k20), consistent with the compute-bound ncu profile. Promotion path: **flipped to default ON in 0.8.13 (2026-08-23)** on real-shape evidence, NOT on the originally-recorded NATIVE-PARITY served protocol, which was never run (no wrapper exists). Re-measured on the Qwen3.8-27B CB gold artifact's four real fp4 rungs at true (N,K) across M∈{1,2,4,8,16}: all 40 (shape × M) points bit-identical and faster, worst per-M aggregate −3.44%, best −10.17%. Bit-identity removes the quality axis, so the flip is perf-only and no artifact needs re-validation. See CHANGELOG 0.8.13 for the full deviation statement.
+Ports from the grouped kernel: predicated spill-word read, uint2 packed codebook gathers (per-element bf16→f32 chains unchanged — packed conversion stays unported per its recorded regression), aligned-down u64 burst staging with last-superblock fallback and a slot-bound guard. Bit-exact both modes (92 legacy gates + 15 new dual-mode tests). Benchmark: R2 wins all 32 measured points; gains grow with k (−0.9%…−13.6% @k16, −7.2%…−20.4% @k20), consistent with the compute-bound ncu profile. Promotion path: still opt-in. A default flip was attempted 2026-08-23 and REVERTED on measurement: R2 wins on the gold artifact's real rungs (n_sb 20/68, all 40 shape x M points bit-identical and faster, -3.44% to -10.17% per-M) but REGRESSES at M=1 when n_sb < WARPS (+9.14% at k=12/K=768/n_sb=3 vs a 0.36% control spread; +4.50% at n_sb=5; the same cells win at M=2). The original grid missed it because perf was measured only at the artifact's own K, while the 1728-config edge sweep covered small K for BIT-IDENTITY only. A flip needs a kernel early-exit or a measured n_sb crossover, plus the served leg. See CHANGELOG.
 
 ### B2 — persistent-B packed-staging vectorization (proposed; REJECTED)
 
@@ -75,7 +75,7 @@ Roofline memo conclusions adopted: decode repetition follows TM (not CTA ownersh
 | G2 | q-count premise correction (residues [1,128]) | INFO | Prover record; comment-level fix available if desired |
 | G3 | Spill-word live set = {persistent-B k44} | INFO | Justifies predicated-load optimizations; documented |
 | G4 | Empty-expert overhead negligible | INFO | Design trade priced; no action |
-| G5 | Dense-fp4v2 structural lag vs grouped kernel | PERF | FIXED by B1; **default ON in 0.8.13** (2026-08-23 real-shape M-sweep) |
+| G5 | Dense-fp4v2 structural lag vs grouped kernel | PERF | FIXED by B1 (opt-in flag); default flip ATTEMPTED and REVERTED 2026-08-23 — R2 regresses at M=1, n_sb < WARPS |
 | G6 | Multi-chunk layers missing tile-order win | PERF | FIXED by B7 (unconditional, bit-identical outputs) |
 | G7 | Byte-granular staging instruction waste | PERF | PROPOSED fix B2 REJECTED on measurement (k=12 +7…11%); item open |
 

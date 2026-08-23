@@ -857,9 +857,10 @@ DEVINL int fp4v2_stage_r2(uint8_t* __restrict__ dst,
   return 0;
 }
 
-// R2BACKPORT (round-2 backport from the grouped MoE fp4-v2 kernel, DEFAULT ON
-// since 0.8.13; set PRISMAQUANT_CB_FP4V2_DENSE_R2=0 to opt OUT): selects a
-// SECOND instantiation
+// R2BACKPORT (round-2 backport from the grouped MoE fp4-v2 kernel, opt-in via
+// PRISMAQUANT_CB_FP4V2_DENSE_R2, default OFF -- a 0.8.13 flip to default-ON was
+// REVERTED on measurement, see the n_sb < WARPS note below): selects a SECOND
+// instantiation
 // of the dense kernel with the grouped kernel's round-2 load schedule —
 //   (a) the third stage-word read s32[widx+2] is predicated on rem + k_bits
 //       > 64 (it contributes nothing otherwise), one fewer smem load per
@@ -1087,7 +1088,7 @@ void launch_gemv_fp4_v2(const torch::Tensor& xq, const torch::Tensor& qw,
   // switch and only defaulted on after a served-KL-safe A/B (bit-identical).
   const bool fp4v2_db = pq_env_is("PRISMAQUANT_CB_FP4V2_SCHED", "db");
   const int v2 = pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2") ? 1 : 0;
-  // Round-2 backport (DEFAULT ON since 0.8.13; =0 opts out): selects the
+  // Round-2 backport (opt-in, default OFF; =1 selects it): selects the
   // R2BACKPORT instantiation — the grouped MoE fp4-v2 kernel's round-2 load
   // schedule (predicated third stage-word read, packed uint2 codebook
   // gathers, aligned-down u64 burst staging) ported onto the dense kernel's
@@ -1099,7 +1100,7 @@ void launch_gemv_fp4_v2(const torch::Tensor& xq, const torch::Tensor& qw,
   // their true (N,K), all 40 (shape x M) points over M in {1,2,4,8,16} are
   // bit-identical AND faster — worst per-M aggregate -3.44%, best -10.17%.
   const bool fp4v2_r2 =
-      pq_env_bool01("PRISMAQUANT_CB_FP4V2_DENSE_R2", true);
+      pq_env_bool01("PRISMAQUANT_CB_FP4V2_DENSE_R2", false);
 #define PQ_LAUNCH_FP4V2(W, DBFLAG, R2FLAG)                                  \
   cb_gemv_fp4_v2_kernel<MT, W, DBFLAG, R2FLAG>                              \
       <<<(unsigned)N, (W)*32, 0, stream>>>(                                 \

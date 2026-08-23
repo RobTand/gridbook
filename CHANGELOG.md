@@ -2,45 +2,51 @@
 
 ## Unreleased
 
-## 0.8.13 — 2026-08-23
+## Unreleased
 
-- **Changed: the dense FP4-CB v2 GEMV round-2 backport
-  (`PRISMAQUANT_CB_FP4V2_DENSE_R2`) is now ON by default.** Set the flag to
-  `0` to opt out; the legacy instantiation stays reachable as the bisection
-  arm. Because the two instantiations are **bit-identical**, this is a
-  perf-only change: no shipped artifact's outputs, KL or PPL can move, and no
-  artifact needs re-validation.
+### Measured negative result: the R2 default flip was attempted and REVERTED
 
-  Evidence (`dq-runs/r2-kernel-2026-08-23`), measured on the Qwen3.8-27B CB
-  gold artifact's four REAL fp4 rungs (`NVFP4_CB_K12/K14/K16/K18`) at their
-  true `(N, K)` and true target multiplicities, A/B/A-interleaved per point:
+`PRISMAQUANT_CB_FP4V2_DENSE_R2` stays **default OFF**. A flip to default-ON was
+prepared, committed, and then reverted the same day when a wider grid found
+regressions the promotion evidence had missed. Recorded here because the
+measurement is the durable part.
 
-  | M | R2 delta on its own kernel | projected end-to-end | bit-identical |
-  |---|---|---|---|
-  | 1 | −7.83% | −0.591% | yes |
-  | 2 | −10.17% | −0.768% | yes |
-  | 4 | −5.89% | −0.445% | yes |
-  | 8 | −7.29% | −0.551% | yes |
-  | 16 | −3.44% | −0.260% | yes |
+**Where R2 wins.** On the Qwen3.8-27B CB gold artifact's four real fp4 rungs
+(`NVFP4_CB_K12/14/16/18`, n_sb 20 and 68), all 40 (shape × M) points over
+M∈{1,2,4,8,16} are bit-identical AND faster — per-M aggregate −3.44% to
+−10.17%.
 
-  All **40** (shape × M) points are bit-identical AND faster; zero regressions
-  at any M, covering every `launch_gemv_fp4_v2` instantiation (so MTP /
-  spec-decode verify batches at M∈{2,4,8} benefit too, not just M=1 decode).
-  Unit gate `tests/test_dense_fp4v2_backport.py` 15 passed / 1 skipped (the
-  skip is the deleted fp4 signed mode).
+**Where R2 loses.** At **M=1 with `n_sb < WARPS`**, the aligned-down u64 burst
+staging never amortizes: a warp does ONE iteration and some warps idle, so the
+setup cost dominates. Measured with 5 interleaved A/B/A repeats:
 
-  **Deviation from the recorded promotion gate, stated plainly:** `docs/
-  BENCHMARKS.md` required a served **NATIVE-PARITY** run before any default
-  flip. That protocol was **NOT** run — no wrapper for it exists. The
-  substitute evidence is (a) bit-identity, which removes the quality axis by
-  construction, leaving only perf; (b) per-shape, per-M kernel timing at the
-  artifact's real geometry, which is where B2's whole-operator regression
-  would have shown; and (c) a served A/B on the Qwen3.8-27B CB gold artifact
-  showing no regression (−0.77% warm-to-warm, matching the −0.664% read-byte
-  projection). That served A/B was itself **underpowered** — R2's kernel is
-  only 7.55% of that artifact's checkpoint bytes, so even a −20% kernel win
-  projects to ≤1.51% against a ±1.29% noise band — and is reported as
-  corroborating, not as the promotion evidence.
+| cell | n_sb | R2 delta | control spread |
+|---|---|---|---|
+| k=12 K=768 M=1 | 3 | **+9.14%** | 0.36% |
+| k=12 K=1280 M=1 | 5 | **+4.50%** | 1.33% |
+| k=12 K=1536 M=1 | 6 | +1.80% | 2.04% (borderline) |
+
+`n_sb=4` is unaffected — it takes the `use4` branch (4 warps, all active). The
+same cells at **M=2 all win** (−2.7% to −6.3%), so this is specifically the
+single-row, few-superblock tail.
+
+**Why the first evidence missed it.** The perf sweep used only the artifact's
+real K∈{5120,17408} (n_sb 20/68); the 1728-config edge fuzz *did* cover small
+K but asserted only **bit-identity**, never timing. Small `n_sb` was therefore
+never perf-tested. The lesson is the B2 lesson again in a new costume: a grid
+chosen from the shipping artifact's geometry cannot clear a kernel for
+geometry the artifact does not contain.
+
+**What a future flip needs:** either a kernel early-exit for the
+`n_sb < WARPS`/M=1 regime, or an explicit measured `n_sb` crossover in the
+launcher (the `use4` heuristic is the existing precedent for a measured
+shape-based dispatch) — plus the served leg that the reverted attempt lacked.
+
+Bit-identity itself is NOT in question and is now permanently gated:
+`tests/test_dense_fp4v2_r2_edge_geometry.py` sweeps 1728 configs over
+k∈{12..20} × K∈{512,1024,2048,3072} × N∈{1,17,48,96} × M∈{1,3,5,8,15,16} ×
+sched∈{None,db} with zero mismatches, targeting the staging boundary that
+moves with `type_size`. That test is kept.
 
 ## 0.8.12 — 2026-08-22
 

@@ -92,16 +92,20 @@ def test_r2_bit_identical_across_edge_geometry(k, K, monkeypatch):
     monkeypatch.delenv(SCHED_FLAG, raising=False)
 
 
-def test_r2_default_is_on():
-    """The 0.8.13 flip: with the env unset, the launcher must take the R2 arm.
+def test_r2_default_is_off():
+    """R2 must stay default OFF until the n_sb < WARPS regression is fixed.
 
-    Guards against a silent revert of the default in cb_gemv.cu -- the
-    CHANGELOG, audit row and BENCHMARKS all state ON, and a doc/code split
-    here is exactly the 'current and wrong' failure the house forbids.
+    A 2026-08-23 flip to default-ON was reverted: R2 wins on large n_sb but
+    LOSES at M=1 when n_sb < WARPS (+9.14% at k=12/K=768/n_sb=3 against a
+    0.36% control spread) because the burst staging never amortizes over a
+    single warp iteration. Guards against re-flipping without either a kernel
+    early-exit for that regime or an explicit measured n_sb crossover.
     """
     import pathlib
     src = pathlib.Path(__file__).resolve().parents[1] / "gridbook" / "csrc" / "cb_gemv.cu"
     text = src.read_text()
-    assert 'pq_env_bool01("PRISMAQUANT_CB_FP4V2_DENSE_R2", true)' in text, (
-        "PRISMAQUANT_CB_FP4V2_DENSE_R2 is documented as default ON since "
-        "0.8.13 but cb_gemv.cu no longer defaults it true")
+    assert 'pq_env_bool01("PRISMAQUANT_CB_FP4V2_DENSE_R2", false)' in text, (
+        "PRISMAQUANT_CB_FP4V2_DENSE_R2 defaults to ON, but the documented "
+        "measurement says it regresses at M=1 with n_sb < WARPS. If the "
+        "kernel now early-exits that regime, update this test WITH the "
+        "measurement that justifies it")
