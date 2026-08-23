@@ -832,43 +832,45 @@ DEVINL void fp4v2_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
 
 // R2 backport stage for one dense fp4-v2 superblock (grouped MoE round-2):
 // an aligned-down u64 burst replaces the byte-granular copy — ONE wide
-// evict-first load+store per lane instead of ceil(type_size/32) byte
+// evict-first load+store per active lane instead of ceil(type_size/32) byte
 // loads+stores. type_size = 4k+9 is ODD, so each superblock base has its own
-// sub-8 phase; the head offset off8 (0..7) is returned and folded into the
-// extraction's bitpos (shifted by off8*8) so the u32 smem reads line up with
-// the staged window. The LAST superblock of a row keeps the byte path: a u64
-// there could read up to 7 bytes past the row's final byte (past the tensor
-// for the last row), whereas an interior superblock reads into the next
-// in-row superblock, always in bounds. The caller's burst_ok rejects the
-// burst outright when the worst-case window would exceed the stage slot.
-DEVINL int fp4v2_stage_r2(uint8_t* __restrict__ dst,
-                          const uint8_t* __restrict__ gsrc, int lane,
-                          int type_size, bool burst_ok, bool last_sb) {
-  if (!last_sb && burst_ok) {
-    const uintptr_t a = reinterpret_cast<uintptr_t>(gsrc);
-    const int off8 = (int)(a & 7u);
-    const uint64_t* g8 = reinterpret_cast<const uint64_t*>(a - off8);
-    uint64_t* d8 = reinterpret_cast<uint64_t*>(dst);
-    const int nv = (off8 + type_size + 7) >> 3;
-    if (lane < nv) d8[lane] = __ldcs(g8 + lane);
-    return off8;
-  }
-  for (int b = lane; b < type_size; b += 32) dst[b] = __ldcs(gsrc + b);
-  return 0;
+// sub-8 head offset; off8 is a property of the ADDRESS, so the caller
+// derives it from the row phase before the loads issue and folds it into the
+// extraction bitpos (shifted by off8*8) so the u32 smem reads line up with
+// the staged window. The 8-byte window overruns the superblock's final byte
+// by up to 7 bytes: an interior superblock reads into the next in-row
+// superblock, and a ROW'S FINAL superblock reads into that row's pad slack —
+// the launcher TORCH_CHECKs stride(0) - n_sb*type_size >= 8 (pad_qweight's
+// documented read-slack invariant), so no byte-granular fallback exists on
+// this path. (The grouped MoE kernel keeps its own last-superblock byte
+// fallback: expert stacks have NO per-row padding to check.)
+DEVINL void fp4v2_stage_r2(uint8_t* __restrict__ dst,
+                           const uint8_t* __restrict__ gsrc, int lane,
+                           int type_size, int off8) {
+  const uint64_t* g8 = reinterpret_cast<const uint64_t*>(
+      reinterpret_cast<uintptr_t>(gsrc) - off8);
+  uint64_t* d8 = reinterpret_cast<uint64_t*>(dst);
+  const int nv = (off8 + type_size + 7) >> 3;
+  if (lane < nv) d8[lane] = __ldcs(g8 + lane);
 }
 
 // R2BACKPORT (round-2 backport from the grouped MoE fp4-v2 kernel, opt-in via
-// PRISMAQUANT_CB_FP4V2_DENSE_R2, default OFF -- a 0.8.13 flip to default-ON was
-// REVERTED on measurement, see the n_sb < WARPS note below): selects a SECOND
-// instantiation
-// of the dense kernel with the grouped kernel's round-2 load schedule —
-//   (a) the third stage-word read s32[widx+2] is predicated on rem + k_bits
-//       > 64 (it contributes nothing otherwise), one fewer smem load per
-//       superblock on the hot path;
-//   (b) packed uint2 codebook gathers replace 8 scalar bf16 __ldg loads per
+// PRISMAQUANT_CB_FP4V2_DENSE_R2, default OFF pending a served-leg decision):
+// selects a SECOND instantiation of the dense kernel with the grouped kernel's
+// round-2 load schedule —
+//   (a) packed uint2 codebook gathers replace 8 scalar bf16 __ldg loads per
 //       codeword (conversion chain unchanged, see fp4v2_decode_fma);
-//   (c) aligned-down u64 burst staging replaces the byte-granular stage
-//       (fp4v2_stage_r2, per-superblock head offset).
+//   (b) aligned-down u64 burst staging replaces the byte-granular stage on
+//       EVERY superblock (fp4v2_stage_r2; the launcher's pad-slack and
+//       slot-bound TORCH_CHECKs make the row-final burst provably in-bounds,
+//       and each iteration's head offset derives from the row phase before
+//       the stage issues);
+//   (c) the third stage-word read is UNCONDITIONAL, exactly like the legacy
+//       arm. R2 originally predicated it on rem + k_bits > 64 ("one fewer
+//       smem load"); on GB10 that measured SLOWER — a per-lane-divergent
+//       predicate on the hot path costs more than the load it saves, and for
+//       every shipped rung k <= 20 the word can never contribute anyway
+//       (rem + k_bits <= 51). Removed 2026-08-23 on that isolation.
 // The dense fp4-v2 GEMV is compute-bound (ncu SM 71% / mem 44%), so the goal
 // is fewer issued load instructions per codeword. BIT-EXACTNESS IS THE GATE:
 // every schedule x flag combination must produce identical bits, which tests/
@@ -915,13 +917,12 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
 
   if constexpr (R2BACKPORT) {
     // Round-2 backport paths: same decode compute, different load schedule.
-    // burst_ok: the u64 burst writes ((off8 + type_size + 7) >> 3) * 8 bytes
-    // with off8 <= 7, so require the worst case to stay inside the 208-byte
-    // stage slot (it also bounds the off8-shifted scale-byte reads). Every
-    // shipped fp4-v2 rung is far below the bound; an extreme accepted
-    // type_size falls back to the byte stage rather than scribbling into the
-    // next warp's slot.
-    const bool burst_ok = ((((7 + type_size + 7) >> 3) << 3) <= kSlotBytes);
+    // The u64 burst writes ((off8 + type_size + 7) >> 3) * 8 bytes with
+    // off8 <= 7; the launcher's TORCH_CHECKs pin BOTH bounds that make the
+    // burst unconditional here: the worst-case window stays inside the
+    // 208-byte stage slot, and every row's pad slack covers the <= 7-byte
+    // overrun of its final superblock.
+    const int row_phase = (int)(reinterpret_cast<uintptr_t>(row) & 7);
     if constexpr (DB) {
       // R2 double buffer: identical prefetch structure to the legacy DB path
       // below — stage superblock s+WARPS into the OTHER slot while decoding
@@ -934,11 +935,10 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
       // compute order preserved for the overlap.
       int s = warp;
       if (s < n_sb) {
-        const int off8_0 =
-            fp4v2_stage_r2(stage[warp][0], row + (int64_t)s * type_size, lane,
-                           type_size, burst_ok, /*last_sb=*/s + 1 >= n_sb);
+        int off8 = (row_phase + (int64_t)s * type_size) & 7;
+        fp4v2_stage_r2(stage[warp][0], row + (int64_t)s * type_size, lane,
+                       type_size, off8);
         int buf = 0;
-        int off8 = off8_0;
         while (s < n_sb) {
           __syncwarp();
           const int bitpos = off8 * 8 + lane * k_bits;
@@ -949,16 +949,21 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
               reinterpret_cast<const uint32_t*>(stage[warp][buf]);
           const uint32_t w0_ = s32[widx];
           const uint32_t w1_ = s32[widx + 1];
-          const uint32_t w2_ = (rem + k_bits > 64) ? s32[widx + 2] : 0u;
+          // Third word UNCONDITIONALLY (legacy parity): for every shipped
+          // rung rem + k_bits <= 51 < 64 it cannot contribute and the select
+          // in fp4v2_decode_fma discards it; the R2 predicated form measured
+          // SLOWER on GB10 (dq-runs/r2-tail-exp isolation, 2026-08-23).
+          const uint32_t w2_ = s32[widx + 2];
           const uint8_t super_e = stage[warp][buf][off8 + scale_off];
           const uint8_t sub_byte =
               stage[warp][buf][off8 + sub_off];
           const int s_next = s + WARPS;
           int off8_next = 0;
           if (s_next < n_sb) {
-            off8_next = fp4v2_stage_r2(
-                stage[warp][buf ^ 1], row + (int64_t)s_next * type_size, lane,
-                type_size, burst_ok, /*last_sb=*/s_next + 1 >= n_sb);
+            off8_next = (row_phase + (int64_t)s_next * type_size) & 7;
+            fp4v2_stage_r2(stage[warp][buf ^ 1],
+                           row + (int64_t)s_next * type_size, lane,
+                           type_size, off8_next);
           }
           fp4v2_decode_fma<MT, R2BACKPORT>(w0_, w1_, w2_, rem, super_e,
                                            sub_byte, grp, s, lane, M, x, K,
@@ -970,13 +975,15 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
         }
       }
     } else {
-      // R2 single buffer: burst stage, extract with the head offset folded
-      // in, release the slot, decode+FMA — the legacy structure with the
-      // round-2 staging/extraction.
+      // R2 single buffer: burst stage on EVERY superblock (the launcher's
+      // pad-slack check covers the row-final overrun), extract with the head
+      // offset folded in — derived from the row phase before the stage
+      // issues, so it does not extend the post-barrier critical chain — then
+      // release the slot, decode+FMA.
       for (int s = warp; s < n_sb; s += WARPS) {
-        const int off8 =
-            fp4v2_stage_r2(stage[warp][0], row + (int64_t)s * type_size, lane,
-                           type_size, burst_ok, /*last_sb=*/s + 1 >= n_sb);
+        const int off8 = (row_phase + (int64_t)s * type_size) & 7;
+        fp4v2_stage_r2(stage[warp][0], row + (int64_t)s * type_size, lane,
+                       type_size, off8);
         __syncwarp();
         const int bitpos = off8 * 8 + lane * k_bits;
         const int b0 = bitpos >> 3;
@@ -986,7 +993,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
             reinterpret_cast<const uint32_t*>(stage[warp][0]);
         const uint32_t w0_ = s32[widx];
         const uint32_t w1_ = s32[widx + 1];
-        const uint32_t w2_ = (rem + k_bits > 64) ? s32[widx + 2] : 0u;
+        const uint32_t w2_ = s32[widx + 2];   // unconditional, see DB note
         const uint8_t super_e = stage[warp][0][off8 + scale_off];
         const uint8_t sub_byte = stage[warp][0][off8 + sub_off];
         __syncwarp();
@@ -1081,6 +1088,22 @@ void launch_gemv_fp4_v2(const torch::Tensor& xq, const torch::Tensor& qw,
   // divides 4 but not 8 (K=1024 -> 4) leaves a tail at 8 warps; 4 warps divide
   // it exactly. Large rows amortize the tail and prefer 8 warps.
   const int n_sb = (int)(K >> 8);
+  // Burst-staging preconditions (hold for BOTH instantiations; checked once
+  // here so the R2 arm can drop its byte-granular fallback):
+  //  1. pad_qweight gives every packed row >= 8 bytes of read slack. The R2
+  //     u64 window overruns a superblock's last byte by up to 7 bytes, which
+  //     lands in the NEXT row's bytes for interior rows and in this slack for
+  //     the last row. Requiring it unconditionally keeps the weight-storage
+  //     contract arm-independent and fails loud instead of best-effort.
+  //  2. The worst-case burst window ((7 + ts + 7) >> 3) << 3 bytes stays
+  //     inside the 208-byte smem stage slot.
+  TORCH_CHECK(qw.stride(0) - (int64_t)n_sb * type_size >= 8,
+              "cb_gemv_fp4_v2 wants pad_qweight'd weights (>= 8 bytes of "
+              "read slack per packed row); got stride ", qw.stride(0),
+              " for ", n_sb, " superblocks x ", type_size, " B");
+  TORCH_CHECK((((7 + type_size + 7) >> 3) << 3) <= kSlotBytes,
+              "fp4-v2 type_size ", type_size,
+              " exceeds the burst-stage window bound");
   const bool use4 = (n_sb % 8 != 0) && (n_sb % 4 == 0) && (n_sb < 48);
   // Default: single-buffer (legacy) — the DENSE fp4-v2 kernel is the same
   // one-block-per-row (latency-exposed) shape as the dense fp8 kernel, so the
@@ -1090,34 +1113,33 @@ void launch_gemv_fp4_v2(const torch::Tensor& xq, const torch::Tensor& qw,
   const int v2 = pq_env_is("PRISMAQUANT_CB_DECODE_CONTRACT", "v2") ? 1 : 0;
   // Round-2 backport (opt-in, default OFF; =1 selects it): selects the
   // R2BACKPORT instantiation — the grouped MoE fp4-v2 kernel's round-2 load
-  // schedule (predicated third stage-word read, packed uint2 codebook
-  // gathers, aligned-down u64 burst staging) ported onto the dense kernel's
+  // schedule (packed uint2 codebook gathers, aligned-down u64 burst staging
+  // on every superblock under the launcher's pad-slack/slot-bound checks,
+  // unconditional third stage-word read) ported onto the dense kernel's
   // DB/single-buffer structure. Outputs are BIT-IDENTICAL to the legacy
   // instantiation; the switch stays so a serving run can bisect the two arms.
   // Strict {0,1} read per call: host-only, CUDA-graph-capture-safe.
-  // MEASURED SHAPE DEPENDENCE (2026-08-23, dq-runs/r2-kernel-2026-08-23) --
-  // this is why the default is still OFF. R2's win is real but CONDITIONAL.
-  // Wins: on the Qwen3.8-27B CB gold artifact's four real fp4 rungs
-  // (K12/14/16/18, n_sb 20 and 68) all 40 (shape x M) points over
-  // M in {1,2,4,8,16} are bit-identical AND faster, per-M aggregate -3.44%
-  // to -10.17%. Loses: at M=1 with a small or warp-IMBALANCED n_sb, where the
-  // aligned-down u64 burst staging never amortizes --
-  //     k=12 K= 768 (n_sb=3)  M=1: +9.14%  (control spread 0.36%)
-  //     k=12 K=1280 (n_sb=5)  M=1: +4.50%  (control spread 1.33%)
-  //     k=12 K=2304 (n_sb=9)  M=1: +2.43%  (control spread 1.38%)
-  // An n_sb sweep {1..24} x k in {12,16} shows the crossover is RAGGED, not a
-  // threshold: the use4 branch (n_sb 4,12,20) never loses, and n_sb 8/16/24
-  // are fine because every warp does an equal number of iterations -- but
-  // n_sb 9/10 lose at k=12, where one or two warps do TWO iterations while
-  // the rest do one, so the straggler carries R2's un-amortized setup on the
-  // critical path. It is k-dependent and non-monotone, so a use4-style
-  // dispatch cannot express it; a fix belongs in the KERNEL (early-exit or
-  // cheaper staging when a warp's iteration count is 1, or the block is
-  // imbalanced), not in this launcher. M=2 wins essentially everywhere.
-  // A default flip was attempted on 2026-08-23 and REVERTED when this was
-  // found. All 60 crossover cells were bit-identical; correctness is not the
-  // issue, and tests/test_dense_fp4v2_r2_edge_geometry.py gates it at 1728
-  // configs.
+  // MEASURED STATE (2026-08-23, dq-runs/r2-kernel-2026-08-23 +
+  // dq-runs/r2-tail-exp) -- this is why the default is still OFF pending a
+  // served-leg decision. The ORIGINAL round-2 backport won large n_sb but
+  // regressed at M=1 whenever n_sb was small or warp-imbalanced (k=12:
+  // +9.14% at n_sb=3, +4.50% at 5, +2.43% at 9 vs control spreads <=1.4%),
+  // which reverted the first default flip. Ingredient isolation over one
+  // binary (env-selected arms, interleaved A/B/A, all arms bit-compared)
+  // attributed the loss NOT to the packed gathers (innocent at every cell)
+  // but to two staging-side details: the LAST-superblock byte-path fallback
+  // -- which put the straggler iteration of an imbalanced block on the slow
+  // path and inlined a multi-way stage-dispatch tree -- and the per-lane
+  // predicated third-word read. The kernel fix (burst on every superblock
+  // behind fail-loud pad-slack/slot-bound checks, unconditional third word,
+  // phase-derived head offset off the post-barrier chain) removed the
+  // regression WITHOUT removing the win: the n_sb {1..24} x k {12,16} x M
+  // {1,2} A/B/A sweep has ZERO loss cells (M=1 spans -0.03% .. -18.9%, M=2
+  // -2.4% .. -17.3%, all bit-identical), and the Qwen3.8-27B real-shape bench
+  // reports 0 regressions beyond control drift with per-M kernel-time
+  // aggregates -11.4% .. -20.1%. A default flip remains a separate decision
+  // with a served leg attached; tests/test_dense_fp4v2_r2_edge_geometry.py
+  // gates bit-identity at 1728 configs either way.
   const bool fp4v2_r2 =
       pq_env_bool01("PRISMAQUANT_CB_FP4V2_DENSE_R2", false);
 #define PQ_LAUNCH_FP4V2(W, DBFLAG, R2FLAG)                                  \

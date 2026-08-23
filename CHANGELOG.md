@@ -179,6 +179,62 @@ k∈{12..20} × K∈{512,1024,2048,3072} × N∈{1,17,48,96} × M∈{1,3,5,8,15,
 sched∈{None,db} with zero mismatches, targeting the staging boundary that
 moves with `type_size`. That test is kept.
 
+### Fixed: the R2 M=1 imbalanced-tail regression, kernel-side (default stays OFF)
+
+The regression above is fixed IN the `R2BACKPORT` instantiation — no
+`n_sb`/warp-count dispatch was added — so the default flip is unblocked pending
+only the served leg. Ingredient isolation over ONE binary with env-selectable
+arms (interleaved A/B/A, every arm bit-compared per cell;
+`dq-runs/r2-tail-exp`) attributed the loss to two staging-side details, and
+**acquitted the packed gathers** (the arm that adds ONLY uint2 gathers tracks
+legacy within noise at every cell, including n_sb=1):
+
+| isolation arm (k=12, M=1) | n_sb=1 | n_sb=3 | n_sb=9 |
+|---|---|---|---|
+| legacy | 14.04 us | 15.38 | 27.53 |
+| shipped R2 | 16.05 (+14.3%) | 17.11 (+11.2%) | 28.95 (+5.2%) |
+| gathers only | 14.14 (+0.7%) | 15.28 (~) | 27.58 (~) |
+| burst staging only (scalar gathers) | 16.21 (+15.5%) | 17.13 (+11.4%) | 29.17 (+6.0%) |
+| R2 + last-sb burst | 14.76 (+5.1%) | 16.02 (+4.2%) | 27.90 (+1.3%) |
+| R2 + last-sb burst + unconditional w2 | 14.58 (+3.9%) | 15.80 (+2.7%) | 27.41 (−0.4%) |
+
+1. **Last-superblock byte-path fallback.** It put the straggler iteration of an
+   imbalanced block (the ONLY iteration when `n_sb <= WARPS` for the row-final
+   warp) on a slower path, and inlining both stage variants produced a
+   multi-way specialized dispatch tree in SASS.
+2. **Predicated third stage-word read.** The per-lane-divergent predicate on
+   the hot path costs more than the smem load it saves on GB10; for every
+   shipped rung k≤20 (`rem+k ≤ 51 < 64`) the word can never contribute, and
+   the guarded compose discards whatever is read, so reading it unconditionally
+   (legacy parity) is bit-safe at every k.
+
+The landed fix: burst staging on EVERY superblock behind two fail-loud
+launcher checks — `qw.stride(0) - n_sb*type_size >= 8` (pad_qweight's
+documented ≥8-byte read-slack invariant covers the ≤7-byte window overrun of a
+row's final superblock) and the worst-case burst window inside the 208-byte
+stage slot — plus an UNCONDITIONAL third-word read, plus each iteration's head
+offset derived from the row phase BEFORE the stage issues (an address
+property), taking the off8→bitpos chain off the post-barrier critical path.
+The grouped MoE kernel keeps its own last-superblock byte fallback (expert
+stacks have no per-row padding to check).
+
+Measured result (same harnesses as the negative result,
+`dq-runs/r2-tail-exp/logs/both.log`):
+
+- **Crossover sweep** n_sb∈{1..24 grid} × k∈{12,16} × M∈{1,2}, interleaved
+  A/B/A: **zero loss cells**, every cell bit-identical. M=1 deltas span
+ −0.03%…−18.91% (the +11.75%/+9.14%/+2.43% cells are now
+ −0.78%/−0.52%/−7.48%); M=2 spans −2.39%…−17.27%.
+- **Qwen3.8-27B real-shape bench**: 0 of 40 (shape × M) points regress beyond
+  their control drift; per-M kernel-time aggregates M=1 −17.69%, M=2 −18.59%,
+  M=4 −13.15%, M=8 −20.08%, M=16 −11.39%. The large-n_sb win is LARGER than
+  the shipped backport's (−3.44%…−10.17%), not traded away.
+
+`PRISMAQUANT_CB_FP4V2_DENSE_R2` remains default OFF; flipping it is now a
+served-leg decision, not a correctness or shape-risk one. Callers hitting the
+new pad-slack check were never safe under the old last-row arithmetic either;
+all production paths build weights through `codec.pad_qweight`.
+
 ## 0.8.12 — 2026-08-22
 
 - **Added: dense FP4-CB v2 GEMV round-2 backport behind
