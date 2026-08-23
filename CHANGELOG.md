@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+### CB MoE expert stacks serve under expert parallelism (contract schema v7)
+
+Routed CB MoE now serves above one rank with `-tp N --enable-expert-parallel`.
+Tensor parallelism was never the right axis for it and still refuses: a CB
+expert stack's last dimension is `(in/256)·type_size` superblock bytes, not
+input columns, so vLLM's intermediate split would cut a packed superblock and
+there is no partial-superblock decode. Expert parallelism shards the EXPERT
+axis — the axis a stack is already indexed on — so every rank holds whole
+experts, whole superblocks, and per-expert numerics byte-identical to a
+single-rank serve. Dense Linears in the same model stay tensor-parallel at the
+full world size, which is vLLM's own split.
+
+- New torch-only `gridbook/moe_ep.py`. `local_expert_gather_index` turns
+  `layer.expert_map` into this rank's global-id gather index ordered by local
+  slot — a general `nonzero` gather, never a contiguous-range assumption,
+  because vLLM's `round_robin` placement is genuinely interleaved — and
+  refuses any map that is not a monotone bijection onto `range(E_local)`.
+  `remap_local_expert_ids` rewrites global router ids to local slots inside
+  the opaque custom op, aliasing remote pairs to the token's own smallest
+  local expert at weight exactly `0.0` (expert 0 only when the token has no
+  local pair). Compaction would make the pair count data-dependent and so
+  uncapturable; aliasing keeps every shape static, and it is exact rather than
+  approximate because `apply_router_weight_on_input` is refused outright for
+  CB MoE, so the router weight is always applied in the combine.
+- Both loaders — the `RoutedExperts` instance wrapper in `moe.py` and the
+  top-level `load_weights` wrapper — gather a whole-stack `(E_global, …)`
+  checkpoint tensor down to this rank through one shared rule that reads only
+  what `create_weights` stamped on the destination param, so neither needs a
+  module lookup. Their shape refusals now name the EP placement.
+- `config.py::_require_ep_moe_serving` admits the stacked lane above one rank
+  only under `use_ep` with MoE `tp_size` 1, no all2all topology (data-,
+  pipeline-context- and sequence-parallel EP expect a dispatch/combine method
+  Gridbook does not implement), no EPLB, and no `skip_final_all_reduce` —
+  the last because Gridbook returns this rank's partial and relies on vLLM's
+  stock final all-reduce. Mixed per-expert-format stacks keep refusing, now
+  naming the mode that does serve. Each admitted layer announces itself.
+- Contract: a new `expert_parallel` section on its own axis, with the topology
+  predicate and per-unit `expert_admission` laws, validated field-for-field
+  against the enforcement sites. `schema` and `contract_version` move together
+  to `gridbook.runtime-contract.v7` / 7; a v6-pinned producer must refuse a v7
+  contract whole until its pin is bumped deliberately.
+- **Not measured**: no two-node serve has been run. The evidence is
+  single-box, simulating the split in-process — per-rank stacks byte-identical
+  to slices of the whole stack, remote pairs bitwise inert through the real
+  decode and prefill kernels (proved by output invariance under three
+  different alias targets), the remapped decode capturing and replaying as a
+  CUDA graph, and per-rank partials summing to the whole-layer answer.
+  Expert-parallel serving is correctness-only until the two-node gate runs.
+
 ### Signed CB family (NVFP4_CB_S) deleted from the runtime
 
 The sign-magnitude codebook family is gone from gridbook's runtime, not just

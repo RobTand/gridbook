@@ -27,6 +27,7 @@ for "gridbook" will find nothing. Search for **`[prismaquant-cb]`**.
 - [Do I really need `--enforce-eager`?](#do-i-really-need---enforce-eager)
 - [Non-Blackwell GPU: what breaks](#non-blackwell-gpu-what-breaks)
 - [Tensor parallel (`tp > 1`)](#tensor-parallel-tp--1)
+- [Expert parallel (`-tp N --enable-expert-parallel`)](#expert-parallel--tp-n---enable-expert-parallel)
 - [The model loads but generates garbage](#the-model-loads-but-generates-garbage)
 - [Other exceptions you may hit](#other-exceptions-you-may-hit)
 - [The first model load stalls for kernel compilation](#the-first-model-load-stalls-for-kernel-compilation)
@@ -465,8 +466,14 @@ superblock boundaries only — a degree whose K-shard or N-shard would break a
 group boundary is refused at weight construction with a structured
 `ShardGroupAlignmentError` naming the target, axis, group size and degree.
 
-Everything else still refuses at construction, naming itself: MoE expert
-stacks (expert parallelism is the planned first target there), delegated
+**Routed CB MoE expert stacks are the exception, and they need a different
+flag.** A CB expert stack's last dimension is superblock bytes, not input
+columns, so a tensor-parallel intermediate split would cut a packed
+superblock. Serve them with `-tp N --enable-expert-parallel`, which shards the
+expert axis instead — see [Expert parallel](#expert-parallel-tp--1---enable-expert-parallel).
+`-tp N` alone refuses at construction and says so.
+
+Everything else still refuses at construction, naming itself: delegated
 compressed-tensors groups, source-passthrough units, quantized embedding
 units and mixed-format fused projections. An artifact mixing those surfaces
 with dense CB therefore fails on its first unsupported layer. Ignored
@@ -480,6 +487,52 @@ dynamic FP8 activation scales are computed over each rank's local K window
 on row-parallel layers at TP>1, exactly as stock W8A8 schemes behave — so
 served logits are not bit-identical to TP=1; quality comparison belongs to
 the standing same-session KL gate.
+
+---
+
+## Expert parallel (`-tp N --enable-expert-parallel`)
+
+The multi-rank mode for **routed CB MoE expert stacks**. Tensor parallelism
+splits a unit's rows and columns, which a CB expert stack cannot survive — its
+last dimension is `(in/256)·type_size` superblock bytes, and there is no
+partial-superblock decode. Expert parallelism splits the expert axis, which is
+the axis a stack is already indexed on, so each rank holds whole experts and
+whole superblocks. A rank's expert bytes are byte-identical to the
+corresponding slice of a single-rank stack.
+
+**Symptom** — `Gridbook serves CB MoE expert stacks ... above one rank only
+under expert parallelism; the live vLLM worker reports TP=2 and expert
+parallelism is off for this MoE layer.`
+
+**Fix** — add `--enable-expert-parallel`. `-tp N` alone tensor-parallelizes the
+expert stacks, which is the case being refused. Dense Linears in the same model
+stay tensor-parallel at the full world size; that is vLLM's own split, not a
+setting you choose separately.
+
+On a successful load each admitted layer announces itself:
+
+```
+[prismaquant-cb] moe_admission model.layers.3.mlp.experts -> expert_parallel(ep_size=2); this rank holds 128 of 256 experts
+```
+
+Other refusals on this path, and what each means:
+
+| Refusal names | Why |
+|---|---|
+| `moe tp_size=N` | Expert parallelism is on but the MoE layer is still tensor-parallel; EP must own the whole MoE axis. |
+| `all2all expert-parallel topology (dp_size=… pcp_size=… sp_size=…)` | Data-, pipeline-context- or sequence-parallel EP. vLLM switches those to all2all dispatch/combine kernels, which expect a MoE method that exchanges tokens between ranks; Gridbook computes only its own experts. Set those sizes to 1. |
+| `expert-load-balancing (EPLB) is enabled` | Gridbook holds whole expert stacks resident and cannot follow a live re-placement. |
+| `skip_final_all_reduce is set` | Gridbook returns this rank's partial output and relies on vLLM's stock final all-reduce to sum the ranks. With the reduce skipped, nothing sums them. |
+| `expert_map is not a bijection` / `is not monotone` | The placement this rank was given does not name each of its local slots exactly once in ascending order. Both stock placement strategies (`linear`, `round_robin`) satisfy this; a custom one may not. |
+| `per-expert format groups` | A mixed-format expert stack. Its format partition is declared over *global* expert ids and each per-format sub-stack is sized from that partition, so a rank owning an arbitrary subset can neither size nor fill them. Export the layer as a single CB format. |
+
+**The honest caveat**: no two-node serve has been measured. Everything above is
+established on one box by simulating the split in-process — byte-identical
+per-rank stacks, bitwise-inert remote pairs through the real kernels, and
+per-rank partials that sum to the whole-layer answer
+(`tests/test_moe_ep_exactness.py`). Treat expert-parallel serving as a
+correctness feature for models that do not fit one box, not a measured
+speedup, until that gate runs.
 
 ---
 

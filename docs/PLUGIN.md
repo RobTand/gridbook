@@ -104,10 +104,10 @@ second runtime tree or maintain a parallel loader table.
   shard_size fields — input axis requires whole 256-weight superblocks;
   output axis requires the native kernel's 8-wide (fp4) or 16-wide (fp8) row
   quantum). Everything else keeps refusing at construction, naming itself:
-  MoE expert stacks (EP-first, `moetp.md`), delegated compressed-tensors
-  groups, source-passthrough units (the FP8 lane pins TP=1 in its own
-  release gate), quantized embedding units and mixed-format fused
-  projections. Ignored (BF16) Linears stay on vLLM-native sharding. Dense
+  delegated compressed-tensors groups, source-passthrough units (the FP8 lane
+  pins TP=1 in its own release gate), quantized embedding units and
+  mixed-format fused projections. Ignored (BF16) Linears stay on vLLM-native
+  sharding. Dense
   TP>1 remains **correctness-only**: no two-node serve has been measured on
   this hardware yet, so nothing here claims a decode win. The fact is
   published, not prose: every serving unit carries a `tensor_parallel` row
@@ -116,6 +116,25 @@ second runtime tree or maintain a parallel loader table.
   `FULL_DECODE_ONLY` is also capture-correct with the permanent opaque dispatch
   and is being promoted through the model-size performance gates
   ([details](TROUBLESHOOTING.md#do-i-really-need---enforce-eager)).
+- **MoE expert stacks: expert parallel, not tensor parallel.** A CB expert
+  stack's last dimension is superblock bytes, not input columns, so vLLM's
+  tensor-parallel intermediate split would cut a packed superblock and there
+  is no partial-superblock decode. Serve routed CB MoE above one rank with
+  `-tp N --enable-expert-parallel`, which shards the EXPERT axis instead: each
+  rank holds a disjoint subset of whole experts, whole superblocks, and
+  per-expert numerics byte-identical to a single-rank serve. `-tp N` **without**
+  `--enable-expert-parallel` refuses at method construction, naming the flag.
+  So do the expert-parallel topologies whose premise Gridbook has not
+  established — data-, pipeline-context- and sequence-parallel EP (vLLM
+  switches those to all2all dispatch/combine kernels, which expect a MoE
+  method that exchanges tokens), EPLB, and `skip_final_all_reduce` (Gridbook
+  returns this rank's partial and relies on vLLM's stock final all-reduce).
+  Mixed per-expert-format stacks also stay refused: their format partition is
+  declared over global expert ids. The capability is published per unit in the
+  contract's `expert_parallel` section (see
+  [Expert-parallel capability](#expert-parallel-capability)). Like dense TP>1,
+  this is **correctness-only**: no two-node serve has been measured on this
+  hardware, so nothing here claims a throughput result.
 - **BF16 activations only** — the shipping CUDA dense and grouped-MoE bindings
   require BF16. Gridbook no longer advertises FP16 to vLLM and therefore fails
   at dtype validation instead of crashing or changing dtype at a dispatch
@@ -128,7 +147,7 @@ second runtime tree or maintain a parallel loader table.
 
 ## Tensor-parallel capability
 
-As of contract schema `gridbook.runtime-contract.v6`, the packaged contract
+As of contract schema `gridbook.runtime-contract.v7`, the packaged contract
 carries a `tensor_parallel` section that publishes, per serving unit, what the
 runtime actually enforces. The table is an attestation: each row restates a
 refusal or admission site in this package, and
@@ -174,12 +193,49 @@ contract that omits a shipped unit, invents one, drops a mandatory field,
 caps the capless dense CB surface with a number, or publishes a numeric claim
 no enforcement site stands behind.
 
-**Compatibility rule:** `schema` and `contract_version` move together (v6 / 6),
+**Compatibility rule:** `schema` and `contract_version` move together (v7 / 7),
 and readers match the schema string exactly. A producer pinned to
-`gridbook.runtime-contract.v5` must refuse a v6 contract whole — no partial
+`gridbook.runtime-contract.v6` must refuse a v7 contract whole — no partial
 parsing, no field-by-field salvage across versions — and keep producing against
-its pinned runtime until its pin is deliberately bumped. Reading a v5 contract
-with a v6 reader fails the same way.
+its pinned runtime until its pin is deliberately bumped. Reading a v6 contract
+with a v7 reader fails the same way.
+
+## Expert-parallel capability
+
+`expert_parallel` is the second axis, published beside `tensor_parallel` and
+read the same way. Tensor parallelism splits one unit's rows and columns;
+expert parallelism splits a routed MoE layer's experts and leaves every expert
+whole. CB expert stacks serve on the second axis and never on the first, so
+they carry rows here and none there. `tests/test_runtime_contract_ep.py`
+checks every row against the source text of its enforcement site.
+
+- `axis` is vLLM's expert-parallel size, and `semantics` is `closed_world` —
+  same reading rule as above: exactly one row named *U*, or refusal.
+- `requires` is the TOPOLOGY predicate, which is what makes this axis
+  different: expert parallelism only keeps whole experts if no other parallel
+  axis is splitting the layer too. Each field is one branch of
+  `config.py::_require_ep_moe_serving` — `vllm_flag`
+  (`--enable-expert-parallel`), `moe_tensor_parallel_size` 1,
+  `all2all_kernels` false (vLLM's own derivation covering dp / pcp /
+  sequence-parallel EP), `expert_load_balancing` false, and
+  `skip_final_all_reduce` false.
+- `cb_moe_expert_stack` rows (`NVFP4_CB_K`, `FP8_CB_K`) publish
+  `expert_admission` laws rather than a numeric cap, for the same reason the
+  dense CB rows do: `shard_axis` `expert`; `sharded_dims` `none` (a rank's
+  expert bytes are byte-identical to the corresponding slice of the
+  world-size-1 stack); `placement` `monotone_bijection` (the loaders refuse
+  any other `expert_map`); `checkpoint_leading_dim` `global_expert_count`
+  (both loaders gather a whole-stack checkpoint tensor down to this rank);
+  `remote_pair_handling` `zero_weight_alias`; and `cross_rank_reduction`
+  `vllm_final_all_reduce` — the reduction is vLLM's, not Gridbook's.
+- `cb_moe_expert_stack_refused` rows publish an explicit `max_world_size` so a
+  consumer can tell *refused* from *unknown*. Today that is
+  `cb_moe_per_expert_format_groups`, capped at 1.
+
+**Not yet measured:** every claim here is single-box. The two-node gate — a
+real `-tp 2 --enable-expert-parallel` serve across two hosts, with generation
+and a KL check against the single-rank artifact — has not been run, and until
+it has, expert-parallel serving is correctness-only.
 
 ## Layout / registration
 
