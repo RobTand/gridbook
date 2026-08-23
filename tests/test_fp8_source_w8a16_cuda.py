@@ -171,9 +171,22 @@ def test_raw_gemv_m1_m2_m4_m8_matches_independent_oracle(m):
 
 
 @pytest.mark.parametrize("n,k", [
+    # Whole-model (TP=1) planes.
     (8192, 4096),
     (32768, 1024),
     (4096, 8192),
+    (2048, 4096),
+    (4096, 2048),
+    # The per-rank planes a TP=2 serve actually hands the kernel: wq_b
+    # (32768,1024) and wo_a (8192,4096) cut on the output axis, wo_b
+    # (4096,8192) and down_proj (4096,2048) cut on the input axis, and one
+    # shared-expert gate/up role (2048,4096) cut on the output axis. Every
+    # local extent is a multiple of the 128 source block, so these are the
+    # shapes the shard law admits rather than shapes chosen for coverage.
+    (16384, 1024),
+    (4096, 4096),
+    (4096, 1024),
+    (1024, 4096),
 ])
 def test_decode_covers_each_distinct_dsv4_source_shape(n, k):
     q, scales = _raw_planes(n, k, seed=n + k)

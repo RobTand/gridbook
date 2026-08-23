@@ -174,10 +174,13 @@ of that site.
     row exists so a producer can pre-check the same laws.
   - **Source-passthrough formats** publish a numeric `max_world_size` of 1
     unless their lane enforces shard laws of its own. A unit whose method
-    branches on an execution arm carries per-arm rows INSTEAD of a unit-level
-    number, because one scalar cannot cover a law-admitted arm and a capped
-    arm at once; each arm then carries either `max_world_size` or
-    `shard_admission`, never both.
+    branches on an execution arm additionally carries per-arm rows, and each
+    arm carries either `max_world_size` or `shard_admission`, never both nor
+    neither. A unit with a **law-admitted** arm carries no unit-level number
+    at all, because one scalar cannot cover a law-admitted arm and a capped
+    arm at once; an armed unit whose every arm is capped keeps its unit cap of
+    1, which its dispatch gate does enforce. Where a unit-level number is
+    present it gates first, before the arm row is consulted.
   - **The one law-admitted passthrough arm** (v7) is
     `fp8_e4m3_ue8m0_block128` / `dense`. Its `shard_admission` publishes
     `input_axis_group` 128, `output_axis_quantum` 128 and `merged_roles`
