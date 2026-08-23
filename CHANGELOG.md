@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### FP8 source passthrough serves above one tensor-parallel rank
+
+The `fp8_e4m3_ue8m0_block128` lane's dense arm no longer pins TP=1. The pin
+(`_DSV4_RELEASE_TP`, plus the blanket refusal in `config._delegate_passthrough`)
+was a release gate, not a measurement: the lane's own byte layout is exactly
+what vLLM's stock narrowing already shards. It is replaced by the structural
+law that makes that narrowing correct.
+
+- **The law.** `BlockQuantScaleParameter` narrows the UE8M0 plane with the
+  same arithmetic as the value plane, converting element counts to block
+  counts by ceil division, so the narrow start is `rank * ceil(local / 128)`.
+  That indexes the full plane's block grid correctly if and only if the
+  per-rank extent on the sharded axis is a whole multiple of 128; below it,
+  ranks silently read shifted blocks. `fp8_source_w8a16` now refuses anything
+  else with `ShardAlignmentError` (a `ValueError`) inside `create_weights` —
+  before any parameter exists for a loader to copy into, because a misaligned
+  narrow is silently wrong rather than loud. On a merged plane the law is per
+  fused role, since the block offsets are converted role by role.
+- **The degree is structural.** Shard degrees come from `create_weights`' own
+  arguments (`input_size` vs `input_size_per_partition`, `output_size` vs
+  `sum(output_partition_sizes)`), never from `layer.tp_size`: vLLM's
+  `LinearBase` stamps the world size onto every layer, including
+  `ReplicatedLinear` and `disable_tp=True` merged planes. DeepSeek-V4 has 64
+  such replicated passthrough planes per model that report `tp_size = N` while
+  holding whole tensors; enforcing on `tp_size` would refuse them.
+- **The grouped-BMM arm still refuses above degree 1.** Column-sharding a
+  grouped `wo_a` plane divides the kernel's group count (G 8 -> 4 at TP=2).
+  The scale narrowing is byte-exact there — the cut lands on a group boundary
+  — but the kernel qualification does not transfer, so the arm refuses with a
+  message naming what a re-qualification would need. Qualified geometries live
+  in one table (`_QUALIFIED_BMM_GEOMETRIES`) so a measured one can be added.
+- **Other passthrough formats are unchanged.** `mxfp4_e2m1_ue8m0_g32` and
+  `mxfp8_e4m3_e8m0_g32` have no sharded audit and keep refusing by name at
+  dispatch; mixed-format fused planes keep their own separate refusal.
+- **Contract v7.** An armed passthrough unit now publishes admission per arm
+  and carries no unit-level `max_world_size`: one scalar cannot cover a
+  law-admitted arm and a capped arm at once. The FP8-source dense arm
+  publishes `shard_admission` (`input_axis_group` 128, `output_axis_quantum`
+  128, `merged_roles` `per_role_group_multiple`); its BMM arm keeps
+  `max_world_size` 1 with the pinned geometry. `mxfp8_e4m3_e8m0_g32` moves to
+  the same shape with both arms still capped at 1 — no capability change.
+  Schema and `contract_version` move together to v7 / 7.
+
 ### CB MoE expert stacks serve under expert parallelism (contract schema v7)
 
 Routed CB MoE now serves above one rank with `-tp N --enable-expert-parallel`.

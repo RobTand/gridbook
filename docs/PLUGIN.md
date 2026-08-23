@@ -172,18 +172,38 @@ of that site.
     (`even_division`; merged checkpoint roles divide across ranks). A shard
     that violates them is refused by the runtime regardless of the table; the
     row exists so a producer can pre-check the same laws.
-  - **Source-passthrough formats** keep numeric `max_world_size` rows pinned
-    to 1. A unit whose method branches on an execution arm carries per-arm
-    rows; the `fp8_e4m3_ue8m0_block128` BMM arm additionally pins the only
+  - **Source-passthrough formats** publish a numeric `max_world_size` of 1
+    unless their lane enforces shard laws of its own. A unit whose method
+    branches on an execution arm carries per-arm rows INSTEAD of a unit-level
+    number, because one scalar cannot cover a law-admitted arm and a capped
+    arm at once; each arm then carries either `max_world_size` or
+    `shard_admission`, never both.
+  - **The one law-admitted passthrough arm** (v7) is
+    `fp8_e4m3_ue8m0_block128` / `dense`. Its `shard_admission` publishes
+    `input_axis_group` 128, `output_axis_quantum` 128 and `merged_roles`
+    `per_role_group_multiple`: the lane derives each Linear's shard degree
+    from its own `create_weights` arguments — never from `layer.tp_size`,
+    which vLLM stamps onto replicated layers too — and refuses, before any
+    parameter exists, any shard whose per-rank extent on the sharded axis is
+    not a whole multiple of the 128-element source block. That is exactly the
+    condition under which vLLM's `BlockQuantScaleParameter` narrow (start
+    `rank * ceil(local / 128)`) indexes the UE8M0 block grid correctly; below
+    it, ranks read shifted scale blocks with no error. On a merged plane the
+    law applies per fused role, because the block offsets are converted role
+    by role. The refusal is `ShardAlignmentError` (a `ValueError`).
+  - **The same unit's `bmm` arm stays capped at 1** and pins the only
     qualified grouped geometry (`bmm_groups` 8, `rows_per_group` 1024,
-    `k` 4096).
+    `k` 4096). Column-sharding a grouped plane divides the kernel's group
+    count (G 8 -> 4 at TP=2), which is a new kernel qualification rather than
+    a shard law, so it is refused until one is measured.
 - `semantics` is `closed_world`. A consumer must read the table with the same
   rule the validator enforces for publishers:
 
   Serving unit *U* at world size *t* is permitted only if the table contains
   exactly one row named *U* and the exact arm row when the unit has arms; a
   numeric claim must cover *t*, and any pinned geometry must match exactly;
-  a dense CB row defers to its published laws at weight construction. Every
+  a row (or arm) that publishes `shard_admission` defers to those laws at
+  weight construction and carries no number to compare against. Every
   other outcome — no row, two rows, an unknown arm name, a larger *t* than a
   numeric claim, a different geometry — is a refusal. There is no default,
   wildcard, or inheritance.

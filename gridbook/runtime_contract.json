@@ -147,11 +147,14 @@
       {
         "unit": "fp8_e4m3_ue8m0_block128",
         "kind": "source_passthrough_format",
-        "max_world_size": 1,
         "arms": [
           {
             "arm": "dense",
-            "max_world_size": 1
+            "shard_admission": {
+              "input_axis_group": 128,
+              "output_axis_quantum": 128,
+              "merged_roles": "per_role_group_multiple"
+            }
           },
           {
             "arm": "bmm",
