@@ -130,18 +130,18 @@ def _build_fp4(*, experts=_E_GLOBAL, hidden=_HIDDEN, inter=_INTER, k=15,
     from gridbook.moe import PrismaQuantCBMoEMethod
 
     n_sub = 2
-    type_size = 4 * k + 9
+    coding = fmt.SCALE_CODING_TWO_TIER
+    type_size = fmt.nvfp4_cb_type_size(k, "fp4", coding)
+    assert type_size == 4 * k + 9, "two-tier v2 type size moved"
     codebook = fmt._resolve_codebook(k, "fp4", "product", None,
                                      torch.device(DEV))
     torch.manual_seed(seed)
     w13 = torch.randn(experts, 2 * inter, hidden, device=DEV) * 0.05
     w2 = torch.randn(experts, hidden, inter, device=DEV) * 0.05
     p13, _ = fmt.nvfp4_cb_pack(w13, k, grid="fp4", mode="product",
-                               codebook=codebook,
-                               coding=fmt.SCALE_CODING_TWO_TIER)
+                               codebook=codebook, scale_coding=coding)
     p2, _ = fmt.nvfp4_cb_pack(w2, k, grid="fp4", mode="product",
-                              codebook=codebook,
-                              coding=fmt.SCALE_CODING_TWO_TIER)
+                              codebook=codebook, scale_coding=coding)
 
     method = PrismaQuantCBMoEMethod.__new__(PrismaQuantCBMoEMethod)
     method.quant_config = None
@@ -388,6 +388,7 @@ def test_rank_partials_sum_to_the_whole_layer_output(fmt, placement, tokens,
 @pytest.mark.parametrize("placement", list(MAPS))
 def test_every_pair_is_live_on_exactly_one_rank(placement):
     """The routing-level statement behind the sum, checked without kernels."""
+    _require_stack()
     ids, w = _routing(64, _E_GLOBAL, _TOPK, seed=2)
     live = torch.zeros_like(w)
     for rank in range(4):
