@@ -233,10 +233,10 @@ tile *is* an NVFP4/FP8 tile:
 Formats mix per-Linear with plain NVFP4, FP8 and BF16 inside one standard
 `safetensors` checkpoint. The 0.5 native dense serving gate is deliberately
 narrower than the format spec: CB Linears must be biasless, and FP4 must be an
-unsigned product rung with v2 scale coding. A non-`None` bias, signed S-rung,
-or FP4-v1 dense layer is never routed through an unowned framework operation:
-the public dense method rejects bias, and model load rejects the two unsupported
-FP4 families. See [`docs/MOTIVATION.md`](docs/MOTIVATION.md) for the
+unsigned product rung with v2 scale coding (the signed S-rung family was
+deleted from the runtime on 2026-08-23). A non-`None` bias or FP4-v1 dense
+layer is never routed through an unowned framework operation: the public dense
+method rejects bias, and model load rejects the unsupported FP4-v1 family. See [`docs/MOTIVATION.md`](docs/MOTIVATION.md) for the
 full argument and [`docs/KERNELS.md`](docs/KERNELS.md) for the kernel design.
 
 ---
