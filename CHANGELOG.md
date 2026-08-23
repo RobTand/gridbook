@@ -31,14 +31,17 @@ law that makes that narrowing correct.
   grouped `wo_a` plane divides the kernel's group count (G 8 -> 4 at TP=2).
   The scale narrowing is byte-exact there — the cut lands on a group boundary
   — but the kernel qualification does not transfer, so the arm refuses with a
-  message naming what a re-qualification would need. Qualified geometries live
-  in one table (`_QUALIFIED_BMM_GEOMETRIES`) so a measured one can be added.
+  message naming what a re-qualification would need. Qualified geometries are
+  built in one place (`_qualified_bmm_geometries()`) from the pinned constants,
+  so a measured geometry can be added there and nowhere else.
 - **Other passthrough formats are unchanged.** `mxfp4_e2m1_ue8m0_g32` and
   `mxfp8_e4m3_e8m0_g32` have no sharded audit and keep refusing by name at
   dispatch; mixed-format fused planes keep their own separate refusal.
-- **Contract v7.** An armed passthrough unit now publishes admission per arm
-  and carries no unit-level `max_world_size`: one scalar cannot cover a
-  law-admitted arm and a capped arm at once. The FP8-source dense arm
+- **Contract v7.** A passthrough unit whose method branches on an execution
+  arm now publishes admission per arm, and a unit with a **law-admitted** arm
+  carries no unit-level `max_world_size`: one scalar cannot cover a
+  law-admitted arm and a capped arm at once. An armed unit whose every arm is
+  capped keeps its unit-level 1. The FP8-source dense arm
   publishes `shard_admission` (`input_axis_group` 128, `output_axis_quantum`
   128, `merged_roles` `per_role_group_multiple`); its BMM arm keeps
   `max_world_size` 1 with the pinned geometry. `mxfp8_e4m3_e8m0_g32` moves to
