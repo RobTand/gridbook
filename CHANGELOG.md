@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-## Unreleased
 
 ### Measured negative result: the R2 default flip was attempted and REVERTED
 
