@@ -473,11 +473,24 @@ superblock. Serve them with `-tp N --enable-expert-parallel`, which shards the
 expert axis instead — see [Expert parallel](#expert-parallel-tp--1---enable-expert-parallel).
 `-tp N` alone refuses at construction and says so.
 
-Everything else still refuses at construction, naming itself: delegated
-compressed-tensors groups, source-passthrough units, quantized embedding
-units and mixed-format fused projections. An artifact mixing those surfaces
-with dense CB therefore fails on its first unsupported layer. Ignored
-(BF16) Linears keep vLLM's own sharding.
+**Dense FP8 source-passthrough Linears** (`fp8_e4m3_ue8m0_block128`) shard
+too, under their own law: each rank's extent on the sharded axis must be a
+whole multiple of the 128-element source block — per fused role on a merged
+plane — because vLLM narrows the UE8M0 scale plane with the same arithmetic
+as the value plane over the block grid, starting at `rank * ceil(local /
+128)`. Anything else is refused at weight construction with a structured
+`ShardAlignmentError`, before any parameter exists: a misaligned scale narrow
+is silently wrong rather than loud, so it cannot be caught later. Note that
+the lane derives the shard degree from the layer's own sizes, not from
+`tp_size`, because vLLM stamps the world size onto replicated layers too.
+
+Everything else still refuses at construction, naming itself: **grouped-BMM**
+passthrough units (sharding a grouped plane divides the kernel's group count,
+which needs a kernel re-qualification, not a shard law), delegated
+compressed-tensors groups, other source-passthrough formats, quantized
+embedding units and mixed-format fused projections. An artifact mixing those
+surfaces with dense CB therefore fails on its first unsupported layer.
+Ignored (BF16) Linears keep vLLM's own sharding.
 
 Two honest caveats: no two-node serve has been measured yet (the reference
 hardware is single-GPU DGX Spark; cross-node TP over 10 GbE without RDMA is
