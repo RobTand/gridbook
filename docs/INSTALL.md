@@ -384,9 +384,10 @@ discrete GPU with its own VRAM, ordinary vLLM utilization guidance applies.
   their own law: each rank's extent on the sharded axis must be a whole
   multiple of the 128-element source block, per fused role on a merged plane,
   because vLLM narrows the UE8M0 scale plane over the block grid by ceil
-  division. The same format's **grouped-BMM** units still refuse above one
-  rank — sharding a grouped plane divides the kernel's group count, which is
-  a kernel re-qualification rather than a shard law. Delegated
+  division. The same format's **grouped-BMM** units shard only at the
+  degrees whose grouped geometry was measured (1, 2 and 4 — sharding a
+  grouped plane divides the kernel's group count, so each degree is its own
+  qualification); a degree outside that list is refused. Delegated
   compressed-tensors groups, other source-passthrough formats, quantized
   embedding units and mixed-format fused projections refuse at construction
   naming themselves; routed CB MoE has its own axis, below. No cross-node

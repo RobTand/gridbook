@@ -194,11 +194,15 @@ of that site.
     it, ranks read shifted scale blocks with no error. On a merged plane the
     law applies per fused role, because the block offsets are converted role
     by role. The refusal is `ShardAlignmentError` (a `ValueError`).
-  - **The same unit's `bmm` arm stays capped at 1** and pins the only
-    qualified grouped geometry (`bmm_groups` 8, `rows_per_group` 1024,
-    `k` 4096). Column-sharding a grouped plane divides the kernel's group
-    count (G 8 -> 4 at TP=2), which is a new kernel qualification rather than
-    a shard law, so it is refused until one is measured.
+  - **The same unit's `bmm` arm publishes the same law plus a closed list of
+    measured shard degrees** (`qualified_shard_degrees` `[1, 2, 4]`) and pins
+    the grouped geometry it qualifies (`bmm_groups` 8, `rows_per_group` 1024,
+    `k` 4096 — the UNSHARDED plane). Column-sharding a grouped plane divides
+    the kernel's group count (G 8 -> 4 at TP=2), so alignment alone cannot
+    admit it: each degree is its own measurement. Degrees 1, 2 and 4 were
+    measured on the release device on 2026-08-23 (every rank's call bitwise
+    equal to the corresponding columns of the unsharded G=8 call); a degree
+    outside the list is refused, however aligned the plane is.
 - `semantics` is `closed_world`. A consumer must read the table with the same
   rule the validator enforces for publishers:
 
@@ -206,7 +210,9 @@ of that site.
   exactly one row named *U* and the exact arm row when the unit has arms; a
   numeric claim must cover *t*, and any pinned geometry must match exactly;
   a row (or arm) that publishes `shard_admission` defers to those laws at
-  weight construction and carries no number to compare against. Every
+  weight construction and carries no number to compare against — except that
+  a `shard_admission` carrying `qualified_shard_degrees` admits *t* only when
+  *t* is in that list. Every
   other outcome — no row, two rows, an unknown arm name, a larger *t* than a
   numeric claim, a different geometry — is a refusal. There is no default,
   wildcard, or inheritance.

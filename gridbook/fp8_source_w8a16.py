@@ -41,7 +41,15 @@ _GEMM_ALIGNMENT = 8
 _DSV4_BMM_GROUPS = 8
 _DSV4_BMM_ROWS = 1024
 _DSV4_BMM_K = 4096
-_DSV4_BMM_QUALIFIED_SHARD_DEGREE = 1
+#: Shard degrees whose grouped geometry has been MEASURED on the release
+#: device.  Column-sharding a grouped plane divides the kernel's group count,
+#: so each degree is its own qualification: degree ``d`` runs ``G/d`` groups of
+#: the same 1024x4096 rows.  Degrees 2 and 4 were qualified on 2026-08-23 --
+#: every rank's call is BITWISE equal to the corresponding columns of the
+#: unsharded G=8 call, and decode time scales with the bytes a rank holds
+#: (0.496x at G=4, 0.253x at G=2, measured against a working set too large to
+#: cache).  A degree that is not listed here is refused, not assumed.
+_DSV4_BMM_QUALIFIED_SHARD_DEGREES = (1, 2, 4)
 
 #: Both parallel axes must land on a whole source block, because vLLM narrows
 #: the UE8M0 plane with the SAME shard arithmetic it uses for the value plane
@@ -62,14 +70,16 @@ def _qualified_bmm_geometries():
 
     Each entry is ``(groups, rows_per_group, K, shard_degree)``.  Sharding a
     grouped plane column-wise divides the kernel's group count, so a sharded
-    geometry is a NEW qualification -- measure it, then add its tuple here --
-    rather than something a shard law can grant.  Built from the constants at
-    call time so a test may pin a small geometry by patching them.
+    geometry is a NEW qualification -- measure it, then list its degree in
+    ``_DSV4_BMM_QUALIFIED_SHARD_DEGREES`` -- rather than something a shard law
+    can grant.  Built from the constants at call time so a test may pin a small
+    geometry by patching them.
     """
 
     return frozenset({
-        (_DSV4_BMM_GROUPS, _DSV4_BMM_ROWS, _DSV4_BMM_K,
-         _DSV4_BMM_QUALIFIED_SHARD_DEGREE),
+        (_DSV4_BMM_GROUPS // degree, _DSV4_BMM_ROWS, _DSV4_BMM_K, degree)
+        for degree in _DSV4_BMM_QUALIFIED_SHARD_DEGREES
+        if _DSV4_BMM_GROUPS % degree == 0
     })
 
 
@@ -375,17 +385,19 @@ def _build_method_class():
                 rows = n // groups
                 geometry = (groups, rows, k, shard_degree)
                 if geometry not in _qualified_bmm_geometries():
+                    qualified = ", ".join(
+                        f"G={g}, N={r}, K={kk} at shard degree {d}"
+                        for g, r, kk, d in sorted(
+                            _qualified_bmm_geometries(), key=lambda e: e[3]))
                     raise ValueError(
                         "source-FP8 W8A16 BMM is qualified only for grouped "
-                        f"geometry G={_DSV4_BMM_GROUPS}, N={_DSV4_BMM_ROWS}, "
-                        f"K={_DSV4_BMM_K} at shard degree "
-                        f"{_DSV4_BMM_QUALIFIED_SHARD_DEGREE}; got "
+                        f"geometry {qualified}; got "
                         f"G={groups}, N={rows}, K={k}, shard degree="
                         f"{shard_degree} (TP={tp_size}). Column-sharding a "
                         "grouped plane divides the kernel's group count, "
                         "which is a NEW kernel qualification rather than a "
-                        "shard law; qualify the sharded geometry and add it "
-                        "to this lane's qualified table.")
+                        "shard law; qualify the sharded geometry and add its "
+                        "degree to this lane's qualified table.")
             elif shard_degree > 1:
                 # The construction-time laws already refused every misaligned
                 # shard; re-assert them against the RESIDENT shape so a loader

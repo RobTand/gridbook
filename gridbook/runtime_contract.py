@@ -71,17 +71,28 @@ _TP_LAW_ADMITTED_ARMS: dict[tuple[str, str], dict[str, Any]] = {
         "output_axis_quantum": 128,
         "merged_roles": "per_role_group_multiple",
     },
+    # The grouped arm obeys the same alignment law AND a closed list of
+    # measured shard degrees, because column-sharding a grouped plane divides
+    # the kernel's group count: alignment alone cannot admit a degree whose
+    # geometry nobody ran.  The list mirrors
+    # ``fp8_source_w8a16._DSV4_BMM_QUALIFIED_SHARD_DEGREES``.
+    ("fp8_e4m3_ue8m0_block128", "bmm"): {
+        "input_axis_group": 128,
+        "output_axis_quantum": 128,
+        "merged_roles": "per_role_group_multiple",
+        "qualified_shard_degrees": [1, 2, 4],
+    },
 }
 
 #: The exact grouped-BMM geometry each armed unit qualifies, keyed by
 #: (unit, arm).  Today only the FP8-source W8A16 BMM arm is pinned, to the
 #: constants in ``gridbook/fp8_source_w8a16.py`` (``_DSV4_BMM_GROUPS``,
-#: ``_DSV4_BMM_ROWS``, ``_DSV4_BMM_K``, enforced alongside
-#: ``_DSV4_BMM_QUALIFIED_SHARD_DEGREE``).  Column-sharding a grouped plane
-#: divides the kernel's group count, so the sharded geometry is a NEW
-#: qualification and the arm keeps its ``max_world_size: 1`` cap until one is
-#: measured.  An arm without an entry here must omit ``requires_geometry``
-#: entirely.
+#: ``_DSV4_BMM_ROWS``, ``_DSV4_BMM_K``).  The geometry is the UNSHARDED plane;
+#: which shard degrees of it are admitted is the separate
+#: ``qualified_shard_degrees`` list on the arm's ``shard_admission``, because
+#: column-sharding a grouped plane divides the kernel's group count and each
+#: degree is its own measurement.  An arm without an entry here must omit
+#: ``requires_geometry`` entirely.
 _TP_REQUIRED_GEOMETRY: dict[tuple[str, str], dict[str, int]] = {
     ("fp8_e4m3_ue8m0_block128", "bmm"): {
         "bmm_groups": 8,
@@ -377,10 +388,10 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
             law = _TP_LAW_ADMITTED_ARMS.get((unit_id, arm_name))
             if law is None:
                 arm_expected = {"arm", "max_world_size"}
-                if "requires_geometry" in arm:
-                    arm_expected = arm_expected | {"requires_geometry"}
             else:
                 arm_expected = {"arm", "shard_admission"}
+            if "requires_geometry" in arm:
+                arm_expected = arm_expected | {"requires_geometry"}
             _keys(arm, arm_path, arm_expected)
             if arm_name not in required_arms:
                 _fail(f"{arm_path}.arm",
@@ -388,6 +399,18 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
             if arm_name in arm_names:
                 _fail(f"{path}.arms", f"duplicate arm {arm_name!r}")
             arm_names.append(arm_name)
+            # The geometry pin is independent of how the arm is admitted: a
+            # law-admitted arm still names the unsharded plane it qualifies.
+            geometry_key = (unit_id, arm_name)
+            if geometry_key in _TP_REQUIRED_GEOMETRY:
+                pinned = _TP_REQUIRED_GEOMETRY[geometry_key]
+                if arm.get("requires_geometry") != pinned:
+                    _fail(f"{arm_path}.requires_geometry",
+                          f"must equal {pinned}")
+            elif "requires_geometry" in arm:
+                _fail(f"{arm_path}.requires_geometry",
+                      f"is not pinned for {unit_id!r} arm {arm_name!r}; "
+                      "omit it rather than under-specifying")
             if law is not None:
                 admission_path = f"{arm_path}.shard_admission"
                 admission = _object(arm["shard_admission"], admission_path)
@@ -405,16 +428,6 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
                 _fail(f"{arm_path}.max_world_size",
                       "must be 1; no enforcement site in this build allows "
                       "more")
-            geometry_key = (unit_id, arm_name)
-            if geometry_key in _TP_REQUIRED_GEOMETRY:
-                pinned = _TP_REQUIRED_GEOMETRY[geometry_key]
-                if arm.get("requires_geometry") != pinned:
-                    _fail(f"{arm_path}.requires_geometry",
-                          f"must equal {pinned}")
-            elif "requires_geometry" in arm:
-                _fail(f"{arm_path}.requires_geometry",
-                      f"is not pinned for {unit_id!r} arm {arm_name!r}; "
-                      "omit it rather than under-specifying")
         missing = sorted(set(required_arms) - set(arm_names))
         if missing:
             _fail(f"{path}.arms", f"missing arm claim(s): {missing}")

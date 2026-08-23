@@ -158,7 +158,16 @@
           },
           {
             "arm": "bmm",
-            "max_world_size": 1,
+            "shard_admission": {
+              "input_axis_group": 128,
+              "output_axis_quantum": 128,
+              "merged_roles": "per_role_group_multiple",
+              "qualified_shard_degrees": [
+                1,
+                2,
+                4
+              ]
+            },
             "requires_geometry": {
               "bmm_groups": 8,
               "rows_per_group": 1024,

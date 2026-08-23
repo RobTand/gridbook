@@ -96,10 +96,13 @@ def _patch_load_edges(monkeypatch, lane):
         (7, 1024, 4096, 1, "G=7, N=1024, K=4096, shard degree=1"),
         (8, 896, 4096, 1, "G=8, N=896, K=4096, shard degree=1"),
         (8, 1024, 3968, 1, "G=8, N=1024, K=3968, shard degree=1"),
-        # A column-sharded DSv4 wo_a: the local plane is perfectly aligned
-        # (4096 rows, 4 groups of 1024) and its scale narrow is exact, but
-        # the KERNEL was qualified at G=8.  A shard law cannot grant that.
-        (4, 1024, 4096, 2, "G=4, N=1024, K=4096, shard degree=2"),
+        # Degrees 2 and 4 are measured, so their group counts pass; the near
+        # miss is a degree nobody ran.  At TP=8 a DSv4 wo_a rank would hold
+        # one group -- perfectly aligned, and still refused.
+        (1, 1024, 4096, 8, "G=1, N=1024, K=4096, shard degree=8"),
+        # The right group count at the WRONG degree: G=4 is qualified at
+        # degree 2 only, because the plane it came from is what was measured.
+        (4, 1024, 4096, 4, "G=4, N=1024, K=4096, shard degree=4"),
     ),
 )
 def test_grouped_geometry_near_miss_refuses_before_native_resolution_or_marker(
@@ -114,7 +117,11 @@ def test_grouped_geometry_near_miss_refuses_before_native_resolution_or_marker(
         method.process_weights_after_loading(layer)
 
     message = str(exc.value)
+    # The refusal enumerates the whole qualified set, so it stays true as
+    # degrees are qualified instead of naming a stale single geometry.
     assert "G=8, N=1024, K=4096 at shard degree 1" in message
+    assert "G=4, N=1024, K=4096 at shard degree 2" in message
+    assert "G=2, N=1024, K=4096 at shard degree 4" in message
     assert got in message
     assert calls == []
     assert not hasattr(layer, dsv4_woa.DSV4_FP8_SOURCE_W8A16_BMM_ATTR)
@@ -361,11 +368,12 @@ def test_contract_tp_rows_match_this_gate(monkeypatch):
     """The contract's rows for ``fp8_e4m3_ue8m0_block128`` restate THIS gate.
 
     The packaged table admits the DENSE arm above one rank under whole-128
-    shard laws and keeps the grouped-BMM arm capped at one.  Feed the lane
-    the CONTRACT'S OWN numbers on both halves: an aligned dense shard at the
-    published law must finalize, and the BMM arm at the published geometry
-    must refuse the moment it is sharded.  If the gate and the table ever
-    drift apart, one half of this test fails.
+    shard laws, and admits the grouped-BMM arm at the shard degrees that were
+    measured -- and only those.  Feed the lane the CONTRACT'S OWN numbers on
+    every half: an aligned dense shard at the published law must finalize, a
+    misaligned one must refuse, the BMM arm must finalize at each published
+    degree, and it must refuse at a degree the table does not list.  If the
+    gate and the table ever drift apart, one half of this test fails.
     """
     import json
     from importlib.resources import files as resource_files
@@ -378,7 +386,10 @@ def test_contract_tp_rows_match_this_gate(monkeypatch):
     arms = {arm["arm"]: arm for arm in row["arms"]}
     law = arms["dense"]["shard_admission"]
     assert "max_world_size" not in arms["dense"]
-    assert arms["bmm"]["max_world_size"] == 1
+    assert "max_world_size" not in arms["bmm"]
+    bmm_law = arms["bmm"]["shard_admission"]
+    degrees = bmm_law["qualified_shard_degrees"]
+    assert degrees == sorted(set(degrees)), "degrees are a sorted, unique set"
     geometry = arms["bmm"]["requires_geometry"]
     assert geometry == {"bmm_groups": 8, "rows_per_group": 1024, "k": 4096}
 
@@ -403,18 +414,38 @@ def test_contract_tp_rows_match_this_gate(monkeypatch):
         method.process_weights_after_loading(misaligned)
     assert calls == []
 
-    # BMM, at exactly the published geometry, sharded: refused.
+    # BMM, at exactly the published geometry, at every published degree:
+    # admitted, with the group count the shard actually leaves the kernel.
+    for degree in degrees:
+        calls.clear()
+        bmm = _layer(
+            groups=geometry["bmm_groups"] // degree,
+            rows=geometry["rows_per_group"],
+            k=geometry["k"],
+            tp_size=degree,
+            plan=lane.ShardPlan(row_degree=1, col_degree=degree),
+        )
+        method.process_weights_after_loading(bmm)
+        assert calls == ["source_ext", "grouped_ext", "adapter"]
+        assert bmm._fp8_source_groups == geometry["bmm_groups"] // degree
+        assert bmm._fp8_source_shard_degree == degree
+        assert getattr(bmm, dsv4_woa.DSV4_FP8_SOURCE_W8A16_BMM_ATTR) == \
+            dsv4_woa.DSV4_FP8_SOURCE_W8A16_BMM_ABI
+
+    # One degree past the published list: refused, however aligned it is.
+    unmeasured = max(degrees) * 2
     calls.clear()
-    bmm = _layer(
-        groups=geometry["bmm_groups"] // 2,
+    beyond = _layer(
+        groups=max(1, geometry["bmm_groups"] // unmeasured),
         rows=geometry["rows_per_group"],
         k=geometry["k"],
-        tp_size=2,
-        plan=lane.ShardPlan(row_degree=1, col_degree=2),
+        tp_size=unmeasured,
+        plan=lane.ShardPlan(row_degree=1, col_degree=unmeasured),
     )
-    with pytest.raises(ValueError, match=r"qualified only.*shard degree=2"):
-        method.process_weights_after_loading(bmm)
+    with pytest.raises(ValueError,
+                       match=rf"qualified only.*shard degree={unmeasured}"):
+        method.process_weights_after_loading(beyond)
 
     assert calls == []
-    assert not hasattr(bmm, dsv4_woa.DSV4_FP8_SOURCE_W8A16_BMM_ATTR)
-    assert not hasattr(bmm, lane._READY_ATTR)
+    assert not hasattr(beyond, dsv4_woa.DSV4_FP8_SOURCE_W8A16_BMM_ATTR)
+    assert not hasattr(beyond, lane._READY_ATTR)

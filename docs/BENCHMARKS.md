@@ -12,6 +12,42 @@ All results are from a **single NVIDIA GB10 / DGX Spark** (Blackwell `sm_121`,
 [caveats](#caveats--read-these) — these are single-box, single-seed
 measurements, and the 295B result carries **no quality-vs-teacher claim**.
 
+## 2026-08-23 FP8-source grouped shard — decode microbenchmark
+
+Why it exists: DeepSeek-V4's `wo_a` is a grouped-BMM source-passthrough unit,
+and column-sharding it for tensor parallelism divides the kernel's group count
+(G 8 -> 4 at TP=2). That is a new kernel geometry, so it was measured before
+the lane admitted it. **This is a kernel microbenchmark, not a served result**:
+no two-node serve has been run, and nothing here is a TP speedup claim.
+
+Execution identity: GB10 `sm_121`, image `gridbook:0.8.12-r2ab`, branch
+`tp-passthrough`. Geometry is the DSv4 `wo_a` plane — 1024 rows per group,
+K 4096, batch 1. Driver `scripts/bench_fp8_source_grouped_shard.py`. Each arm:
+500 iterations per timed run after 50 warmup, three A/B/A repeats, median,
+CUDA-event timed, **rotating over a 268 MB working set** so no arm is served
+from cache.
+
+| call | per call | vs G=8 | bytes a rank holds |
+|---|---:|---:|---:|
+| G=8, whole plane (TP=1) | 163.34 µs | 1.000× | 33.6 MB |
+| G=4, one rank at TP=2 | 80.90 µs | 0.496× | 16.8 MB |
+| G=2, one rank at TP=4 | 41.23 µs | 0.253× | 8.4 MB |
+
+Decode time falls with the bytes a rank holds, near-exactly linearly: there is
+**no occupancy cliff** at the smaller group counts.
+
+One trap worth publishing. A hot loop over a single resident plane — the
+obvious way to write this bench — reports G=4 at 0.294× instead of 0.496×,
+because 16.8 MB is small enough to be served from cache while 33.6 MB is not.
+A real serve streams every other layer between two `wo_a` calls, so the
+rotating number is the honest one. The cache-friendly number would have
+overstated the sharded arm by 1.7×.
+
+Exactness, measured alongside: at both degrees and on every rank, the sharded
+call is bitwise equal to the corresponding columns of the unsharded G=8 call,
+on the expand path and the GEMV path alike
+(`tests/test_fp8_source_w8a16_cuda.py`).
+
 ## 2026-07-31 CUDA-graph canary — close-rate, not formal parity
 
 This is historical evidence from the commit named below. Its then-new opaque

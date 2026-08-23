@@ -484,9 +484,12 @@ is silently wrong rather than loud, so it cannot be caught later. Note that
 the lane derives the shard degree from the layer's own sizes, not from
 `tp_size`, because vLLM stamps the world size onto replicated layers too.
 
-Everything else still refuses at construction, naming itself: **grouped-BMM**
-passthrough units (sharding a grouped plane divides the kernel's group count,
-which needs a kernel re-qualification, not a shard law), delegated
+**Grouped-BMM** passthrough units shard only at a measured degree: sharding a
+grouped plane divides the kernel's group count, so degrees 1, 2 and 4 are
+qualified (DSv4 `wo_a`: G=8, 1024 rows/group, K=4096) and anything else is
+refused by name.
+
+Everything else still refuses at construction, naming itself: delegated
 compressed-tensors groups, other source-passthrough formats, quantized
 embedding units and mixed-format fused projections. An artifact mixing those
 surfaces with dense CB therefore fails on its first unsupported layer.

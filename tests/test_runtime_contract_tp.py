@@ -121,21 +121,30 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
                   for arm in units["mxfp8_e4m3_e8m0_g32"]["arms"]}
     assert units["mxfp8_e4m3_e8m0_g32"]["max_world_size"] == 1
     assert all(arm["max_world_size"] == 1 for arm in mxfp8_arms.values())
-    # The FP8-source unit publishes NO unit-level number: one scalar cannot
-    # cover its law-admitted dense arm and its capped BMM arm at once.
+    # The FP8-source unit publishes NO unit-level number: admission differs
+    # per arm, and one scalar could not carry both arms' rules.
     assert "max_world_size" not in units["fp8_e4m3_ue8m0_block128"]
     fp8_arms = {arm["arm"]: arm
                 for arm in units["fp8_e4m3_ue8m0_block128"]["arms"]}
-    # The one pinned execution geometry: FP8-source W8A16 grouped BMM, still
-    # capped at one rank.
-    assert fp8_arms["bmm"]["max_world_size"] == 1
-    assert fp8_arms["bmm"]["requires_geometry"] == {
+    # The one pinned execution geometry: FP8-source W8A16 grouped BMM.  The
+    # geometry names the UNSHARDED plane; the degrees say which shards of it
+    # were measured.  Both are needed -- alignment alone cannot admit a group
+    # count nobody ran.
+    bmm = fp8_arms["bmm"]
+    assert "max_world_size" not in bmm
+    assert bmm["requires_geometry"] == {
         "bmm_groups": 8,
         "rows_per_group": 1024,
         "k": 4096,
     }
-    # The one law-admitted passthrough arm: FP8-source W8A16 dense.  It
-    # publishes laws and NO cap, exactly like the dense CB families.
+    assert bmm["shard_admission"] == {
+        "input_axis_group": 128,
+        "output_axis_quantum": 128,
+        "merged_roles": "per_role_group_multiple",
+        "qualified_shard_degrees": [1, 2, 4],
+    }
+    # The dense arm publishes the same laws and NO degree list: alignment is
+    # the whole rule there, exactly like the dense CB families.
     dense = fp8_arms["dense"]
     assert "max_world_size" not in dense
     assert "requires_geometry" not in dense
@@ -188,7 +197,14 @@ def _permitted(table: dict, unit: str, world_size: int, *, arm=None,
         return False
     arm_row = matches[0]
     if "shard_admission" in arm_row:
-        return geometry is None and "max_world_size" not in arm_row
+        if "max_world_size" in arm_row:
+            return False
+        degrees = arm_row["shard_admission"].get("qualified_shard_degrees")
+        if degrees is not None and world_size not in degrees:
+            return False
+        if "requires_geometry" in arm_row:
+            return geometry == arm_row["requires_geometry"]
+        return geometry is None
     if world_size > arm_row["max_world_size"]:
         return False
     if "requires_geometry" in arm_row:
@@ -228,14 +244,25 @@ def test_closed_world_lookup_refuses_what_the_table_does_not_claim():
         assert not _permitted(table, capped, 8)
     for arm in ("dense", "bmm"):
         assert not _permitted(table, "mxfp8_e4m3_e8m0_g32", 2, arm=arm)
-    # The FP8-source BMM arm stays capped even though its unit's dense arm
-    # was lifted: sharding a grouped plane is a kernel re-qualification.
+    # The FP8-source BMM arm names the UNSHARDED plane, so a consumer asks
+    # with G=8 and the degree it wants; only measured degrees are admitted.
+    dsv4_wo_a = {"bmm_groups": 8, "rows_per_group": 1024, "k": 4096}
+    assert _permitted(
+        table, "fp8_e4m3_ue8m0_block128", 2, arm="bmm", geometry=dsv4_wo_a)
+    assert _permitted(
+        table, "fp8_e4m3_ue8m0_block128", 4, arm="bmm", geometry=dsv4_wo_a)
+    # A degree past the measured list -> REFUSED, however aligned it is.
+    assert not _permitted(
+        table, "fp8_e4m3_ue8m0_block128", 8, arm="bmm", geometry=dsv4_wo_a)
+    # The per-rank group count is NOT what the row publishes; asking with it
+    # is asking about a plane the table never claimed -> REFUSED.
     assert not _permitted(
         table, "fp8_e4m3_ue8m0_block128", 2, arm="bmm",
         geometry={"bmm_groups": 4, "rows_per_group": 1024, "k": 4096})
+    # And the geometry still has to match: a different plane -> REFUSED.
     assert not _permitted(
         table, "fp8_e4m3_ue8m0_block128", 2, arm="bmm",
-        geometry={"bmm_groups": 8, "rows_per_group": 1024, "k": 4096})
+        geometry={"bmm_groups": 8, "rows_per_group": 2048, "k": 4096})
     # An armed unit consulted without naming the arm -> REFUSED.
     assert not _permitted(table, "mxfp8_e4m3_e8m0_g32", 1)
     # An arm name the unit does not publish -> REFUSED.
@@ -379,17 +406,31 @@ def _relax_the_dense_merged_role_law(contract):
 
 
 def _law_on_an_unadmitted_arm(contract):
-    # The grouped-BMM arm has no shard law to publish: sharding it is a
-    # kernel re-qualification, so it keeps a numeric cap.
-    _fp8_arm(contract, "bmm")["shard_admission"] = {
+    # MXFP8 has no sharded audit on either arm, so neither may publish a law
+    # in place of the number a site actually enforces.
+    row = _units_by_id(contract)["mxfp8_e4m3_e8m0_g32"]
+    row["arms"][0]["shard_admission"] = {
         "input_axis_group": 128,
         "output_axis_quantum": 128,
         "merged_roles": "per_role_group_multiple",
     }
 
 
-def _widen_the_bmm_arm(contract):
+def _cap_the_bmm_arm_again(contract):
     _fp8_arm(contract, "bmm")["max_world_size"] = 2
+
+
+def _widen_the_bmm_degrees(contract):
+    # TP=8 leaves one group per rank; the kernel was never run there.
+    _fp8_arm(contract, "bmm")["shard_admission"][
+        "qualified_shard_degrees"] = [1, 2, 4, 8]
+
+
+def _drop_the_bmm_degree_list(contract):
+    # Without it the arm would read as "any aligned degree", which is exactly
+    # the claim the grouped kernel does not support.
+    del _fp8_arm(contract, "bmm")["shard_admission"][
+        "qualified_shard_degrees"]
 
 
 def _invent_geometry_pin(contract):
@@ -427,7 +468,9 @@ def _invent_geometry_pin(contract):
         (_corrupt_the_dense_input_axis_law, "must equal 128"),
         (_relax_the_dense_merged_role_law, "must equal"),
         (_law_on_an_unadmitted_arm, "unknown field.*shard_admission"),
-        (_widen_the_bmm_arm, "no enforcement site"),
+        (_cap_the_bmm_arm_again, "unknown field.*max_world_size"),
+        (_widen_the_bmm_degrees, "must equal"),
+        (_drop_the_bmm_degree_list, "missing field"),
     ],
 )
 def test_validator_rejects_tables_that_overclaim_or_underclaim(
@@ -596,10 +639,10 @@ def _lane_constants(tree, prefix: str) -> dict:
     for node in tree.body:
         if (isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Constant)):
+                and isinstance(node.value, (ast.Constant, ast.Tuple))):
             name = node.targets[0].id
             if name.startswith(prefix):
-                constants[name] = node.value.value
+                constants[name] = ast.literal_eval(node.value)
     return constants
 
 
@@ -611,7 +654,7 @@ def test_fp8_source_geometry_rows_match_the_lane_constants():
         "_DSV4_BMM_GROUPS": 8,
         "_DSV4_BMM_ROWS": 1024,
         "_DSV4_BMM_K": 4096,
-        "_DSV4_BMM_QUALIFIED_SHARD_DEGREE": 1,
+        "_DSV4_BMM_QUALIFIED_SHARD_DEGREES": (1, 2, 4),
     }
 
     row = _units_by_id(load_runtime_contract())["fp8_e4m3_ue8m0_block128"]
@@ -621,10 +664,12 @@ def test_fp8_source_geometry_rows_match_the_lane_constants():
         "rows_per_group": constants["_DSV4_BMM_ROWS"],
         "k": constants["_DSV4_BMM_K"],
     }
-    # The BMM arm's numeric cap IS the qualified shard degree: sharding a
-    # grouped plane divides the kernel's group count.
-    assert arms["bmm"]["max_world_size"] == \
-        constants["_DSV4_BMM_QUALIFIED_SHARD_DEGREE"]
+    # The BMM arm publishes the MEASURED shard degrees rather than a cap:
+    # sharding a grouped plane divides the kernel's group count, so each
+    # degree is its own qualification and the list is the enforcement site's.
+    assert "max_world_size" not in arms["bmm"]
+    assert arms["bmm"]["shard_admission"]["qualified_shard_degrees"] == \
+        list(constants["_DSV4_BMM_QUALIFIED_SHARD_DEGREES"])
     assert "qualified only for grouped" in source
 
     # And the qualified table the refusal consults is built from exactly
