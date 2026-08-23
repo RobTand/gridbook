@@ -318,9 +318,8 @@ def cb_gemv_choice(k_bits: int, n_sub: int, type_size: int,
     mode = cb_gemv_mode()
     if mode == "inherited":
         return False, "mode=inherited (kill switch)"
-    # v2 is PRODUCT-MODE ONLY. `_cuda_moe_ok` admits n_sub in (1, 2) for
-    # fp4-v2; a signed n_sub=1 rung would trip v2's own `cb_elems` TORCH_CHECK
-    # loudly rather than silently, but it must never get that far.
+    # v2 is PRODUCT-MODE ONLY. `_cuda_moe_ok` admits n_sub=2 for fp4-v2; any
+    # other n_sub must never reach v2's own `cb_elems` TORCH_CHECK.
     if n_sub != 2:
         return False, f"n_sub={n_sub} (v2 is product-mode only)"
     if type_size != 4 * k_bits + 9:

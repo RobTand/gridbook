@@ -249,7 +249,7 @@ DEVINL void cb_fma_x_scaled(int s, int lane, int M, const uint16_t* x,
 }
 
 // Shared x-FMA tail for the dense decode helpers: identical for the fp8
-// and fp4-v2 (product AND signed) paths — ONE bit-identical epilogue.
+// and fp4-v2 product paths — ONE bit-identical epilogue.
 template <int MT>
 DEVINL void cb_fma_x(int s, int lane, int M, const uint16_t* x, int64_t K,
                         const float* wv, float* acc) {
@@ -737,29 +737,6 @@ torch::Tensor cb_gemv_fp8(torch::Tensor x, torch::Tensor qw_padded,
 // IDENTICAL compute — only the load schedule differs (the clean bit-identity
 // A/B unit). The word/scale read stays inline so the DB path can inject its
 // prefetch between the read and this compute.
-// Signed-mode (NVFP4_CB_S*, n_sub==1) codeword decode: 8 LSB sign bits
-// (bit j -> coordinate j negative) + a (k-8)-bit magnitude index into ONE
-// non-negative half-grid table of 8-dim entries. The 8 bf16 magnitudes are a
-// single 16-byte gather (entries are 8-element aligned); the sign is applied
-// by flipping the bf16 sign bit (exact), THEN the two-tier scale multiplies
-// and rounds — bit-exact to nvfp4_cb_reconstruct's signed branch.
-DEVINL void fp4v2_signed_gather(uint64_t code, const uint16_t* cb_bf16,
-                                int64_t cb_base, float sc, int v2, float* wv) {
-  const uint32_t sign8 = (uint32_t)(code & 0xffu);
-  const int64_t elt = cb_base + (int64_t)(code >> 8) * 8;
-  const uint4 q = __ldg(reinterpret_cast<const uint4*>(cb_bf16 + elt));
-  const uint32_t qw[4] = {q.x, q.y, q.z, q.w};
-#pragma unroll
-  for (int j = 0; j < 8; ++j) {
-    uint16_t b = (uint16_t)((qw[j >> 1] >> ((j & 1) * 16)) & 0xffffu);
-    b = (uint16_t)(b ^ (((sign8 >> j) & 1u) << 15));   // exact sign flip
-    // v2: raw signed magnitude — the group scale multiplies the lane
-    // PARTIAL once (cb_fma_x_scaled), not each weight, and no round.
-    wv[j] = v2 ? bf16_to_f32(b)
-               : bf16_to_f32(f32_to_bf16_rn(bf16_to_f32(b) * sc));
-  }
-}
-
 // R2GATHER (round-2 backport, opt-in): the two 4-element sub-index gathers
 // become ONE aligned 8-byte uint2 __ldg each — 4x fewer codebook load
 // instructions per codeword on the compute-bound dense path. The per-element
@@ -785,12 +762,6 @@ DEVINL void fp4v2_decode_fma(uint32_t w0_, uint32_t w1_, uint32_t w2_, int rem,
   const uint32_t code16 = (uint32_t)((sub_byte >> ((grp & 1) * 4)) & 0xFu);
   const float sc = __ldg(compose + (int)super_e * 16 + (int)code16);
   float wv[8];
-  if (n_sub == 1) {                              // signed mode (S-rungs)
-    fp4v2_signed_gather(code, cb_bf16, cb_base, sc, v2, wv);
-    if (v2) cb_fma_x_scaled<MT>(s, lane, M, x, K, wv, sc, acc);
-    else cb_fma_x<MT>(s, lane, M, x, K, wv, acc);
-    return;
-  }
 #pragma unroll
   for (int i = 0; i < 2; ++i) {
     const uint32_t idx = (uint32_t)(code >> sp.off[i]) & sp.mask[i];
@@ -899,7 +870,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp4_v2_kernel(
 
   const uint8_t* row = qw + n * qw_stride;
   const int64_t cb_base = (int64_t)__ldg(cboff + n);
-  const SubSplit<2, 4> sp(k_bits);        // unused in signed (n_sub==1) mode
+  const SubSplit<2, 4> sp(k_bits);        // product mode: the 2-way split
   const uint64_t code_mask =
       (k_bits >= 64) ? ~0ull : ((1ull << k_bits) - 1ull);
   const int scale_off = 4 * k_bits;             // base of the 9-byte scale sec.
@@ -1197,10 +1168,9 @@ torch::Tensor cb_gemv_fp4_v2(torch::Tensor x, torch::Tensor qw_padded,
   TORCH_CHECK(compose.scalar_type() == torch::kFloat32 &&
                   compose.numel() == 256 * 16,
               "compose must be the (256*16,) fp32 two-tier table");
-  TORCH_CHECK(n_sub == 2 || n_sub == 1,
-              "fp4-v2 GEMV: n_sub=2 (product) or n_sub=1 (signed S-rungs)");
-  TORCH_CHECK(n_sub == 2 || k_bits > 8,
-              "signed mode needs k > 8 (8 sign bits + magnitude index)");
+  TORCH_CHECK(n_sub == 2,
+              "fp4-v2 GEMV: n_sub=2 (product) only; the signed n_sub=1 "
+              "family was removed from the runtime");
   TORCH_CHECK(K % 256 == 0, "K must be a multiple of the 256 superblock");
   TORCH_CHECK(type_size == 4 * k_bits + 9,
               "fp4-v2 type_size must be 4k+9 (E8M0 super + 8 sub-nibble bytes)");
@@ -1663,9 +1633,6 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp4_v2_kernel(
     // __floats2bfloat162_rn round was tried and is bit-identical but slower
     // here — the extra pack/unpack outweighs the halved conversions.)
     float wv[8];
-    if (n_sub == 1) {                          // signed mode (S-rungs)
-      fp4v2_signed_gather(code, cb_bf16, 0, sc, v2, wv);
-    } else {
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const uint32_t idx = (uint32_t)(code >> sp.off[i]) & sp.mask[i];
@@ -1687,7 +1654,6 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp4_v2_kernel(
       wv[i * 4 + 3] = bf16_to_f32(
           f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y >> 16)) * sc));
       }
-    }
     }
 
     // --- FMA against x: one 16-byte load per lane -------------------------
@@ -1836,9 +1802,6 @@ __global__ __launch_bounds__(RPB * 32) void cb_moe_gemv_fp4_v2_rowpack_kernel(
       const float sc = __ldg(compose + (int)super_e * 16 + (int)code16);
 
       float wv[8];
-      if (n_sub == 1) {                        // signed mode (S-rungs)
-        fp4v2_signed_gather(code, cb_bf16, 0, sc, v2, wv);
-      } else {
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
         const uint32_t idx = (uint32_t)(code >> sp.off[i]) & sp.mask[i];
@@ -1859,7 +1822,6 @@ __global__ __launch_bounds__(RPB * 32) void cb_moe_gemv_fp4_v2_rowpack_kernel(
         wv[i * 4 + 3] = bf16_to_f32(
             f32_to_bf16_rn(bf16_to_f32((uint16_t)(quad.y >> 16)) * sc));
         }
-      }
       }
 
       // FMA against the SHARED smem x (16-byte LDS.128; no gmem/L2 traffic).
@@ -2071,9 +2033,9 @@ torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
               "compose must be the (256*16,) fp32 two-tier table");
   TORCH_CHECK(pair_expert.scalar_type() == torch::kInt32);
   TORCH_CHECK(pair_xrow.scalar_type() == torch::kInt32);
-  TORCH_CHECK(n_sub == 2 || n_sub == 1,
-              "fp4-v2 MoE GEMV: n_sub=2 (product) or n_sub=1 (signed)");
-  TORCH_CHECK(n_sub == 2 || k_bits > 8, "signed mode needs k > 8");
+  TORCH_CHECK(n_sub == 2,
+              "fp4-v2 MoE GEMV: n_sub=2 (product) only; the signed n_sub=1 "
+              "family was removed from the runtime");
   TORCH_CHECK(type_size == 4 * k_bits + 9,
               "fp4-v2 type_size must be 4k+9 (E8M0 super + 8 sub-nibble bytes)");
   TORCH_CHECK(type_size <= kSlotBytes, "type_size exceeds the smem stage slot");

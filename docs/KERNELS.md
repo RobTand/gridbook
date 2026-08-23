@@ -98,8 +98,9 @@ requires the v2 extension even when the decode selector remains `inherited`:
 currently admits only CUDA cc 12.0/12.1. The grouped-BF16 GEMM is SM80-capable
 in isolation, but does not lower that complete FP4 serving floor.
 The dense table applies only after the 0.5 load gate: public CB dense Linears
-must be biasless, and FP4 must be unsigned product-v2. A non-`None` bias,
-signed S-rung, or FP4-v1 dense layer is format-valid where applicable but has
+must be biasless, and FP4 must be unsigned product-v2 (the signed family is
+deleted from the runtime entirely). A non-`None` bias or
+FP4-v1 dense layer is format-valid where applicable but has
 no complete owned every-M native operation. The public method rejects bias;
 model load rejects the unsupported FP4 families.
 

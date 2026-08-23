@@ -35,7 +35,7 @@
  * Unlike the fp8 fork, k_bits/n_sub/type_size are RUNTIME parameters: the
  * packed stream never touches a TMA descriptor or a k-sized smem layout here,
  * so one instantiation serves the whole rung ladder (K12..K24 product,
- * S13..S16 signed, v1 + v2 scale coding). The value LUT (max 16 KiB at k24)
+ * v1 + v2 scale coding). The value LUT (max 16 KiB at k24)
  * and the v2 compose table (4 KiB) are smem-resident (R6), staged once per
  * CTA.
  *
@@ -212,8 +212,8 @@ struct CollectiveMma<
   static constexpr int CbStageDescBytes = 16;
 
   // Fixed smem LUT carve (R6): value LUT sized for the LARGEST fp4 rung
-  // (product k24: two 2^12-entry sub-tables x 2 B = 16 KiB; every signed rung
-  // S13..S16 is <= 1 KiB) + the two-tier compose table (256 x 16 e4m3 bytes).
+  // (product k24: two 2^12-entry sub-tables x 2 B = 16 KiB) + the two-tier
+  // compose table (256 x 16 e4m3 bytes).
   // Runtime lut_bytes selects how much is staged; the carve is constant so
   // ONE instantiation serves the whole ladder.
   static constexpr int CbLutMaxBytes = 16384;
@@ -286,16 +286,15 @@ struct CollectiveMma<
     // --- packed CB weight stream (replaces ptr_B/dB/ptr_SFB) --------------
     uint8_t const* ptr_packed{nullptr};   // [N_rows, >= n_sb*type_size] (+>=8B row slack)
     int64_t packed_row_bytes{0};          // explicit row stride (any parity)
-    uint8_t const* ptr_lut{nullptr};      // value LUT: product -> u16 nibble
-                                          // quads (tbl0 then tbl1); signed ->
-                                          // u32 nibble octets (magnitudes)
+    uint8_t const* ptr_lut{nullptr};      // value LUT: product u16 nibble
+                                          // quads (tbl0 then tbl1)
     int32_t lut_bytes{0};                 // <= CbLutMaxBytes
     int32_t const* ptr_lut_tile_ids{nullptr}; // dense: [ceil(N/TileN)]
     int32_t num_lut_blocks{1};            // concatenated fixed-size LUT blocks
     int32_t num_lut_tiles{0};             // bounds ptr_lut_tile_ids before read
     uint8_t const* ptr_compose{nullptr};  // v2: (256*16) e4m3 bytes; else null
     int32_t k_bits{0};
-    int32_t n_sub{2};                     // 2 = product, 1 = signed
+    int32_t n_sub{2};                     // product (the only runtime mode)
     int32_t type_size{0};                 // 4k+9 (v2) or 4k+16 (v1)
     int32_t is_v2{1};
     // --- OPTIONAL tile-indexed grouping (MoE), the fp8 fork's mechanism:
@@ -391,7 +390,7 @@ struct CollectiveMma<
     bool implementable = cutlass::detail::check_alignment<min_tma_aligned_elements_A>(cute::make_shape(M,K,L), StrideA{});
     implementable = implementable && (K % 256 == 0) && (L == 1);
     implementable = implementable && (args.k_bits >= 9) && (args.k_bits <= 24);
-    implementable = implementable && (args.n_sub == 1 || args.n_sub == 2);
+    implementable = implementable && (args.n_sub == 2);
     implementable = implementable && (args.type_size == 4 * args.k_bits + (args.is_v2 ? 9 : 16));
     implementable = implementable && (args.packed_row_bytes >= (K / 256) * args.type_size);
     implementable = implementable && (args.lut_bytes > 0) && (args.lut_bytes <= CbLutMaxBytes);
@@ -691,12 +690,10 @@ struct CollectiveMma<
     const int64_t row_stride = params.packed_row_bytes;
     const int N_rows = params.N_rows;
     const uint32_t mask_k = (uint32_t)((1ull << kb) - 1ull);
-    const bool signed_mode = (params.n_sub == 1);
     const int w0 = kb - (kb >> 1);                   // ceil-first split
     const uint32_t mask0 = (1u << w0) - 1u;
     const uint32_t mask1 = (1u << (kb >> 1)) - 1u;
     const uint16_t* lut16 = reinterpret_cast<const uint16_t*>(shared_tensors.smem_lut.data());
-    const uint32_t* lut32 = reinterpret_cast<const uint32_t*>(shared_tensors.smem_lut.data());
     const int64_t sb_off = int64_t(sb) * ts;
     const int idx_off = half * 2 * kb;               // half-superblock base
 
@@ -727,16 +724,7 @@ struct CollectiveMma<
       const uint32_t code = uint32_t(w64 >> rem) & mask_k;
 
       uint32_t out32;
-      if (signed_mode) {
-        // 8 LSB sign bits + magnitude index above them; positive-half-grid
-        // nibbles get their e2m1 sign bit from the code's sign byte.
-        out32 = lut32[code >> 8];
-        const uint32_t signs = code & 0xFFu;
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < 8; ++j) {
-          out32 ^= ((signs >> j) & 1u) << (4 * j + 3);
-        }
-      } else {
+      {
         const uint32_t p0 = lut16[code & mask0];
         const uint32_t p1 = lut16[(1u << w0) + ((code >> w0) & mask1)];
         out32 = p0 | (p1 << 16);

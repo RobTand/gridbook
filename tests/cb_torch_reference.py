@@ -96,33 +96,23 @@ def decode_cb_values(
 
     codes = extract_codewords(
         qw_padded, N=N, K=K, k_bits=k_bits, type_size=type_size)
-    local8 = torch.arange(8, device=qw_padded.device, dtype=torch.int64)
     row_base = cb_row_offset.to(torch.int64)[:, None, None, None]
 
-    if n_sub == 1:
-        # Signed layout: eight low bits are per-coordinate signs and the
-        # remaining high bits select one non-negative 8-vector.
-        magnitude = codes >> 8
-        gather = row_base + magnitude[..., None] * 8 + local8
-        values = cb_flat[gather]
-        negative = ((codes[..., None] >> local8) & 1).bool()
-        values = torch.where(negative, -values, values)
-    else:
-        sub_dim = 8 // n_sub
-        widths = _split_widths(k_bits, n_sub)
-        bit_offset = 0
-        table_base = 0
-        pieces = []
-        local = torch.arange(sub_dim, device=qw_padded.device,
-                             dtype=torch.int64)
-        for width in widths:
-            index = (codes >> bit_offset) & ((1 << width) - 1)
-            gather = (row_base + table_base
-                      + index[..., None] * sub_dim + local)
-            pieces.append(cb_flat[gather])
-            bit_offset += width
-            table_base += (1 << width) * sub_dim
-        values = torch.cat(pieces, dim=-1)
+    sub_dim = 8 // n_sub
+    widths = _split_widths(k_bits, n_sub)
+    bit_offset = 0
+    table_base = 0
+    pieces = []
+    local = torch.arange(sub_dim, device=qw_padded.device,
+                         dtype=torch.int64)
+    for width in widths:
+        index = (codes >> bit_offset) & ((1 << width) - 1)
+        gather = (row_base + table_base
+                  + index[..., None] * sub_dim + local)
+        pieces.append(cb_flat[gather])
+        bit_offset += width
+        table_base += (1 << width) * sub_dim
+    values = torch.cat(pieces, dim=-1)
 
     return values.reshape(N, K)
 

@@ -86,35 +86,6 @@
       ]
     },
     {
-      "family": "NVFP4_CB_S",
-      "name_pattern": "NVFP4_CB_S{k}",
-      "grid": "fp4",
-      "mode": "signed",
-      "n_sub": 1,
-      "rungs": [
-        12,
-        13,
-        14,
-        15,
-        16,
-        17,
-        18,
-        19,
-        20,
-        21,
-        22,
-        23,
-        24
-      ],
-      "layout_versions": [
-        1,
-        2
-      ],
-      "moe_layout_versions": [
-        2
-      ]
-    },
-    {
       "family": "FP8_CB_K",
       "name_pattern": "FP8_CB_K{k}",
       "grid": "fp8",
@@ -166,15 +137,6 @@
       },
       {
         "unit": "NVFP4_CB_K",
-        "kind": "cb_format_family",
-        "shard_admission": {
-          "input_axis_group": 256,
-          "output_axis_quantum": 8,
-          "merged_roles": "even_division"
-        }
-      },
-      {
-        "unit": "NVFP4_CB_S",
         "kind": "cb_format_family",
         "shard_admission": {
           "input_axis_group": 256,

@@ -342,17 +342,19 @@ def test_dense_static_lsq_modes_reach_only_the_lsq_activation_family(
 
 @pytest.mark.parametrize(
     "k,n_sub,expected",
-    [(24, 2, True), (20, 1, True), (21, 1, False)],
-    ids=["product-k24-16k", "signed-s20-16k", "signed-s21-over-16k"],
+    [(24, 2, True), (20, 1, False), (21, 1, False)],
+    ids=["product-k24-16k", "signed-s20-family-removed",
+         "signed-s21-family-removed"],
 )
 def test_dense_fused_fp4_selector_enforces_lut_smem_limit(
     monkeypatch, k, n_sub, expected
 ):
-    """The Python selector must reject an oversized signed LUT before JIT.
+    """The Python selector must reject a non-product n_sub before JIT.
 
-    Product K24 and signed S20 sit exactly on the 16-KiB boundary; signed S21
-    needs 32 KiB and must fall through without constructing/calling the fused
-    kernel.  This drives the real dense eligibility method on CPU.
+    Product K24 sits exactly on the 16-KiB boundary and stays eligible; any
+    n_sub other than 2 is ineligible outright now that the signed family is
+    removed (its S21 over-carve scenario died with it). This drives the real
+    dense eligibility method on CPU.
     """
 
     method = PrismaQuantCBLinearMethod.__new__(PrismaQuantCBLinearMethod)

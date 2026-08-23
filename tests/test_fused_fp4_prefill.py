@@ -16,9 +16,8 @@ Contracts pinned:
     the fp8 k=32 rate, a silent half-speed failure parity cannot catch.
   * cb_fused_fp4_prefill_mm_scaled == (host-expanded e2m1/SFB planes ->
     sm120_nvf4_mm_scaled stock blockscaled GEMM) BIT-IDENTICAL across the
-    full fused-eligible rung ladder (product K12..K24, signed S12..S20,
-    every rung under both v1 and v2), the M ladder,
-    and ragged N/K.
+    full fused-eligible rung ladder (product K12..K24, both v1 and v2), the
+    M ladder, and ragged N/K.
   * fp32-emulation tolerance on the kernel's OWN activation bucket
     (native NVFP4: per-tensor fp32 global x per-group ue4m3 SF). NOTE: this
     bucket differs from the quality/transient path's fp32-group-scale QDQ —
@@ -76,7 +75,7 @@ def prep_weight(k, N, K, mode, coding, seed):
                                        codebook=cb, scale_coding=coding)
     ts = fmt.nvfp4_cb_type_size(k, "fp4", coding)
     is_v2 = coding == fmt.SCALE_CODING_TWO_TIER
-    n_sub = 2 if mode == "product" else 1
+    n_sub = 2
     cb_flat = codec.build_flat_codebook([t.to(DEV) for t in cb])
     lut = codec.build_fp4_value_lut(cb_flat, k, n_sub).to(DEV)
     compose = (codec.build_compose_u8().to(DEV) if is_v2 else
@@ -238,7 +237,6 @@ _FUSED_ELIGIBLE_RUNG_CASES = [
     for coding in (fmt.SCALE_CODING_V1, fmt.SCALE_CODING_TWO_TIER)
     for mode, rungs in (
         ("product", range(12, 25)),
-        ("signed", range(12, 21)),
     )
     for k in rungs
 ]
@@ -654,20 +652,28 @@ def test_bindings_reject_invalid_tensor_contracts():
                 *dense_args[:3], foreign_lut, *dense_args[4:])
 
 
-def test_binding_rejects_first_oversized_signed_lut():
-    """S21 is decoder-compatible but exceeds the fused 16-KiB LUT carve."""
+def test_removed_signed_family_refuses_at_the_fused_abi():
+    """The removed signed n_sub=1 family fails LOUD at the fused binding.
 
-    k, N, K = 21, 128, 256
-    wctx = prep_weight(k, N=N, K=K, mode="signed",
+    The kernel now admits product (n_sub=2) only; a stale signed caller must
+    get the binding refusal, never a silent misread. (The old oversized-LUT
+    refusal this test sits beside was reachable ONLY through signed geometry:
+    a legal product rung tops out at exactly the 16-KiB carve, so with the
+    family gone that scenario is unconstructible and its test is deleted.)
+    """
+
+    k, N, K = 16, 128, 256
+    wctx = prep_weight(k, N=N, K=K, mode="product",
                        coding=fmt.SCALE_CODING_TWO_TIER, seed=63)
     x = torch.randn(32, K, dtype=torch.bfloat16, device=DEV)
     aq, sfa, _, recip = quant_act(x)
-    with pytest.raises(RuntimeError, match="value LUT exceeds the smem carve"):
+    with pytest.raises(RuntimeError,
+                       match=r"n_sub must be 2|n_sub=1"):
         ext.cb_fused_fp4_prefill_mm_scaled(
             aq, sfa, wctx["qwp"], wctx["lut"], wctx["compose"],
             recip.reshape(1).expand(x.shape[0]).contiguous().float(),
             torch.ones(N, dtype=torch.float32, device=DEV),
-            N, K, k, wctx["n_sub"], wctx["ts"], True,
+            N, K, k, 1, wctx["ts"], True,
         )
 
 

@@ -17,13 +17,19 @@ RFC 2119.
 
 A **codeword** encodes a **`d = 8`**-dimensional vector of grid values. A
 **`k`-bit index per 8 weights** selects a codeword. There are two value grids and
-three index-encoding modes.
+two index-encoding modes.
 
 | Family | Grid | Codeword values | Activation | Per-group scale | Body bits/weight |
 |---|---|---|---|---|---|
 | `NVFP4_CB_K{k}` | FP4 / E2M1 | `{0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}` | W4A4 | group-16 E4M3, **in the weight bytes** | `k/8 + 0.5` (v1) |
-| `NVFP4_CB_S{k}` | FP4 / E2M1 | positive half-grid + explicit signs | W4A4 | group-16 E4M3, **in the weight bytes** | `k/8 + 0.5` (v1) |
 | `FP8_CB_K{k}` | FP8 / E4M3 | E4M3 grid, `‖·‖ ≤ 448` | W8A8 | **none in weight bytes** — per-output-channel FP32, separate tensor | `k/8` |
+
+> **Removed family.** `NVFP4_CB_S{k}` (sign-magnitude half-grid, `mode:
+> "signed"`) was deleted from the runtime on 2026-08-23 — the producer had
+> stopped emitting it on 2026-08-17 because an `n_sub=1` codebook can never
+> satisfy the native-FP4 predicate. No published artifact encodes it. A
+> conforming implementation **MUST refuse** a `"mode": "signed"` scheme
+> instead of decoding it.
 
 > **Naming.** The dtype in a family name (`NVFP4`, `FP8`) names the **grid the
 > codebook's values live on — not the storage width**. Storage is the k-bit
@@ -117,15 +123,10 @@ Sub-index `i` decodes `8 / n_sub` coordinates via sub-codebook `i`. The 8-dim
 codeword is the concatenation `[sub0 | sub1 | ...]`. `n_sub` **MUST** be 2 for the
 FP4 grid and 4 for the FP8 grid in this version.
 
-**`signed` mode** — 8 explicit sign bits (low byte) then the `(k-8)`-bit magnitude
-index:
-```
- bit:  k-1 ............ 8 | 7 6 5 4 3 2 1 0
-       [  magnitude idx  ] | [ s7 ... s1 s0 ]
-```
-Sign bit `j` (bit `j` of the low byte) is **1 iff coordinate `j` is negative**.
-Decoded coordinate `j` = `mag_codebook[mag_idx][j] * (-1 if s_j else +1)`. The
-magnitude codebook holds non-negative grid values.
+**`signed` mode — REMOVED (2026-08-23).** The historical encoding was 8
+explicit sign bits (low byte) then a `(k-8)`-bit magnitude index into one
+non-negative half-grid table. It is no longer part of the format: implementations
+**MUST refuse** `"mode": "signed"` rather than decode it.
 
 ### 1.2 Scale coding — FP4 grid
 
@@ -252,8 +253,6 @@ for each row, each superblock s:
     code = codewords[v]
     if mode == full:     cw = codebook[code]                          # 8 coords
     if mode == product:  cw = concat( sub_cb[i][ (code >> off_i) & ((1<<b_i)-1) ]  for i in 0..n_sub-1 )
-    if mode == signed:   mag = mag_codebook[code >> 8]
-                         cw  = [ mag[j] * (-1 if bit_j(code & 0xFF) else +1)  for j in 0..7 ]
     for coord j in 0..7:
       w_idx = s*256 + v*8 + j
       if grid == fp4 and layout_version == 1:  scale = e4m3( qweight[row, base + 4k + group16(v,j)] )
@@ -307,7 +306,7 @@ loaded via pickle/`torch.load`.
 
 | Tensor | dtype / shape | Meaning |
 |---|---|---|
-| `cb_codebook.<ref>.<fmt>` | `fp16` `(2^K, 8)` | `full` / `signed` codebook (`K = k` for full, `K = k-8` for signed) |
+| `cb_codebook.<ref>.<fmt>` | `fp16` `(2^K, 8)` | `full` codebook (`K = k`) |
 | `cb_codebook.<ref>.<fmt>.sub{i}` | `fp16` `(2^b_i, 8/n_sub)` | `product` sub-codebook `i` |
 
 - `<ref>` is `lattice` (a deterministic fixed lattice — no per-tensor sidecar
@@ -416,12 +415,12 @@ the following vocabulary:
       "format": "NVFP4_CB_K16",
       "scheme": {
         "grid": "fp4",                     // "fp4" | "fp8"
-        "mode": "product",                 // "full" | "product" | "signed"
+        "mode": "product",                 // "full" | "product" ("signed" removed 2026-08-23; MUST be refused)
         "k": 16,
         "superblock": 256,
         "group_size": 16,                  // fp4 group-16 scale; 0 for fp8
         "vec_dim": 8,
-        "n_sub": 2,                        // product sub-count; 1 for full/signed
+        "n_sub": 2,                        // product sub-count; 1 for full
         "type_size": 73,                   // bytes per 256-weight superblock (MUST match grid,k,version)
         "act_bits": 4,                     // 4 (fp4, W4A4) | 8 (fp8, W8A8)
         "codebook_source": "lattice",      // "lattice" | "learned"
@@ -459,7 +458,7 @@ the following vocabulary:
 }
 ```
 
-- `codebook_ref` is a single tensor name (`full` / `signed`) or an ordered list
+- `codebook_ref` is a single tensor name (`full`) or an ordered list
   `sub0..sub{n_sub-1}` (`product`).
 - Targets sharing one `(codebook_ref, format)` **SHOULD** be grouped into one
   config group.
@@ -606,16 +605,17 @@ forever — this is the permanent backward-compatibility anchor. A new coding
 **SHOULD** reconstruct to a native per-group scale representation (as v2 composes
 to exact E4M3) so no downstream kernel surgery is needed.
 
-**Adding an index mode.** `full` / `product` / `signed` are the defined modes.
-A new mode MAY be added by specifying its `k`-bit codeword decode into 8
+**Adding an index mode.** `full` and `product` are the defined modes; `signed`
+was removed on 2026-08-23 and MUST be refused (see §0). A new mode MAY be added
+by specifying its `k`-bit codeword decode into 8
 coordinates; it **MUST** keep the LSB-first superblock packing (§1.1) and the
 256-weight superblock.
 
 **What every conforming implementation MUST honor (the stable core):**
 
 1. the 256-weight superblock and `in_features % 256 == 0` requirement;
-2. LSB-first index packing (§1.1) and the `full`/`product`/`signed` decode
-   semantics (§1);
+2. LSB-first index packing (§1.1) and the `full`/`product` decode
+   semantics (§1), plus the refusal of the removed `signed` mode;
 3. `type_size = f(grid, k, layout_version)` and the version-keyed `effective_bits`
    (§1.4), asserted at pack/load;
 4. v1 = E4M3-direct 16-byte plane; v2 = two-tier 9-byte plane composing to exact
@@ -633,7 +633,7 @@ reference GB10 hardware, a flat codebook table in shared memory is `2^k × 4` by
 (FP4). Against the measured 99 KB opt-in shared memory per block, flat tables are
 comfortable to `k ≤ 13` and marginal at `k = 14`; higher `k` **SHOULD** use a
 structured/computed codebook (a small stored generator plus sign/permutation
-decomposition, as the `signed`/`product` modes provide) rather than a stored flat
+decomposition, as the `product` mode provides) rather than a stored flat
 table, or the fused prefill kernel is infeasible. This is a hardware constraint on
 codebook design, not a format-layout constraint — the byte layout is identical
 regardless.

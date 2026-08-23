@@ -20,7 +20,7 @@
 //    role from the fp8 workstream).
 //  - cb_fused_fp4_prefill_mm_scaled: the decode-in-prologue NVFP4_CB GEMM.
 //    k_bits/n_sub/type_size/scale-coding are RUNTIME parameters — one
-//    instantiation serves K12..K24 product, S13..S16 signed, v1 and v2.
+//    instantiation serves K12..K24 product, v1 and v2.
 //
 // Scale convention (weight side is EXACT, activation side is native NVFP4):
 //  - SFB = the per-group-16 e4m3 weight scale, composed in-prologue (v2
@@ -781,7 +781,9 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
   TORCH_CHECK(tile_m == 128 || tile_m == 256,
               "dense fused fp4 tile_m must be 128 or 256");
   TORCH_CHECK(k_bits >= 9 && k_bits <= 24, "fp4 rung k_bits out of range");
-  TORCH_CHECK(n_sub == 1 || n_sub == 2, "fp4 n_sub must be 1 (signed) or 2");
+  TORCH_CHECK(n_sub == 2,
+              "fp4 n_sub must be 2 (product); the signed n_sub=1 family was "
+              "removed from the runtime");
   TORCH_CHECK(type_size == 4 * k_bits + (is_v2 ? 9 : 16),
               "type_size inconsistent with k_bits/scale coding");
   const int M = (int)a.size(0);
@@ -798,12 +800,10 @@ torch::Tensor cb_fused_fp4_prefill_mm_scaled(
   // No tail-slack requirement: the consumer's gmem gathers stay inside each
   // row's own superblock (aligned-u32 index windows end <= ts-1; the scale
   // plane is read with u8 loads).
-  // Value LUT size must match the rung exactly. Product: two ceil-first
-  // sub-tables of u16 nibble-quads; signed: 2^(k-8) u32 nibble-octets.
+  // Value LUT size must match the rung exactly: two ceil-first sub-tables of
+  // u16 nibble-quads (product).
   const int64_t w0 = k_bits - k_bits / 2;
-  const int64_t lut_need = (n_sub == 2)
-      ? ((1LL << w0) + (1LL << (k_bits / 2))) * 2
-      : (1LL << (k_bits - 8)) * 4;
+  const int64_t lut_need = ((1LL << w0) + (1LL << (k_bits / 2))) * 2;
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8 &&
               lut.is_contiguous() && lut.numel() >= lut_need &&
               lut.numel() % lut_need == 0,
@@ -1058,7 +1058,7 @@ torch::Tensor cb_fused_fp4_moe_grouped(
               "a must be contiguous packed-e2m1 uint8 [Mp, K/2]");
   TORCH_CHECK(K % 256 == 0, "K must be a multiple of 256");
   TORCH_CHECK(N % 8 == 0, "N must be a multiple of 8 (bf16 TMA epilogue)");
-  TORCH_CHECK(k_bits >= 9 && k_bits <= 24 && (n_sub == 1 || n_sub == 2));
+  TORCH_CHECK(k_bits >= 9 && k_bits <= 24 && n_sub == 2);
   TORCH_CHECK(type_size == 4 * k_bits + (is_v2 ? 9 : 16),
               "type_size inconsistent with k_bits/scale coding");
   const int Mp = (int)a.size(0);
@@ -1080,9 +1080,7 @@ torch::Tensor cb_fused_fp4_moe_grouped(
   // No tail-slack requirement (gmem gathers stay in-superblock; see the
   // dense entry note), so registered expert stacks are consumed as-is.
   const int64_t w0 = k_bits - k_bits / 2;
-  const int64_t lut_need = (n_sub == 2)
-      ? ((1LL << w0) + (1LL << (k_bits / 2))) * 2
-      : (1LL << (k_bits - 8)) * 4;
+  const int64_t lut_need = ((1LL << w0) + (1LL << (k_bits / 2))) * 2;
   TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == torch::kUInt8 &&
               lut.is_contiguous() && lut.numel() == lut_need &&
               lut_need <= 16384, "value LUT must be uint8[", lut_need, "]");

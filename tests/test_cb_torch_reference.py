@@ -51,27 +51,6 @@ def test_uneven_product_decode_and_row_offsets():
     assert torch.equal(got, torch.stack(expected_rows))
 
 
-def test_signed_decode_applies_per_coordinate_sign_bits():
-    k_bits, N, K = 13, 1, 256
-    codes = [((vector % 32) << 8) | ((vector * 17) & 0xFF)
-             for vector in range(32)]
-    packed = _pack_row(codes, k_bits).reshape(1, -1)
-    codebook = torch.arange(32 * 8, dtype=torch.float32).to(torch.bfloat16)
-    got = decode_cb_values(
-        packed, codebook, torch.zeros(1, dtype=torch.int32), N=N, K=K,
-        k_bits=k_bits, n_sub=1, type_size=4 * k_bits)
-
-    expected = []
-    for code in codes:
-        magnitude = code >> 8
-        vector = codebook[magnitude * 8:(magnitude + 1) * 8].clone()
-        for coordinate in range(8):
-            if code & (1 << coordinate):
-                vector[coordinate] = -vector[coordinate]
-        expected.append(vector)
-    assert torch.equal(got[0], torch.cat(expected))
-
-
 def test_fp8_and_two_tier_weight_rounding():
     k_bits, n_sub, N, K = 13, 2, 1, 256
     codes = [((vector * 5) & 0x7F) | (((vector + 7) & 0x3F) << 7)

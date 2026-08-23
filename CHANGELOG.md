@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Signed CB family (NVFP4_CB_S) deleted from the runtime
+
+The sign-magnitude codebook family is gone from gridbook's runtime, not just
+from the producer. PrismaQuant stopped emitting it on 2026-08-17 (an `n_sub=1`
+codebook can never satisfy gridbook's native-FP4 predicate; "not performant,
+we don't support them"), which left the runtime as a stale decoder whose own
+test suite could no longer even build signed fixtures — the encoder refuses
+`mode="signed"` at call time, so a full suite reported hundreds of failures.
+Rob made the product call on 2026-08-23: **"The signed codebooks can be
+deleted."**
+
+Removed in one commit, so no contract row outlives its enforcement site:
+
+- CUDA decode paths (`cb_gemv.cu`, `cb_fused_fp4_gemm.cu`,
+  `cutlass_fork/sm120_cb_fused_fp4_mma.hpp`): the `fp4v2_signed_gather`
+  routine, every `n_sub == 1` decode branch and LUT-sizing arm, and the
+  CUTLASS `signed_mode` path are deleted. The bindings now REFUSE `n_sub != 2`
+  by name — fail closed and loud, never a silent product-mode misread of
+  signed bytes. Product-only kernels that already refused the layout
+  (`cb_moe_persistent_b.cu`, `cb_gemv_v2.cu`) are untouched, as is every C
+  type keyword (`unsigned` casts); none of the deleted code was keyword text.
+- Python admission (`linear.py`, `moe.py`, `codec.py`): eligibility selectors
+  admit only `n_sub in {fp8: 4, fp4: 2}`; the fused FP4 value-LUT builder
+  drops its signed branch; the MoE constructor refuses non-product fp4
+  schemes at load.
+- Tests: all signed-fixture tests are deleted rather than skipped (their
+  encoder anchor no longer exists), and two new refusal tests pin the
+  removed family's loud failure at the dense GEMV and fused-prefill ABIs;
+  CPU eligibility tests now assert n_sub=1 is ineligible outright.
+- Contract: the `NVFP4_CB_S` format row and its closed-world
+  `tensor_parallel` unit row are deleted from `runtime_contract.json`. The
+  schema stays at v6: the table's SHAPE and reading rules are unchanged, and
+  the closed-world semantics turns the missing row into a producer-side
+  refusal by design — a reader pinned to v6 reads this contract correctly
+  and refuses any stale NVFP4_CB_S artifact without a repin. A bump would
+  have forced v6-pinned producers to refuse everything for no safety gain.
+  No published artifact encodes an S-rung (all four published HF artifacts'
+  sidecars verified clean; the only S-rung export ever found is the local
+  2026-07-22 K-vs-S research bundle that the 0.5 load gate already refused).
+
 ### Contract schema v6: dense CB tensor-parallel admission is attested as laws, not a cap
 
 The shard-aware loading lift above removed the blanket TP=1 gate that schema

@@ -314,8 +314,9 @@ def test_degenerate_shapes_are_rejected():
 def test_only_the_fp4_v2_product_mode_is_eligible(override):
     """The kernel decodes v2's two sub-tables and 9-byte scale plane only.
 
-    v1 layouts and signed n_sub=1 rungs are a different decode entirely, so a
-    shape that merely looks close must stay on the shipping route.
+    v1 layouts and non-product n_sub values are a different decode entirely,
+    so a shape that merely looks close must stay on the shipping route.
+    (The signed n_sub=1 family itself was removed from the runtime.)
     """
     assert lane.eligible(_ext_stub(), _layer_stub(16),
                          **_shape(16, **override)) is False

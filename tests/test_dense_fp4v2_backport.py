@@ -53,31 +53,31 @@ def _assert_reference_close(y_cuda, y_reference, tag):
     assert rel <= 1e-3, f"{tag}: norm backstop rel {rel:.3e}"
 
 
-def _encode_dense(pq, k, N, K, cb, seed, mode="product"):
+def _encode_dense(pq, k, N, K, cb, seed):
     """(N, K) weight -> fp4 two-tier v2 on-disk bytes via the REAL encoder
     (reusing the stack encoder with E=1), so every (super, sub) scale pair is
     legal by construction."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     w = (torch.randn(1, N, K, generator=g) * 0.02).to(DEV)
-    fields = pq.nvfp4_cb_fields(w, k, grid="fp4", mode=mode, codebook=cb,
+    fields = pq.nvfp4_cb_fields(w, k, grid="fp4", mode="product", codebook=cb,
                                 scale_coding="two_tier", encode_tier="fast")
-    b = pq.nvfp4_cb_assemble_bytes(fields, k, grid="fp4", mode=mode)
+    b = pq.nvfp4_cb_assemble_bytes(fields, k, grid="fp4", mode="product")
     ts = pq.nvfp4_cb_type_size(k, "fp4", "two_tier")
     n_sb = K // codec.SUPERBLOCK
     return b.reshape(1, N, n_sb * ts)[0].contiguous().to(DEV), ts
 
 
-def _prep(pq, k, N, K, seed, mode="product", cb=None):
+def _prep(pq, k, N, K, seed, cb=None):
     if cb is None:
-        cb = pq._resolve_codebook(k, "fp4", mode, None, torch.device(DEV))
-    packed, ts = _encode_dense(pq, k, N, K, cb, seed, mode=mode)
+        cb = pq._resolve_codebook(k, "fp4", "product", None, torch.device(DEV))
+    packed, ts = _encode_dense(pq, k, N, K, cb, seed)
     subs = list(cb) if isinstance(cb, (tuple, list)) else [cb]
     return dict(qwp=codec.pad_qweight(packed),
                 cb_flat=codec.build_flat_codebook(subs),
                 compose=codec.build_compose_table(
                     codec.TWO_TIER_SUB_TABLE).to(DEV),
                 row_off=torch.zeros(N, dtype=torch.int32, device=DEV),
-                N=N, K=K, k=k, n_sub=(1 if mode == "signed" else 2), ts=ts)
+                N=N, K=K, k=k, n_sub=2, ts=ts)
 
 
 def _run(p, xq):
@@ -154,24 +154,6 @@ def test_r2_backport_bit_exact_v2_contract(monkeypatch):
     for sched in (None, "db"):
         outs.update(_run_both_r2_arms(monkeypatch, p, xq, sched))
     _assert_arms_bit_equal(outs, "dense fp4-v2 R2 contract v2")
-
-
-def test_r2_backport_bit_exact_signed_mode(monkeypatch):
-    """Signed S-rungs (n_sub=1): the R2 staging/predication still applies; the
-    magnitude gather is the shared fp4v2_signed_gather. Skips where the
-    mounted encoder has deleted the signed mode (upstream change)."""
-    pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
-    try:
-        p = _prep(pq, k=14, N=48, K=512, seed=88, mode="signed")
-    except ValueError:
-        pytest.skip("encoder deleted the fp4 signed mode")
-    torch.manual_seed(8)
-    x = torch.randn(3, 512, dtype=torch.bfloat16, device=DEV)
-    xq = codec.fp4_group16_act_qdq(x).to(torch.bfloat16)
-    outs = {}
-    for sched in (None, "db"):
-        outs.update(_run_both_r2_arms(monkeypatch, p, xq, sched))
-    _assert_arms_bit_equal(outs, "dense fp4-v2 R2 signed")
 
 
 def test_r2_backport_bit_exact_fused_row_offset(monkeypatch):

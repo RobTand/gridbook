@@ -126,11 +126,13 @@ def test_contract_pins_current_format_ladders_and_layout_restrictions():
     by_family = {
         item["family"]: item for item in load_runtime_contract()["formats"]
     }
-    assert set(by_family) == {"NVFP4_CB_K", "NVFP4_CB_S", "FP8_CB_K"}
-    for family in ("NVFP4_CB_K", "NVFP4_CB_S"):
-        assert by_family[family]["rungs"] == list(range(12, 25))
-        assert by_family[family]["layout_versions"] == [1, 2]
-        assert by_family[family]["moe_layout_versions"] == [2]
+    assert set(by_family) == {"NVFP4_CB_K", "FP8_CB_K"}
+    # The signed NVFP4_CB_S family was removed from the runtime (2026-08-23);
+    # a row for it must not outlive its enforcement sites.
+    assert "NVFP4_CB_S" not in by_family
+    assert by_family["NVFP4_CB_K"]["rungs"] == list(range(12, 25))
+    assert by_family["NVFP4_CB_K"]["layout_versions"] == [1, 2]
+    assert by_family["NVFP4_CB_K"]["moe_layout_versions"] == [2]
     assert by_family["FP8_CB_K"]["rungs"] == list(range(28, 49))
     assert by_family["FP8_CB_K"]["layout_versions"] == [1]
     assert by_family["FP8_CB_K"]["moe_layout_versions"] == [1]

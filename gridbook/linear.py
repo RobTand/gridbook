@@ -820,10 +820,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         ok = getattr(self, "_cuda_gemv_cached", None)
         if ok is None:
             fp8_ok = not self.is_fp4 and self.n_sub == 4
-            # The main extension can decode n_sub=1 signed rungs, but the
-            # native-only dense lane rejects them at model load because no
-            # quality-preserving native prefill covers every M.
-            fp4v2_ok = self.is_fp4 and self.is_v2 and self.n_sub in (1, 2)
+            fp4v2_ok = self.is_fp4 and self.is_v2 and self.n_sub == 2
             ok = fp8_ok or fp4v2_ok
             if ok:
                 from .cuda_ext import get_ext
@@ -853,11 +850,11 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
     def _require_fp4_v2_product(self, operation: str) -> None:
         """Pin dense quality serving to the native FP4-v2 product layout.
 
-        The signed (``n_sub=1``) and legacy v1 layouts have decode support in
-        older kernels, but no exact native BF16 expansion contract. Selecting
-        a numerically different implementation for larger M would make one
-        layer change format with batch size, so the entire dense serving lane
-        rejects those layouts until their native expansion is implemented.
+        The legacy v1 layout has decode support in older kernels but no exact
+        native BF16 expansion contract. Selecting a numerically different
+        implementation for larger M would make one layer change format with
+        batch size, so the entire dense serving lane rejects that layout
+        until its native expansion is implemented.
         """
         if (self.is_fp4 and self.is_v2 and self.n_sub == 2
                 and self.type_size == 4 * self.k + 9):
@@ -865,8 +862,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         from .cuda_ext import NativeKernelUnavailableError
         raise NativeKernelUnavailableError(
             f"{self.prefix}: {operation} requires FP4-CB-v2 product layout "
-            "(n_sub=2, type_size=4*k+9); legacy v1 and signed n_sub=1 "
-            "layouts have no native quality-preserving dense prefill kernel")
+            "(n_sub=2, type_size=4*k+9); legacy v1 layouts have no native "
+            "quality-preserving dense prefill kernel")
 
     def _require_fp4_cuda_gemv(self) -> None:
         """Require the owned FP4-v2 product GEMV for M<=8."""
@@ -927,7 +924,7 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                   and getattr(layer, "_cb_fp4_input_global_scale", None)
                   is not None))
               and 12 <= self.k <= 24
-              and self.n_sub in (1, 2)
+              and self.n_sub == 2
               and K % 256 == 0
               and layer._cb_N % 8 == 0
               and self.type_size == 4 * self.k + (9 if self.is_v2 else 16))

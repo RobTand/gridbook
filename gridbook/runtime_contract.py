@@ -491,7 +491,6 @@ def validate_runtime_contract(contract: Any) -> None:
             _fail(f"{path}.grid", "must be 'fp4' or 'fp8'")
         expected_n_sub = {
             ("fp4", "product"): 2,
-            ("fp4", "signed"): 1,
             ("fp8", "product"): 4,
         }.get((grid, mode))
         if expected_n_sub is None:
