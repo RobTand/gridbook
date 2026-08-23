@@ -74,17 +74,16 @@ second runtime tree or maintain a parallel loader table.
   closed. Native dense FP4 serving in 0.5 accepts only unsigned product mode
   with v2 scale coding. A format-valid FP4-v1 product layer is rejected at
   model load because its exact every-M native quality expander is not
-  implemented. **Signed** mode (S-rungs, n_sub=1: 8 sign bits + magnitude index into
-  one half-grid table) was validated by a historical 18-test GPU battery on
-  2026-07-22. It is **closed as research-only** by the K-vs-S head-to-head
-  the same day: over 776 matched-rate per-(Linear, rung) comparisons the
-  unsigned rungs won 79% of the time and the allocator placed 6 signed units
-  against 147 unsigned, so S-rungs stay **off production menus**. The format
-  stays in the spec for exotic weight geometries; no published artifact uses
-  one. In 0.5, native dense serving also rejects a signed S-rung at model load:
-  the format is valid and remains available for research codecs, but the exact
-  every-M native prefill contract is not implemented for it. Full mode:
-  spec-reserved, unimplemented.
+  implemented. **Signed** mode (S-rungs, n_sub=1) was validated by a
+  historical 18-test GPU battery on 2026-07-22 and closed as research-only by
+  the same-day K-vs-S head-to-head: over 776 matched-rate per-(Linear, rung)
+  comparisons the unsigned rungs won 79% of the time and the allocator placed
+  6 signed units against 147 unsigned. The producer deleted the family on
+  2026-08-17 ("not performant, we don't support them"); on 2026-08-23 the
+  runtime followed — decode kernels, Python admission, tests, the packaged
+  contract row, and the SPEC definition are gone, and a `"mode": "signed"`
+  scheme now fails closed everywhere. No published artifact encodes an
+  S-rung. Full mode: spec-reserved, unimplemented.
 - **Mixed containers are supported and shipping.** A config group carrying a
   `"scheme"` key is a CB group and is served by this plugin; a group without one
   uses the stock `compressed-tensors` vocabulary and is delegated to a real
@@ -142,7 +141,7 @@ of that site.
   single number is true of every dispatch path; publishing one would assert
   more than any site enforces.
 - Each entry in `units` names one producer-addressable unit: a CB format family
-  (`NVFP4_CB_K`, `NVFP4_CB_S`, `FP8_CB_K`) or one source-passthrough format id.
+  (`NVFP4_CB_K`, `FP8_CB_K`) or one source-passthrough format id.
   Two claim shapes exist, matching the two enforcement shapes in the runtime:
   - **Dense CB families** publish `shard_admission` instead of a cap, because
     no dispatch path enforces a numeric ceiling for them — above one rank,

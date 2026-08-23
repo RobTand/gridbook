@@ -76,7 +76,6 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
     assert set(units) == {
         "FP8_CB_K",
         "NVFP4_CB_K",
-        "NVFP4_CB_S",
         "fp8_e4m3_ue8m0_block128",
         "mxfp4_e2m1_ue8m0_g32",
         "mxfp8_e4m3_e8m0_g32",
@@ -88,8 +87,6 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
         "FP8_CB_K": {"input_axis_group": 256, "output_axis_quantum": 16,
                      "merged_roles": "even_division"},
         "NVFP4_CB_K": {"input_axis_group": 256, "output_axis_quantum": 8,
-                       "merged_roles": "even_division"},
-        "NVFP4_CB_S": {"input_axis_group": 256, "output_axis_quantum": 8,
                        "merged_roles": "even_division"},
     }
     for family, admission in expected_admission.items():
@@ -184,6 +181,11 @@ def test_closed_world_lookup_refuses_what_the_table_does_not_claim():
     # An unknown unit id has no row -> REFUSED.
     assert not _permitted(table, "NVFP4_CB_K99", 1)
     assert not _permitted(table, "fp8_e4m3_ue8m0_block128_extra", 1)
+    # A REMOVED unit has no row either: the signed NVFP4_CB_S family left the
+    # runtime (2026-08-23), and the closed-world reading refuses its artifacts
+    # without any new machinery — absence IS the refusal.
+    assert not _permitted(table, "NVFP4_CB_S", 1)
+    assert not _permitted(table, "NVFP4_CB_S", 2)
     # A world size no numeric claim covers -> REFUSED.  Every passthrough
     # unit is still capped at 1; only the dense CB rows defer.
     for capped in ("fp8_e4m3_ue8m0_block128", "mxfp4_e2m1_ue8m0_g32",
@@ -269,7 +271,7 @@ def _corrupt_output_axis_quantum(contract):
 
 
 def _relax_merged_roles(contract):
-    _units_by_id(contract)["NVFP4_CB_S"]["shard_admission"][
+    _units_by_id(contract)["NVFP4_CB_K"]["shard_admission"][
         "merged_roles"] = "best_effort"
 
 
@@ -408,8 +410,7 @@ def test_dense_cb_admission_rows_match_the_linear_gates():
 
     units = _units_by_id(load_runtime_contract())
     quanta = {"fp4": 8, "fp8": 16}
-    for family, grid in (("FP8_CB_K", "fp8"), ("NVFP4_CB_K", "fp4"),
-                         ("NVFP4_CB_S", "fp4")):
+    for family, grid in (("FP8_CB_K", "fp8"), ("NVFP4_CB_K", "fp4")):
         admission = units[family]["shard_admission"]
         assert admission["input_axis_group"] == superblock
         assert admission["output_axis_quantum"] == quanta[grid]

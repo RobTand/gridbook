@@ -339,8 +339,9 @@ def test_requested_native_fp4_mode_fails_closed_if_kernel_becomes_unavailable(
 
 @pytest.mark.parametrize(
     "k,n_sub,expected",
-    [(24, 2, True), (20, 1, True), (21, 1, False)],
-    ids=["product-k24-16k", "signed-s20-16k", "signed-s21-over-16k"],
+    [(24, 2, True), (20, 1, False), (21, 1, False)],
+    ids=["product-k24-16k", "signed-s20-family-removed",
+         "signed-s21-family-removed"],
 )
 def test_native_fp4_moe_eligibility_enforces_lut_smem_limit(
     monkeypatch, k, n_sub, expected

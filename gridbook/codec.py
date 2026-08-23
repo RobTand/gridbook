@@ -307,8 +307,6 @@ def fp4_value_lut_nbytes(k_bits: int, n_sub: int) -> int:
         w0 = k_bits - k_bits // 2
         w1 = k_bits // 2
         return ((1 << w0) + (1 << w1)) * 2
-    if n_sub == 1:
-        return (1 << (k_bits - 8)) * 4
     raise ValueError(f"fp4 value LUT: unsupported n_sub={n_sub}")
 
 
@@ -318,8 +316,7 @@ def build_fp4_value_lut(cb_flat: torch.Tensor, k_bits: int,
 
     product (n_sub=2): two ceil-first sub-tables of 4-dim vectors; each entry
     becomes a u16 of 4 nibble codes (LSB-first) -> bytes = (2^w0 + 2^w1) * 2.
-    signed (n_sub=1): 2^(k-8) positive 8-dim magnitude vectors; each entry a
-    u32 of 8 nibble codes -> bytes = 2^(k-8) * 4. Max 16 KiB (k24 product).
+    Max 16 KiB (k24 product).
     """
     if n_sub == 2:
         w0 = k_bits - k_bits // 2
@@ -332,13 +329,6 @@ def build_fp4_value_lut(cb_flat: torch.Tensor, k_bits: int,
             u16 = c[:, 0] | (c[:, 1] << 4) | (c[:, 2] << 8) | (c[:, 3] << 12)
             out.append(u16.to(torch.int16).view(torch.uint8).reshape(-1))
         return torch.cat(out).contiguous()
-    if n_sub == 1:
-        m = cb_flat[:(1 << (k_bits - 8)) * 8].reshape(-1, 8)
-        c = fp4_e2m1_codes(m).to(torch.int64)
-        u32 = torch.zeros(c.shape[0], dtype=torch.int64, device=c.device)
-        for j in range(8):
-            u32 |= c[:, j] << (4 * j)
-        return (u32.to(torch.int32).view(torch.uint8).reshape(-1).contiguous())
     raise ValueError(f"fp4 value LUT: unsupported n_sub={n_sub}")
 
 

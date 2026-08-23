@@ -139,8 +139,8 @@ def expand_fp4_v2_to_weight(
     two-subcodebook product dictionary. The dense loader handles fused modules
     with multiple dictionaries by invoking this wrapper once per contiguous
     role segment and concatenating the native BF16 results. Passing a raw
-    concatenation to one invocation, and signed ``n_sub=1`` encoding, remain
-    unsupported and are rejected. A padded row input is compacted to the raw
+    concatenation to one invocation remains unsupported and is rejected. A
+    padded row input is compacted to the raw
     byte plane expected by the existing extension.
     """
     row_bytes = _validate_packed_rows(

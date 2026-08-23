@@ -438,11 +438,11 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             raise NotImplementedError(
                 f"{prefix}: fp4 MoE experts require two-tier v2 scale coding "
                 "(fp4-v1 expert transient not yet implemented)")
-        if self.is_fp4 and (self.n_sub not in (1, 2)
+        if self.is_fp4 and (self.n_sub != 2
                             or self.type_size != 4 * self.k + 9):
             raise NotImplementedError(
-                f"{prefix}: native FP4 MoE requires the v2 serialized layout "
-                "(n_sub in {1,2}, type_size=4*k+9)")
+                f"{prefix}: native FP4 MoE requires the v2 serialized "
+                "product layout (n_sub=2, type_size=4*k+9)")
 
     # -- weight buffers (stacked experts) ------------------------------------
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
@@ -945,12 +945,6 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
                         f"{mode!r} is unavailable ({reason}); changing to the "
                         "exact BF16 bridge would violate the explicit "
                         "activation contract")
-            elif self.n_sub != 2:
-                from .cuda_ext import NativeKernelUnavailableError
-                raise NativeKernelUnavailableError(
-                    f"{self.prefix}: signed FP4-CB experts have no exact "
-                    "native BF16 prefill bridge; select a supported native "
-                    "fused FP4 MoE activation mode")
         from .ops import register_cb_layer
         layer._cb_layer_id = register_cb_layer(self, layer)
 
@@ -1091,8 +1085,8 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             reason = "artifact has no loaded stage activation scales"
         elif not 12 <= self.k <= 24:
             reason = f"k={self.k} is outside the fused range [12, 24]"
-        elif self.n_sub not in (1, 2):
-            reason = f"n_sub={self.n_sub} is not 1 or 2"
+        elif self.n_sub != 2:
+            reason = f"n_sub={self.n_sub} is not the product mode 2"
         elif self.type_size != 4 * self.k + 9:
             reason = "serialized row type_size is not FP4-CB layout v2"
         elif layer._cb_hidden % codec.SUPERBLOCK != 0:
