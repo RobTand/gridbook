@@ -3,7 +3,7 @@
 Since the shard-aware loading wave, dense CB Linears construct above one
 tensor-parallel rank under structural shard-alignment gates, while every
 other surface refuses by name at a numeric TP=1 ceiling.  As of schema
-``gridbook.runtime-contract.v7`` the packaged contract publishes exactly
+``gridbook.runtime-contract.v8`` the packaged contract publishes exactly
 that split as machine-readable per-unit rows, so a producer gate can branch
 on fields instead of prose (principle: an attested claim, never an asserted
 one).
@@ -157,9 +157,9 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
 
 def test_schema_and_contract_version_move_together():
     contract = load_runtime_contract()
-    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v7"
+    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v8"
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 7
+    assert contract["contract_version"] == 8
 
 
 # --- 2. Closed-world reading: absence means REFUSED ---------------------------

@@ -1,6 +1,6 @@
 {
-  "schema": "gridbook.runtime-contract.v7",
-  "contract_version": 7,
+  "schema": "gridbook.runtime-contract.v8",
+  "contract_version": 8,
   "abi_features": {
     "dspark_construction_physical_bridge": 1,
     "routed_moe_per_role_codebook_lut": 1,

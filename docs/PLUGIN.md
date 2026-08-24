@@ -155,7 +155,7 @@ second runtime tree or maintain a parallel loader table.
 
 ## Tensor-parallel capability
 
-As of contract schema `gridbook.runtime-contract.v7`, the packaged contract
+As of contract schema `gridbook.runtime-contract.v8`, the packaged contract
 carries a `tensor_parallel` section that publishes, per serving unit, what the
 runtime actually enforces. The table is an attestation: each row restates a
 refusal or admission site in this package, and
@@ -230,12 +230,12 @@ contract that omits a shipped unit, invents one, drops a mandatory field,
 caps the capless dense CB surface with a number, or publishes a numeric claim
 no enforcement site stands behind.
 
-**Compatibility rule:** `schema` and `contract_version` move together (v7 / 7),
+**Compatibility rule:** `schema` and `contract_version` move together (v8 / 8),
 and readers match the schema string exactly. A producer pinned to
-`gridbook.runtime-contract.v6` must refuse a v7 contract whole — no partial
+`gridbook.runtime-contract.v7` must refuse a v8 contract whole — no partial
 parsing, no field-by-field salvage across versions — and keep producing against
-its pinned runtime until its pin is deliberately bumped. Reading a v6 contract
-with a v7 reader fails the same way.
+its pinned runtime until its pin is deliberately bumped. Reading a v7 contract
+with a v8 reader fails the same way.
 
 ## Expert-parallel capability
 

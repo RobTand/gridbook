@@ -65,9 +65,9 @@ law that makes that narrowing correct.
   same law plus `qualified_shard_degrees` `[1, 2, 4]`, keeping the pinned
   geometry (which names the unsharded plane). `mxfp8_e4m3_e8m0_g32` moves to
   the same shape with both arms still capped at 1 — no capability change.
-  Schema and `contract_version` move together to v7 / 7.
+  Schema and `contract_version` move together to v8 / 8.
 
-### CB MoE expert stacks serve under expert parallelism (contract schema v7)
+### CB MoE expert stacks serve under expert parallelism (contract schema v8)
 
 Routed CB MoE now serves above one rank with `-tp N --enable-expert-parallel`.
 Tensor parallelism was never the right axis for it and still refuses: a CB
