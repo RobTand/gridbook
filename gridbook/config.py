@@ -1499,9 +1499,11 @@ class PrismaQuantConfig(QuantizationConfig):
            weight construction.  The source-FP8 W8A16 lane does
            (``fp8_source_w8a16._require_shard_alignment``: whole-128 local
            extents on the sharded axis, per-role alignment on merged planes,
-           and its grouped-BMM arm still refused above shard degree 1).  Every
-           other passthrough format has no sharded audit at all, so it refuses
-           above one HERE rather than discovering it after weights are copied.
+           and its grouped-BMM arm admitted only at a MEASURED shard degree,
+           since column-sharding a grouped plane divides the kernel's group
+           count).  Every other passthrough format has no sharded audit at
+           all, so it refuses above one HERE rather than discovering it after
+           weights are copied.
         """
 
         if fmt.id != _WIRE_FP8_BLOCK128_TP:
