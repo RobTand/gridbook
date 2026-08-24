@@ -1,8 +1,10 @@
 """Mixed-format fused projections above one tensor-parallel rank.
 
-DeepSeek-V4's shipped 92 GB artifact fuses a CB ``gate_proj`` with a
-source-passthrough block-FP8 ``up_proj`` in four shared-expert
-``gate_up_proj`` modules.  vLLM presents that as ONE
+DeepSeek-V4's shipped 92 GB artifact has EIGHT shared-expert
+``gate_up_proj`` modules whose two roles do not share one method: four fuse a
+CB ``gate_proj`` with a source-passthrough block-FP8 ``up_proj`` (layers 0,
+19, 21, 22), and four fuse two CB roles at different rungs, K48 with K44
+(layers 12, 13, 18, 32).  vLLM presents each as ONE
 ``MergedColumnParallelLinear``; Gridbook gives each role its own carrier and
 its own existing method.  Above one rank the composer therefore has exactly
 two jobs, and this file pins both:
@@ -597,10 +599,66 @@ def test_an_unstamped_carrier_refuses_rather_than_assuming_degree_one():
 # 4. The shipped DSv4 modules.
 # ===========================================================================
 
+@pytest.mark.parametrize("layer_index", [12, 13, 18, 32])
+def test_shipped_dsv4_two_cb_rung_modules_construct_and_load_at_tp2(
+        monkeypatch, layer_index):
+    """The OTHER four: two CB roles at different rungs, K48 fused with K44.
+
+    A mixed-format fusion does not require a non-CB role — two CB roles whose
+    schemes differ have no honest single merged method either, and layers 12,
+    13, 18 and 32 of the shipped artifact are exactly that. Their planes have
+    different row widths, which is what makes the per-carrier narrowing
+    (rather than one merged narrow) the thing being checked here.
+    """
+
+    gate = f"model.layers.{layer_index}.ffn.shared_experts.w1"
+    up = f"model.layers.{layer_index}.ffn.shared_experts.w3"
+    fused = f"model.layers.{layer_index}.ffn.shared_experts.gate_up_proj"
+    k44 = {**CB_SCHEME, "k": 44, "type_size": 176,
+           "codebook_ref": [f"cb.fp8.k44.sub{i}" for i in range(CB_N_SUB)]}
+    k44_row_bytes = (K_FULL // SUPERBLOCK) * 176
+
+    generator = torch.Generator().manual_seed(31)
+    checkpoint = {
+        gate + ".cb_qweight": torch.randint(
+            0, 256, (ROLE_N, CB_ROW_BYTES), dtype=torch.uint8,
+            generator=generator),
+        gate + ".weight_scale": torch.rand(ROLE_N, generator=generator),
+        up + ".cb_qweight": torch.randint(
+            0, 256, (ROLE_N, k44_row_bytes), dtype=torch.uint8,
+            generator=generator),
+        up + ".weight_scale": torch.rand(ROLE_N, generator=generator),
+    }
+
+    for rank in range(2):
+        _as_rank(monkeypatch, rank, 2)
+        method = MixedFusedLinearMethod(fused, [
+            (gate, _cb_method(gate)),
+            (up, PrismaQuantCBLinearMethod(types.SimpleNamespace(), k44, up)),
+        ])
+        layer = torch.nn.Module()
+        method.create_weights(layer, K_FULL, [ROLE_N // 2, ROLE_N // 2],
+                              K_FULL, 2 * ROLE_N, torch.bfloat16)
+        _load_mixed(layer, checkpoint)
+        for index, (name, row_bytes) in enumerate(
+                ((gate, CB_ROW_BYTES), (up, k44_row_bytes))):
+            planes = _carrier_planes(layer, index)
+            assert tuple(planes["cb_qweight"].shape) == (ROLE_N // 2,
+                                                         row_bytes)
+            assert torch.equal(
+                planes["cb_qweight"].data,
+                checkpoint[name + ".cb_qweight"].narrow(
+                    0, rank * (ROLE_N // 2), ROLE_N // 2))
+            assert torch.equal(
+                planes["weight_scale"].data,
+                checkpoint[name + ".weight_scale"].narrow(
+                    0, rank * (ROLE_N // 2), ROLE_N // 2))
+
+
 @pytest.mark.parametrize("layer_index", [0, 19, 21, 22])
 def test_shipped_dsv4_mixed_modules_construct_and_load_at_tp2(
         monkeypatch, layer_index):
-    """The four blocking modules, at their real shapes, on both ranks."""
+    """The four CB-gate / passthrough-up modules, at their real shapes."""
 
     gate = f"model.layers.{layer_index}.ffn.shared_experts.w1"
     up = f"model.layers.{layer_index}.ffn.shared_experts.w3"
