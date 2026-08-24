@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// CB decode GEMV v2 — smem-resident dictionary, M<=16 grouped MoE decode
-// (GB10 / sm_121a).
+// FP4-CB v2 decode/expand — staged dictionaries on Blackwell cc12.0/12.1.
+// Public artifacts use K1..K25; direct K26..K32 instantiations are retained
+// only for kernel research.
 //
 // PRIOR ART IN THIS TREE. Staging the codebook in shared memory is NOT a new
 // idea here: cutlass_fork/sm120_cb_fused_mma.hpp:140-196 already does it for
@@ -17,8 +18,9 @@
 // dense NVFP4; this kernel converts that byte win into latency by removing the
 // L2 round-trip:
 //
-//   1. the WHOLE per-rung sub-codebook (product n_sub=2: k13 1.5 KB, k16 4 KB,
-//      k20 16 KB, k24 64 KB — all fit the sm_121a 99 KB opt-in smem budget) is
+//   1. the WHOLE per-rung sub-codebook (product n_sub=2: k1 24 B, k13 1.5 KB,
+//      k16 4 KB, k20 16 KB, k24 64 KB, k25 96 KB — all fit the cc12x 99 KB
+//      opt-in smem budget) is
 //      staged to shared memory ONCE per block by all threads (vectorized
 //      uint4), then every decode gather is an LDS hit instead of an L2/DRAM
 //      round-trip;
@@ -33,9 +35,8 @@
 // The inherited decode GEMV's rowpack schedule hard-caps its request at 48 KB
 // (cb_gemv.cu:1445, `if (rp_smem <= 48 * 1024)`, else it falls through to the
 // non-rowpack schedule) and never calls cudaFuncSetAttribute. This kernel opts
-// in to the sm_121a 99 KB dynamic-smem budget explicitly, which is what makes
-// the k20 (16 KB) and k24 (64 KB) staged-dictionary configurations expressible
-// at all.
+// in to the cc12x 99 KB dynamic-smem budget explicitly, which makes K25 the
+// last whole-dictionary public rung.
 //
 // NUMERICS. The byte format, decode semantics and wv rounding are identical to
 // cb_gemv.cu (v1: w = bf16_rn(f32(cb)*sc); v2 contract: raw values with sc

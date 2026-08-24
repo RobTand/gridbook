@@ -117,38 +117,48 @@ separately compiled and qualified subsets: their default/off selectors use the
 exact supported route, while an explicitly required but ineligible optimized
 lane fails the load rather than borrowing research evidence.
 `python -m gridbook.sm120_preflight` cross-compiles the generic main/v2
-modules, persistent-B, and the grouped BF16 bridge with exact RTX 50 targets
-and verifies their symbols/cubins without launching them. Its receipt is
-permanently compile-only; GB10 execution cannot qualify RTX 50 correctness or
-performance.
+modules, persistent-B, and the grouped BF16 bridge with exact RTX 50 targets,
+verifies their symbols/cubins, and resolves the native vLLM FP8/CUTLASS ABI
+without launching an operation. Its dual-family CB receipt is permanently
+compile-only; GB10 execution cannot qualify RTX 50 correctness or performance.
 
-Reader, producer, chooser, and SM120 lane domains all stop at K25. K26..K32
-retain direct generic kernels and compile preflight for research and future
-requalification, but are invalid public artifacts and have no lane attestation.
+NVFP4 reader, producer, chooser, and SM120 lane domains all stop at K25.
+K26..K32 retain direct generic kernels and compile preflight for research and
+future requalification, but are invalid public artifacts and have no lane
+attestation. FP8-CB independently uses its K4..K48 step-four producer ladder.
 
 The 2026-08-24 GB10 synthetic shoulder probe used a 5120x5120 exact expansion,
 M1/N5120/K5120 dense decode, and E8/P8/N1024/K4096 grouped decode. Times are
 CUDA-event medians; they are directional GB10 evidence, not RTX 50 claims:
 
-| rung | dictionary route | expand ms | dense decode ms | grouped decode ms |
+| rung | expander dictionary route | expand ms | dense decode ms | grouped decode ms |
 |---:|---|---:|---:|---:|
-| K24 | 64 KiB staged | 0.415 | 0.143 | 0.153 |
-| K25 | 96 KiB staged | 0.465 | 0.182 | 0.211 |
-| K26 | 128 KiB global | 0.602 | 0.230 | 0.273 |
-| K27 | 192 KiB global | 0.628 | 0.221 | 0.265 |
-| K28 | 256 KiB global | 0.655 | 0.260 | 0.275 |
-| K29 | 384 KiB global | 0.669 | 0.235 | 0.279 |
-| K30 | 512 KiB global | 0.675 | 0.238 | 0.285 |
-| K31 | 768 KiB global | 0.681 | 0.240 | 0.287 |
-| K32 | 1 MiB global | 0.691 | 0.243 | 0.289 |
+| K24 | 64 KiB staged | 0.472 | 0.183 | 0.185 |
+| K25 | 96 KiB staged | 0.538 | 0.216 | 0.240 |
+| K26 | 128 KiB global | 0.597 | 0.244 | 0.269 |
+| K27 | 192 KiB global | 0.624 | 0.220 | 0.264 |
+| K28 | 256 KiB global | 0.651 | 0.250 | 0.285 |
+| K29 | 384 KiB global | 0.661 | 0.238 | 0.287 |
+| K30 | 512 KiB global | 0.672 | 0.235 | 0.291 |
+| K31 | 768 KiB global | 0.676 | 0.242 | 0.291 |
+| K32 | 1 MiB global | 0.682 | 0.235 | 0.292 |
 
-The expander has a visible K25->K26 residency cliff (+29% latency), followed
-by only +15% from K26 to K32. K32 versus K24 was +67% expansion, +70% dense
-decode, and +89% grouped decode in these cells. These measurements retain
-K26..K32 as direct kernel research only; public support and the canonical
-chooser end at K25. The direct v2 HALF schedule was promising at K26 in this
-synthetic probe; a future format-range expansion requires a new
-production-shape A/B and an explicit contract change.
+The expander's K25->K26 residency discontinuity cost 11.1%. At that same rung
+boundary, the direct dense and grouped decoders, which use global cached LUT
+gathers on both sides, cost 12.8% and 12.0% respectively as the codeword and
+dictionary grew. From K26 to K32, the cost was another 14.2% expansion and
+8.8% grouped decode; direct dense was noisy and 3.8% faster at K32 in this
+shape. Relative to K24, K32 cost 44.5% expansion, 28.6% dense decode, and
+58.3% grouped decode. The complete raw samples, environment,
+source hashes, and immutable container identity are in
+`/home/rob/dq-runs/20260824_nvfp4_k24_k32_shoulder_repro/receipt.json`
+(SHA-256
+`293760999abcd885f449f49e7971ccfc5d8e5c758c41237e58f12f18a813943d`);
+the exact benchmark program has SHA-256
+`cdc40bd243a55d6f2e1a143bb4813f36a8c04d2561f073e9f7b15fd4afff2104`.
+These synthetic measurements retain K26..K32 as direct kernel research only;
+public support and the canonical chooser end at K25. A future format-range
+expansion requires a new production-shape A/B and an explicit contract change.
 
 ### Source block-FP8 W8A16 (`fp8_e4m3_ue8m0_block128`)
 

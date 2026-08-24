@@ -840,11 +840,12 @@ class PrismaQuantConfig(QuantizationConfig):
         CUTLASS scaled GEMM, whose hardware floor is sm_89.  The main decode
         extension itself can compile for sm_80, so a global capability floor
         would otherwise let an A100 load successfully and fail only when the
-        first prompt crosses the 16-token decode boundary.  NVFP4-CB is a
-        Blackwell activation contract: an exact BF16 expansion primitive on
-        Ada does not make the format supported there, and AQUA must never see
-        an FP4 candidate on RTX 40.  Enforce both activation-family floors at
-        this one load-time choke point.
+        first prompt crosses the 16-token decode boundary.  NVFP4-CB is an
+        exact cc12.0/12.1 activation contract: an exact BF16 expansion
+        primitive on another architecture does not make the format supported
+        there, and AQUA must never see an FP4 candidate on RTX 40.  Enforce the
+        broad FP8 floor and the exact FP4 capability set at this one load-time
+        choke point.
         """
 
         if not torch.cuda.is_available():
@@ -854,8 +855,16 @@ class PrismaQuantConfig(QuantizationConfig):
             floor = (8, 9)
             family = "FP8-CB"
         elif grid == "fp4":
-            floor = (10, 0)
-            family = "NVFP4-CB"
+            capability = tuple(torch.cuda.get_device_capability())
+            supported = ((12, 0), (12, 1))
+            if capability not in supported:
+                raise ValueError(
+                    f"NVFP4-CB target {prefix!r} requires compute capability "
+                    "sm_120 or sm_121 for its activation contract; "
+                    f"the current device reports "
+                    f"sm_{capability[0]}{capability[1]}"
+                )
+            return
         else:
             return
         capability = tuple(torch.cuda.get_device_capability())

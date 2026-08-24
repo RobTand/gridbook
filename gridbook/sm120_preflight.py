@@ -1,13 +1,15 @@
-"""No-launch compile preflight for NVFP4-CB on RTX 50 (compute 12.0).
+"""No-launch compile preflight for CB formats on RTX 50 (compute 12.0).
 
 The physical qualification host is a GB10 (compute 12.1), so it cannot prove
 RTX 50 device correctness or speed.  This callable instead cross-compiles the
 four CUDA modules with explicit ``sm_120`` / ``sm_120a`` SASS, checks their
-complete binding contracts, and verifies the emitted cubin targets.  Public
-NVFP4 format support is K1..K25.  The bindings intentionally retain K26..K32
-templates as a direct research surface; compiling those templates does not
-make them reader-, producer-, lane-, or artifact-supported.  The preflight
-never queries a live device and never invokes an operator.
+complete binding contracts, verifies the emitted cubin targets, and loads the
+native vLLM FP8/CUTLASS ABI without invoking it.  Public NVFP4 format support
+is K1..K25; FP8-CB uses its K4..K48 step-four producer ladder.  The bindings
+intentionally retain NVFP4 K26..K32 templates as a direct research surface;
+compiling those templates does not make them reader-, producer-, lane-, or
+artifact-supported.  The preflight never queries a live device and never
+invokes an operator.
 
 A passing receipt has a permanent ``compile_only`` ceiling.  Run it in the
 pinned CUDA serving toolchain with an explicit, non-production build directory::
@@ -28,6 +30,7 @@ import subprocess
 from typing import Any
 
 from . import cuda_ext
+from .native_cutlass import _REQUIRED_OPS, require_native_fp8_cutlass
 from .runtime_contract import load_runtime_contract
 
 
@@ -38,6 +41,52 @@ SM120_ACCELERATED_GENCODE = cuda_ext._gencode_flag(
     SM120_CAPABILITY, accelerated=True)
 _NVFP4_PUBLIC_RUNGS = tuple(range(1, 26))
 _NVFP4_DIRECT_KERNEL_RUNGS = tuple(range(1, 33))
+_FP8_READER_RUNGS = (4, 8, 12, 16, 20, 24, *range(28, 49))
+_FP8_PRODUCER_RUNGS = tuple(range(4, 49, 4))
+_SM120_CELL_LAWS = {
+    "nvfp4_cb_dense_sm120_decode_cuda_gemv": (
+        "NVFP4_CB_K", "dense", "decode", "backed",
+        _NVFP4_PUBLIC_RUNGS, (),
+    ),
+    "nvfp4_cb_dense_sm120_batch_expand_bf16": (
+        "NVFP4_CB_K", "dense", "batch", "fallback",
+        _NVFP4_PUBLIC_RUNGS, (),
+    ),
+    "nvfp4_cb_routed_sm120_decode_cuda_gemv": (
+        "NVFP4_CB_K", "routed_moe", "decode", "backed",
+        _NVFP4_PUBLIC_RUNGS, (),
+    ),
+    "nvfp4_cb_routed_sm120_batch_persistent_b": (
+        "NVFP4_CB_K", "routed_moe", "batch", "backed",
+        _NVFP4_PUBLIC_RUNGS,
+        ({"fact": "role_split", "op": "equals", "value": False},),
+    ),
+    "nvfp4_cb_routed_sm120_batch_expand_bf16": (
+        "NVFP4_CB_K", "routed_moe", "batch", "fallback",
+        _NVFP4_PUBLIC_RUNGS, (),
+    ),
+    "fp8_cb_dense_sm120_decode_cuda_gemv": (
+        "FP8_CB_K", "dense", "decode", "backed",
+        _FP8_PRODUCER_RUNGS, (),
+    ),
+    "fp8_cb_dense_sm120_batch_expand_cutlass_w8a8": (
+        "FP8_CB_K", "dense", "batch", "backed",
+        _FP8_PRODUCER_RUNGS, (),
+    ),
+    "fp8_cb_routed_sm120_decode_cuda_gemv": (
+        "FP8_CB_K", "routed_moe", "decode", "backed",
+        _FP8_PRODUCER_RUNGS, (),
+    ),
+    "fp8_cb_routed_sm120_batch_persistent_b": (
+        "FP8_CB_K", "routed_moe", "batch", "backed",
+        _FP8_PRODUCER_RUNGS,
+        ({"fact": "role_split", "op": "equals", "value": False},),
+    ),
+    "fp8_cb_routed_sm120_batch_expand_bf16": (
+        "FP8_CB_K", "routed_moe", "batch", "fallback",
+        _FP8_PRODUCER_RUNGS, (),
+    ),
+}
 
 
 def _sha256(path: Path) -> str:
@@ -66,13 +115,70 @@ def _nvfp4_format_row() -> dict[str, Any]:
     return row
 
 
+def _fp8_format_row() -> dict[str, Any]:
+    contract = load_runtime_contract()
+    rows = [row for row in contract["formats"]
+            if row["family"] == "FP8_CB_K"]
+    if len(rows) != 1:
+        raise RuntimeError("runtime contract must contain one FP8_CB_K row")
+    row = rows[0]
+    expected = {
+        "rungs": _FP8_READER_RUNGS,
+        "producer_rungs": _FP8_PRODUCER_RUNGS,
+    }
+    for field, law in expected.items():
+        if tuple(row[field]) != law:
+            raise RuntimeError(
+                f"SM120 preflight FP8 {field} drift: expected "
+                f"{list(law)}, got {row[field]}")
+
+    return row
+
+
+def _validate_sm120_lane_cells() -> None:
+    """Attest the exact ten-cell dual-family compile-only route table."""
+
+    contract = load_runtime_contract()
+    cells = [cell for cell in contract["lane_eligibility"]["cells"]
+             if cell["platform"] == "sm_120"]
+    by_id = {cell["id"]: cell for cell in cells}
+    if set(by_id) != set(_SM120_CELL_LAWS):
+        raise RuntimeError(
+            "SM120 preflight lane-cell drift: expected "
+            f"{sorted(_SM120_CELL_LAWS)}, got {sorted(by_id)}")
+
+    for cell_id, law in _SM120_CELL_LAWS.items():
+        family, structure, regime, route_status, rungs, predicates = law
+        expected = {
+            "platform": "sm_120",
+            "family": family,
+            "structure": structure,
+            "regime": regime,
+            "rungs": list(rungs),
+            "route_status": route_status,
+            "qualification": "compile_only",
+            "requires_serve_flags": [],
+            "predicates": list(predicates),
+        }
+        actual = {field: by_id[cell_id][field] for field in expected}
+        if actual != expected:
+            raise RuntimeError(
+                f"SM120 preflight lane-cell drift for {cell_id!r}: "
+                f"expected {expected}, got {actual}")
+
+
 def _validate_sources(sources: dict[str, Path]) -> None:
     required = {
         "main": (
             '"fp4-v2 GEMV: k_bits must be in [1,32]',
             '"fp4-v2 MoE GEMV: k_bits must be in [1,32]',
+            "fp8_reader_kbits_supported(k_bits)",
+            '"fp8 k_bits is outside the v10 accepted reader domain"',
             'm.def("cb_gemv_fp4_v2"',
             'm.def("cb_moe_gemv_fp4_v2"',
+            'm.def("cb_gemv_fp8"',
+            'm.def("cb_expand_fp8"',
+            'm.def("cb_moe_gemv_fp8"',
         ),
         "v2": (
             '"k_bits must be in [1,32]',
@@ -95,8 +201,8 @@ def _validate_sources(sources: dict[str, Path]) -> None:
         missing = [fragment for fragment in fragments if fragment not in text]
         if missing:
             raise RuntimeError(
-                f"{sources[key]} predates the K1..K32 direct NVFP4 kernel "
-                "research surface; "
+                f"{sources[key]} predates the required dual-family CB "
+                "compile surface; "
                 f"missing {missing}")
 
 
@@ -122,9 +228,11 @@ def _sass_targets(shared_object: str | os.PathLike[str]) -> list[str]:
 def compile_nvfp4_sm120_preflight(
     build_directory: str | os.PathLike[str], *, verbose: bool = False,
 ) -> dict[str, Any]:
-    """Cross-compile public K1..K25 plus research-only K26..K32, no launch."""
+    """Cross-compile both CB ladders plus research NVFP4 K26..K32, no launch."""
 
     _nvfp4_format_row()
+    _fp8_format_row()
+    _validate_sm120_lane_cells()
     build_inputs = (
         "cb_gemv.cu", "cb_gemv_v2.cu", "cb_moe_persistent_b.cu",
         *cuda_ext._BF16_GROUPED_BUILD_INPUTS,
@@ -216,15 +324,26 @@ def compile_nvfp4_sm120_preflight(
             "sass_targets": targets,
         }
 
+    # FP8-CB batch routes compose Gridbook's native expansion with vLLM's
+    # direct per-token FP8 quantizer and CUTLASS W8A8 operation.  Import and
+    # symbol resolution do not allocate tensors or invoke either operator.
+    require_native_fp8_cutlass("CB SM120 compile-only preflight")
+
     return {
-        "schema": "gridbook.sm120-nvfp4-compile-preflight.v1",
+        "schema": "gridbook.sm120-cb-compile-preflight.v2",
         "capability": list(SM120_CAPABILITY),
         "qualification_ceiling": "compile_only",
         "device_executed": False,
         "reader_rungs": list(_NVFP4_PUBLIC_RUNGS),
         "producer_rungs": list(_NVFP4_PUBLIC_RUNGS),
         "direct_kernel_research_rungs": list(_NVFP4_DIRECT_KERNEL_RUNGS),
+        "fp8_reader_rungs": list(_FP8_READER_RUNGS),
+        "fp8_producer_rungs": list(_FP8_PRODUCER_RUNGS),
         "modules": modules,
+        "vllm_native_fp8_abi": {
+            "required_ops": list(_REQUIRED_OPS),
+            "status": "present_not_executed",
+        },
         "claims_excluded": [
             "device_correctness",
             "device_performance",

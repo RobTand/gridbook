@@ -20,19 +20,24 @@
 - Overlapping FP8/NVFP4 rates carry no manual family priority. AQUA selection
   remains driven by registered activation contracts, not contract row order or
   an implicit FP8 preference. Model load now enforces those activation-family
-  floors: FP8-CB requires `sm_89+`, while NVFP4-CB requires Blackwell
-  `sm_100+`, so RTX 40 cannot acquire an NVFP4 candidate through a generic
-  BF16-expansion fallback.
-- The lane table now records five closed-world SM120 cells for the canonical
-  K1..K25 public range, all `compile_only`: dense/routed decode are backed,
+  domains: FP8-CB requires `sm_89+`, while NVFP4-CB requires exact `sm_120` or
+  `sm_121`, so RTX 40 and unsupported Blackwell capability families cannot
+  acquire an NVFP4 candidate through a generic BF16-expansion fallback.
+- The lane table now records ten closed-world SM120 cells, all `compile_only`.
+  Five NVFP4 cells cover K1..K25: dense/routed decode are backed,
   role-unsplit routed batch is backed by persistent-B, and both
-  expand-plus-BF16 routes are explicit fallbacks. The no-launch preflight also
-  cross-compiles the modules carrying the K26..K32 direct research surface and verifies all four
-  modules as exact `sm_120`/`sm_120a` SASS, without promoting those templates
-  into the public contract.
+  expand-plus-BF16 routes are explicit fallbacks. Five FP8 cells cover the
+  K4..K48 step-four producer ladder: dense/routed decode and dense
+  expand-plus-native-CUTLASS W8A8 are backed, role-unsplit routed batch is
+  backed by persistent-B, and routed expand-plus-BF16 is the fallback. The
+  no-launch preflight cross-compiles the modules carrying both families,
+  verifies all four modules as exact `sm_120`/`sm_120a` SASS, and resolves the
+  vLLM native FP8/CUTLASS ABI. It does not promote NVFP4 K26..K32 research
+  templates into the public contract.
 - Schema and `contract_version` move together to
-  `gridbook.runtime-contract.v11` / 11. All tensor/expert-parallel and FP8
-  fields retain their v10 semantics.
+  `gridbook.runtime-contract.v11` / 11. All tensor/expert-parallel fields and
+  FP8 format-ladder semantics retain their v10 meaning; lane eligibility gains
+  the five compile-only SM120 FP8 cells above.
 
 ### FP8-CB producer ladder expands to K4..K48/4 (contract schema v10)
 

@@ -198,6 +198,13 @@ route and how far their qualification has progressed.
   an RTX 50 artifact or a performance claim. The separate no-launch preflight
   additionally compiles K26..K32 as direct-kernel research scaffolding; those
   values have no format registration or production lane row.
+- The SM120 FP8-CB rows cover the complete K4..K48 step-four producer ladder.
+  Dense and routed decode are `backed`; dense batch uses exact expansion plus
+  native CUTLASS W8A8 and is `backed`; routed batch uses persistent-B when
+  `role_split == false`, with exact expansion plus the grouped BF16 bridge as
+  the `fallback`. Every row remains `compile_only`. These rows make the
+  validation-only dual-family AQUA candidate surface structurally explicit;
+  they do not authorize an RTX 50 artifact or prefer FP8 over NVFP4.
 - `python -m gridbook.sm89_preflight --build-directory <dedicated-dir>
   --receipt <receipt.json>`
   cross-compiles the production generic module with explicit
@@ -207,10 +214,12 @@ route and how far their qualification has progressed.
   `qualification_ceiling: compile_only` and explicitly excludes device,
   performance and graph claims.
 - `python -m gridbook.sm120_preflight --build-directory <dedicated-dir>
-  --receipt <receipt.json>` performs the corresponding no-launch NVFP4 gate.
+  --receipt <receipt.json>` performs the corresponding no-launch dual-family
+  CB gate.
   It compiles the generic decode/expand modules as `sm_120` and the
   architecture-conditional persistent-B and BF16 bridge modules as `sm_120a`,
-  validates their complete symbol surfaces, and checks the emitted cubins.
+  validates their complete symbol surfaces, checks the emitted cubins, and
+  resolves the direct native vLLM FP8/CUTLASS ABI without invoking it.
   The `a` suffix is a code-generation detail, not a second contract platform.
 - Gridbook intentionally carries no torch.compile or CUDA-graph configuration
   or attestation in this table. The serving producer owns its immutable graph

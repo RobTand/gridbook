@@ -735,7 +735,7 @@ def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
                              "model.layers.0.mlp.unclaimed")
 
 
-def test_cb_activation_families_enforce_their_device_floors(monkeypatch):
+def test_cb_activation_families_enforce_their_device_domains(monkeypatch):
     import gridbook.config as config_mod
 
     cfg = PrismaQuantConfig(_config())
@@ -752,16 +752,32 @@ def test_cb_activation_families_enforce_their_device_floors(monkeypatch):
     fp4 = {**_SCHEME, "grid": "fp4"}
     monkeypatch.setattr(config_mod.torch.cuda, "get_device_capability",
                         lambda: (8, 9))
-    with pytest.raises(ValueError, match=r"NVFP4-CB.*sm_100\+.*sm_89"):
+    with pytest.raises(ValueError, match=r"NVFP4-CB.*sm_120 or sm_121.*sm_89"):
         cfg._require_cb_device_capability(fp4,
                                           "model.layers.0.mlp.down_proj")
 
     monkeypatch.setattr(config_mod.torch.cuda, "get_device_capability",
                         lambda: (10, 0))
+    with pytest.raises(ValueError, match=r"NVFP4-CB.*sm_120 or sm_121.*sm_100"):
+        cfg._require_cb_device_capability(fp4,
+                                          "model.layers.0.mlp.down_proj")
+
+    monkeypatch.setattr(config_mod.torch.cuda, "get_device_capability",
+                        lambda: (12, 0))
+    cfg._require_cb_device_capability(fp4, "model.layers.0.mlp.down_proj")
+    monkeypatch.setattr(config_mod.torch.cuda, "get_device_capability",
+                        lambda: (12, 1))
     cfg._require_cb_device_capability(fp4, "model.layers.0.mlp.down_proj")
 
+    for unsupported in ((12, 2), (13, 0)):
+        monkeypatch.setattr(config_mod.torch.cuda, "get_device_capability",
+                            lambda unsupported=unsupported: unsupported)
+        with pytest.raises(ValueError, match=r"NVFP4-CB.*sm_120 or sm_121"):
+            cfg._require_cb_device_capability(
+                fp4, "model.layers.0.mlp.down_proj")
 
-def test_mixed_nvfp4_expert_subgroup_enforces_the_same_sm100_floor(
+
+def test_mixed_nvfp4_expert_subgroup_enforces_the_same_exact_cc12_domain(
     monkeypatch,
 ):
     """The per-expert mixed branch must not bypass NVFP4 admission."""
@@ -851,7 +867,7 @@ def test_mixed_nvfp4_expert_subgroup_enforces_the_same_sm100_floor(
     )
     layer = object.__new__(config_mod.RoutedExperts)
     layer.moe_config = types.SimpleNamespace(num_experts=2)
-    with pytest.raises(ValueError, match=r"NVFP4-CB.*sm_100\+.*sm_89"):
+    with pytest.raises(ValueError, match=r"NVFP4-CB.*sm_120 or sm_121.*sm_89"):
         cfg.get_quant_method(layer, prefix)
 
 

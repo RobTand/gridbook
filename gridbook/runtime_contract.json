@@ -451,6 +451,137 @@
         "qualification": "compile_only",
         "requires_serve_flags": [],
         "predicates": []
+      },
+      {
+        "id": "fp8_cb_dense_sm120_decode_cuda_gemv",
+        "platform": "sm_120",
+        "family": "FP8_CB_K",
+        "structure": "dense",
+        "regime": "decode",
+        "rungs": [
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48
+        ],
+        "route_status": "backed",
+        "qualification": "compile_only",
+        "requires_serve_flags": [],
+        "predicates": []
+      },
+      {
+        "id": "fp8_cb_dense_sm120_batch_expand_cutlass_w8a8",
+        "platform": "sm_120",
+        "family": "FP8_CB_K",
+        "structure": "dense",
+        "regime": "batch",
+        "rungs": [
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48
+        ],
+        "route_status": "backed",
+        "qualification": "compile_only",
+        "requires_serve_flags": [],
+        "predicates": []
+      },
+      {
+        "id": "fp8_cb_routed_sm120_decode_cuda_gemv",
+        "platform": "sm_120",
+        "family": "FP8_CB_K",
+        "structure": "routed_moe",
+        "regime": "decode",
+        "rungs": [
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48
+        ],
+        "route_status": "backed",
+        "qualification": "compile_only",
+        "requires_serve_flags": [],
+        "predicates": []
+      },
+      {
+        "id": "fp8_cb_routed_sm120_batch_persistent_b",
+        "platform": "sm_120",
+        "family": "FP8_CB_K",
+        "structure": "routed_moe",
+        "regime": "batch",
+        "rungs": [
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48
+        ],
+        "route_status": "backed",
+        "qualification": "compile_only",
+        "requires_serve_flags": [],
+        "predicates": [
+          {
+            "fact": "role_split",
+            "op": "equals",
+            "value": false
+          }
+        ]
+      },
+      {
+        "id": "fp8_cb_routed_sm120_batch_expand_bf16",
+        "platform": "sm_120",
+        "family": "FP8_CB_K",
+        "structure": "routed_moe",
+        "regime": "batch",
+        "rungs": [
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48
+        ],
+        "route_status": "fallback",
+        "qualification": "compile_only",
+        "requires_serve_flags": [],
+        "predicates": []
       }
     ]
   },

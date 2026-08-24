@@ -175,6 +175,11 @@ def test_platform_lanes_pin_structural_routes_without_device_claims():
         "nvfp4_cb_routed_sm120_decode_cuda_gemv",
         "nvfp4_cb_routed_sm120_batch_persistent_b",
         "nvfp4_cb_routed_sm120_batch_expand_bf16",
+        "fp8_cb_dense_sm120_decode_cuda_gemv",
+        "fp8_cb_dense_sm120_batch_expand_cutlass_w8a8",
+        "fp8_cb_routed_sm120_decode_cuda_gemv",
+        "fp8_cb_routed_sm120_batch_persistent_b",
+        "fp8_cb_routed_sm120_batch_expand_bf16",
     }
 
     sm89 = [cell for cell in by_id.values() if cell["platform"] == "sm_89"]
@@ -186,20 +191,38 @@ def test_platform_lanes_pin_structural_routes_without_device_claims():
     assert all(cell["family"] == "FP8_CB_K" for cell in sm89)
     assert all(cell["rungs"] == _FP8_PRODUCER_RUNGS for cell in sm89)
 
-    sm120 = [cell for cell in by_id.values()
-             if cell["platform"] == "sm_120"]
+    sm120_nvfp4 = [cell for cell in by_id.values()
+                   if cell["platform"] == "sm_120"
+                   and cell["family"] == "NVFP4_CB_K"]
     assert {(cell["structure"], cell["regime"], cell["route_status"])
-            for cell in sm120} == {
+            for cell in sm120_nvfp4} == {
         ("dense", "decode", "backed"),
         ("dense", "batch", "fallback"),
         ("routed_moe", "decode", "backed"),
         ("routed_moe", "batch", "backed"),
         ("routed_moe", "batch", "fallback"),
     }
-    assert all(cell["family"] == "NVFP4_CB_K" for cell in sm120)
-    assert all(cell["rungs"] == _NVFP4_PUBLIC_RUNGS for cell in sm120)
+    assert all(cell["rungs"] == _NVFP4_PUBLIC_RUNGS
+               for cell in sm120_nvfp4)
+
+    sm120_fp8 = [cell for cell in by_id.values()
+                 if cell["platform"] == "sm_120"
+                 and cell["family"] == "FP8_CB_K"]
+    assert {(cell["structure"], cell["regime"], cell["route_status"])
+            for cell in sm120_fp8} == {
+        ("dense", "decode", "backed"),
+        ("dense", "batch", "backed"),
+        ("routed_moe", "decode", "backed"),
+        ("routed_moe", "batch", "backed"),
+        ("routed_moe", "batch", "fallback"),
+    }
+    assert all(cell["rungs"] == _FP8_PRODUCER_RUNGS for cell in sm120_fp8)
     persistent = by_id["nvfp4_cb_routed_sm120_batch_persistent_b"]
     assert persistent["predicates"] == [
+        {"fact": "role_split", "op": "equals", "value": False}
+    ]
+    fp8_persistent = by_id["fp8_cb_routed_sm120_batch_persistent_b"]
+    assert fp8_persistent["predicates"] == [
         {"fact": "role_split", "op": "equals", "value": False}
     ]
     assert all(cell["qualification"] == "compile_only"
