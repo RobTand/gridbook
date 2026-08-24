@@ -157,7 +157,8 @@ assignment's backend must name the complete owned dispatch chain, for example
 rather than the generic words `Gridbook`, `FP8`, or `source-passthrough`. Attach
 logs proving `fp8_source_gemv` for decode-sized calls and
 `fp8_source_expand_bf16` plus `cb_bf16_grouped_mm` for larger calls. For DSV4
-`wo_a`, the same evidence must show the grouped W8A16 adapter and `tp=1`.
+`wo_a`, the same evidence must show the grouped W8A16 adapter and a qualified
+shard degree (1, 2 or 4).
 Conversely, direct `mxfp8_e4m3_e8m0_g32` remains W8A8 and must name
 `mxfp8_dense_mm`. Neither wire may borrow the other's arithmetic label or
 evidence merely because both store E4M3 weights with UE8M0 scales.

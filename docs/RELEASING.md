@@ -414,8 +414,10 @@ the following; a CPU-only skip does not count:
   including exact BF16 transient values, then its output through
   cb_bf16_grouped_mm;
 - dense and grouped (G=8,N=1024,K=4096) DSV4 wo_a, at decode and
-  representative prefill M, with tp=1, group isolation, and invalid geometry
-  refusal;
+  representative prefill M, at every qualified shard degree (grouped: 1, 2, 4;
+  dense: whatever the alignment law admits), with group isolation, per-rank
+  equality against the unsharded call, and invalid geometry or unqualified
+  degree refusal;
 - unchanged BF16 activation tensors and a source dispatch that cannot call
   activation QDQ, mxfp8_dense_mm, PyTorch matmul, cuBLAS, or Triton;
 - resident raw E4M3 weight plus UE8M0 scale only, with no persistent BF16
@@ -439,7 +441,7 @@ startup/dispatch logs proving:
 2. source decode dispatched fp8_source_gemv;
 3. source prefill dispatched fp8_source_expand_bf16 followed by
    cb_bf16_grouped_mm;
-4. DSV4 wo_a used the grouped W8A16 adapter; and
+4. DSV4 wo_a used the grouped W8A16 adapter, at a qualified shard degree; and
 5. no source unit fell back or entered mxfp8_dense_mm/activation QDQ.
 
 The production launch for 0.8.6 is **target-only 256k** and must omit

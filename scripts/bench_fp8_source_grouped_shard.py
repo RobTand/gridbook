@@ -1,6 +1,6 @@
 """Decode microbench: DSv4 wo_a grouped GEMV at G=8 (TP=1) vs its TP shards.
 
-Not a gate. The requirement the coordinator funded is TP>1 SUPPORT; this number
+Not a gate. The qualification requirement is TP>1 SUPPORT; this number
 only says whether a TP=2 wo_a decode is a win, a wash, or a regression per rank.
 
 Geometry is the DSv4 o-projection plane: rows/group 1024, K 4096, batch 1.

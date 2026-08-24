@@ -92,7 +92,8 @@ second runtime tree or maintain a parallel loader table.
   vanilla-FP8 Linears this way, and the 27B's vision tower is a stock NVFP4
   W4A16 group. **Consequence:** an artifact's hardware requirements are the union
   of gridbook's and those of its delegated groups.
-- **Tensor parallel: dense CB Linears only, above one rank.** Since the
+- **Tensor parallel: dense CB and FP8 source-passthrough Linears, above one
+  rank.** Since the
   shard-aware loading wave (2026-08-23), dense CB Linears load correctly at
   TP>1 with no change to any exported byte: vLLM's stock declared-dim
   narrowing slices whole packed rows on column-parallel layers and
@@ -104,10 +105,17 @@ second runtime tree or maintain a parallel loader table.
   shard_size fields — input axis requires whole 256-weight superblocks;
   output axis requires the native kernel's 8-wide (fp4) or 16-wide (fp8) row
   quantum). Everything else keeps refusing at construction, naming itself:
-  delegated compressed-tensors groups, source-passthrough units (the FP8 lane
-  pins TP=1 in its own release gate), quantized embedding units and
-  mixed-format fused projections. Ignored (BF16) Linears stay on vLLM-native
-  sharding. Dense
+  delegated compressed-tensors groups, quantized embedding units and
+  mixed-format fused projections; routed CB MoE expert stacks refuse on this
+  axis and serve on the expert-parallel one instead (see below).
+  `fp8_e4m3_ue8m0_block128` source-passthrough units are no longer among the
+  refusals: dense ones shard when every rank's extent on the sharded axis is
+  a whole multiple of the 128-element source block (per fused role on a
+  merged plane, because vLLM narrows the UE8M0 scale plane over the block
+  grid by ceil division), and grouped-BMM ones shard only at a degree whose
+  divided group count was measured on the release device — 1, 2 and 4 at the
+  DSv4 `wo_a` geometry; an unmeasured degree is refused even when perfectly
+  aligned. Ignored (BF16) Linears stay on vLLM-native sharding. Dense
   TP>1 remains **correctness-only**: no two-node serve has been measured on
   this hardware yet, so nothing here claims a decode win. The fact is
   published, not prose: every serving unit carries a `tensor_parallel` row
