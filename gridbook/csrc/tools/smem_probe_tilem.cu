@@ -118,12 +118,11 @@ void row() {
          est <= cutlass::arch::sm120_smem_capacity_bytes ? "FIT" : "OVER");
 }
 
-// THE RUNG LAW (K1.2, verified 2026-08-02 by trying to probe otherwise).
+// THE RUNG LAW (K1.2; v10 producer extension 2026-08-24).
 //
-// The producer's FP8-CB ladder is every INTEGER k_bits in [28, 48]
-// (prismaquant/format_registry.py: `for _k in range(28, 49)` -- 3.5..6.0 bpw in
-// 0.125 steps). The fused mid-M collective can serve only the multiples of 4,
-// and that is a property of the FORMAT and of TMA, not a missing instantiation:
+// v10 producers emit K4..K48 step 4. The accepted reader domain also retains
+// every integer K28..K48 for legacy artifacts. The fused mid-M collective can
+// serve only the multiples of 4, a property of the FORMAT and of TMA:
 //
 //   1. TMA BOX. Packed B is read by SM90_TMA_LOAD with a box of
 //      (TileN, CbTypeSize) bytes over the [N, n_sb*CbTypeSize] byte stream,
@@ -140,11 +139,10 @@ void row() {
 //      offsets. A uniform-width decode would therefore be WRONG, not merely
 //      unaligned, for every rung with k_bits % 4 != 0.
 //
-// Both laws bite at the same place, so the probe walks the law's rungs. The
-// other 15 integer rungs are not "unmeasured" -- they cannot be instantiated at
-// all (the collective static_asserts before any smem question arises), which is
-// itself the measurement. See the rung-surface note in cb_fused_gemm.cu.
-constexpr int kKbLo = 28;
+// Both laws bite at the same place, so the probe walks the canonical producer
+// rungs. Legacy irregular reader rungs cannot instantiate this collective and
+// use the generic decode/expand paths instead.
+constexpr int kKbLo = 4;
 constexpr int kKbHi = 48;
 constexpr int kKbStep = 4;
 constexpr int kKbCount = (kKbHi - kKbLo) / kKbStep + 1;

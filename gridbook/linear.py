@@ -189,21 +189,53 @@ class ShardGroupAlignmentError(ValueError):
         )
 
 
-def _fp8_fused_midm_enabled() -> bool:
-    """The FP8-CB mid-M fused lane's OPT-OUT flag, parsed like every other.
+def _fp8_fused_midm_mode() -> str:
+    """Return the process-stable FP8 fused-mid-M request.
 
-    ``PRISMAQUANT_CB_FUSED_MIDM`` is default-ON, so it used to be spelled
-    ``!= "0"`` — which made ``false``, ``off`` and ``no`` all ENABLE the lane
-    they read as disabling, and it was evaluated unlatched at three separate
-    sites that could disagree. It is now the same strict tri-state parse and
-    the same process-stable latch as the opt-in lanes, with ``default=True``
-    carrying the opt-out sense instead of an inverted comparison.
+    Unset means ``auto``: enable only on the exact Blackwell capabilities the
+    fused extension compiles for.  ``0`` means off and ``1`` means require.
+    Keeping ``1`` distinct from ``auto`` matters on Ada: an explicit request
+    must fail at MODEL LOAD instead of silently substituting expand+CUTLASS,
+    while the default must never ask the Blackwell-only loader to JIT there.
     """
-    from .lane_select import latched_bool
+    from .lane_select import latched_choice
 
-    return latched_bool(
-        "PRISMAQUANT_CB_FUSED_MIDM", default=True,
-        meaning="the FP8-CB fused mid-M decode-in-prologue lane")
+    return latched_choice(
+        "PRISMAQUANT_CB_FUSED_MIDM",
+        spellings={"": "auto", "0": "off", "1": "require"},
+        meaning="the FP8-CB fused mid-M decode-in-prologue lane",
+    )
+
+
+def _fp8_fused_midm_enabled(device: torch.device) -> bool:
+    """Resolve the fused-mid-M request for ``device`` at model load.
+
+    The optional fused implementation is an sm12x kernel.  Ada's native
+    FP8-CB path is CUDA GEMV through M=8 and expand + native W8A8 CUTLASS above
+    it; resolving ``auto`` to false here prevents a doomed ``get_fused_ext``
+    build before that route can be reached.  Capability discovery is metadata
+    only and performs no tensor read or device synchronization.
+    """
+    from .cuda_ext import NativeKernelUnavailableError
+    from .lane_select import device_capability
+
+    mode = _fp8_fused_midm_mode()
+    if mode == "off":
+        return False
+    capability = device_capability(device)
+    if capability in ((12, 0), (12, 1)):
+        return True
+    if mode == "require":
+        got = ("unavailable" if capability is None
+               else f"{capability[0]}.{capability[1]}")
+        raise NativeKernelUnavailableError(
+            "PRISMAQUANT_CB_FUSED_MIDM=1 requires the fused FP8-CB "
+            "decode-in-prologue kernel on compute capability 12.0 or 12.1, "
+            f"but the loading device reports {got}; disable the explicit "
+            "request or use the native FP8 expand+CUTLASS route"
+        )
+    # Fail closed when CUDA cannot identify the device as an attested sm12x.
+    return False
 
 
 def _fp4_dense_sm_count(device: torch.device) -> int:
@@ -803,13 +835,25 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             self._require_fp8_cuda_ext("model-load attestation")
             require_native_fp8_cutlass(
                 f"{self.prefix} dense FP8 quality prefill")
-            # Optional fused decode-in-prologue is resolved now even when it
-            # misses. get_fused_ext memoizes that result, so first prefill can
-            # neither JIT-compile nor silently discover a different path.
-            fused_midm = _fp8_fused_midm_enabled()
+            # The optional decode-in-prologue specialization is sm12x-only.
+            # Resolve AUTO/explicit policy against the loading device before
+            # touching its loader: on Ada AUTO is false and get_fused_ext must
+            # never be called, so the native M>8 expand+CUTLASS route remains
+            # reachable. On sm12x, get_fused_ext memoizes the load result, so
+            # first prefill can neither JIT nor discover a different path.
+            fused_midm = _fp8_fused_midm_enabled(dev)
             layer._cb_fp8_fused_midm = fused_midm
             if fused_midm:
-                get_fused_ext()
+                fused_ext = get_fused_ext()
+                if (fused_ext is None
+                        and _fp8_fused_midm_mode() == "require"):
+                    raise NativeKernelUnavailableError(
+                        f"{self.prefix}: PRISMAQUANT_CB_FUSED_MIDM=1 "
+                        "requires the fused FP8-CB decode-in-prologue "
+                        "extension, but it did not load; Gridbook does not "
+                        "substitute expand+CUTLASS behind an explicit lane "
+                        "requirement"
+                    )
         from .ops import register_cb_layer
         layer._cb_layer_id = register_cb_layer(self, layer)
 
@@ -1292,12 +1336,25 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # Triton fallback: running a different kernel family silently would
         # invalidate both the serving contract and any throughput comparison.
         if not self.is_fp4 and M <= FP8_CUDA_GEMV_M_MAX:
+            route_shape = (
+                f"FP8_CB_K{int(self.k)}:M{int(M)}:N{int(N)}:K{int(K)}"
+            )
+            emit_route(
+                layer, kind="dense", policy="fp8_cb_cuda_gemv",
+                symbol="cb_gemv_fp8", tile_m=0, shape=route_shape,
+                contract=_route_bridge_contract(False), state="error",
+                reason="launch did not return")
             self._require_fp8_cuda_ext("decode GEMV")
             y = cb_gemv_fp8(x, layer._cb_qw_padded, layer._cb_flat_fp8,
                             layer._cb_row_offset, layer._cb_scale,
                             N, K, self.k, self.n_sub, self.type_size)
             if bias is not None:
                 y = y + bias
+            emit_route(
+                layer, kind="dense", policy="fp8_cb_cuda_gemv",
+                symbol="cb_gemv_fp8", tile_m=0, shape=route_shape,
+                contract=_route_bridge_contract(False), state="served",
+                reason=None)
             return y
 
         # FP8_CB prefill (M large): transiently expand THIS layer's packed
@@ -1321,24 +1378,25 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # Mid-M fused decode-in-prologue: at M in [9, 128] ONE M-tile covers
         # the batch, so decoding B inside the CUTLASS prologue has no redundant
         # M-tile work. This native route now owns M=9..16 as well.
-        # OPT-OUT with PRISMAQUANT_CB_FUSED_MIDM=0 for a native-vs-native A/B;
-        # the exact route remains CUDA expand + direct CUTLASS.
+        # AUTO on sm12x, or explicitly requested there. Ada always uses CUDA
+        # expand + direct CUTLASS for this band; an explicit fused request on
+        # Ada was already refused at model load.
         # Numerics: the _scaled entry applies BOTH the per-token activation
         # scale and the per-channel weight scale inside its fp32 EVT epilogue
         # and rounds once to bf16 — the same rounding ORDER as
         # cutlass_scaled_mm (the older unscaled entry rounded first and scaled
         # in python, which moved served prompt logprobs by up to 0.86 nats).
-        # RUNG COVERAGE (K1.2). The lane serves the rung LAW —
-        # codec.FP8_FUSED_KBITS, k in [28,48] step 4 — and never a literal
-        # ladder copied from the .cu (this used to be an inline
+        # RUNG COVERAGE (K1.2). The lane serves the v10 producer rung LAW —
+        # codec.FP8_FUSED_KBITS, K4..K48 step 4 — and never a literal ladder
+        # copied from the .cu (this used to be an inline
         # `self.k in (28, 32, 36, 40, 44, 48)`, one of two copies that could
         # each drift from the kernel independently). The law is the cheap gate
         # because asking the MODULE first would force a JIT build at first
         # forward for rungs that can never take this path; once the module is
         # in hand, `fused_fp8_kbits` is the authority and the law is only a
-        # filter over it. Rungs off the law are not "unsupported" — they take
-        # the exact expand + CUTLASS route below, which serves all 21.
-        # ONE latched read (see ``_fp8_fused_midm_enabled``), taken on the
+        # filter over it. Legacy irregular reader rungs off the law are not
+        # "unsupported" — they take the exact expand + CUTLASS route below.
+        # ONE latched read (see ``_fp8_fused_midm_mode``), taken on the
         # dispatch path as well as at load so a mid-serve change RAISES instead
         # of being silently ignored. The value USED is the layer's, fixed at
         # load; this read exists to make the change loud. That was previously
@@ -1347,8 +1405,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # comparison could only notice a change straddling those two lines, and
         # every one of the three accepted "false" and "off" as ENABLED because
         # they tested ``!= "0"``.
-        live = _fp8_fused_midm_enabled()
-        fused_midm = getattr(layer, "_cb_fp8_fused_midm", live)
+        _fp8_fused_midm_mode()
+        fused_midm = bool(getattr(layer, "_cb_fp8_fused_midm", False))
         if (bias is None and FP8_CUDA_GEMV_M_MAX < x2.shape[0] <= 128
                 and codec.fp8_fused_rung_supported(self.k)
                 and fused_midm
@@ -1360,7 +1418,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
                 # telemetry at all (only the fp4 lane's three tile attributes),
                 # so a served FP8 prefill was indistinguishable in a dispatch
                 # report from one that quietly took the expand+GEMM route.
-                shape = f"M{int(x2.shape[0])}:N{int(N)}:K{int(K)}"
+                shape = (f"FP8_CB_K{int(self.k)}:M{int(x2.shape[0])}:"
+                         f"N{int(N)}:K{int(K)}")
                 emit_route(layer, kind="dense", policy="fp8_cb_midm",
                            symbol="cb_fused_prefill_mm_scaled", tile_m=128,
                            shape=shape, contract="fp8_per_token_dynamic",
@@ -1383,6 +1442,13 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # op consumes the resulting [N,K] e4m3 tile. Missing CUDA support is
         # fatal, never a
         # hidden Triton byte-gather.
+        shape = (f"FP8_CB_K{int(self.k)}:M{int(x2.shape[0])}:"
+                 f"N{int(N)}:K{int(K)}")
+        emit_route(
+            layer, kind="dense", policy="fp8_cb_expand_cutlass_w8a8",
+            symbol="cb_expand_fp8+_C.cutlass_scaled_mm", tile_m=0,
+            shape=shape, contract=_route_bridge_contract(False),
+            state="error", reason="native composition did not return")
         self._require_fp8_cuda_ext("weight expansion")
         from .ops import cb_expand_fp8
         W_e4m3 = cb_expand_fp8(
@@ -1392,4 +1458,9 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         out = native_cutlass_scaled_mm(
             xq, W_e4m3.t(), sa, ws, torch.bfloat16)
         del W_e4m3
+        emit_route(
+            layer, kind="dense", policy="fp8_cb_expand_cutlass_w8a8",
+            symbol="cb_expand_fp8+_C.cutlass_scaled_mm", tile_m=0,
+            shape=shape, contract=_route_bridge_contract(False),
+            state="served", reason=None)
         return out.reshape(*x.shape[:-1], N)

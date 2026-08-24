@@ -188,6 +188,16 @@ deterministic on the scale path (identical input bytes → identical output).
 
 The FP8 grid has **no per-superblock scale plane**. `type_size = 4k`. Its scales
 are **per-output-channel FP32**, shipped in a separate tensor (§4).
+
+The v10 Gridbook runtime profile distinguishes a wire **reader domain** from a
+canonical **producer menu**. FP8-CB readers accept
+`k ∈ {4,8,12,16,20,24} ∪ [28,48]`; this preserves every previously emitted
+integer K28..K48 artifact. New v10 producers emit exactly
+`k ∈ {4,8,12,…,48}` (step four). These sets do not change the packing rule:
+every accepted FP8 row still has exactly `4k` index bytes per 256 weights and
+uses the ceil-first four-way product split above. A runtime may support a
+broader format-valid research `k`, but it MUST NOT claim that value as part of
+Gridbook's v10 reader or producer profile.
 Reconstruction:
 ```
 weight[i] = codeword_value[i] * weight_scale[row]

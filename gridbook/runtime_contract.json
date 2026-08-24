@@ -1,6 +1,6 @@
 {
-  "schema": "gridbook.runtime-contract.v9",
-  "contract_version": 9,
+  "schema": "gridbook.runtime-contract.v10",
+  "contract_version": 10,
   "abi_features": {
     "dspark_construction_physical_bridge": 1,
     "routed_moe_per_role_codebook_lut": 1,
@@ -77,6 +77,21 @@
         23,
         24
       ],
+      "producer_rungs": [
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24
+      ],
       "layout_versions": [
         1,
         2
@@ -92,6 +107,12 @@
       "mode": "product",
       "n_sub": 4,
       "rungs": [
+        4,
+        8,
+        12,
+        16,
+        20,
+        24,
         28,
         29,
         30,
@@ -114,6 +135,20 @@
         47,
         48
       ],
+      "producer_rungs": [
+        4,
+        8,
+        12,
+        16,
+        20,
+        24,
+        28,
+        32,
+        36,
+        40,
+        44,
+        48
+      ],
       "layout_versions": [
         1
       ],
@@ -122,6 +157,77 @@
       ]
     }
   ],
+  "lane_eligibility": {
+    "schema": "gridbook.lane-eligibility.v2",
+    "platforms": {
+      "sm_89": {
+        "compute_capability": [
+          8,
+          9
+        ]
+      }
+    },
+    "regimes": [
+      "decode",
+      "batch"
+    ],
+    "structures": [
+      "dense",
+      "routed_moe"
+    ],
+    "cells": [
+      {
+        "id": "fp8_cb_dense_sm89_decode_cuda_gemv",
+        "platform": "sm_89",
+        "family": "FP8_CB_K",
+        "structure": "dense",
+        "regime": "decode",
+        "rungs": [
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48
+        ],
+        "route_status": "backed",
+        "qualification": "compile_only",
+        "requires_serve_flags": [],
+        "predicates": []
+      },
+      {
+        "id": "fp8_cb_dense_sm89_batch_expand_cutlass_w8a8",
+        "platform": "sm_89",
+        "family": "FP8_CB_K",
+        "structure": "dense",
+        "regime": "batch",
+        "rungs": [
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          36,
+          40,
+          44,
+          48
+        ],
+        "route_status": "backed",
+        "qualification": "compile_only",
+        "requires_serve_flags": [],
+        "predicates": []
+      }
+    ]
+  },
   "tensor_parallel": {
     "axis": "vllm_tensor_parallel_world_size",
     "semantics": "closed_world",

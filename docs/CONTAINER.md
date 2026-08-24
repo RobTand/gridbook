@@ -28,26 +28,24 @@ volume over `PRISMAQUANT_CB_EXT_DIR` (see [Volumes](#volumes)) and do a
 throwaway load with the flag set before serving traffic. Both lanes fail the
 load rather than silently falling back, so a failed build is loud, not slow.
 
-**Fused FP8 module build cost (measured, GB10 / cc 12.1, cold cache, 2026-08-02).**
-`get_fused_ext()` compiles 20 kernel instantiations — six `k_bits` rungs ×
-{dense unscaled, dense scaled, grouped TileM=128}, plus grouped TileM=256 at
-k28/k32. Measured by clearing `$PRISMAQUANT_CB_EXT_DIR/fused` and timing the
-loader:
+**Fused FP8 module build cost (old matrix measured; v10 matrix pending).**
+The 2026-08-02 GB10 / cc 12.1 cold-cache measurement covered 20 kernel
+instantiations — six `k_bits` rungs × {dense unscaled, dense scaled, grouped
+TileM=128}, plus grouped TileM=256 at k28/k32. It was measured by clearing
+`$PRISMAQUANT_CB_EXT_DIR/fused` and timing the loader:
 
 | source | cold build |
 |---|---|
 | pre-K1.2 (merge base) | 71.4 s |
 | K1.2 | 76.0 s, 75.7 s |
 
-**+4.6 s (~6%).** The K1.2 work changed *no* kernel instantiation — the six
-compiled rungs were already the complete set the packed-B TMA box and the
-uniform sub-table width admit (see
-[KERNELS](KERNELS.md#rung-coverage-what-this-lane-can-and-cannot-serve-k12)) —
-so the delta is compile-time *evaluation*, not code generation: the rung-law
-predicates, the smem closed form, and the twelve-cell `static_assert` table that
-pins it to the probe. Every rung that could be *added* would need a different
-TMA schedule and a ragged-width decode, i.e. a new kernel rather than another
-template instantiation, so this is not a preview of a larger future cost.
+**+4.6 s (~6%) for that historical matrix.** v10 expands the canonical producer
+law to K4..K48 step 4: 12 × {dense unscaled, dense scaled, grouped TileM=128}
+plus grouped TileM=256 through K32, or 44 instantiations. Its cold build time has
+not been measured. Do not reuse the ~76 s result for this larger source surface;
+the assigned Blackwell compile gate must record a new number. Legacy irregular
+K28..K48 reader rungs remain outside this collective and use the generic routes
+(see [KERNELS](KERNELS.md#rung-coverage-what-this-lane-can-and-cannot-serve-k12)).
 
 ---
 

@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### FP8-CB producer ladder expands to K4..K48/4 (contract schema v10)
+
+- `formats[].rungs` is now explicitly the accepted **reader** domain and the
+  new `formats[].producer_rungs` field is the canonical writer menu. FP8-CB
+  readers accept K4/K8/K12/K16/K20/K24 plus every legacy K28..K48 artifact;
+  v10 producers emit exactly K4..K48 in steps of four. NVFP4's reader and
+  producer sets remain byte-for-byte the existing K12..K24 ladder.
+- The generic dense/grouped FP8 CUDA decoder and transient expander admit the
+  low reader rungs. Their aligned word extraction now predicates both tail
+  words, including the K4/vector-31 case where the old unconditional `widx+1`
+  read addressed one word beyond the exact packed body.
+- The Blackwell fused source surface instantiates every producer rung and its
+  low-rung LUT allocation remains 1 KiB-aligned. This is a compile/source
+  surface change, not new GPU qualification evidence: low-rung device parity
+  and served speed remain gates.
+- `lane_eligibility` v2 publishes exact-platform, structure, regime and rung
+  route facts separately from wire-format acceptance. The initial SM89 dense
+  decode and batch rows are `compile_only`; they cannot make an artifact
+  producer-legal. Graph/capture policy and per-run graph evidence deliberately
+  remain outside Gridbook's packaged contract.
+- `python -m gridbook.sm89_preflight --build-directory ... --receipt ...` is a callable,
+  no-launch cross-compile/ABI preflight using explicit `sm_89` gencode. Its
+  receipt ceiling is permanently `compile_only`. The 2026-08-24 no-device run
+  produced an `sm_89` cubin and passed the full Gridbook main-extension symbol
+  contract plus vLLM's direct FP8 quantization/CUTLASS ABI check. Durable
+  receipt:
+  `/home/rob/dq-runs/20260824_gridbook_sm89_v10_compile_only/receipt.json`,
+  SHA-256
+  `55a3679654db97617846f6addf46f8fbf617e16afbaeeebeea4ad2f454159bcd`.
+  It loaded no model or tensor and is not device, graph, quality or speed
+  evidence.
+- Dense FP8 decode and expand + direct CUTLASS routes now write two-phase
+  scalar-only route telemetry (error before launch, served after return),
+  including the FP8-CB rung and exact M/N/K shape without a tensor read or
+  synchronization.
+- FP8 fused-mid-M selection is now platform-safe at model load: unset means
+  auto (enabled only on cc 12.0/12.1), so an SM89 load never invokes the
+  Blackwell-only fused JIT before reaching its native expand+CUTLASS route.
+  Explicit `PRISMAQUANT_CB_FUSED_MIDM=1` on SM89 fails the load by name. The
+  analogous routed fused eligibility check also rejects non-sm12x before
+  querying that extension.
+- Schema and `contract_version` move together to
+  `gridbook.runtime-contract.v10` / 10. Tensor- and expert-parallel tables keep
+  their v9 byte semantics unchanged.
+
 ## 0.9.0 — 2026-08-23
 
 **Tensor parallelism is supported.** Gridbook artifacts serve above one rank

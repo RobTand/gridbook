@@ -26,8 +26,9 @@
 //           scale = max(amax/448, 1/(448*512)) -> clamp -> e4m3 rn-satfinite
 //           -> f32 -> * scale -> bf16_rn).
 //
-// Scope: fp8 grid, `product` mode, n_sub=4 (sub_dim=2) — the shipped
-// FP8_CB_K{36,40,44,48} rungs. Unsupported contracts fail before launch;
+// Scope: fp8 grid, `product` mode, n_sub=4 (sub_dim=2) — the v10 K4..K48
+// multiples-of-four producer ladder plus legacy irregular K28..K48 readers.
+// Unsupported contracts fail before launch;
 // Gridbook has no alternate Triton implementation.
 // Compiled by torch.utils.cpp_extension WITHOUT fast-math (division and
 // conversion rounding must match torch exactly).
@@ -81,10 +82,20 @@ inline bool pq_env_bool01(const char* name, bool fallback) {
 
 constexpr int kThreads = 256;            // 8 warps
 constexpr int kWarps = kThreads / 32;
-constexpr int kSlotBytes = 208;          // >= max type_size (192) + 16 slack
-                                         // for the aligned 3-word extraction
+constexpr int kSlotBytes = 208;          // >= max type_size (192) + 16 slack;
+                                         // FP8 tail words are still predicated
 constexpr float kFp8Max = 448.0f;
 constexpr float kMinScale = 1.0f / (448.0f * 512.0f);
+
+// v10 reader ABI: low canonical rungs plus the complete legacy high domain.
+// Keep this independent of the producer law (K4..K48/4): old irregular
+// K28..K48 artifacts remain loadable, while never-produced K25..K27 and
+// arbitrary widths below K28 fail at the native binding as well as config
+// resolution.
+inline bool fp8_reader_kbits_supported(int k_bits) {
+  return (k_bits >= 4 && k_bits <= 24 && k_bits % 4 == 0) ||
+         (k_bits >= 28 && k_bits <= 48);
+}
 // torch computes tensor/scalar as a RECIPROCAL MULTIPLY (a * f32(1/448)), not
 // a true division — 1 f32 ULP off correctly-rounded for some amax. The scale
 // must match codec.fp8_dynamic_act_qdq bit-for-bit, so replicate that chain.
@@ -208,6 +219,21 @@ struct SubSplit {
     }
   }
 };
+
+// Load only the aligned words that can contribute to this k-bit codeword.
+// The 32 codewords occupy exactly 4*k_bits bytes, so w0 is always resident.
+// At low rungs (notably lane 31 at K4), widx+1 is already one word beyond the
+// staged body; relying on kSlotBytes' uninitialized shared tail made the value
+// algebraically harmless but the read itself undefined.  Predication is the
+// format-independent guard for both canonical low rungs and legacy ragged
+// high rungs.
+DEVINL void fp8_load_codeword_words(
+    const uint32_t* s32, int widx, int rem, int k_bits,
+    uint32_t& w0, uint32_t& w1, uint32_t& w2) {
+  w0 = s32[widx];
+  w1 = (rem + k_bits > 32) ? s32[widx + 1] : 0u;
+  w2 = (rem + k_bits > 64) ? s32[widx + 2] : 0u;
+}
 
 // Decode one superblock's already-read packed words (w0/w1/w2, rem) into wv[8]
 // (e4m3 LUT, Triton-bit-exact rounding) and FMA against x for each active m.
@@ -373,9 +399,9 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
         __syncwarp();
         const uint32_t* s32 =
             reinterpret_cast<const uint32_t*>(stage[warp][buf]);
-        const uint32_t w0_ = s32[widx];
-        const uint32_t w1_ = s32[widx + 1];
-        const uint32_t w2_ = s32[widx + 2];
+        uint32_t w0_, w1_, w2_;
+        fp8_load_codeword_words(
+            s32, widx, rem, k_bits, w0_, w1_, w2_);
         const int s_next = s + WARPS;
         if (s_next < n_sb) {
           const uint64_t* gN = reinterpret_cast<const uint64_t*>(
@@ -397,9 +423,9 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
         __syncwarp();
         const uint32_t* s32 =
             reinterpret_cast<const uint32_t*>(stage[warp][0]);
-        const uint32_t w0_ = s32[widx];
-        const uint32_t w1_ = s32[widx + 1];
-        const uint32_t w2_ = s32[widx + 2];
+        uint32_t w0_, w1_, w2_;
+        fp8_load_codeword_words(
+            s32, widx, rem, k_bits, w0_, w1_, w2_);
         __syncwarp();
         fp8_decode_fma<MT>(w0_, w1_, w2_, rem, s, lane, M, x, K, cb16, cb_base,
                            k_bits, sp, code_mask, sc_row, v2, acc);
@@ -420,9 +446,9 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_fp8_kernel(
       }
       __syncwarp();
       const uint32_t* s32 = reinterpret_cast<const uint32_t*>(stage[warp][0]);
-      const uint32_t w0_ = s32[widx];
-      const uint32_t w1_ = s32[widx + 1];
-      const uint32_t w2_ = s32[widx + 2];
+      uint32_t w0_, w1_, w2_;
+      fp8_load_codeword_words(
+          s32, widx, rem, k_bits, w0_, w1_, w2_);
       __syncwarp();
       fp8_decode_fma<MT>(w0_, w1_, w2_, rem, s, lane, M, x, K, cb16, cb_base,
                          k_bits, sp, code_mask, sc_row, v2, acc);
@@ -669,6 +695,8 @@ torch::Tensor cb_gemv_fp8(torch::Tensor x, torch::Tensor qw_padded,
   TORCH_CHECK(scale.scalar_type() == torch::kFloat32);
   TORCH_CHECK(n_sub == 4, "CUDA GEMV supports the fp8 n_sub=4 rungs only");
   TORCH_CHECK(K % 256 == 0, "K must be a multiple of the 256 superblock");
+  TORCH_CHECK(fp8_reader_kbits_supported(k_bits),
+              "fp8 k_bits is outside the v10 accepted reader domain");
   TORCH_CHECK(type_size <= 192, "type_size beyond the fp8 rung range (<=K48)");
   TORCH_CHECK(type_size == 4 * k_bits, "fp8 type_size must equal 4*k");
   // Widest sub-table (ceil-first split) must stay within the shipped range.
@@ -1279,9 +1307,9 @@ __global__ __launch_bounds__(WARPS * 32) void cb_moe_gemv_fp8_kernel(
     const int rem = ((b0 & 3) << 3) + (bitpos & 7);
     const uint32_t* s32 = reinterpret_cast<const uint32_t*>(stage[warp]);
     const int widx = b0 >> 2;
-    const uint32_t w0_ = s32[widx];
-    const uint32_t w1_ = s32[widx + 1];
-    const uint32_t w2_ = s32[widx + 2];
+    uint32_t w0_, w1_, w2_;
+    fp8_load_codeword_words(
+        s32, widx, rem, k_bits, w0_, w1_, w2_);
     __syncwarp();
     const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
     uint64_t code = lo >> rem;
@@ -1894,6 +1922,8 @@ torch::Tensor cb_moe_gemv_fp8(torch::Tensor xq, torch::Tensor qw_stack,
   TORCH_CHECK(pair_expert.scalar_type() == torch::kInt32);
   TORCH_CHECK(pair_xrow.scalar_type() == torch::kInt32);
   TORCH_CHECK(n_sub == 4);
+  TORCH_CHECK(fp8_reader_kbits_supported(k_bits),
+              "fp8 k_bits is outside the v10 accepted reader domain");
   TORCH_CHECK((k_bits + n_sub - 1) / n_sub <= 12 && type_size == 4 * k_bits &&
               type_size <= 192);
   const int64_t Nout = qw_stack.size(1);
@@ -2215,9 +2245,9 @@ __global__ __launch_bounds__(WARPS * 32) void cb_expand_fp8_kernel(
     const int rem = ((b0 & 3) << 3) + (bitpos & 7);
     const uint32_t* s32 = reinterpret_cast<const uint32_t*>(stage[warp]);
     const int widx = b0 >> 2;
-    const uint32_t w0_ = s32[widx];
-    const uint32_t w1_ = s32[widx + 1];
-    const uint32_t w2_ = s32[widx + 2];
+    uint32_t w0_, w1_, w2_;
+    fp8_load_codeword_words(
+        s32, widx, rem, k_bits, w0_, w1_, w2_);
     __syncwarp();
     const uint64_t lo = ((uint64_t)w1_ << 32) | (uint64_t)w0_;
     uint64_t code = lo >> rem;
@@ -2257,6 +2287,8 @@ static void cb_expand_fp8_launch(const torch::Tensor& qw_padded,
   TORCH_CHECK(cb_row_offset.scalar_type() == torch::kInt32 &&
               cb_row_offset.numel() == N);
   TORCH_CHECK(n_sub == 4);
+  TORCH_CHECK(fp8_reader_kbits_supported(k_bits),
+              "fp8 k_bits is outside the v10 accepted reader domain");
   TORCH_CHECK(K % 256 == 0 && type_size == 4 * k_bits && type_size <= 192);
   TORCH_CHECK(qw_padded.dim() == 2 && qw_padded.size(0) == N &&
               qw_padded.stride(1) == 1);

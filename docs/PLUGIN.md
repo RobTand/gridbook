@@ -50,7 +50,7 @@ gated activations are attested during model load and invoke their registered
 
 The producer/runtime boundary is machine-readable at
 `gridbook/runtime_contract.json` and loadable without torch or vLLM through
-`gridbook.runtime_contract.load_runtime_contract()`. Closed schema v5 also
+`gridbook.runtime_contract.load_runtime_contract()`. Closed schema v10 also
 attests `abi_features.source_fp8_block128_w8a16 = 1`,
 `abi_features.dspark_construction_physical_bridge = 1`, and a per-unit
 tensor-parallel capability table, so a producer can require the BF16-activation
@@ -59,8 +59,8 @@ and construction/physical namespace ABI (including weight-only drafts), or a
 specific tensor-parallel size for a specific format without inferring
 semantics from the package version. It
 declares accepted quantization names, serialized packing/type-size
-rules, supported CB rung
-families, and producer-profile loader coverage. The plugin derives its own
+rules, accepted CB reader rungs, canonical producer rungs, exact-platform lane
+eligibility, and producer-profile loader coverage. The plugin derives its own
 registration aliases and top-level loader-module list from this file rather
 than repeating them in Python. PrismaQuant pins an immutable Gridbook
 commit and validates against this packaged contract; it does not vendor a
@@ -84,6 +84,13 @@ second runtime tree or maintain a parallel loader table.
   contract row, and the SPEC definition are gone, and a `"mode": "signed"`
   scheme now fails closed everywhere. No published artifact encodes an
   S-rung. Full mode: spec-reserved, unimplemented.
+- **FP8-CB v10 reader and producer domains are intentionally different.**
+  `formats[FP8_CB_K].rungs` accepts K4/K8/K12/K16/K20/K24 and every integer
+  K28..K48, retaining older irregular artifacts. `producer_rungs` is the
+  hardware-aligned K4..K48 step-4 menu. A producer MUST choose from the latter;
+  a reader MUST continue to admit the former. NVFP4's two fields both remain
+  K12..K24. `type_size` is still exactly `4*k` for FP8, so no legacy byte
+  interpretation changed.
 - **Mixed containers are supported and shipping.** A config group carrying a
   `"scheme"` key is a CB group and is served by this plugin; a group without one
   uses the stock `compressed-tensors` vocabulary and is delegated to a real
@@ -155,9 +162,42 @@ second runtime tree or maintain a parallel loader table.
   framework bias add behind the serving boundary. Delegated non-CB groups keep
   their upstream method's contract.
 
+## Capability-scoped serving lanes
+
+Contract v10 adds `lane_eligibility` schema
+`gridbook.lane-eligibility.v2`. It does not widen the byte reader domain; it
+states which exact platform/structure/regime/rung compositions have a native
+route and how far their qualification has progressed.
+
+- `platforms` maps a scalar id such as `sm_89` to one exact compute capability,
+  never a `>=` family or wildcard.
+- Every `cells` row names one scalar platform, format family, structure
+  (`dense` or `routed_moe`), regime (`decode` or `batch`), non-empty subset of
+  that family's `producer_rungs`, route status, qualification, serve flags and
+  closed predicates. Absence is unbacked; an explicit `unbacked` row is invalid.
+- `route_status` is `backed`, `backed_with_serve_flag`, or `fallback`.
+  `qualification` is independent: `compile_only` proves no device execution
+  and is never producer-legal; `device_qualified` requires the physical gate.
+- The initial SM89 dense FP8-CB decode (`cb_gemv_fp8`) and batch
+  (`cb_expand_fp8` + direct vLLM CUTLASS W8A8) rows cover the producer ladder
+  but remain `compile_only`. This contract therefore does **not** authorize a
+  4090 artifact yet.
+- `python -m gridbook.sm89_preflight --build-directory <dedicated-dir>
+  --receipt <receipt.json>`
+  cross-compiles the production generic module with explicit
+  `compute_89/sm_89` code, verifies its full symbol surface, and checks the
+  direct vLLM FP8 quantization/CUTLASS ABI without invoking an operator. It
+  never uses the production extension cache. The emitted JSON says
+  `qualification_ceiling: compile_only` and explicitly excludes device,
+  performance and graph claims.
+- Gridbook intentionally carries no torch.compile or CUDA-graph configuration
+  or attestation in this table. The serving producer owns its immutable graph
+  requirement and references the per-run endpoint receipt that actually proved
+  it; source compilation cannot establish graph correctness.
+
 ## Tensor-parallel capability
 
-As of contract schema `gridbook.runtime-contract.v9`, the packaged contract
+As of contract schema `gridbook.runtime-contract.v10`, the packaged contract
 carries a `tensor_parallel` section that publishes, per serving unit, what the
 runtime actually enforces. The table is an attestation: each row restates a
 refusal or admission site in this package, and
@@ -248,12 +288,12 @@ contract that omits a shipped unit, invents one, drops a mandatory field,
 caps the capless dense CB surface with a number, or publishes a numeric claim
 no enforcement site stands behind.
 
-**Compatibility rule:** `schema` and `contract_version` move together (v9 / 9),
+**Compatibility rule:** `schema` and `contract_version` move together (v10 / 10),
 and readers match the schema string exactly. A producer pinned to the previous
-schema (v8) must refuse a `gridbook.runtime-contract.v9` contract whole — no
+schema (v9) must refuse a `gridbook.runtime-contract.v10` contract whole — no
 partial parsing, no field-by-field salvage across versions — and keep producing
-against its pinned runtime until its pin is deliberately bumped. Reading a v8
-contract with a v9 reader fails the same way. Only the CURRENT schema string is
+against its pinned runtime until its pin is deliberately bumped. Reading a v9
+contract with a v10 reader fails the same way. Only the CURRENT schema string is
 spelled in full anywhere outside the changelog, so a stale pin cannot hide in
 prose.
 
@@ -603,7 +643,11 @@ quality expansion plus an optional alternate decode GEMV:
   large M every M-tile CTA re-decodes B, so transient-expand is preferred. Its
   extension availability and selector mode are resolved during model load, not
   on the first eligible forward; changing the relevant environment value after
-  load raises instead of silently changing residency or dispatch.
+  load raises instead of silently changing residency or dispatch. Unset means
+  auto: only a cc 12.0/12.1 loading device resolves this specialization on.
+  SM89 never queries its Blackwell-only JIT and uses CUDA expansion + native
+  W8A8 CUTLASS above M=8; explicitly setting the selector to `1` there refuses
+  the model load rather than substituting that route behind the request.
 
 **`gridbook/csrc/cb_bf16_grouped_gemm.cu`** (CUTLASS, separate JIT ext) — the
 quality-preserving BF16 bridge:
@@ -679,7 +723,7 @@ tooling and model cards — see the README's naming section.)
 | `PRISMAQUANT_CB_MOE_PERSISTENT_B` | `auto` (0.8.9) | The persistent-B decode-in-mainloop lane for the **routed CB MoE quality prefill** above the `M<=16` GEMV band, BOTH payload families: FP4-CB two-tier v2 (`csrc/cb_moe_persistent_b.cu`, ROADMAP K1.1) and stock FP8-CB (K1.1's second payload family). A CTA owns one (expert, N-tile), decodes that weight tile from packed CB bytes into shared memory ONCE, and streams the expert's routed rows through it, so the `[E,N,K]` BF16 transient never exists and unrouted experts cost nothing. Same activation payload, FP32 accumulate, one bf16 round; weight decode is bit-identical to the expanders (`torch.equal`), so only the FP32 reduction order differs from the bridge (reassociation-class). **Unset means `auto` since 0.8.9**: each routed CB layer engages its family's arm where the load-time predicate and the extension attest, and keeps the expand+bridge route where they do not (per-role FP8-CB split books, an ineligible tile config, a missing extension), with a per-layer fallback line naming why — the bridge is exactly the pre-0.8.9 default. `1`/`require` keeps the pre-0.8.9 semantics exactly: every routed CB layer must take the lane, and a layer no arm can serve **fails the load** by name — the A/B-integrity contract. `0`/`off` is the kill switch. FP8 eligibility: cfg1 k≤33, cfg4 k≤31, cfg2/3 to k=48 (the 2-CTAs/SM occupancy floor). It takes precedence over `PRISMAQUANT_CB_BF16_SM120` for these layers, because it replaces the pair of operations that lane is one half of — and is itself outranked by `PRISMAQUANT_CB_FUSED_FP4_MOE`, which changes the activation contract (see [Lane precedence](#lane-precedence--which-flag-wins-when-several-are-set)); when overridden it is announced rather than discovered. Unknown spellings and mid-process changes raise. Served evidence: the FP4 arm's same-session served A/B on the DSv4 92 GB body (kl_mean −0.051 %, PPL −0.30 % — arithmetic noise) and the 0.8.9 default-state served KL/PPL leg on the shipped clean 87 GB body, on top of each arm's bitwise decode-identity CUDA suite and the 15.8–18.4× whole-routed-operator microbenchmark at DSv4 shapes. See [KERNELS](KERNELS.md#persistent-b-decode-in-mainloop-default-auto-prismaquant_cb_moe_persistent_b) and the [benchmark table](BENCHMARKS.md#2026-08-02-persistent-b-grouped-moe-decode-in-mainloop-microbenchmark-proposal-data). |
 | `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG` | `0` | Tile override for the lane above; `0` lets the kernel choose from the SHAPES (mean routed rows per expert), which is the production setting. A non-zero value is a 1-based index into `cb_moe_persistent_b_configs()` and is **validated at model load against what this build compiled**, so a stale or mistyped index fails the load instead of aborting the first request that carries routed rows. Measurement knob only. |
 | `GRIDBOOK_MXFP8_DENSE` | off | `1` opts in Gridbook's **direct MXFP8 dense W8A8 lane** (`csrc/mxfp8_dense_gemm.cu`) for `mxfp8_e4m3_e8m0_g32`: E4M3 weights with one UE8M0 scale per 32 K-elements, served on the stock sm120/sm121 block-scaled CollectiveBuilder collective (`kind::mxf8f6f4`), with activations quantized dynamically per 32. Correctness was audited on sm_121, but the NATIVE-PARITY served timing bench remains pending. With the flag unset, a direct-MXFP8 passthrough unit refuses at model load with this flag named; compiled only for cc 12.0/12.1 and attested at load like every lane (`lane_select.require_lane`). The source `fp8_e4m3_ue8m0_block128` wire is **not controlled by this flag** and never enters this W8A8 lane: it uses the separately attested W8A16 source route with unchanged BF16 activations. Unknown spellings and mid-process changes raise. |
-| `PRISMAQUANT_CB_FUSED_MIDM` | `1` | Resolved during model load. `0` skips the CUTLASS mid-M FP8 fused specialization and its JIT build; the exact native expansion/CUTLASS route remains. Only `''` (unset), `0` and `1` are accepted — before 2026-08-02 this was compared `!= "0"`, so `false` and `off` silently ENABLED the lane they read as disabling. Process-stable: changing the value after dispatch is fixed raises rather than taking effect. |
+| `PRISMAQUANT_CB_FUSED_MIDM` | `auto` | Resolved during model load against the loading device. Unset enables the CUTLASS decode-in-prologue specialization only on cc 12.0/12.1; on SM89 it does **not** query/build the Blackwell-only fused extension and M>8 uses native CUDA expansion + native W8A8 CUTLASS. `0` disables the specialization everywhere. `1` requires it and therefore fails model load on SM89, an unidentified device, any other unsupported capability, or a supported device whose extension does not load; Gridbook never substitutes the expansion route behind that explicit requirement. Only `''` (unset), `0` and `1` are accepted — before 2026-08-02 this was compared `!= "0"`, so `false` and `off` silently enabled the lane they read as disabling. Process-stable: changing the value after dispatch is fixed raises rather than taking effect. |
 | `PRISMAQUANT_CB_DECODE_CONTRACT` | `v1` | `v2` selects the scale-epilogue-hoist decode contract. Measured **null** on the served 27B; kept for reproducibility. |
 | `PRISMAQUANT_DEBUG_PREFIXES` | off | `1` prints, per Linear, whether it resolved to a CB scheme or to a config-declared non-CB group — the first tool to reach for when memory use is higher than expected. |
 | `PRISMAQUANT_PRELOAD_FUSED` | off | `1` independently attempts to build/preload **every** native extension family at registration — decode GEMV, GEMV-v2, grouped BF16, both fused FP8-CB/NVFP4-CB modules, fused FP4-v2, persistent-B MoE, direct MXFP8 dense, and source block-FP8 W8A16 — so both arms of a served A/B can carry identical extension residency. (Before 2026-08-02 it warmed only the two fused modules, which left the other five free to differ between arms; the name is kept because it is the published one.) Each family is attempted independently and fail-soft: one that will not build on this box leaves the others warmed. Only `''` (unset), `0` and `1` are accepted: this was compared `== "1"` until 2026-08-02, so `true` and a stray-space `" 1 "` warmed nothing while the operator believed both arms were residency-matched — a failure invisible in the results. A family that does not warm is now named on stderr rather than silently skipped. Registration treats this as a capability probe; a serving caller still requires its selected native operation and fails closed (see the measurement side-effect in [`KERNELS.md`](KERNELS.md#a-measurement-side-effect-worth-knowing)). |

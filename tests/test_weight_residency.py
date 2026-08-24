@@ -126,6 +126,59 @@ def _write_checkpoint_header(directory, *, rows=7):
     return path
 
 
+@pytest.mark.parametrize("k_bits", [4, 8, 12, 16, 20, 24, *range(28, 49)])
+def test_fp8_scheme_loader_accepts_v10_reader_domain(k_bits):
+    from gridbook.runtime_contract import load_runtime_contract
+
+    PrismaQuantConfig._validate_cb_format_scheme(
+        {
+            "grid": "fp8", "mode": "product", "k": k_bits,
+            "n_sub": 4, "type_size": 4 * k_bits,
+        },
+        "model.layers.0.self_attn.q_proj",
+        load_runtime_contract(),
+    )
+
+
+@pytest.mark.parametrize("k_bits", [3, 5, 25, 27, 49])
+def test_fp8_scheme_loader_rejects_values_outside_v10_reader_domain(k_bits):
+    from gridbook.runtime_contract import load_runtime_contract
+
+    with pytest.raises(ValueError, match="outside the packaged reader domain"):
+        PrismaQuantConfig._validate_cb_format_scheme(
+            {
+                "grid": "fp8", "mode": "product", "k": k_bits,
+                "n_sub": 4, "type_size": 4 * k_bits,
+            },
+            "model.layers.0.self_attn.q_proj",
+            load_runtime_contract(),
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("k", True, "k must be an integer"),
+        ("n_sub", 2, "requires n_sub=4"),
+        ("type_size", 17, r"requires type_size=4\*k=16"),
+    ],
+)
+def test_fp8_scheme_loader_rejects_incoherent_physical_fields(
+    field, value, message
+):
+    from gridbook.runtime_contract import load_runtime_contract
+
+    scheme = {
+        "grid": "fp8", "mode": "product", "k": 4,
+        "n_sub": 4, "type_size": 16,
+    }
+    scheme[field] = value
+    with pytest.raises(ValueError, match=message):
+        PrismaQuantConfig._validate_cb_format_scheme(
+            scheme, "model.layers.0.self_attn.q_proj", load_runtime_contract()
+        )
+
+
 def _checkpoint_header_method(source):
     quant_config = types.SimpleNamespace(_get_sidecar_source=lambda: source)
     method = object.__new__(PrismaQuantCBLinearMethod)
@@ -644,7 +697,7 @@ def test_layer_no_longer_references_the_original_storage():
 
 def test_repointed_cb_qweight_still_satisfies_the_fp8_kernel_checks():
     """``layer.cb_qweight.data`` is still passed to cb_fused_prefill_mm_scaled
-    (mid-M, default-on). Mirror its TORCH_CHECKs."""
+    (mid-M on sm12x auto/require). Mirror its TORCH_CHECKs."""
     layer, _ = _loaded_layer()
     qw = layer.cb_qweight.data
     row_bytes = (_K // codec.SUPERBLOCK) * _SCHEME["type_size"]
@@ -857,6 +910,12 @@ def test_same_ref_fused_roles_enter_native_fused_kernel(monkeypatch, M):
     # of the latch, and is what this test was implicitly relying on not being
     # true.
     monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "1")
+    from gridbook import lane_select
+    monkeypatch.setattr(
+        lane_select, "device_capability", lambda _device=None: (12, 1))
+    # Explicit mode is a true requirement at load. The full stand-in below is
+    # installed for forward; load only needs a non-None attestation object.
+    monkeypatch.setattr(cuda_ext, "get_fused_ext", lambda: object())
     method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
     N, K = layer._cb_N, layer._cb_K
     _mock_fp8_ops(monkeypatch, N)
@@ -911,6 +970,14 @@ def test_distinct_ref_roles_use_native_expand_before_fused_ext(monkeypatch, M):
     out = method._apply_inline(layer, torch.zeros(M, K, dtype=torch.bfloat16))
     assert len(fallback_calls) == 1
     assert torch.equal(out, torch.full_like(out, 7.0))
+    from gridbook.nvfp4_activation_contract import read_route
+    route = read_route(layer)
+    assert route["policy"] == "fp8_cb_expand_cutlass_w8a8"
+    assert route["symbol"] == "cb_expand_fp8+_C.cutlass_scaled_mm"
+    assert route["shape"] == f"FP8_CB_K{method.k}:M{M}:N{N}:K{K}"
+    assert route["contract"] == "fp8_per_token_dynamic"
+    assert route["state"] == "served"
+    assert route["reason"] is None
 
 
 @pytest.mark.parametrize("M", [9, 16])
@@ -953,6 +1020,11 @@ def test_missing_required_cuda_ext_fails_closed(monkeypatch, M):
     )
     with pytest.raises(RuntimeError, match="alternate fallback is forbidden"):
         method._apply_inline(layer, torch.zeros(M, K, dtype=torch.bfloat16))
+    from gridbook.nvfp4_activation_contract import read_route
+    route = read_route(layer)
+    assert route["policy"] == "fp8_cb_expand_cutlass_w8a8"
+    assert route["state"] == "error"
+    assert route["reason"] == "native composition did not return"
 
 
 @pytest.mark.parametrize("M", [1, 8])
@@ -971,6 +1043,34 @@ def test_fp8_decode_uses_native_cuda_gemv(monkeypatch, M):
     out = method._apply_inline(layer, torch.zeros(M, K, dtype=torch.bfloat16))
     assert calls == [torch.Size([M, K])]
     assert torch.equal(out, torch.full_like(out, 13.0))
+    from gridbook.nvfp4_activation_contract import read_route
+    route = read_route(layer)
+    assert route["policy"] == "fp8_cb_cuda_gemv"
+    assert route["symbol"] == "cb_gemv_fp8"
+    assert route["shape"] == f"FP8_CB_K{method.k}:M{M}:N{N}:K{K}"
+    assert route["contract"] == "fp8_per_token_dynamic"
+    assert route["state"] == "served"
+    assert route["reason"] is None
+
+
+def test_fp8_decode_route_retains_error_when_native_launch_raises(monkeypatch):
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+    N, K = layer._cb_N, layer._cb_K
+    monkeypatch.setattr(method, "_cuda_gemv_ok", lambda: True)
+    monkeypatch.setattr(
+        sys.modules["gridbook.linear"], "cb_gemv_fp8",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    with pytest.raises(RuntimeError, match="boom"):
+        method._apply_inline(layer, torch.zeros(1, K, dtype=torch.bfloat16))
+
+    from gridbook.nvfp4_activation_contract import read_route
+    route = read_route(layer)
+    assert route["policy"] == "fp8_cb_cuda_gemv"
+    assert route["symbol"] == "cb_gemv_fp8"
+    assert route["shape"] == f"FP8_CB_K{method.k}:M1:N{N}:K{K}"
+    assert route["state"] == "error"
+    assert route["reason"] == "launch did not return"
 
 
 def test_fused_lut_guard_rejects_uniform_nonzero_base():
@@ -1133,6 +1233,94 @@ def test_fp8_fused_midm_optout_skips_model_load_jit(monkeypatch):
         lambda: pytest.fail("FP8 fused opt-out built optional extension"),
     )
     _loaded_layer()
+
+
+def test_fp8_fused_midm_auto_on_sm89_never_loads_blackwell_extension(
+        monkeypatch):
+    """Ada AUTO reaches expand+CUTLASS; it never probes the sm12x JIT."""
+    from gridbook import cuda_ext, lane_select
+    from gridbook import ops as cb_ops
+
+    monkeypatch.delenv("PRISMAQUANT_CB_FUSED_MIDM", raising=False)
+    monkeypatch.setattr(
+        lane_select, "device_capability", lambda _device=None: (8, 9))
+    monkeypatch.setattr(
+        cuda_ext,
+        "get_fused_ext",
+        lambda: pytest.fail("SM89 AUTO queried the Blackwell-only extension"),
+    )
+    method, layer, _ = _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+    assert layer._cb_fp8_fused_midm is False
+
+    N, K = layer._cb_N, layer._cb_K
+    _mock_fp8_ops(monkeypatch, N)
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Ada route selection/telemetry synchronized CUDA"
+        ),
+    )
+    expands = []
+
+    def _expand(*args, **kwargs):
+        expands.append((args, kwargs))
+        return torch.zeros(N, K, dtype=torch.float32)
+
+    monkeypatch.setattr(cb_ops, "cb_expand_fp8", _expand)
+    out = method._apply_inline(
+        layer, torch.zeros(16, K, dtype=torch.bfloat16)
+    )
+    assert len(expands) == 1
+    assert torch.equal(out, torch.full_like(out, 7.0))
+    from gridbook.nvfp4_activation_contract import read_route
+    route = read_route(layer)
+    assert route["kind"] == "dense"
+    assert route["policy"] == "fp8_cb_expand_cutlass_w8a8"
+    assert route["symbol"] == "cb_expand_fp8+_C.cutlass_scaled_mm"
+    assert route["tile_m"] == 0
+    assert route["shape"] == f"FP8_CB_K{method.k}:M16:N{N}:K{K}"
+    assert route["contract"] == "fp8_per_token_dynamic"
+    assert route["state"] == "served"
+    assert route["reason"] is None
+
+
+def test_fp8_fused_midm_explicit_on_sm89_fails_before_jit(monkeypatch):
+    """An explicit Blackwell-only request on Ada fails at model load."""
+    from gridbook import cuda_ext, lane_select
+    from gridbook.cuda_ext import NativeKernelUnavailableError
+
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "1")
+    monkeypatch.setattr(
+        lane_select, "device_capability", lambda _device=None: (8, 9))
+    monkeypatch.setattr(
+        cuda_ext,
+        "get_fused_ext",
+        lambda: pytest.fail("explicit SM89 refusal reached the sm12x JIT"),
+    )
+    with pytest.raises(
+        NativeKernelUnavailableError,
+        match=(r"PRISMAQUANT_CB_FUSED_MIDM=1 requires.*"
+               r"compute capability 12\.0 or 12\.1.*reports 8\.9"),
+    ):
+        _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
+
+
+def test_fp8_fused_midm_explicit_on_blackwell_fails_if_extension_misses(
+        monkeypatch):
+    """`1` is a requirement, not auto with a different spelling."""
+    from gridbook import cuda_ext, lane_select
+    from gridbook.cuda_ext import NativeKernelUnavailableError
+
+    monkeypatch.setenv("PRISMAQUANT_CB_FUSED_MIDM", "1")
+    monkeypatch.setattr(
+        lane_select, "device_capability", lambda _device=None: (12, 1))
+    monkeypatch.setattr(cuda_ext, "get_fused_ext", lambda: None)
+    with pytest.raises(
+        NativeKernelUnavailableError,
+        match=r"PRISMAQUANT_CB_FUSED_MIDM=1 requires.*did not load",
+    ):
+        _fused_loaded_layer([_REF_A, _REF_A, _REF_A])
 
 
 def test_fp8_fused_midm_optout_cannot_enable_jit_after_model_load(

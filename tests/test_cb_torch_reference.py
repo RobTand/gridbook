@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 from cb_torch_reference import (
     decode_cb_values,
@@ -16,6 +17,77 @@ def _pack_row(codes: list[int], k_bits: int, tail: bytes = b"") -> torch.Tensor:
         stream |= int(code) << (vector * k_bits)
     index_bytes = stream.to_bytes(4 * k_bits, "little")
     return torch.tensor(list(index_bytes + tail), dtype=torch.uint8)
+
+
+_FP8_PRODUCER_RUNGS = tuple(range(4, 49, 4))
+_FP8_LEGACY_IRREGULAR_RUNGS = (29, 33, 47)
+
+
+@pytest.mark.parametrize("k_bits", _FP8_PRODUCER_RUNGS)
+def test_fp8_product_decode_covers_every_v10_producer_rung(k_bits):
+    """Exact 4*k-byte rows decode at K4..K48 without implicit tail bytes."""
+
+    mask = (1 << k_bits) - 1
+    codes = [((vector * 0x9E3779B1) ^ (mask >> (vector % 5))) & mask
+             for vector in range(32)]
+    # Make the final K4 codeword consume the final nibble of the exact body;
+    # this is the lane whose native aligned widx+1 read must be predicated.
+    codes[-1] = mask
+    packed = _pack_row(codes, k_bits).reshape(1, -1)
+    assert packed.shape[1] == 4 * k_bits
+
+    width = k_bits // 4
+    tables = []
+    for sub in range(4):
+        table = (torch.arange((1 << width) * 2, dtype=torch.float32)
+                 + sub * 10000).to(torch.bfloat16)
+        tables.append(table)
+    codebook = torch.cat(tables)
+    offsets = torch.zeros(1, dtype=torch.int32)
+
+    got_codes = extract_codewords(
+        packed, N=1, K=256, k_bits=k_bits, type_size=4 * k_bits)
+    assert torch.equal(got_codes[0, 0], torch.tensor(codes))
+    got = decode_cb_values(
+        packed, codebook, offsets, N=1, K=256, k_bits=k_bits,
+        n_sub=4, type_size=4 * k_bits)
+
+    expected = []
+    sub_mask = (1 << width) - 1
+    for code in codes:
+        for sub, table in enumerate(tables):
+            index = (code >> (sub * width)) & sub_mask
+            expected.extend(table[index * 2:index * 2 + 2])
+    assert torch.equal(got[0], torch.stack(expected))
+
+
+@pytest.mark.parametrize("k_bits", _FP8_LEGACY_IRREGULAR_RUNGS)
+def test_fp8_legacy_irregular_reader_keeps_ceil_first_split(k_bits):
+    """v10 producer law narrows; the older K28..K48 reader ABI does not."""
+
+    widths = [k_bits // 4 + (1 if i < k_bits % 4 else 0)
+              for i in range(4)]
+    codes = [((vector + 1) * 0x123456789ABC) & ((1 << k_bits) - 1)
+             for vector in range(32)]
+    packed = _pack_row(codes, k_bits).reshape(1, -1)
+    tables = [
+        (torch.arange((1 << width) * 2, dtype=torch.float32)
+         + sub * 10000).to(torch.bfloat16)
+        for sub, width in enumerate(widths)
+    ]
+    got = decode_cb_values(
+        packed, torch.cat(tables), torch.zeros(1, dtype=torch.int32),
+        N=1, K=256, k_bits=k_bits, n_sub=4, type_size=4 * k_bits)
+
+    expected = []
+    bit_offset = 0
+    for code in codes:
+        bit_offset = 0
+        for width, table in zip(widths, tables):
+            index = (code >> bit_offset) & ((1 << width) - 1)
+            expected.extend(table[index * 2:index * 2 + 2])
+            bit_offset += width
+    assert torch.equal(got[0], torch.stack(expected))
 
 
 def test_uneven_product_decode_and_row_offsets():

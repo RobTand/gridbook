@@ -1380,12 +1380,13 @@ _FUSED_SYMBOLS = (
 def fused_fp8_kbits(ext) -> tuple[int, ...]:
     """The k_bits rungs the loaded fused FP8 module actually COMPILED.
 
-    K1.2. The product FP8-CB ladder is every integer 28..48, but the fused
-    mid-M lane backs only the multiples of 4 — a format + TMA law spelled out
-    at the top of ``csrc/cb_fused_gemm.cu``, not a build option. Dispatch must
-    therefore ASK the module rather than carry a literal ladder: a duplicated
-    literal is exactly how a call site silently misses a compiled rung (or
-    offers an uncompiled one) when the kernel's surface moves.
+    K1.2. v10 producers emit K4..K48 step 4, while the accepted reader domain
+    also preserves legacy irregular K28..K48 artifacts.  The fused mid-M lane
+    backs the producer law — the format + TMA law spelled out at the top of
+    ``csrc/cb_fused_gemm.cu``. Dispatch must still ASK the module rather than
+    carry a literal ladder: a duplicated literal is exactly how a call site
+    silently misses a compiled rung (or offers an uncompiled one) when the
+    kernel's surface moves.
 
     Read ONCE and memoized on the module object, like
     ``fp4v2_fused_midm_lane._facts`` — the cache then dies exactly when the

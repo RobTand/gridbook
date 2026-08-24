@@ -22,6 +22,10 @@ from gridbook.runtime_contract import (
 )
 
 
+_FP8_READER_RUNGS = [4, 8, 12, 16, 20, 24, *range(28, 49)]
+_FP8_PRODUCER_RUNGS = list(range(4, 49, 4))
+
+
 def _plugin_source() -> Path:
     spec = importlib.util.find_spec("gridbook.plugin")
     assert spec is not None and spec.origin
@@ -35,7 +39,7 @@ def test_packaged_contract_loads_and_validates():
     contract = load_runtime_contract()
     assert contract == raw
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 9
+    assert contract["contract_version"] == 10
     assert contract["abi_features"] == {
         "dspark_construction_physical_bridge": 1,
         "routed_moe_per_role_codebook_lut": 1,
@@ -132,9 +136,11 @@ def test_contract_pins_current_format_ladders_and_layout_restrictions():
     # a row for it must not outlive its enforcement sites.
     assert "NVFP4_CB_S" not in by_family
     assert by_family["NVFP4_CB_K"]["rungs"] == list(range(12, 25))
+    assert by_family["NVFP4_CB_K"]["producer_rungs"] == list(range(12, 25))
     assert by_family["NVFP4_CB_K"]["layout_versions"] == [1, 2]
     assert by_family["NVFP4_CB_K"]["moe_layout_versions"] == [2]
-    assert by_family["FP8_CB_K"]["rungs"] == list(range(28, 49))
+    assert by_family["FP8_CB_K"]["rungs"] == _FP8_READER_RUNGS
+    assert by_family["FP8_CB_K"]["producer_rungs"] == _FP8_PRODUCER_RUNGS
     assert by_family["FP8_CB_K"]["layout_versions"] == [1]
     assert by_family["FP8_CB_K"]["moe_layout_versions"] == [1]
     assert load_runtime_contract()["packing"] == {
@@ -144,6 +150,44 @@ def test_contract_pins_current_format_ladders_and_layout_restrictions():
         "index_bytes_per_k": 4,
         "index_bit_order": "lsb_first",
         "subindex_split": "ceil_first",
+    }
+
+
+def test_sm89_dense_lanes_are_compile_only_and_cover_producer_rungs():
+    """A source build is not a 4090 serve qualification."""
+
+    lanes = load_runtime_contract()["lane_eligibility"]
+    assert lanes == {
+        "schema": "gridbook.lane-eligibility.v2",
+        "platforms": {"sm_89": {"compute_capability": [8, 9]}},
+        "regimes": ["decode", "batch"],
+        "structures": ["dense", "routed_moe"],
+        "cells": [
+            {
+                "id": "fp8_cb_dense_sm89_decode_cuda_gemv",
+                "platform": "sm_89",
+                "family": "FP8_CB_K",
+                "structure": "dense",
+                "regime": "decode",
+                "rungs": _FP8_PRODUCER_RUNGS,
+                "route_status": "backed",
+                "qualification": "compile_only",
+                "requires_serve_flags": [],
+                "predicates": [],
+            },
+            {
+                "id": "fp8_cb_dense_sm89_batch_expand_cutlass_w8a8",
+                "platform": "sm_89",
+                "family": "FP8_CB_K",
+                "structure": "dense",
+                "regime": "batch",
+                "rungs": _FP8_PRODUCER_RUNGS,
+                "route_status": "backed",
+                "qualification": "compile_only",
+                "requires_serve_flags": [],
+                "predicates": [],
+            },
+        ],
     }
 
 
@@ -217,6 +261,46 @@ def _unsupported_format_mode(contract):
     contract["formats"][0]["mode"] = "full"
 
 
+def _producer_rung_off_law(contract):
+    contract["formats"][1]["producer_rungs"].remove(48)
+
+
+def _legacy_irregular_rung_claimed_by_lane(contract):
+    contract["lane_eligibility"]["cells"][0]["rungs"] = [29]
+
+
+def _explicit_unbacked_lane(contract):
+    contract["lane_eligibility"]["cells"][0]["route_status"] = "unbacked"
+
+
+def _unknown_lane_key(contract):
+    contract["lane_eligibility"]["cells"][0]["detail"] = "not schema"
+
+
+def _wrong_platform_capability(contract):
+    contract["lane_eligibility"]["platforms"]["sm_89"][
+        "compute_capability"
+    ] = [9, 0]
+
+
+def _duplicate_lane_id(contract):
+    contract["lane_eligibility"]["cells"][1]["id"] = (
+        contract["lane_eligibility"]["cells"][0]["id"]
+    )
+
+
+def _flag_on_unflagged_lane(contract):
+    contract["lane_eligibility"]["cells"][0][
+        "requires_serve_flags"
+    ] = ["GRIDBOOK_TEST=1"]
+
+
+def _unknown_lane_predicate_fact(contract):
+    contract["lane_eligibility"]["cells"][0]["predicates"] = [
+        {"fact": "model_id", "op": "equals", "value": "anything"}
+    ]
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -239,6 +323,14 @@ def _unsupported_format_mode(contract):
          "source_fp8_block128_w8a16"),
         (_wrong_source_fp8_w8a16_capability, "must be 1"),
         (_unsupported_format_mode, "unsupported grid/mode pair"),
+        (_producer_rung_off_law, "canonical producer ladder"),
+        (_legacy_irregular_rung_claimed_by_lane, "non-producer rungs"),
+        (_explicit_unbacked_lane, "closed-world absence"),
+        (_unknown_lane_key, "unknown field"),
+        (_wrong_platform_capability, "platform id must be the exact"),
+        (_duplicate_lane_id, "duplicate cell id"),
+        (_flag_on_unflagged_lane, "requires_serve_flags must be empty"),
+        (_unknown_lane_predicate_fact, "must be one of"),
     ],
 )
 def test_validation_rejects_incompatible_contracts(mutate, message):
@@ -315,7 +407,9 @@ def _scan_for_version_pins() -> dict[str, str]:
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(
             name for name in dirnames
-            if not name.startswith(".") and name != "__pycache__")
+            if not name.startswith(".")
+            and name not in {"__pycache__", "build"}
+        )
         for filename in sorted(filenames):
             if not filename.endswith(_PIN_SUFFIXES):
                 continue
@@ -337,7 +431,7 @@ def test_no_pin_file_carries_a_stale_schema_string():
     it is not an import error, not a test failure anywhere else, and it ships.
     """
 
-    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v9"
+    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v10"
     current = int(_SCHEMA_PATTERN.fullmatch(RUNTIME_CONTRACT_SCHEMA).group(1))
 
     for name, text in _scan_for_version_pins().items():

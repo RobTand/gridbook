@@ -70,8 +70,10 @@ still describe some of them as future work.
   block; speculative decode at k=1 measured 14.6 → **16.1 tok/s** on prose. (The
   remaining upside needs vLLM to capture drafter CUDA graphs — upstream work, see
   below.)
-- **Every integer rung** across both ladders (NVFP4-CB K12–K24, FP8-CB K28–K48)
-  with ceil-first uneven index splits, encoder-anchored and frozen.
+- **Every accepted reader rung** across both families (NVFP4-CB K12–K24;
+  FP8-CB K4/K8/K12/K16/K20/K24 plus every K28–K48), with ceil-first uneven
+  index splits, encoder-anchored and frozen. v10's FP8 producer menu is the
+  K4..K48 step-4 subset.
 - **Packaging.** The CUDA sources ship inside the Python package, so a
   non-editable `pip install` produces a working CUDA path. Previously any
   non-editable install silently degraded to the Triton fallback in retired
@@ -241,27 +243,31 @@ Two things banked from an attempt that was reverted before it shipped:
   books remain outside the FP8 arm (bridge under auto, announced). See
   [KERNELS](docs/KERNELS.md#persistent-b-decode-in-mainloop-default-auto-prismaquant_cb_moe_persistent_b).
 - [x] **K1.2 — Cover the complete FP8-CB mid-M production rung surface.
-  RESOLVED (2026-08-02) — second arm.** Production does permit every K28–K48,
-  but the first arm ("instantiate and test every product rung") is **closed by a
-  format + TMA law**, not by effort: `type_size = 4k` is the packed-B TMA box's
+  RESOLVED (2026-08-02; producer law expanded 2026-08-24).** The v10 producer
+  menu is K4..K48 step 4, while the reader retains every legacy K28..K48.
+  Reader-only irregular rungs remain closed to this collective by a
+  **format + TMA law**, not by effort: `type_size = 4k` is the packed-B TMA box's
   contiguous extent and must be a 16-byte multiple (`k % 4 == 0`), and the fused
   mainloop's single `CbSubW = k/4` sub-table width is the format's real layout
   only on those same rungs — the format splits `k` over `n_sub = 4` raggedly
   (`csrc/cb_gemv.cu` `SubSplit`), so a uniform decode at k37 would be *wrong*,
-  not merely unaligned. The six compiled rungs were therefore already the
-  maximum this collective admits, and the published 27B artifact's 8-rung
-  K36–K47 ladder hits exactly the three multiples of 4 it contains.
-  **The second arm is implemented:** the compiled set is queryable
+  not merely unaligned. Every canonical producer rung is now instantiated;
+  K4..K24 remain compile/source coverage only until their physical Blackwell
+  gates run. The published 27B artifact's legacy 8-rung K36–K47 ladder still
+  hits exactly the three multiples of 4 it contains.
+  **The concrete-route arm remains implemented:** the compiled set is queryable
   (`cb_fused_kbits()`), Python gates on the derived law and confirms against the
   module instead of carrying duplicated literals, every kernel switch is
   generated from one rung list, the smem feasibility predicate is a closed form
-  `static_assert`ed against the probe's measured cells, the published smem table
+  `static_assert`ed against the source-pinned expected cells (with the original
+  high-rung measurements retained), the published smem table
   was regenerated (it quoted the stale pre-R6 base), an off-law rung is refused
   with a message naming the law and the routes that *do* serve it, and per-rung
   bit-exact gates are parametrized from the module's own reported surface. See
   [KERNELS](docs/KERNELS.md#rung-coverage-what-this-lane-can-and-cannot-serve-k12).
-  Serving all 21 rungs through this lane would need a new packed-B TMA schedule
-  *and* a ragged-width decode — a new kernel, tracked separately if ever wanted.
+  Serving a legacy irregular rung through this lane would need a new packed-B
+  TMA schedule *and* a ragged-width decode — a new kernel, tracked separately
+  if ever wanted.
 - [ ] **K1.3 — Reassess large-M dense FP8-CB from a fresh roofline.** The
   transient path remains about 1.44x native, but the existing persistent-N
   implementation was 2–5.7x slower. Profile current traffic and synchronization

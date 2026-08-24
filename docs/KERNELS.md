@@ -328,11 +328,12 @@ before kernel dispatch rather than inventing runtime scales.
 
 #### Rung coverage: what this lane can and cannot serve (K1.2)
 
-The FP8-CB product ladder is **every integer `k` in [28, 48]** (3.5–6.0 bpw in
-0.125 steps; `runtime_contract.json` carries all 21, and Gridbook serves all 21).
-The fused mid-M lane backs **the multiples of 4 — `k ∈ {28, 32, 36, 40, 44, 48}`
-— and no others.** That is a property of the format and of TMA, not a missing
-template instantiation:
+The v10 FP8-CB **producer** ladder is every multiple of four from K4 through
+K48. The accepted **reader** domain is broader:
+`{4,8,12,16,20,24} ∪ [28,48]`, retaining all older irregular K28..K48
+artifacts. The fused source surface instantiates the 12 producer rungs and no
+reader-only irregular rung. That is a property of the format and of TMA, not a
+missing template instantiation:
 
 1. **TMA box.** Packed B is fetched with a box of `(TileN, type_size)` *bytes*,
    where `type_size = 4k` is one 256-weight superblock. TMA requires the box's
@@ -344,52 +345,56 @@ template instantiation:
    the true widths are `(10, 9, 9, 9)` with non-uniform offsets. A uniform decode
    would be *wrong*, not merely unaligned.
 
-Both conditions coincide, so one law expresses them, and the six compiled rungs
-are already the maximum this collective admits. Supporting the other 15 would
+Both conditions coincide, so one law expresses them, and the 12 producer rungs
+are the complete set this collective admits. Supporting a legacy irregular rung would
 need a different packed-B TMA schedule (a box spanning 4 superblocks is the
 smallest 16-byte-aligned one for odd `k`, and its shared-memory cost is far over
 budget) *and* a ragged-width decode — i.e. a new kernel and a producer-layout
 conversation, not an instantiation.
 
 Consequence for dispatch, and what ROADMAP K1.2 actually delivered: its first
-arm ("instantiate every product rung") is closed by the laws above, so the
-second is the live one — **encode the concrete route so an allocator cannot
-price an unbacked fast path.** The compiled set is therefore *queryable*
+arm ("instantiate every producer rung") is now represented in source, while
+the concrete loaded set remains *queryable*
 (`cb_fused_kbits()`), Python gates on the derived law
 (`codec.FP8_FUSED_KBITS`) and then confirms against the module rather than
 carrying a duplicated literal, every switch in the kernel is generated from one
 rung list, and an off-law rung is refused with a message naming the law and
-pointing at the routes that do serve it. Rungs off the law are not unsupported —
-they take the decode GEMV and the expand + CUTLASS quality bridge, exactly as
-before.
+pointing at the routes that do serve it. Reader rungs off the law are not
+unsupported — they take the decode GEMV and expand + CUTLASS quality bridge,
+exactly as before. K4..K24 are newly instantiated source cells and remain
+device-unqualified until the Blackwell physical parity/performance gates run;
+the older high-rung evidence below must not be generalized to them.
 
-Measured shared memory, `GemmKernel::SharedStorageSize` at TileN=64 / TileK=128
-/ Stages=2 against the 101,376 B `sm_120` ceiling (regenerated 2026-08-02 from
-`csrc/tools/smem_probe_tilem.cu`; the previously published table quoted the
-pre-R6 base and was stale by up to 16,384 B once the LUT stage landed):
+The source-pinned shared-memory closed form at TileN=64 / TileK=128 / Stages=2
+against the 101,376 B `sm_120` ceiling is:
 
-| TileM | k28 | k32 | k36 | k40 | k44 | k48 |
-|---|---|---|---|---|---|---|
-| 128 | 67,584 | 70,656 | 74,752 | 80,896 | 91,136 | 93,184 |
-| 256 | 100,352 | **101,376** | 103,424 | 105,472 | 107,520 | 109,568 |
+| TileM | k4 | k8 | k12 | k16 | k20 | k24 | k28 | k32 |
+|---|---|---|---|---|---|---|---|---|
+| 128 | 55,296 | 57,344 | 59,392 | 61,440 | 63,488 | 65,536 | 67,584 | 70,656 |
+| 256 | 88,064 | 90,112 | 92,160 | 94,208 | 96,256 | 98,304 | 100,352 | **101,376** |
 
-TileM=128 fits at every rung; **TileM=256 fits only at k28 and k32**, and the
-k32 cell lands on *exactly* the ceiling (zero margin), so the tile selector will
+| TileM | k36 | k40 | k44 | k48 |
+|---|---|---|---|---|
+| 128 | 74,752 | 80,896 | 91,136 | 93,184 |
+| 256 | 103,424 | 105,472 | 107,520 | 109,568 |
+
+The K28..K48 values retain the 2026-08-02 measured provenance. K4..K24 are
+derived from the same allocation law and pinned as compile-time expectations;
+they are not presented as a completed GPU probe. TileM=128 is within the
+closed-form ceiling at every producer rung; **TileM=256 is within it through
+k32**, whose cell lands on *exactly* the ceiling (zero margin), so the selector will
 not choose it until it is launch-verified. TileM must be a multiple of the
 TiledMma's 128-row M, so 128/256/384 are the only candidates at all and 384 is
 infeasible everywhere (`smem_A` alone is 98,304 B). The kernel encodes this as a
-closed form that is `static_assert`ed cell-by-cell against those twelve measured
+closed form that is `static_assert`ed cell-by-cell against all 24 expected
 numbers, so a storage-policy change becomes a compile error rather than a stale
-table.
+table once the translation unit is compiled.
 
-Build cost: instantiating the six rungs × (dense unscaled, dense scaled, grouped
-128) plus grouped 256 × {k28, k32} is **20 kernel instantiations, ~76 s cold-cache
-JIT** in the GB10 container. The K1.2 work changed no instantiation, but it is
-not free: measured both ways on the same box, the cold build went **71.4 s at
-the merge base to 76.0 s / 75.7 s, i.e. +4.6 s (~6%)**. That delta is
-compile-time *evaluation* — the rung-law predicates and the twelve-cell
-`static_assert` table above — not code generation. The measurement and its
-method are in [CONTAINER](CONTAINER.md).
+Build surface: the old six-rung matrix had 20 instantiations. The v10 source has
+12 × (dense unscaled, dense scaled, grouped-128) plus grouped-256 at K4..K32,
+for 44. The prior ~76 s GB10 cold-JIT measurement applies only to the old
+20-cell build; the expanded build time is unmeasured until the assigned
+Blackwell compile gate runs.
 
 #### Measured status
 
@@ -1119,7 +1124,7 @@ too.
 | MoE grouped decode GEMV, smem-resident dictionary | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_GEMV`; `inherited` is the kill switch and never probes or builds): v2 engages only where the compiled occupancy predicate says it wins, and an unavailable extension degrades loudly to inherited. On the K=2048/4096 shapes (8/16 superblocks) the compile-time virtual-warp specialization is bit-exact to the inherited default for every rung — with all `PRISMAQUANT_CB_W2_*` overrides absent — and measured 1.8175–1.9977x in the final-source captured v1 direct-op benchmark; the same-process DSV4 quality gate produced zero full-vocabulary KL/NLL/PPL/target-logprob delta over 240 positions. Other widths retain rowpack order and may reassociate against inherited — on those the predicate is the only gate and no served A/B exists. The compiled predicate still routes k24 at K≥2048 to inherited. Historical Laguna validation measured +5.97% |
 | MoE grouped decode GEMV, routed FP8 whole-row sibling | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_FP8_GEMV_V2`) for exactly K28/4/112 at K=2048/4096 — off-cell stacks keep the inherited kernel with the reason logged; `1`/`require` is the strict A/B-arm spelling under which unsupported uniform FP8 cells and per-expert mixed FP8-CB groups fail closed. The final-source operator gate passed 17/17; the exact-artifact eager same-engine gate produced zero full-vocabulary and router-route delta over 240 positions; the final-binary served rerun (B-v3, 2026-08-14, FULL_DECODE_ONLY graphs, route census, quiesced host) measured **+8.62% decode** with acceptance parity, attributing the earlier held signal's integrity failure to host interference. Soak and high-concurrency protocols have not run as named gates |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
-| FP8-CB fused decode-in-prologue prefill | **Bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128**; native transient expansion + CUTLASS serves ineligible and large-M shapes. **Rung surface: `k ∈ {28,32,36,40,44,48}` — the multiples of 4 in the product range, which is the complete set the packed-B TMA box (`type_size = 4k` must be 16-byte aligned) and the mainloop's uniform `CbSubW = k/4` sub-table width admit.** The other 15 integer rungs are served (decode GEMV + expand/CUTLASS bridge), just not by this lane; the compiled set is reported by `cb_fused_kbits()` and dispatch derives eligibility from it rather than from a literal ladder |
+| FP8-CB fused decode-in-prologue prefill | The established K28/K32/K36/K40/K44/K48 cells are **bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128** on the sm12x lane; native transient expansion + CUTLASS serves ineligible and large-M shapes. Selection is load-time auto on cc 12.0/12.1 only: SM89 never invokes the Blackwell fused loader and uses native GEMV at M≤8 / native expand+W8A8 CUTLASS above it; explicit fused-on on SM89 fails the load. v10 expands the **source/compiled rung law to K4..K48 step 4**, the complete producer set admitted by the packed-B TMA box (`type_size = 4k` must be 16-byte aligned) and uniform `CbSubW = k/4` decode. K4..K24 are compile/source coverage only and remain device-unqualified; no old high-rung result is evidence for them. Legacy irregular K28..K48 reader rungs use generic GEMV + expand/CUTLASS. The loaded set is reported by `cb_fused_kbits()` rather than duplicated in dispatch |
 | FP4-CB v2 fused mid-M prefill (dense) | **Opt-in** (`PRISMAQUANT_CB_FP4_FUSED_MIDM`), contract-preserving. The in-prologue decode is proven **bit-identical to `cb_expand_v2` for the whole decoded tile at all 13 K12–K24 rungs** (one-hot read-out, no tolerance), so only the FP32 reduction order moves. Measured 1.06–4.37× the shipping expand + bridge route at M ∈ {9,16,32,64,128} on 27B/DSV4-class shapes, every cell bit-equal to the same-config oracle — a wider band than the fp8 twin because the fp4 quality expand writes BF16 (4× the fp8 expand's transient bytes). Served NATIVE-PARITY protocol **not run**; an unexplained M ≤ 12 latency cliff is open. Ineligible shapes (M ≤ 8, M > 128, multi-dictionary fused modules, uncompiled rungs) fall through to today's exact path unchanged |
 | NVFP4-CB fused native-FP4 prefill (dense and MoE) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, MoE routed-quality, and p95 served gates remain open |
 | MoE persistent-B decode-in-mainloop prefill (FP4-CB v2 + stock FP8-CB) | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_MOE_PERSISTENT_B`; `1`/`require` keeps the fail-load A/B-integrity semantics, `0`/`off` the kill switch), ROADMAP K1.1 both payload families. Decodes each expert weight tile once and streams that expert's exact routed segment through it, eliminating the `[E,N,K]` BF16 transient and all work for unrouted experts. Weight decode bit-identical to the expanders (`torch.equal`); reduction-order-class output difference vs the bridge. Whole-routed-operator microbenchmark wins every cell (FP4 1.05–3.36×; FP8 15.8–18.4× at DSv4 shapes); served: FP4 same-session A/B kl_mean −0.051% / PPL −0.30%, plus the 0.8.9 default-state served KL/PPL leg on the shipped clean 87 GB body. Per-role FP8-CB split books are outside the FP8 arm and keep the bridge under auto (announced). **Staging vectorization proposed and REJECTED (2026-08-21)**: u32-interior copies with funnel-shift edges (odd `4k+9` phases) + whole-slot zeroing were byte-neutral per the staging theorem but measured +7…+11% whole-operator slower at the DSv4-dominant k=12 (`__noinline__` spelling worse still, +14%); the byte-granular loop remains |

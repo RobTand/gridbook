@@ -30,7 +30,7 @@
 //  - cb_fused_prefill_mm: the decode-in-prologue FP8_CB GEMM — B is the
 //    PACKED byte stream + a global e4m3-byte LUT; the dense tile never
 //    exists in HBM. KBits template-dispatched over the RUNG LAW below
-//    (28..48 step 4) — a strict subset of the 21-rung product ladder;
+//    (K4..K48 step 4) — the canonical v10 producer ladder;
 //    cb_fused_kbits() reports what this build carries.
 //  - smem_report: per-config SharedStorage sizes (budget sanity).
 //
@@ -87,10 +87,11 @@ using ClusterShape = Shape<_1, _1, _1>;
 // ===========================================================================
 // THE FUSED RUNG LAW (K1.2, established 2026-08-02).
 //
-// The producer's FP8-CB ladder is EVERY INTEGER k_bits in [28, 48]
-// (prismaquant/format_registry.py `for _k in range(28, 49)` — 3.5..6.0 bpw in
-// 0.125 steps; gridbook/runtime_contract.json carries the same 21 rungs). The
-// fused mid-M lane serves the MULTIPLES OF 4 and no others, and the K1.2
+// The v10 producer's FP8-CB ladder is every multiple of four from K4 through
+// K48. The accepted READER domain additionally retains every integer K28..K48
+// so legacy irregular artifacts remain loadable; those off-law readers use
+// generic GEMV/expand and are not producer rungs. The fused mid-M lane serves
+// the MULTIPLES OF 4 and no others, and the K1.2
 // investigation established that this is a property of the FORMAT and of TMA
 // — not a missing template instantiation that could be added:
 //
@@ -113,14 +114,14 @@ using ClusterShape = Shape<_1, _1, _1>;
 //     decode would be WRONG, not merely unaligned.
 //
 // The two laws coincide exactly, which is why one predicate expresses both.
-// Consequence for dispatch: the 21-rung product ladder is NOT fully backed by
-// this lane, and Python must therefore ASK for the backed set rather than
+// Consequence for dispatch: the legacy irregular reader domain is NOT fully
+// backed by this lane, and Python must therefore ASK for the backed set rather than
 // carry a literal (`cb_fused_kbits()` below). ROADMAP K1.2 offers exactly two
 // arms — instantiate every product rung, or "encode the concrete route so the
 // allocator cannot price an unbacked fast path". Arm one is closed by the
 // laws above; this file implements arm two, and makes the surface queryable.
 // ===========================================================================
-constexpr int64_t kFusedKbLo = 28;
+constexpr int64_t kFusedKbLo = 4;
 constexpr int64_t kFusedKbHi = 48;
 constexpr int64_t kFusedKbStep = 4;   // = 16 / gcd(4, 16), i.e. law 1 above.
 
@@ -132,7 +133,8 @@ constexpr bool fused_kbits_supported(int64_t kb) {
 // THE one rung list. Every switch, every report and every binding below is
 // generated from it, because 21-case switches hand-written N times is a bug
 // farm — the whole point of K1.2's dispatch half.
-#define PQ_FUSED_RUNGS(X) X(28) X(32) X(36) X(40) X(44) X(48)
+#define PQ_FUSED_RUNGS(X) \
+  X(4) X(8) X(12) X(16) X(20) X(24) X(28) X(32) X(36) X(40) X(44) X(48)
 
 // ...and the list is proved equal to the law in BOTH directions: every member
 // satisfies the predicate, and the member count equals the law's cardinality.
@@ -384,8 +386,8 @@ void check_fused_kbits(int64_t k_bits) {
       "multiple for the packed-B TMA box, and the mainloop's single "
       "CbSubW = k_bits/4 sub-table width is only the format's real layout when "
       "k_bits % 4 == 0 (csrc/cb_gemv.cu SubSplit splits raggedly otherwise). "
-      "Every integer rung 28..48 IS served by Gridbook — through the decode "
-      "GEMV and the expand+GEMM quality bridge — just not through this lane. "
+      "Legacy irregular rungs 28..48 are still served by Gridbook through the "
+      "decode GEMV and expand+GEMM bridge, but are reader-only off this lane. "
       "Enumerate cb_fused_kbits() rather than assuming a ladder.");
 }
 
@@ -574,20 +576,23 @@ constexpr int64_t kMoeTileM = size<0>(TileF{});
 // FEASIBILITY IS SMEM-BOUND, and the bound bites the HIGH rungs first, because
 // smem grows with BOTH TileM (smem_A = TileM*TileK*Stages) and k_bits
 // (smem_BP = TileN*4*k_bits*Stages), and since R6 also with the staged
-// codebook LUT. Measured by csrc/tools/smem_probe_tilem.cu (host-only, no
-// launch) against cutlass::arch::sm120_smem_capacity_bytes = 101376 (= 99 KiB,
-// the CUDA cc-12.0 max opt-in dynamic smem per block):
+// codebook LUT. The closed form below is reported by the host-only
+// ``smem_report_rungs`` surface and bounded against
+// cutlass::arch::sm120_smem_capacity_bytes = 101376 (= 99 KiB, the CUDA
+// cc-12.0 max opt-in dynamic smem per block). Low logical LUTs reserve one
+// aligned KiB so the following A/B buffers retain their alignment:
 //
 //   GemmKernel::SharedStorageSize, TileN=64 TileK=128 Stages=2
-//   (REGENERATED 2026-08-02, GB10 / CUTLASS 4.3.4 — the previous table quoted
-//    the PRE-R6 base and was stale by up to 16,384 B once the LUT stage landed)
-//   TileM   k28     k32      k36      k40      k44      k48
-//   128    67584   70656    74752    80896    91136    93184     all FIT
-//   256   100352  101376   103424  105472  107520  109568        FIT only 28/32
-//   384  >=132096 (smem_A alone = 98304)                         none FIT
+//   TileM   k4     k8     k12    k16    k20    k24    k28    k32
+//   128   55296  57344  59392  61440  63488  65536  67584  70656
+//   256   88064  90112  92160  94208  96256  98304 100352 101376
+//   TileM   k36    k40    k44    k48
+//   128   74752  80896  91136  93184                    all FIT
+//   256  103424 105472 107520 109568                    none FIT
+//   384  >101376 at every rung                          none FIT
 //
-// So the compiled matrix is: TileM=128 x all six law rungs, plus TileM=256 x
-// {28, 32} ONLY. TileM=384 is infeasible at every rung and is not compiled.
+// So the compiled matrix is TileM=128 x every producer rung, plus TileM=256 x
+// K4..K32. TileM=384 is infeasible at every rung and is not compiled.
 // (TileM must be a multiple of the TiledMma's 128-row M, so 128/256/384 are the
 // only candidates at all — there is no 192 rung to rescue the high k_bits.)
 // NOTE: TileM=256/k_bits=32 lands on EXACTLY the 101376-byte ceiling (zero
@@ -595,7 +600,7 @@ constexpr int64_t kMoeTileM = size<0>(TileF{});
 //
 // The predicate below is a LAW, not a transcription of that table: it is the
 // closed form the collective's own storage policy implies, and it is
-// static_asserted cell-by-cell against the twelve measured numbers, so a future
+// static_asserted cell-by-cell against the closed-form numbers, so a future
 // storage change that breaks the law is a compile error rather than a stale
 // comment. (The old hand-listed `kb == 28 || kb == 32` could not notice.)
 //
@@ -622,7 +627,8 @@ constexpr int64_t moe_lut_bytes(int64_t tm, int64_t kb) {
   const int64_t sub_bytes = (int64_t{1} << (kb / 4)) * 2;   // 2^CbSubW * 2
   const int64_t subs = (tm <= 128) ? ((4 * sub_bytes <= 16384) ? 4 : 2)
                                    : ((4 * sub_bytes <= 1024) ? 4 : 0);
-  return subs * sub_bytes;
+  const int64_t logical = subs * sub_bytes;
+  return logical == 0 ? 0 : ((logical + 1023) / 1024) * 1024;
 }
 
 // smem_A (TileM*TileK*Stages = 256*tm) + smem_BP (TileN*4*kb*Stages = 512*kb)
@@ -646,9 +652,15 @@ constexpr bool moe_tile_supported(int64_t tm, int64_t kb) {
   static_assert(moe_smem_bytes(TM, KB) == BYTES,                            \
                 "measured smem for (TileM=" #TM ", k" #KB ") no longer "    \
                 "matches the closed form; re-run smem_probe_tilem");
+PQ_ASSERT_SMEM(128, 4, 55296)   PQ_ASSERT_SMEM(128, 8, 57344)
+PQ_ASSERT_SMEM(128, 12, 59392)  PQ_ASSERT_SMEM(128, 16, 61440)
+PQ_ASSERT_SMEM(128, 20, 63488)  PQ_ASSERT_SMEM(128, 24, 65536)
 PQ_ASSERT_SMEM(128, 28, 67584)  PQ_ASSERT_SMEM(128, 32, 70656)
 PQ_ASSERT_SMEM(128, 36, 74752)  PQ_ASSERT_SMEM(128, 40, 80896)
 PQ_ASSERT_SMEM(128, 44, 91136)  PQ_ASSERT_SMEM(128, 48, 93184)
+PQ_ASSERT_SMEM(256, 4, 88064)   PQ_ASSERT_SMEM(256, 8, 90112)
+PQ_ASSERT_SMEM(256, 12, 92160)  PQ_ASSERT_SMEM(256, 16, 94208)
+PQ_ASSERT_SMEM(256, 20, 96256)  PQ_ASSERT_SMEM(256, 24, 98304)
 PQ_ASSERT_SMEM(256, 28, 100352) PQ_ASSERT_SMEM(256, 32, 101376)
 PQ_ASSERT_SMEM(256, 36, 103424) PQ_ASSERT_SMEM(256, 40, 105472)
 PQ_ASSERT_SMEM(256, 44, 107520) PQ_ASSERT_SMEM(256, 48, 109568)
@@ -763,9 +775,10 @@ int64_t cb_fused_moe_tile_m() { return kMoeTileM; }
 
 // THE compiled rung set, as the build actually carries it. Python must
 // enumerate this instead of duplicating a literal ladder: the fused lane backs
-// a strict SUBSET of the 21-rung product ladder (see the rung law at the top),
-// and a duplicated literal is how a dispatch silently misses a compiled rung or
-// selects an uncompiled one. Generated from the same list the switches are.
+// the canonical producer ladder (and a strict subset of the legacy accepted
+// reader domain); a duplicated literal is how dispatch silently misses a
+// compiled rung or selects an uncompiled one. Generated from the same list the
+// switches are.
 std::vector<int64_t> cb_fused_kbits() {
 #define PQ_RUNG_VALUE(KB) KB,
   return {PQ_FUSED_RUNGS(PQ_RUNG_VALUE)};
@@ -892,8 +905,8 @@ static void push_rung(std::vector<int64_t>& out) {
 // Flat [k_bits, SharedStorageSize, lut_smem_bytes, resident_sub_tables] per
 // COMPILED rung — generated from the one rung list, so it can never fall behind
 // the dispatch (it did: this used to be a hand-written six-call sequence).
-// "All the rungs" here means all the rungs that EXIST in this lane; the 15
-// integer rungs the law excludes cannot be instantiated to be reported on.
+// "All the rungs" here means the v10 producer ladder; legacy irregular reader
+// rungs cannot be instantiated by this uniform-subtable TMA lane.
 std::vector<int64_t> smem_report_rungs() {
   std::vector<int64_t> out;
 #define PQ_PUSH_RUNG(KB) push_rung<KB>(out);
@@ -936,8 +949,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("out") = py::none(), py::arg("n_offset") = 0);
   m.def("cb_fused_kbits", &cb_fused_kbits,
         "the k_bits rungs this build actually COMPILED for the fused mid-M "
-        "lane, ascending. The product FP8-CB ladder is every integer 28..48; "
-        "this lane serves the multiples of 4 only, because type_size = 4*k "
+        "lane, ascending. The v10 producer ladder is K4..K48 step 4; legacy "
+        "irregular K28..K48 values remain readable through generic routes. "
+        "The fused lane serves multiples of 4 because type_size = 4*k "
         "must be a 16-byte TMA box multiple AND the mainloop's single "
         "CbSubW = k/4 sub-table width is the format's real layout only then. "
         "Enumerate this to decide fused eligibility — never a literal ladder.");

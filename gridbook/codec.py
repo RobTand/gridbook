@@ -43,9 +43,11 @@ def type_size(k: int, is_fp4: bool) -> int:
 
 # --- the FUSED mid-M lane's rung law (K1.2) --------------------------------
 #
-# The product FP8-CB ladder is every INTEGER k in [28, 48] (3.5..6.0 bpw in
-# 0.125 steps), and Gridbook SERVES all 21 of them — through the decode GEMV
-# and the expand+GEMM quality bridge. The decode-in-prologue FUSED lane
+# The accepted FP8-CB reader ladder is K4/K8/K12/K16/K20/K24 plus every
+# INTEGER k in [28, 48].  The dense high-range reader domain preserves legacy
+# irregular artifacts; v10 producers emit K4..K48 step 4.  Gridbook serves the
+# complete reader domain through decode GEMV and the expand+GEMM quality
+# bridge. The decode-in-prologue FUSED lane
 # (csrc/cb_fused_gemm.cu) backs a strict SUBSET, and that is a property of the
 # format and of TMA rather than a build option:
 #
@@ -62,7 +64,7 @@ def type_size(k: int, is_fp4: bool) -> int:
 # a question), and then CONFIRMS against `cuda_ext.fused_fp8_kbits(ext)`, which
 # is what the loaded module actually compiled. tests/test_fused_prefill.py pins
 # the law to the built module's `cb_fused_kbits()`, so the two cannot drift.
-FP8_FUSED_KBITS_LO = 28
+FP8_FUSED_KBITS_LO = 4
 FP8_FUSED_KBITS_HI = 48
 FP8_FUSED_KBITS_STEP = 4
 FP8_FUSED_KBITS = tuple(
@@ -210,14 +212,16 @@ def pad_qweight(qw: torch.Tensor) -> torch.Tensor:
     2. **The padded row stride stays a 16-byte multiple** whenever the UNPADDED
        one was. The fp8 CUTLASS entries (``cb_fused_prefill_mm_scaled``, the
        fused prefill) take the row stride explicitly and TORCH_CHECK
-       ``stride(0) % 16 == 0`` — TMA needs 16-byte-aligned row starts. Every fp8
-       rung has ``type_size = 4k`` in {112,128,144,160,176,192}, so
-       ``row_bytes`` is 16-aligned and ``row_bytes + 16`` still is; the old
-       ``+ 8`` pad was NOT, which is why the padded buffer could not be shared
-       with the registered ``cb_qweight`` parameter and both had to stay
-       resident (see ``linear.process_weights_after_loading``). Pad width is
-       therefore load-bearing, not a spare-bytes choice: dropping it back to 8
-       re-breaks the fp8 prefill kernels' alignment check.
+       ``stride(0) % 16 == 0`` — TMA needs 16-byte-aligned row starts. Every
+       producer rung that can reach that lane has ``k % 4 == 0`` and therefore
+       a 16-byte-aligned ``type_size = 4k``; legacy irregular reader rungs use
+       generic expansion instead. Thus an aligned ``row_bytes`` remains
+       aligned after ``+16``; the old ``+8`` pad did not, which is why the
+       padded buffer could not be shared with the registered ``cb_qweight``
+       parameter and both had to stay resident (see
+       ``linear.process_weights_after_loading``). Pad width is therefore
+       load-bearing, not a spare-bytes choice: dropping it back to 8 re-breaks
+       the fp8 prefill kernels' alignment check.
 
     (fp4 rungs carry an odd ``type_size`` — ``4k+16`` v1, ``4k+9`` v2 — so their
     row stride is not 16-aligned either way; they only ever hit kernels that

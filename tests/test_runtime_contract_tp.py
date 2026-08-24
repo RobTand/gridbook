@@ -3,7 +3,7 @@
 Since the shard-aware loading wave, dense CB Linears construct above one
 tensor-parallel rank under structural shard-alignment gates, while every
 other surface refuses by name at a numeric TP=1 ceiling.  As of schema
-``gridbook.runtime-contract.v9`` the packaged contract publishes exactly
+``gridbook.runtime-contract.v10`` the packaged contract publishes exactly
 that split as machine-readable per-unit rows, so a producer gate can branch
 on fields instead of prose (principle: an attested claim, never an asserted
 one).
@@ -61,7 +61,7 @@ from gridbook.runtime_contract import (
 )
 
 
-def _repo_root() -> Path:
+def _repo_root(test_file: Path | None = None) -> Path:
     """The source checkout whose enforcement sites this file reads.
 
     In-tree that is this file's grandparent. The installed-wheel release gate
@@ -69,7 +69,8 @@ def _repo_root() -> Path:
     the wheel, and exports ``GRIDBOOK_SOURCE_ROOT`` as a data-file locator
     (never on ``PYTHONPATH``); ``GITHUB_WORKSPACE`` is the CI spelling.
     """
-    roots = [Path(__file__).resolve().parents[1]]
+    location = Path(__file__) if test_file is None else Path(test_file)
+    roots = [location.resolve().parents[1]]
     for variable in ("GRIDBOOK_SOURCE_ROOT", "GITHUB_WORKSPACE"):
         value = os.environ.get(variable)
         if value:
@@ -82,6 +83,24 @@ def _repo_root() -> Path:
 
 
 _REPO_ROOT = _repo_root()
+
+
+@pytest.mark.parametrize(
+    "variable", ("GRIDBOOK_SOURCE_ROOT", "GITHUB_WORKSPACE")
+)
+def test_repo_root_honors_installed_wheel_source_locator(
+    monkeypatch, tmp_path, variable,
+):
+    source_root = tmp_path / "checkout"
+    package = source_root / "gridbook"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.delenv("GRIDBOOK_SOURCE_ROOT", raising=False)
+    monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
+    monkeypatch.setenv(variable, str(source_root))
+
+    staged_test = tmp_path / "wheel-tests" / "tests" / "test_contract.py"
+    assert _repo_root(staged_test) == source_root.resolve()
 
 
 def _packaged_contract() -> dict:
@@ -203,9 +222,9 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
 
 def test_schema_and_contract_version_move_together():
     contract = load_runtime_contract()
-    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v9"
+    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v10"
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 9
+    assert contract["contract_version"] == 10
 
 
 # --- 2. Closed-world reading: absence means REFUSED ---------------------------

@@ -736,6 +736,60 @@ class PrismaQuantConfig(QuantizationConfig):
                                     for scale in scales[1:])
 
     @staticmethod
+    def _validate_cb_format_scheme(
+        scheme: dict, target: str, runtime_contract: dict,
+    ) -> None:
+        """Fail closed on an FP8-CB scheme outside the packaged reader ABI.
+
+        v10's ``formats[].rungs`` is the reader domain, intentionally broader
+        than ``producer_rungs`` so legacy irregular K28..K48 artifacts keep
+        loading.  Dense and routed constructors used to trust ``k``, ``n_sub``
+        and ``type_size`` independently; a low-rung typo could therefore size
+        a resident byte plane before the CUDA binding finally rejected it.
+        Resolve those three fields against the one packaged contract while the
+        sidecar is already being parsed.  NVFP4 is untouched here.
+        """
+
+        if scheme.get("grid") != "fp8":
+            return
+        formats = [
+            item for item in runtime_contract.get("formats", ())
+            if item.get("family") == "FP8_CB_K"
+        ]
+        if len(formats) != 1:
+            raise ValueError(
+                f"CB target {target!r}: packaged runtime contract must carry "
+                "exactly one FP8_CB_K format row"
+            )
+        fmt = formats[0]
+        if scheme.get("mode") != fmt["mode"]:
+            raise ValueError(
+                f"CB target {target!r}: FP8-CB mode must be {fmt['mode']!r}"
+            )
+        for field in ("k", "n_sub", "type_size"):
+            value = scheme.get(field)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"CB target {target!r}: FP8-CB {field} must be an integer"
+                )
+        k = scheme["k"]
+        if k not in fmt["rungs"]:
+            raise ValueError(
+                f"CB target {target!r}: FP8_CB_K{k} is outside the packaged "
+                f"reader domain {fmt['rungs']}"
+            )
+        if scheme["n_sub"] != fmt["n_sub"]:
+            raise ValueError(
+                f"CB target {target!r}: FP8_CB_K{k} requires "
+                f"n_sub={fmt['n_sub']}, got {scheme['n_sub']}"
+            )
+        if scheme["type_size"] != 4 * k:
+            raise ValueError(
+                f"CB target {target!r}: FP8_CB_K{k} requires "
+                f"type_size=4*k={4 * k}, got {scheme['type_size']}"
+            )
+
+    @staticmethod
     def _require_cb_device_capability(scheme: dict, prefix: str) -> None:
         """Reject an FP8-CB artifact before its first illegal prefill.
 
@@ -934,6 +988,7 @@ class PrismaQuantConfig(QuantizationConfig):
                 cfg = json.load(fh)
             self.codebook_file = cfg.get("codebook_file", self.codebook_file)
         self._nvfp4_activation_contract = _parse_nvfp4_activation_contract(cfg)
+        runtime_contract = _RUNTIME_CONTRACT
         dspark_target_bridge = _parse_dspark_target_bridge(
             cfg, self._nvfp4_activation_contract
         )
@@ -961,6 +1016,9 @@ class PrismaQuantConfig(QuantizationConfig):
                 continue
             if not isinstance(scheme, dict):
                 raise ValueError("CB config group scheme must be an object")
+            scheme_target = next(iter(group.get("targets", ())), "<no target>")
+            self._validate_cb_format_scheme(
+                scheme, str(scheme_target), runtime_contract)
             for raw_target in group.get("targets", []):
                 target = str(raw_target)
                 canonical = _canonical_target(target)

@@ -11,8 +11,34 @@ from importlib.resources import files
 from typing import Any, Mapping
 
 
-RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v9"
+RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v10"
 _RESOURCE_NAME = "runtime_contract.json"
+
+#: v10 separates the reader domain from the canonical producer menu.  The
+#: high FP8 rungs remain deliberately dense so artifacts written by older
+#: producers keep loading; new producers emit only the hardware-aligned
+#: multiples-of-four ladder.
+_FORMAT_RUNGS: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
+    "NVFP4_CB_K": (tuple(range(12, 25)), tuple(range(12, 25))),
+    "FP8_CB_K": (
+        (4, 8, 12, 16, 20, 24, *range(28, 49)),
+        tuple(range(4, 49, 4)),
+    ),
+}
+
+_LANE_ELIGIBILITY_SCHEMA = "gridbook.lane-eligibility.v2"
+_LANE_STRUCTURES = ("dense", "routed_moe")
+_LANE_REGIMES = ("decode", "batch")
+_LANE_ROUTE_STATUSES = frozenset({
+    "backed", "backed_with_serve_flag", "fallback",
+})
+_LANE_QUALIFICATIONS = frozenset({"compile_only", "device_qualified"})
+_LANE_PREDICATE_FACTS = frozenset({
+    "role_split", "in_features", "out_features",
+})
+_LANE_PREDICATE_OPS = frozenset({
+    "equals", "in", "multiple_of", "at_least", "at_most",
+})
 
 #: The vLLM package roots a ``top_level_loader_modules`` entry may name. The
 #: historical root is ``vllm.model_executor.models``; vLLM 0.24 additionally
@@ -238,9 +264,25 @@ def _positive_int(value: Any, path: str) -> int:
     return value
 
 
+def _non_negative_int(value: Any, path: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        _fail(path, "must be a non-negative integer")
+    return value
+
+
 def _unique_strings(value: Any, path: str) -> list[str]:
     if not isinstance(value, list) or not value:
         _fail(path, "must be a non-empty JSON array")
+    result = [_string(item, f"{path}[{index}]")
+              for index, item in enumerate(value)]
+    if len(set(result)) != len(result):
+        _fail(path, "must not contain duplicates")
+    return result
+
+
+def _unique_strings_allow_empty(value: Any, path: str) -> list[str]:
+    if not isinstance(value, list):
+        _fail(path, "must be a JSON array")
     result = [_string(item, f"{path}[{index}]")
               for index, item in enumerate(value)]
     if len(set(result)) != len(result):
@@ -592,21 +634,166 @@ def _validate_expert_parallel(root: Mapping[str, Any],
               f"unknown {sorted(set(refused_units) - set(_EP_REFUSED_UNITS))}")
 
 
+def _validate_lane_eligibility(
+    root: Mapping[str, Any],
+    family_rungs: Mapping[str, set[int]],
+) -> None:
+    """Validate platform-scoped route facts without claiming graph support.
+
+    Gridbook owns the byte layout and dispatch route, so it publishes those
+    facts here.  A producer's graph/capture policy and each physical run's
+    receipt remain outside this contract.  ``compile_only`` therefore means
+    exactly that: the cell is structurally backed but is not producer-legal
+    until a later contract can honestly publish ``device_qualified``.
+    """
+
+    eligibility = _object(
+        root["lane_eligibility"], "contract.lane_eligibility")
+    _keys(eligibility, "contract.lane_eligibility", {
+        "schema", "platforms", "regimes", "structures", "cells",
+    })
+    if eligibility["schema"] != _LANE_ELIGIBILITY_SCHEMA:
+        _fail("contract.lane_eligibility.schema",
+              f"must be {_LANE_ELIGIBILITY_SCHEMA!r}")
+
+    regimes = _unique_strings(
+        eligibility["regimes"], "contract.lane_eligibility.regimes")
+    if regimes != list(_LANE_REGIMES):
+        _fail("contract.lane_eligibility.regimes",
+              f"must equal {list(_LANE_REGIMES)}")
+    structures = _unique_strings(
+        eligibility["structures"], "contract.lane_eligibility.structures")
+    if structures != list(_LANE_STRUCTURES):
+        _fail("contract.lane_eligibility.structures",
+              f"must equal {list(_LANE_STRUCTURES)}")
+
+    platforms = _object(
+        eligibility["platforms"], "contract.lane_eligibility.platforms")
+    if not platforms:
+        _fail("contract.lane_eligibility.platforms",
+              "must name at least one exact platform")
+    for platform, item in platforms.items():
+        platform_path = f"contract.lane_eligibility.platforms.{platform}"
+        _string(platform, platform_path)
+        platform_data = _object(item, platform_path)
+        _keys(platform_data, platform_path, {"compute_capability"})
+        capability = platform_data["compute_capability"]
+        if not isinstance(capability, list) or len(capability) != 2:
+            _fail(f"{platform_path}.compute_capability",
+                  "must be [major, minor]")
+        major = _positive_int(
+            capability[0], f"{platform_path}.compute_capability[0]")
+        minor = _non_negative_int(
+            capability[1], f"{platform_path}.compute_capability[1]")
+        if platform != f"sm_{major}{minor}":
+            _fail(platform_path,
+                  f"platform id must be the exact capability name "
+                  f"'sm_{major}{minor}'")
+
+    cells = eligibility["cells"]
+    if not isinstance(cells, list) or not cells:
+        _fail("contract.lane_eligibility.cells",
+              "must be a non-empty JSON array")
+    seen_ids: set[str] = set()
+    for index, item in enumerate(cells):
+        path = f"contract.lane_eligibility.cells[{index}]"
+        cell = _object(item, path)
+        _keys(cell, path, {
+            "id", "platform", "family", "structure", "regime", "rungs",
+            "route_status", "qualification", "requires_serve_flags",
+            "predicates",
+        })
+        cell_id = _string(cell["id"], f"{path}.id")
+        if cell_id in seen_ids:
+            _fail("contract.lane_eligibility.cells",
+                  f"duplicate cell id {cell_id!r}")
+        seen_ids.add(cell_id)
+
+        platform = _string(cell["platform"], f"{path}.platform")
+        if platform not in platforms:
+            _fail(f"{path}.platform",
+                  f"must name one of {sorted(platforms)}")
+        family = _string(cell["family"], f"{path}.family")
+        rung_law = _FORMAT_RUNGS.get(family)
+        if rung_law is None or family not in family_rungs:
+            _fail(f"{path}.family",
+                  f"must name one of {sorted(family_rungs)}")
+        producer_rungs = set(rung_law[1])
+        rungs = set(_sorted_unique_ints(cell["rungs"], f"{path}.rungs"))
+        if not rungs <= producer_rungs:
+            _fail(f"{path}.rungs",
+                  "must be a subset of formats[family].producer_rungs; "
+                  f"non-producer rungs {sorted(rungs - producer_rungs)}")
+        structure = _string(cell["structure"], f"{path}.structure")
+        if structure not in _LANE_STRUCTURES:
+            _fail(f"{path}.structure",
+                  f"must be one of {list(_LANE_STRUCTURES)}")
+        regime = _string(cell["regime"], f"{path}.regime")
+        if regime not in _LANE_REGIMES:
+            _fail(f"{path}.regime",
+                  f"must be one of {list(_LANE_REGIMES)}")
+        route_status = _string(
+            cell["route_status"], f"{path}.route_status")
+        if route_status not in _LANE_ROUTE_STATUSES:
+            _fail(f"{path}.route_status",
+                  f"must be one of {sorted(_LANE_ROUTE_STATUSES)}; an "
+                  "unbacked route is represented by closed-world absence")
+        qualification = _string(
+            cell["qualification"], f"{path}.qualification")
+        if qualification not in _LANE_QUALIFICATIONS:
+            _fail(f"{path}.qualification",
+                  f"must be one of {sorted(_LANE_QUALIFICATIONS)}")
+
+        flags = _unique_strings_allow_empty(
+            cell["requires_serve_flags"], f"{path}.requires_serve_flags")
+        if route_status == "backed_with_serve_flag" and not flags:
+            _fail(path, "backed_with_serve_flag must name a serve flag")
+        if route_status != "backed_with_serve_flag" and flags:
+            _fail(path, "requires_serve_flags must be empty unless "
+                  "route_status is 'backed_with_serve_flag'")
+
+        predicates = cell["predicates"]
+        if not isinstance(predicates, list):
+            _fail(f"{path}.predicates", "must be a JSON array")
+        for predicate_index, item in enumerate(predicates):
+            predicate_path = f"{path}.predicates[{predicate_index}]"
+            predicate = _object(item, predicate_path)
+            _keys(predicate, predicate_path, {"fact", "op", "value"})
+            fact = _string(predicate["fact"], f"{predicate_path}.fact")
+            if fact not in _LANE_PREDICATE_FACTS:
+                _fail(f"{predicate_path}.fact",
+                      f"must be one of {sorted(_LANE_PREDICATE_FACTS)}")
+            op = _string(predicate["op"], f"{predicate_path}.op")
+            if op not in _LANE_PREDICATE_OPS:
+                _fail(f"{predicate_path}.op",
+                      f"must be one of {sorted(_LANE_PREDICATE_OPS)}")
+            value = predicate["value"]
+            if op == "in":
+                if not isinstance(value, list) or not value:
+                    _fail(f"{predicate_path}.value",
+                          "must be a non-empty JSON array for op 'in'")
+            elif op == "multiple_of":
+                _positive_int(value, f"{predicate_path}.value")
+            elif op in {"at_least", "at_most"}:
+                if isinstance(value, bool) or not isinstance(value, int):
+                    _fail(f"{predicate_path}.value", "must be an integer")
+
+
 def validate_runtime_contract(contract: Any) -> None:
     """Raise :class:`RuntimeContractError` unless *contract* is self-consistent."""
 
     root = _object(contract, "contract")
     _keys(root, "contract", {
         "schema", "contract_version", "abi_features", "quant_method",
-        "packing", "layout", "formats", "tensor_parallel", "expert_parallel",
-        "producer_profiles",
+        "packing", "layout", "formats", "lane_eligibility",
+        "tensor_parallel", "expert_parallel", "producer_profiles",
     })
     if root["schema"] != RUNTIME_CONTRACT_SCHEMA:
         _fail("contract.schema", f"must be {RUNTIME_CONTRACT_SCHEMA!r}")
     contract_version = _positive_int(
         root["contract_version"], "contract.contract_version")
-    if contract_version != 9:
-        _fail("contract.contract_version", "must be 9 for this schema")
+    if contract_version != 10:
+        _fail("contract.contract_version", "must be 10 for this schema")
 
     features = _object(root["abi_features"], "contract.abi_features")
     _keys(features, "contract.abi_features", {
@@ -741,12 +928,13 @@ def validate_runtime_contract(contract: Any) -> None:
     if not isinstance(formats, list) or not formats:
         _fail("contract.formats", "must be a non-empty JSON array")
     family_grids: dict[str, str] = {}
+    family_rungs: dict[str, set[int]] = {}
     for index, item in enumerate(formats):
         path = f"contract.formats[{index}]"
         fmt = _object(item, path)
         _keys(fmt, path, {
             "family", "name_pattern", "grid", "mode", "n_sub", "rungs",
-            "layout_versions", "moe_layout_versions",
+            "producer_rungs", "layout_versions", "moe_layout_versions",
         })
         family = _string(fmt["family"], f"{path}.family")
         if family in family_grids:
@@ -769,7 +957,25 @@ def validate_runtime_contract(contract: Any) -> None:
         if n_sub != expected_n_sub:
             _fail(f"{path}.n_sub",
                   f"must be {expected_n_sub} for {grid}/{mode}")
-        _sorted_unique_ints(fmt["rungs"], f"{path}.rungs")
+        rungs = _sorted_unique_ints(fmt["rungs"], f"{path}.rungs")
+        producer_rungs = _sorted_unique_ints(
+            fmt["producer_rungs"], f"{path}.producer_rungs")
+        if not set(producer_rungs) <= set(rungs):
+            _fail(f"{path}.producer_rungs",
+                  "must be a subset of the accepted reader rungs")
+        rung_law = _FORMAT_RUNGS.get(family)
+        if rung_law is None:
+            _fail(f"{path}.family",
+                  f"must be one of {sorted(_FORMAT_RUNGS)}")
+        accepted_law, producer_law = rung_law
+        if tuple(rungs) != accepted_law:
+            _fail(f"{path}.rungs",
+                  f"must equal the accepted reader domain {list(accepted_law)}")
+        if tuple(producer_rungs) != producer_law:
+            _fail(f"{path}.producer_rungs",
+                  f"must equal the canonical producer ladder "
+                  f"{list(producer_law)}")
+        family_rungs[family] = set(rungs)
         family_layouts = set(_sorted_unique_ints(
             fmt["layout_versions"], f"{path}.layout_versions"))
         moe_layouts = set(_sorted_unique_ints(
@@ -779,6 +985,11 @@ def validate_runtime_contract(contract: Any) -> None:
         if not moe_layouts <= family_layouts:
             _fail(path, "moe_layout_versions must be a subset of layout_versions")
 
+    if set(family_grids) != set(_FORMAT_RUNGS):
+        _fail("contract.formats",
+              f"format families must equal {sorted(_FORMAT_RUNGS)}")
+
+    _validate_lane_eligibility(root, family_rungs)
     _validate_tensor_parallel(root, family_grids)
     _validate_expert_parallel(root, family_grids)
 

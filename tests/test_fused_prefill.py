@@ -42,8 +42,8 @@ DEV = "cuda"
 
 # K1.2. Every per-rung gate below is parametrized over what the LOADED MODULE
 # says it compiled, not over a literal ladder. That is the point of the change:
-# a hand-written `[36, 40, 44, 48]` tested four of the six compiled rungs and
-# could not notice a seventh appearing or a fourth disappearing. Reading the
+# a hand-written subset once tested only part of the compiled rungs and could
+# not notice a new rung appearing or an old one disappearing. Reading the
 # binding makes the coverage follow the kernel by construction.
 COMPILED_RUNGS = sorted(int(k) for k in fused.cb_fused_kbits())
 
@@ -51,8 +51,9 @@ COMPILED_RUNGS = sorted(int(k) for k in fused.cb_fused_kbits())
 # ---------------------------------------------------------------------------
 # K1.2 — the RUNG SURFACE itself.
 #
-# The product FP8-CB ladder is every integer k in [28, 48]; this lane backs the
-# multiples of 4, because type_size = 4k must be a 16-byte TMA box multiple AND
+# The v10 producer ladder is K4..K48 step 4; the accepted reader domain also
+# retains irregular K28..K48 artifacts. This lane backs the multiples of 4,
+# because type_size = 4k must be a 16-byte TMA box multiple AND
 # the mainloop's single CbSubW = k/4 sub-table width is the format's real layout
 # only then (csrc/cb_gemv.cu `SubSplit` splits raggedly otherwise). Three things
 # then have to agree, forever: the kernel's compiled set, the Python law
@@ -73,7 +74,7 @@ def test_compiled_rungs_are_exactly_the_law():
 
 def test_law_is_the_multiples_of_four_in_the_product_range():
     """...and the law is the FORMAT's law, stated independently of the kernel."""
-    assert COMPILED_RUNGS == [k for k in range(28, 49) if 4 * k % 16 == 0]
+    assert COMPILED_RUNGS == [k for k in range(4, 49) if 4 * k % 16 == 0]
     # The ragged-split half of the law: n_sub=4 gives one uniform sub-table
     # width only on these rungs (csrc/cb_gemv.cu SubSplit: base + (i < extra)).
     for k in COMPILED_RUNGS:
@@ -84,9 +85,9 @@ def test_law_is_the_multiples_of_four_in_the_product_range():
 def test_rungs_off_the_law_are_rejected_by_the_law(k):
     """A product rung this lane cannot serve must be REFUSED, with the reason.
 
-    These are real production rungs (the published 27B artifact's K36-K47
-    ladder contains several), so the failure an operator can hit must name the
-    law and say the rung is still served elsewhere — not "unsupported k_bits".
+    These are legacy accepted reader rungs, so the failure an operator can hit
+    must name the law and say the rung is still served elsewhere — not
+    "unsupported k_bits".
     """
     assert not codec.fp8_fused_rung_supported(k)
     packed, cb8 = _synth(32, N=256, K=1024, seed=5)   # shapes are irrelevant
@@ -108,7 +109,7 @@ def test_grouped_tile_sizes_are_reported_per_rung():
         assert tiles and tiles == sorted(tiles)
         assert set(tiles) <= union
         assert 128 in tiles
-        # The measured smem ceiling: TileM=256 fits only the two lowest rungs
+        # The smem ceiling: TileM=256 fits through k32
         # (256/k32 lands on EXACTLY 101,376 B — the zero-margin cell).
         assert (256 in tiles) == (k <= 32)
 
@@ -122,7 +123,9 @@ def test_smem_report_covers_every_compiled_rung():
     ceiling = rows[-1][1]
     for k, total, lut_bytes, subs in rows[:-1]:
         assert 0 < total <= ceiling
-        assert lut_bytes == subs * (1 << (k // 4)) * 2
+        logical = subs * (1 << (k // 4)) * 2
+        expected_alloc = 0 if logical == 0 else ((logical + 1023) // 1024) * 1024
+        assert lut_bytes == expected_alloc
 
 
 def _synth(k, N, K, seed):
@@ -306,7 +309,7 @@ def test_fused_padded_view_bitexact_vs_contiguous(k):
 
 @pytest.mark.parametrize("k", COMPILED_RUNGS)
 def test_fused_scaled_padded_view_bitexact_vs_contiguous(k):
-    """The default-on mid-M serving entry (linear.py:_apply_inline)."""
+    """The sm12x-auto mid-M serving entry (linear.py:_apply_inline)."""
     N, K, M = 320, 1536, 96
     packed, cb8 = _synth(k, N=N, K=K, seed=200 + k)
     torch.manual_seed(k)

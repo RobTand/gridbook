@@ -116,8 +116,8 @@ def _require_stack():
 def _build(*, experts=8, hidden=512, inter=768, seed=0, k=44, codebook=None):
     """Build a synthetic FP8-CB MoE layer without invoking vLLM loading.
 
-    ``k`` is a parameter because TileM=256 is smem-feasible only at k28/k32
-    (csrc/cb_fused_gemm.cu's measured table). With the rung hardcoded at 44,
+    ``k`` is a parameter because TileM=256 is smem-feasible through k32
+    (csrc/cb_fused_gemm.cu's closed-form table). With the rung hardcoded at 44,
     every 256 gate below skipped unconditionally — so "quality at every
     compiled tile" had no 256 execution behind it at all.
     """
@@ -465,7 +465,9 @@ def _tile_sizes(method, layer):
 
 @pytest.mark.parametrize("k", [28, 44])
 def test_quality_at_every_compiled_tile(k):
-    """k is parametrized because TileM=256 is smem-feasible only at k28/k32.
+    """k spans the established high-rung evidence around the k32 smem cutoff.
+
+    TileM=256 is source-feasible through k32 after the v10 low-rung expansion.
     At the previously hardcoded k44 this test had exactly one compiled tile, so
     "every compiled tile" was a claim with one arm behind it."""
     method, layer, dims = _build(seed=1, k=k)

@@ -168,8 +168,9 @@ activation headroom; see [`docs/INSTALL.md`](docs/INSTALL.md#per-artifact-requir
 
 ## Compatibility
 
-The native path is Blackwell-targeted. The main decode translation unit is not
-arch-specific, but that alone does not make an FP4-CB artifact portable:
+The FP4 native path is Blackwell-targeted; dense FP8-CB also has an Ada route.
+The main decode translation unit is not arch-specific, but that alone does not
+make an FP4-CB artifact portable:
 every FP4-v2 quality path uses the v2 exact expander, whose device prepare
 currently admits only CUDA cc 12.0/12.1. The owned grouped-BF16 CUTLASS GEMM is
 SM80-compatible in isolation; the required expander sets the full FP4 serving
@@ -180,7 +181,8 @@ the code and untested**.
 |---|---|---|---|---|
 | **GB10 / DGX Spark, `sm_121`** | native CUDA GEMV | fused CUTLASS when eligible; otherwise CUDA expand → CUTLASS W8A8 | FP8: CUDA expand → CUTLASS; FP4 M>8: native BF16 expand → Gridbook CUTLASS grouped GEMM (`E=1`); fused native-NVFP4 remains opt-in | **MEASURED target.** Published results below predate the final native-only dispatch and remain tied to their recorded commits. |
 | **RTX 5090, `sm_120`** | same dispatch | same dispatch | same dispatch | **USER-REPORTED** working (vLLM 0.25.1, 27B artifact, [issue #1](https://github.com/RobTand/gridbook/issues/1)) before the final native-only dispatch. No new speed numbers are published; the exact `nvcc` arch flag (`sm_120` vs measured `sm_121`) is untested here. |
-| **H100 `sm_90`, RTX 4090 / L40S `sm_89`** | FP8-CB decode is expected to work; an FP4-CB layer is rejected at weight load | Blackwell fused kernel ineligible; CUDA expand → CUTLASS expected for FP8 (`sm_89+`) | FP8 native expansion + CUTLASS expected; FP4 unavailable because v2 expander prepare rejects the device | **FP8-ONLY IS INFERRED / UNTESTED. FP4-CB IS UNSUPPORTED IN 0.5.** Also gated by non-CB groups in the artifact. |
+| **RTX 4090 / L40S, `sm_89`** | FP8-CB CUDA GEMV cross-compiles; an FP4-CB layer is rejected at weight load | Blackwell fused kernel is load-time auto-off; CUDA expand → native CUTLASS W8A8 is the intended route | FP8 main extension + direct CUTLASS ABI cross-compile/registration preflight passed; FP4 unavailable because v2 expander prepare rejects the device | **FP8 COMPILE-ONLY, NOT DEVICE-QUALIFIED.** No physical Ada correctness, graph, memory or speed gate has run; contract v10 cells remain `compile_only`. FP4-CB is unsupported. |
+| **H100, `sm_90`** | FP8-CB decode is expected to work; an FP4-CB layer is rejected at weight load | Blackwell fused kernel ineligible; CUDA expand → CUTLASS expected for FP8 | FP8 native expansion + CUTLASS expected; FP4 unavailable because v2 expander prepare rejects the device | **FP8-ONLY IS INFERRED / UNTESTED.** No SM90 cross-compile or device gate is claimed. FP4-CB is unsupported. |
 | **A100 `sm_80`** | no complete production lane: FP8 prefill needs `sm_89+`, and FP4 load requires cc 12.0/12.1 | FP8-CB rejected | grouped BF16 GEMM supports SM80, but the required FP4-v2 expander rejects the device | **UNSUPPORTED FOR PRODUCTION CB SERVING IN 0.5.** No slow fallback is selected. |
 | **Supported NVIDIA GPU, no `nvcc`** | unavailable | unavailable | unavailable | **FAILS CLOSED.** Prebuild and package compatible native extensions, or provide `nvcc` in the serving environment. |
 | **Non-NVIDIA** | unsupported | unsupported | unsupported | **UNSUPPORTED / UNQUALIFIED.** The canceled ROCm prototype is not shipped or dispatched. |

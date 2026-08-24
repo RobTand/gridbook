@@ -183,13 +183,17 @@ CUTLASS `sm_120`-family kernel
 ([KERNELS.md](KERNELS.md)). Dispatch then uses native CUDA transient expansion
 plus CUTLASS GEMM, which is the general shipping path—not a Triton fallback.
 
-It is *expected* on any non-Blackwell GPU (the kernel is `sm_120`-family only)
-and anywhere `nvcc` is missing. It can also mean vLLM's bundled CUTLASS headers
-were not found — the fused build takes them from your vLLM install, and
+With the default auto selection, non-Blackwell GPUs no longer query this
+loader at all: SM89 goes directly to native expansion + W8A8 CUTLASS. Setting
+`PRISMAQUANT_CB_FUSED_MIDM=1` on such a device fails at model load and names
+the unsupported capability. On Blackwell, the warning can mean `nvcc` is
+missing or vLLM's bundled CUTLASS headers were not found — the fused build
+takes them from your vLLM install, and
 `PRISMAQUANT_CUTLASS_INCLUDE` points it elsewhere
 (see [INSTALL.md](INSTALL.md#cutlass-comes-from-your-vllm-install)).
 
-To skip the build attempt entirely: `PRISMAQUANT_CB_FUSED_MIDM=0`.
+To skip the Blackwell build attempt entirely:
+`PRISMAQUANT_CB_FUSED_MIDM=0`.
 
 ---
 

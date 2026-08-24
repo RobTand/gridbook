@@ -1889,20 +1889,25 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
           * fp8-CB only (the fused kernel's LUT is the 4-sub-table e4m3
             codebook; fp4 two-tier composes a scale the prologue can't);
-          * k on the fused lane's RUNG LAW (``codec.FP8_FUSED_KBITS``: 28..48
-            step 4), uniform per layer by the export union-find, and then
+          * k on the fused lane's RUNG LAW (``codec.FP8_FUSED_KBITS``:
+            K4..K48 step 4), uniform per layer by the export union-find, and then
             CONFIRMED against what this build compiled
-            (``fp8_fused_lane.rung_eligible``). The product ladder is all 21
-            integer rungs; this lane backs the multiples of 4 because
+            (``fp8_fused_lane.rung_eligible``). The v10 producer ladder is the
+            multiples of 4; legacy irregular K28..K48 artifacts remain in the
+            reader domain and use the quality bridge because
             type_size = 4k must be a 16-byte TMA box multiple and the
             mainloop's single CbSubW = k/4 sub-table width is the format's
             real layout only then (see csrc/cb_fused_gemm.cu's rung law). The
-            other rungs are served by the BF16 quality bridge below, so a miss
-            here is a route choice, not a capability gap;
+            off-law reader rungs are served by the BF16 quality bridge below,
+            so a miss here is a route choice, not a capability gap;
           * both projection K's are multiples of 256 (SUPERBLOCK, and the
             kernel's K%256 check);
+          * the loading device is exactly cc 12.0 or 12.1. The grouped-fused
+            module is Blackwell-only; Ada must cache this lane as unavailable
+            before its loader is queried, then use the owned BF16 bridge;
           * packed row stride == row_bytes == (K/256)*4*k, which satisfies
-            BOTH `stride(0) % 16 == 0` (4*k in {144,160,176,192}) and
+            BOTH `stride(0) % 16 == 0` (the rung law makes 4*k 16-byte
+            aligned) and
             `stride(0) >= (K/256)*4*k_bits` with equality (UNPADDED rows).
 
         ONE predicate, not the two this used to be. The retired round-1 path
@@ -1940,6 +1945,17 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             reason = f"inter={layer._cb_inter} is not superblock aligned"
         elif not hasattr(layer, "w13_weight_scale"):
             reason = "layer carries no w13_weight_scale"
+        else:
+            # Do not ask the Blackwell-only fused extension loader to JIT on
+            # Ada (or an unidentified device). This predicate runs during
+            # model load and is cached below, before first forward/capture.
+            from .lane_select import device_capability
+            capability = device_capability(layer.w2_cb_qweight.device)
+            if capability not in ((12, 0), (12, 1)):
+                got = ("unavailable" if capability is None
+                       else f"{capability[0]}.{capability[1]}")
+                reason = ("grouped-fused FP8-CB requires compute capability "
+                          f"12.0 or 12.1, got {got}")
         ok = reason is None
         if ok:
             # The law above is the free gate; the loaded module is the

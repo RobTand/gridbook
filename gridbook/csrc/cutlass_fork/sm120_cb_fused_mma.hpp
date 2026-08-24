@@ -23,8 +23,8 @@
  *     asserted at the python layer).
  *
  * INV-1: the dense fp8 tile exists only as one [TileN, TileK] smem buffer.
- * The k-bit width is a compile-time policy parameter (KBits in
- * {36,40,44,48}); type_size = 4*KBits bytes, n_sub = 4.
+ * The k-bit width is a compile-time policy parameter (KBits in K4..K48,
+ * step 4); type_size = 4*KBits bytes, n_sub = 4.
  **************************************************************************************************/
 #pragma once
 
@@ -140,15 +140,16 @@ struct CollectiveMma<
 
   // --- codebook LUT smem residency policy (R6) ---------------------------
   // The flat codebook is 4 sub-tables x 2^CbSubW rows x 2 e4m3 bytes, i.e.
-  // 8 << CbSubW bytes: k28 1 KB ... k44 16 KB, k48 32 KB. Staging it in smem
+  // 8 << CbSubW logical bytes: k4 16 B ... k28 1 KB, k44 16 KB, k48
+  // 32 KB. Low logical prefixes reserve one aligned KiB. Staging in smem
   // removes the decode gathers' dependence on whatever L1 the kernel's own
   // ~75 KB smem carve-out leaves behind (measured: the k48 32 KB table falls
   // off that cliff -- decode-ALU 0.091 ms at k44 vs 0.779 ms at k48).
   //
   // Feasibility (GemmKernel::SharedStorageSize vs sm_120's 101,376 B ceiling,
   // TileN=64/TileK=128/Stages=2; measured by csrc/tools/smem_probe_tilem.cu):
-  //   TileM=128 base:  k28 66,560 k32 68,608 k36 70,656 k40 72,704 k44 74,752 k48 76,800
-  //   TileM=256 base:  k28 99,328 k32 101,376  (the rest are not compiled)
+  //   TileM=128 supports every K4..K48/4 rung after the LUT carve.
+  //   TileM=256 supports K4..K32 after the LUT carve.
   // The pre-R6 base is exactly TileM*TileK*Stages + TileN*CbTypeSize*Stages +
   // 19,456 B of fixed overhead (decoded-B buffer + epilogue + pipelines), so
   // the headroom a rung can spend on the LUT is:
@@ -158,7 +159,7 @@ struct CollectiveMma<
   //                              (16,384 -> 93,184 total, 8,192 B margin).
   //                              A 3-sub k48 lands on EXACTLY 101,376 with
   //                              zero margin and is deliberately not taken.
-  //   TileM=256: k28 has 2,048 B (full 1,024 B table fits); k32 sits ON the
+  //   TileM=256: full LUTs through k28 fit the 1 KiB policy; k32 sits ON the
   //              ceiling with 0 B headroom, so it stays entirely on the
   //              global path (zero-sized stage, no smem cost).
   // cb_fused_gemm.cu static_asserts the resulting SharedStorageSize for every
@@ -170,7 +171,12 @@ struct CollectiveMma<
   static constexpr int CbLutResidentSubs =
       (TileM <= 128) ? ((4 * CbSubBytes <= 16384) ? 4 : 2)
                      : ((4 * CbSubBytes <= 1024) ? 4 : 0);
-  static constexpr int CbLutSmemBytes = CbLutResidentSubs * CbSubBytes;
+  static constexpr int CbLutLogicalBytes = CbLutResidentSubs * CbSubBytes;
+  // TensorStorage's following A/B buffers are 1024-aligned.  Low-rung LUTs
+  // are only 16..512 logical bytes, so reserve one aligned KiB while copying
+  // only the logical prefix; zero-sized stages still cost exactly zero.
+  static constexpr int CbLutSmemBytes =
+      CbLutLogicalBytes == 0 ? 0 : ((CbLutLogicalBytes + 1023) / 1024) * 1024;
   static_assert(CbLutSmemBytes % 1024 == 0,
                 "LUT stage must be a 1024-byte multiple so it cannot pad the "
                 "1024-aligned A/B buffers that follow it");
@@ -194,9 +200,8 @@ struct CollectiveMma<
   static constexpr int TileN = size<1>(TileShape{});
   static constexpr int TileK = size<2>(TileShape{});
   static_assert(TileK == 128, "CB fused mainloop assumes TileK = 128 (half a 256-weight superblock)");
-  static_assert(KBits == 28 || KBits == 32 || KBits == 36 ||
-                KBits == 40 || KBits == 44 || KBits == 48,
-                "even fp8-CB rungs only (4*KBits must be a 16-byte multiple)");
+  static_assert(KBits >= 4 && KBits <= 48 && KBits % 4 == 0,
+                "fp8-CB fused rungs are K4..K48 step 4");
   static_assert(CbTypeSize % 16 == 0, "type_size must be a 16-byte multiple (TMA box)");
 
   static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
@@ -248,8 +253,8 @@ struct CollectiveMma<
     struct TensorStorage : cute::aligned_struct<128, _0>, LutStorage {
       alignas(1024) cute::array_aligned<SmemAllocTypeA, cute::cosize_v<SmemLayoutA>> smem_A;
       alignas(128) cute::array_aligned<uint8_t, cute::cosize_v<SmemLayoutBPacked>> smem_BP;
-      // 16-byte tail so the last row's aligned-u32 window overread (max
-      // widx+2 -> byte type_size+3) stays inside the allocation.
+      // Retain the historical allocation tail for layout compatibility; the
+      // decoder below predicates w1/w2 and does not rely on reading it.
       alignas(16) cute::array_aligned<uint8_t, 16> smem_BP_pad;
       alignas(1024) cute::array_aligned<SmemAllocTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
     } tensors;
@@ -458,11 +463,8 @@ struct CollectiveMma<
     // per CTA so a wider vector buys nothing measurable.
     uint32_t* dst = reinterpret_cast<uint32_t*>(shared_tensors.lut_smem_mut());
     const uint32_t* src = reinterpret_cast<const uint32_t*>(lut);
-    constexpr int NWords = CbLutSmemBytes / 4;
-    static_assert(NWords % ThreadCount == 0, "LUT stage must divide the MMA thread count");
-    CUTLASS_PRAGMA_UNROLL
-    for (int w = 0; w < NWords / ThreadCount; ++w) {
-      const int idx = thread_idx + w * ThreadCount;
+    constexpr int NWords = CbLutLogicalBytes / 4;
+    for (int idx = thread_idx; idx < NWords; idx += ThreadCount) {
       dst[idx] = __ldg(src + idx);
     }
   }
@@ -490,8 +492,10 @@ struct CollectiveMma<
       const int rem = ((b0 & 3) << 3) + (bitpos & 7);
       const int widx = b0 >> 2;
       const uint32_t w0 = row32[widx];
-      const uint32_t w1 = row32[widx + 1];
-      const uint32_t w2 = row32[widx + 2];
+      const uint32_t w1 =
+          (rem + CbKBits > 32) ? row32[widx + 1] : 0u;
+      const uint32_t w2 =
+          (rem + CbKBits > 64) ? row32[widx + 2] : 0u;
       const uint64_t lo = ((uint64_t)w1 << 32) | (uint64_t)w0;
       uint64_t code = lo >> rem;
       if (rem + CbKBits > 64) {
