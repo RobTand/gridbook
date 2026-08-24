@@ -220,6 +220,9 @@ route and how far their qualification has progressed.
   architecture-conditional persistent-B and BF16 bridge modules as `sm_120a`,
   validates their complete symbol surfaces, checks the emitted cubins, and
   resolves the direct native vLLM FP8/CUTLASS ABI without invoking it.
+  Loading that native ABI requires the CUDA driver library to be visible (for
+  example through the container runtime), but the preflight does not allocate
+  a tensor, query device capability, or launch an operator.
   The `a` suffix is a code-generation detail, not a second contract platform.
 - Gridbook intentionally carries no torch.compile or CUDA-graph configuration
   or attestation in this table. The serving producer owns its immutable graph

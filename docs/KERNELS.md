@@ -121,6 +121,15 @@ modules, persistent-B, and the grouped BF16 bridge with exact RTX 50 targets,
 verifies their symbols/cubins, and resolves the native vLLM FP8/CUTLASS ABI
 without launching an operation. Its dual-family CB receipt is permanently
 compile-only; GB10 execution cannot qualify RTX 50 correctness or performance.
+The ABI registration step must be able to load the CUDA driver library even
+though it allocates no tensor and invokes no operator; a container therefore
+needs driver-library visibility. The 2026-08-24 run against immutable image
+`vllm-node@sha256:d0840ff0e0ba1899a51bf4cb473f43d0c765288b8de708080ad9d95768615141`
+produced
+`/home/rob/dq-runs/20260824_gridbook_sm120_cb_compile_only_a34eb27/receipt.json`
+(SHA-256
+`abbe14915133a01a19c98d644f71c17be0166cac32b93642b9909098e41ae2d1`),
+with `device_executed: false` and exact `sm_120`/`sm_120a` cubins.
 
 NVFP4 reader, producer, chooser, and SM120 lane domains all stop at K25.
 K26..K32 retain direct generic kernels and compile preflight for research and
