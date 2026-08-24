@@ -1,6 +1,6 @@
 {
-  "schema": "gridbook.runtime-contract.v8",
-  "contract_version": 8,
+  "schema": "gridbook.runtime-contract.v9",
+  "contract_version": 9,
   "abi_features": {
     "dspark_construction_physical_bridge": 1,
     "routed_moe_per_role_codebook_lut": 1,
@@ -195,6 +195,16 @@
             "max_world_size": 1
           }
         ]
+      },
+      {
+        "unit": "mixed_fused_projection",
+        "kind": "mixed_fused_projection",
+        "shard_admission": {
+          "axes": [
+            "output"
+          ],
+          "per_role_law": "inherited"
+        }
       }
     ]
   },

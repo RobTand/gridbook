@@ -3,12 +3,19 @@
 Since the shard-aware loading wave, dense CB Linears construct above one
 tensor-parallel rank under structural shard-alignment gates, while every
 other surface refuses by name at a numeric TP=1 ceiling.  As of schema
-``gridbook.runtime-contract.v8`` the packaged contract publishes exactly
+``gridbook.runtime-contract.v9`` the packaged contract publishes exactly
 that split as machine-readable per-unit rows, so a producer gate can branch
 on fields instead of prose (principle: an attested claim, never an asserted
 one).
 
-The same schema adds the second law-admitted surface: the FP8-source W8A16
+The same schema adds a THIRD claim shape, the composite: a
+``mixed_fused_projection`` row for one vLLM merged module whose roles have
+different Gridbook formats.  It is not a format and owns no law, so it
+publishes the axis it admits and the fact that each role's legality is that
+role's own row above — an "inherited" claim rather than a cap the composite
+would be asserting on its roles' behalf.
+
+An earlier schema added the second law-admitted surface: the FP8-source W8A16
 lane's DENSE arm, which enforces its own whole-128 shard laws at weight
 construction, while the same unit's grouped-BMM arm is admitted only at
 shard degrees whose divided group count was measured, because
@@ -87,6 +94,7 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
         "fp8_e4m3_ue8m0_block128",
         "mxfp4_e2m1_ue8m0_g32",
         "mxfp8_e4m3_e8m0_g32",
+        "mixed_fused_projection",
     }
     # Dense CB units admit TP>1 subject to structural shard laws, so they
     # publish those laws instead of a numeric cap.  A cap here would be a
@@ -154,12 +162,28 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
         "merged_roles": "per_role_group_multiple",
     }
 
+    # The composite: a merged module whose roles have different formats. It
+    # publishes no quantum of its own -- gridbook/mixed_linear.py builds each
+    # role's carrier at that role's whole-tensor output size, so the rows
+    # above are what decides -- and no cap, for the same reason the dense CB
+    # rows carry none. The axis list is the one law it does own: a merged
+    # projection is column-parallel, and a row-parallel split of it is
+    # refused by the composer itself.
+    mixed = units["mixed_fused_projection"]
+    assert mixed["kind"] == "mixed_fused_projection"
+    assert "max_world_size" not in mixed
+    assert "arms" not in mixed
+    assert mixed["shard_admission"] == {
+        "axes": ["output"],
+        "per_role_law": "inherited",
+    }
+
 
 def test_schema_and_contract_version_move_together():
     contract = load_runtime_contract()
-    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v8"
+    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v9"
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 8
+    assert contract["contract_version"] == 9
 
 
 # --- 2. Closed-world reading: absence means REFUSED ---------------------------
@@ -228,6 +252,10 @@ def test_closed_world_lookup_refuses_what_the_table_does_not_claim():
     # (its whole-128 construction laws decide the rest).
     assert _permitted(table, "fp8_e4m3_ue8m0_block128", 2, arm="dense")
     assert _permitted(table, "fp8_e4m3_ue8m0_block128", 8, arm="dense")
+    # The composite reads like the other law-admitted rows: the table defers,
+    # and the per-role construction gates decide.
+    assert _permitted(table, "mixed_fused_projection", 2)
+    assert _permitted(table, "mixed_fused_projection", 8)
 
     # An unknown unit id has no row -> REFUSED.
     assert not _permitted(table, "NVFP4_CB_K99", 1)
@@ -433,6 +461,29 @@ def _drop_the_bmm_degree_list(contract):
         "qualified_shard_degrees"]
 
 
+def _cap_the_composite(contract):
+    # A number here would claim a ceiling for every role at once; no site
+    # enforces one, and the roles' own rows are where admission lives.
+    _units_by_id(contract)["mixed_fused_projection"]["max_world_size"] = 2
+
+
+def _drop_the_composite_row(contract):
+    contract["tensor_parallel"]["units"] = [
+        row for row in contract["tensor_parallel"]["units"]
+        if row["unit"] != "mixed_fused_projection"
+    ]
+
+
+def _admit_the_composite_on_the_input_axis(contract):
+    _units_by_id(contract)["mixed_fused_projection"]["shard_admission"][
+        "axes"] = ["output", "input"]
+
+
+def _invent_a_composite_law(contract):
+    _units_by_id(contract)["mixed_fused_projection"]["shard_admission"][
+        "per_role_law"] = "output_axis_quantum_128"
+
+
 def _invent_geometry_pin(contract):
     row = _units_by_id(contract)["mxfp8_e4m3_e8m0_g32"]
     row["arms"][1]["requires_geometry"] = {
@@ -471,6 +522,10 @@ def _invent_geometry_pin(contract):
         (_cap_the_bmm_arm_again, "unknown field.*max_world_size"),
         (_widen_the_bmm_degrees, "must equal"),
         (_drop_the_bmm_degree_list, "missing field"),
+        (_cap_the_composite, "unknown field.*max_world_size"),
+        (_drop_the_composite_row, "mixed_fused_projection"),
+        (_admit_the_composite_on_the_input_axis, "must equal"),
+        (_invent_a_composite_law, "must equal"),
     ],
 )
 def test_validator_rejects_tables_that_overclaim_or_underclaim(
