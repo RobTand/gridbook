@@ -84,6 +84,11 @@ docker run --rm --gpus all --ipc=host \
   --entrypoint bash <cuda-image> -lc 'python3 -m pytest tests/ -q --tb=line -rf'
 ```
 
+The rest of this section describes a **bare CUDA image**. On the **released
+Gridbook image** the picture is different and simpler — see
+[On the released image](#on-the-released-image) below before you copy any of
+it.
+
 **`TORCHINDUCTOR_COMPILE_THREADS=1` is not optional.** Without it, Inductor's
 subprocess compile pool falls over partway through a whole-suite run and every
 later test that crosses a `torch.compile` boundary fails with
@@ -106,6 +111,41 @@ is **container-specific and its cause is not yet diagnosed** — it passes in
 0.6 s outside the image with no GPU at all, so it is not a kernel or numerics
 failure. If you can pin down what the bare CUDA image is missing, that is a
 welcome issue.
+
+### On the released image
+
+The authoritative suite environment is the released image, not a bare CUDA one
+or any host venv (host venvs here carry vLLM stubs only). Measured on
+`gridbook:0.8.12-r2ab` / GB10 `sm_121` on 2026-08-23, two full runs:
+
+```bash
+docker run --rm --gpus all --entrypoint /bin/bash \
+  -v "$PWD":/gb -w /gb -e PYTHONPATH=/gb -e TMPDIR=/tmp \
+  -e PRISMAQUANT_CB_EXT_DIR=<one cache dir per tree> \
+  gridbook:0.8.12-r2ab \
+  -lc '/usr/bin/python3 -m pip install --quiet pytest; /usr/bin/python3 -m pytest -q'
+```
+
+- **`TORCHINDUCTOR_COMPILE_THREADS=1` was not needed and `--ipc=host` was not
+  needed.** Both runs, without either, reported **zero failures** — the
+  290-failure Inductor mode above did not appear. The bare-image guidance is
+  kept because that is a different environment, but do not carry it here.
+- **None of the five environmental failures appeared.** The image has `git`
+  and the CUDA binary utilities, so the dirty-checkout and SASS-symbol tests
+  run for real.
+- The image has no `python` and no `pytest`: use `/usr/bin/python3` and let
+  the `pip install` line above provide pytest.
+- The extension cache is **path-keyed**. Give each checkout its own
+  `PRISMAQUANT_CB_EXT_DIR`, or one tree loads another tree's `.so`.
+- **A large skip count is expected and is not "all green".** Both runs
+  reported 279 skips: `prismaquant` is not installed in the image, so the
+  twelve files that `pytest.importorskip("prismaquant...")` skip wholesale.
+  That is fine for comparing two trees; it is not a coverage claim.
+- **A dirty checkout fails 13 tests by design.** `bench_serve` refuses to
+  produce evidence from an uncommitted tree, so commit before you run the
+  suite (or expect those failures and read them as what they are). In a tree
+  with no `.git` at all those gates cannot fire, which is why a snapshot
+  directory and a real worktree can report different counts for the same code.
 
 CI additionally gates the packaging surface: that the wheel and sdist really
 contain `gridbook/csrc/*.cu`, that a **non-editable** install resolves them from

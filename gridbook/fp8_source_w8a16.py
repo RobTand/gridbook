@@ -19,7 +19,7 @@ not accepted here; it remains the separate W8A8 ``Mxfp8DenseLinearMethod``.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import NamedTuple, Optional, Sequence
 
 import torch
 
@@ -34,13 +34,164 @@ __all__ = [
 WIRE_FP8_BLOCK128 = "fp8_e4m3_ue8m0_block128"
 
 _READY_ATTR = "_gridbook_fp8_source_w8a16_ready"
+_SHARD_ATTR = "_fp8_source_shard_plan"
 _READY_ABI = 1
 _DECODE_MAX_M = 8
 _GEMM_ALIGNMENT = 8
 _DSV4_BMM_GROUPS = 8
 _DSV4_BMM_ROWS = 1024
 _DSV4_BMM_K = 4096
-_DSV4_RELEASE_TP = 1
+#: Shard degrees whose grouped geometry has been MEASURED on the release
+#: device.  Column-sharding a grouped plane divides the kernel's group count,
+#: so each degree is its own qualification: degree ``d`` runs ``G/d`` groups of
+#: the same 1024x4096 rows.  Degrees 2 and 4 were qualified on 2026-08-23 --
+#: every rank's call is BITWISE equal to the corresponding columns of the
+#: unsharded G=8 call, and decode time scales with the bytes a rank holds
+#: (0.496x at G=4, 0.253x at G=2, measured against a working set too large to
+#: cache).  A degree that is not listed here is refused, not assumed.
+_DSV4_BMM_QUALIFIED_SHARD_DEGREES = (1, 2, 4)
+
+#: Both parallel axes must land on a whole source block, because vLLM narrows
+#: the UE8M0 plane with the SAME shard arithmetic it uses for the value plane
+#: (``BlockQuantScaleParameter`` is ``ModelWeightParameter``'s narrowing over
+#: the block grid, with ``adjust_block_scale_shard`` converting element counts
+#: to block counts by CEIL division).  The narrow start is therefore
+#: ``rank * ceil(local / 128)``, which indexes the full plane's block grid
+#: correctly if and only if the local extent is a whole multiple of 128 —
+#: otherwise ranks silently read overlapping or shifted blocks with no error.
+_TP_SHARD_ALIGNMENT = 128
+
+if _TP_SHARD_ALIGNMENT != DS_BLOCK:  # pragma: no cover - import-time invariant
+    raise RuntimeError(
+        "source-FP8 W8A16 shard alignment must be the source block size")
+
+def _qualified_bmm_geometries():
+    """Grouped-BMM geometries a kernel qualification stands behind.
+
+    Each entry is ``(groups, rows_per_group, K, shard_degree)``.  Sharding a
+    grouped plane column-wise divides the kernel's group count, so a sharded
+    geometry is a NEW qualification -- measure it, then list its degree in
+    ``_DSV4_BMM_QUALIFIED_SHARD_DEGREES`` -- rather than something a shard law
+    can grant.  Built from the constants at call time so a test may pin a small
+    geometry by patching them.
+    """
+
+    return frozenset({
+        (_DSV4_BMM_GROUPS // degree, _DSV4_BMM_ROWS, _DSV4_BMM_K, degree)
+        for degree in _DSV4_BMM_QUALIFIED_SHARD_DEGREES
+        if _DSV4_BMM_GROUPS % degree == 0
+    })
+
+
+class ShardAlignmentError(ValueError):
+    """A tensor-parallel shard this lane refuses to construct.
+
+    Raised at weight CONSTRUCTION, before vLLM copies a single byte: a
+    misaligned block-scale narrow is silently wrong rather than loud, so the
+    refusal has to precede the load.  Callers may catch it as ``ValueError``.
+    """
+
+
+class ShardPlan(NamedTuple):
+    """The structural shard degrees of one Linear, per parallel axis.
+
+    Derived from ``create_weights``' own arguments, never from
+    ``layer.tp_size``: vLLM's ``LinearBase`` stamps the world size onto EVERY
+    layer, including ``ReplicatedLinear`` and ``disable_tp=True`` merged
+    planes, so ``tp_size`` cannot distinguish a sharded plane from a
+    replicated one.  DeepSeek-V4 has 43 replicated fused ``wqa_wkv`` planes and
+    21 replicated indexer ``wq_b`` planes that report ``tp_size = N``.
+    """
+
+    row_degree: int
+    col_degree: int
+
+    @property
+    def degree(self) -> int:
+        return max(self.row_degree, self.col_degree)
+
+
+def _axis_degree(full, local, *, axis: str, prefix: str) -> int:
+    """Whole-number shard degree along one axis, or a structured refusal."""
+
+    full = int(full)
+    local = int(local)
+    where = f" at {prefix!r}" if prefix else ""
+    if full <= 0 or local <= 0:
+        raise ShardAlignmentError(
+            f"source-FP8 W8A16{where} needs a positive {axis} extent; got "
+            f"full={full}, per-rank={local}")
+    if full % local != 0:
+        raise ShardAlignmentError(
+            f"source-FP8 W8A16{where} refuses an uneven {axis} partition: "
+            f"the full extent {full} is not a whole multiple of the per-rank "
+            f"extent {local}. Gridbook serves this lane only where every rank "
+            "holds the same shape; serve this model at a tensor-parallel size "
+            "that divides the layer evenly.")
+    return full // local
+
+
+def _resolve_shard_plan(*, input_size, input_size_per_partition,
+                        output_size, output_partition_sizes,
+                        prefix: str) -> ShardPlan:
+    return ShardPlan(
+        row_degree=_axis_degree(
+            input_size, input_size_per_partition,
+            axis="input (row-parallel)", prefix=prefix),
+        col_degree=_axis_degree(
+            output_size, sum(int(w) for w in output_partition_sizes),
+            axis="output (column-parallel)", prefix=prefix),
+    )
+
+
+def _require_shard_alignment(plan: ShardPlan, *, input_size_per_partition: int,
+                             output_partition_sizes: Sequence[int],
+                             prefix: str) -> None:
+    """Refuse any shard whose block-scale narrowing would be misindexed.
+
+    The laws, one per axis, plus the merged-plane law that makes the per-role
+    block offsets tile the local scale plane exactly.
+    """
+
+    where = f" at {prefix!r}" if prefix else ""
+    block = _TP_SHARD_ALIGNMENT
+    if plan.row_degree > 1 and plan.col_degree > 1:
+        raise ShardAlignmentError(
+            f"source-FP8 W8A16{where} refuses a plane sharded on BOTH axes "
+            f"(row degree {plan.row_degree}, column degree "
+            f"{plan.col_degree}); this lane is qualified for one-dimensional "
+            "tensor parallelism only.")
+    if plan.row_degree > 1:
+        local_k = int(input_size_per_partition)
+        if local_k % block != 0:
+            raise ShardAlignmentError(
+                f"source-FP8 W8A16{where} refuses a row-parallel shard of "
+                f"degree {plan.row_degree}: the per-rank K extent {local_k} is "
+                f"not a multiple of the {block}-element source block, so "
+                "vLLM's block-scale narrow would read shifted scale columns. "
+                f"Serve at a tensor-parallel size whose per-rank K is a "
+                f"multiple of {block}.")
+    if plan.col_degree > 1:
+        widths = [int(w) for w in output_partition_sizes]
+        bad = [w for w in widths if w % block != 0]
+        if bad:
+            raise ShardAlignmentError(
+                f"source-FP8 W8A16{where} refuses a column-parallel shard of "
+                f"degree {plan.col_degree}: per-rank output width(s) "
+                f"{bad} are not multiples of the {block}-element source "
+                "block, so vLLM's block-scale narrow would read shifted "
+                "scale rows. On a merged plane EVERY fused role's per-rank "
+                f"width must be a multiple of {block}. Serve at a "
+                "tensor-parallel size that keeps every role aligned.")
+        # The merged-plane offsets are converted to block units role by role,
+        # so exact tiling of the local scale plane is the thing to verify.
+        rows = sum(w // block for w in widths)
+        local_n = sum(widths)
+        if rows != -(-local_n // block):
+            raise ShardAlignmentError(  # pragma: no cover - implied by above
+                f"source-FP8 W8A16{where} refuses a merged column shard whose "
+                f"per-role block rows {rows} do not tile the local scale "
+                f"plane ({-(-local_n // block)} rows)")
 
 
 def _checked_source_loader(weight_loader, *, expected_dtype: torch.dtype,
@@ -107,13 +258,33 @@ def _build_method_class():
         def create_weights(self, layer, input_size_per_partition,
                            output_partition_sizes, input_size, output_size,
                            params_dtype, **extra_weight_attrs):
-            del input_size, output_size, params_dtype
+            del params_dtype
             out_size = int(sum(output_partition_sizes))
             in_size = int(input_size_per_partition)
             if out_size <= 0 or in_size <= 0:
                 raise ValueError(
                     "source-FP8 W8A16 needs positive N and K, got "
                     f"N={out_size}, K={in_size}")
+
+            # Tensor-parallel legality FIRST: a misaligned block-scale narrow
+            # is silent, so it must be refused before any parameter exists for
+            # vLLM's loader to copy into.
+            prefix = str(getattr(layer, "prefix", "") or "")
+            plan = _resolve_shard_plan(
+                input_size=input_size,
+                input_size_per_partition=in_size,
+                output_size=output_size,
+                output_partition_sizes=output_partition_sizes,
+                prefix=prefix,
+            )
+            _require_shard_alignment(
+                plan,
+                input_size_per_partition=in_size,
+                output_partition_sizes=output_partition_sizes,
+                prefix=prefix,
+            )
+            setattr(layer, _SHARD_ATTR, plan)
+
             weight_loader = extra_weight_attrs.get("weight_loader")
             value_loader = _checked_source_loader(
                 weight_loader,
@@ -191,6 +362,20 @@ def _build_method_class():
             groups = 1
             rows = n
             tp_size = int(getattr(layer, "tp_size", 1))
+            plan = getattr(layer, _SHARD_ATTR, None)
+            if plan is None:
+                # Nothing structural to read: this layer's parameters were not
+                # built by THIS method.  Refuse above one rank rather than
+                # guess a shard degree from tp_size, which is stamped on
+                # replicated layers too.
+                if tp_size != 1:
+                    raise ShardAlignmentError(
+                        "source-FP8 W8A16 has no shard plan for this layer "
+                        "(its weights were not constructed by this lane's "
+                        f"create_weights) and the worker reports TP={tp_size}; "
+                        "refusing rather than assuming a shard degree")
+                plan = ShardPlan(1, 1)
+            shard_degree = plan.degree
             if is_bmm:
                 groups = int(getattr(layer, "bmm_batch_size", 0))
                 if groups <= 0 or n % groups != 0:
@@ -198,22 +383,34 @@ def _build_method_class():
                         "source-FP8 W8A16 BMM needs a positive group count "
                         f"dividing N; got groups={groups}, N={n}")
                 rows = n // groups
-                geometry = (groups, rows, k, tp_size)
-                qualified = (
-                    _DSV4_BMM_GROUPS,
-                    _DSV4_BMM_ROWS,
-                    _DSV4_BMM_K,
-                    _DSV4_RELEASE_TP,
-                )
-                if geometry != qualified:
+                geometry = (groups, rows, k, shard_degree)
+                if geometry not in _qualified_bmm_geometries():
+                    qualified = ", ".join(
+                        f"G={g}, N={r}, K={kk} at shard degree {d}"
+                        for g, r, kk, d in sorted(
+                            _qualified_bmm_geometries(), key=lambda e: e[3]))
                     raise ValueError(
                         "source-FP8 W8A16 BMM is qualified only for grouped "
-                        "geometry G=8, N=1024, K=4096, TP=1; got "
-                        f"G={groups}, N={rows}, K={k}, TP={tp_size}")
-            elif tp_size != _DSV4_RELEASE_TP:
-                raise ValueError(
-                    "source-FP8 W8A16 dense serving is release-gated only "
-                    f"for TP=1; got TP={tp_size}")
+                        f"geometry {qualified}; got "
+                        f"G={groups}, N={rows}, K={k}, shard degree="
+                        f"{shard_degree} (TP={tp_size}). Column-sharding a "
+                        "grouped plane divides the kernel's group count, "
+                        "which is a NEW kernel qualification rather than a "
+                        "shard law; qualify the sharded geometry and add its "
+                        "degree to this lane's qualified table.")
+            elif shard_degree > 1:
+                # The construction-time laws already refused every misaligned
+                # shard; re-assert them against the RESIDENT shape so a loader
+                # that produced an unexpected local extent cannot slip past.
+                block = _TP_SHARD_ALIGNMENT
+                if plan.col_degree > 1 and n % block != 0:
+                    raise ShardAlignmentError(
+                        "source-FP8 W8A16 column shard finalized with "
+                        f"N={n}, which is not a multiple of {block}")
+                if plan.row_degree > 1 and k % block != 0:
+                    raise ShardAlignmentError(
+                        "source-FP8 W8A16 row shard finalized with "
+                        f"K={k}, which is not a multiple of {block}")
             if rows % _GEMM_ALIGNMENT != 0:
                 raise ValueError(
                     "source-FP8 W8A16 needs per-group N divisible by the "
@@ -247,6 +444,7 @@ def _build_method_class():
             layer._fp8_source_K = k
             layer._fp8_source_groups = groups
             layer._fp8_source_rows = rows
+            layer._fp8_source_shard_degree = shard_degree
             layer._fp8_source_resident_bytes = q.numel() + scales.numel()
 
             from .ops import register_cb_layer

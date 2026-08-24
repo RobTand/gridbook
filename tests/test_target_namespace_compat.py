@@ -649,10 +649,11 @@ def test_live_tp2_admits_dense_cb_and_refuses_delegation(monkeypatch):
 def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
     """The packaged TP table claims only what the dispatch gates enforce.
 
-    Schema v6: dense CB rows publish shard-admission laws and no numeric cap
-    (dispatch admits them above one rank), while every passthrough row keeps
-    its numeric cap of 1 — and a live world size of 2 still refuses a
-    delegated stock compressed-tensors group at its choke point.
+    Schema v7: dense CB rows publish shard-admission laws and no numeric cap
+    (dispatch admits them above one rank), and so does the FP8-source lane's
+    dense ARM; every other passthrough claim keeps its numeric cap of 1 — and
+    a live world size of 2 still refuses a delegated stock compressed-tensors
+    group at its choke point.
     """
     import json
     from importlib.resources import files as resource_files
@@ -673,9 +674,18 @@ def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
                 "merged_roles": "even_division",
             }
         else:
-            assert row["max_world_size"] == 1
-        assert all(arm["max_world_size"] == 1
-                   for arm in row.get("arms", ()))
+            # A claim is either a number a site enforces or laws a site
+            # enforces, never both and never neither.
+            for arm in row.get("arms", ()):
+                assert ("max_world_size" in arm) ^ ("shard_admission" in arm)
+                if "max_world_size" in arm:
+                    assert arm["max_world_size"] == 1
+            law_admitted = any("shard_admission" in arm
+                               for arm in row.get("arms", ()))
+            if law_admitted:
+                assert "max_world_size" not in row
+            else:
+                assert row["max_world_size"] == 1
 
     import gridbook.config as config_mod
 

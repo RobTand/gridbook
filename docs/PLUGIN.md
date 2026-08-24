@@ -92,7 +92,8 @@ second runtime tree or maintain a parallel loader table.
   vanilla-FP8 Linears this way, and the 27B's vision tower is a stock NVFP4
   W4A16 group. **Consequence:** an artifact's hardware requirements are the union
   of gridbook's and those of its delegated groups.
-- **Tensor parallel: dense CB Linears only, above one rank.** Since the
+- **Tensor parallel: dense CB and FP8 source-passthrough Linears, above one
+  rank.** Since the
   shard-aware loading wave (2026-08-23), dense CB Linears load correctly at
   TP>1 with no change to any exported byte: vLLM's stock declared-dim
   narrowing slices whole packed rows on column-parallel layers and
@@ -104,10 +105,17 @@ second runtime tree or maintain a parallel loader table.
   shard_size fields — input axis requires whole 256-weight superblocks;
   output axis requires the native kernel's 8-wide (fp4) or 16-wide (fp8) row
   quantum). Everything else keeps refusing at construction, naming itself:
-  delegated compressed-tensors groups, source-passthrough units (the FP8 lane
-  pins TP=1 in its own release gate), quantized embedding units and
-  mixed-format fused projections. Ignored (BF16) Linears stay on vLLM-native
-  sharding. Dense
+  delegated compressed-tensors groups, quantized embedding units and
+  mixed-format fused projections; routed CB MoE expert stacks refuse on this
+  axis and serve on the expert-parallel one instead (see below).
+  `fp8_e4m3_ue8m0_block128` source-passthrough units are no longer among the
+  refusals: dense ones shard when every rank's extent on the sharded axis is
+  a whole multiple of the 128-element source block (per fused role on a
+  merged plane, because vLLM narrows the UE8M0 scale plane over the block
+  grid by ceil division), and grouped-BMM ones shard only at a degree whose
+  divided group count was measured on the release device — 1, 2 and 4 at the
+  DSv4 `wo_a` geometry; an unmeasured degree is refused even when perfectly
+  aligned. Ignored (BF16) Linears stay on vLLM-native sharding. Dense
   TP>1 remains **correctness-only**: no two-node serve has been measured on
   this hardware yet, so nothing here claims a decode win. The fact is
   published, not prose: every serving unit carries a `tensor_parallel` row
@@ -147,7 +155,7 @@ second runtime tree or maintain a parallel loader table.
 
 ## Tensor-parallel capability
 
-As of contract schema `gridbook.runtime-contract.v7`, the packaged contract
+As of contract schema `gridbook.runtime-contract.v8`, the packaged contract
 carries a `tensor_parallel` section that publishes, per serving unit, what the
 runtime actually enforces. The table is an attestation: each row restates a
 refusal or admission site in this package, and
@@ -172,18 +180,47 @@ of that site.
     (`even_division`; merged checkpoint roles divide across ranks). A shard
     that violates them is refused by the runtime regardless of the table; the
     row exists so a producer can pre-check the same laws.
-  - **Source-passthrough formats** keep numeric `max_world_size` rows pinned
-    to 1. A unit whose method branches on an execution arm carries per-arm
-    rows; the `fp8_e4m3_ue8m0_block128` BMM arm additionally pins the only
-    qualified grouped geometry (`bmm_groups` 8, `rows_per_group` 1024,
-    `k` 4096).
+  - **Source-passthrough formats** publish a numeric `max_world_size` of 1
+    unless their lane enforces shard laws of its own. A unit whose method
+    branches on an execution arm additionally carries per-arm rows, and each
+    arm carries either `max_world_size` or `shard_admission`, never both nor
+    neither. A unit with a **law-admitted** arm carries no unit-level number
+    at all, because one scalar cannot cover a law-admitted arm and a capped
+    arm at once; an armed unit whose every arm is capped keeps its unit cap of
+    1, which its dispatch gate does enforce. Where a unit-level number is
+    present it gates first, before the arm row is consulted.
+  - **The one law-admitted passthrough arm** (v7) is
+    `fp8_e4m3_ue8m0_block128` / `dense`. Its `shard_admission` publishes
+    `input_axis_group` 128, `output_axis_quantum` 128 and `merged_roles`
+    `per_role_group_multiple`: the lane derives each Linear's shard degree
+    from its own `create_weights` arguments — never from `layer.tp_size`,
+    which vLLM stamps onto replicated layers too — and refuses, before any
+    parameter exists, any shard whose per-rank extent on the sharded axis is
+    not a whole multiple of the 128-element source block. That is exactly the
+    condition under which vLLM's `BlockQuantScaleParameter` narrow (start
+    `rank * ceil(local / 128)`) indexes the UE8M0 block grid correctly; below
+    it, ranks read shifted scale blocks with no error. On a merged plane the
+    law applies per fused role, because the block offsets are converted role
+    by role. The refusal is `ShardAlignmentError` (a `ValueError`).
+  - **The same unit's `bmm` arm publishes the same law plus a closed list of
+    measured shard degrees** (`qualified_shard_degrees` `[1, 2, 4]`) and pins
+    the grouped geometry it qualifies (`bmm_groups` 8, `rows_per_group` 1024,
+    `k` 4096 — the UNSHARDED plane). Column-sharding a grouped plane divides
+    the kernel's group count (G 8 -> 4 at TP=2), so alignment alone cannot
+    admit it: each degree is its own measurement. Degrees 1, 2 and 4 were
+    measured on the release device on 2026-08-23 (every rank's call bitwise
+    equal to the corresponding columns of the unsharded G=8 call); a degree
+    outside the list is refused, however aligned the plane is.
 - `semantics` is `closed_world`. A consumer must read the table with the same
   rule the validator enforces for publishers:
 
   Serving unit *U* at world size *t* is permitted only if the table contains
   exactly one row named *U* and the exact arm row when the unit has arms; a
   numeric claim must cover *t*, and any pinned geometry must match exactly;
-  a dense CB row defers to its published laws at weight construction. Every
+  a row (or arm) that publishes `shard_admission` defers to those laws at
+  weight construction and carries no number to compare against — except that
+  a `shard_admission` carrying `qualified_shard_degrees` admits *t* only when
+  *t* is in that list. Every
   other outcome — no row, two rows, an unknown arm name, a larger *t* than a
   numeric claim, a different geometry — is a refusal. There is no default,
   wildcard, or inheritance.
@@ -193,12 +230,12 @@ contract that omits a shipped unit, invents one, drops a mandatory field,
 caps the capless dense CB surface with a number, or publishes a numeric claim
 no enforcement site stands behind.
 
-**Compatibility rule:** `schema` and `contract_version` move together (v7 / 7),
+**Compatibility rule:** `schema` and `contract_version` move together (v8 / 8),
 and readers match the schema string exactly. A producer pinned to
-`gridbook.runtime-contract.v6` must refuse a v7 contract whole — no partial
+`gridbook.runtime-contract.v7` must refuse a v8 contract whole — no partial
 parsing, no field-by-field salvage across versions — and keep producing against
-its pinned runtime until its pin is deliberately bumped. Reading a v6 contract
-with a v7 reader fails the same way.
+its pinned runtime until its pin is deliberately bumped. Reading a v7 contract
+with a v8 reader fails the same way.
 
 ## Expert-parallel capability
 

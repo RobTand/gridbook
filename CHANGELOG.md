@@ -2,7 +2,72 @@
 
 ## Unreleased
 
-### CB MoE expert stacks serve under expert parallelism (contract schema v7)
+### FP8 source passthrough serves above one tensor-parallel rank
+
+The `fp8_e4m3_ue8m0_block128` lane's dense arm no longer pins TP=1. The pin
+(`_DSV4_RELEASE_TP`, plus the blanket refusal in `config._delegate_passthrough`)
+was a release gate, not a measurement: the lane's own byte layout is exactly
+what vLLM's stock narrowing already shards. It is replaced by the structural
+law that makes that narrowing correct.
+
+- **The law.** `BlockQuantScaleParameter` narrows the UE8M0 plane with the
+  same arithmetic as the value plane, converting element counts to block
+  counts by ceil division, so the narrow start is `rank * ceil(local / 128)`.
+  That indexes the full plane's block grid correctly if and only if the
+  per-rank extent on the sharded axis is a whole multiple of 128; below it,
+  ranks silently read shifted blocks. `fp8_source_w8a16` now refuses anything
+  else with `ShardAlignmentError` (a `ValueError`) inside `create_weights` —
+  before any parameter exists for a loader to copy into, because a misaligned
+  narrow is silently wrong rather than loud. On a merged plane the law is per
+  fused role, since the block offsets are converted role by role.
+- **The degree is structural.** Shard degrees come from `create_weights`' own
+  arguments (`input_size` vs `input_size_per_partition`, `output_size` vs
+  `sum(output_partition_sizes)`), never from `layer.tp_size`: vLLM's
+  `LinearBase` stamps the world size onto every layer, including
+  `ReplicatedLinear` and `disable_tp=True` merged planes. DeepSeek-V4 has 64
+  such replicated passthrough planes per model that report `tp_size = N` while
+  holding whole tensors; enforcing on `tp_size` would refuse them.
+- **The grouped-BMM arm shards at measured degrees only, now 1, 2 and 4.**
+  Column-sharding a grouped `wo_a` plane divides the kernel's group count
+  (G 8 -> 4 at TP=2), so alignment cannot grant it and each degree is its own
+  qualification. Degrees 2 and 4 were measured on the release device
+  (2026-08-23, GB10 sm_121, DSv4 `wo_a` geometry: 1024 rows/group, K 4096,
+  batch 1):
+
+  | call | per call | vs G=8 |
+  |---|---|---|
+  | G=8, whole plane (TP=1) | 163.34 us | 1.000x |
+  | G=4, one rank at TP=2 | 80.90 us | 0.496x |
+  | G=2, one rank at TP=4 | 41.23 us | 0.253x |
+
+  500 iterations per timed run after 50 warmup, three A/B/A repeats, median,
+  CUDA-event timed, each arm rotating over a 268 MB working set so no arm is
+  served from cache. **No occupancy cliff**: decode time falls with the bytes
+  a rank holds, near-exactly linearly. (A hot loop over a single resident
+  plane instead reports G=4 at 0.294x — a cache artifact of the microbench,
+  not a speedup a serve would see. The honest number is 0.496x.) Exactness is
+  stronger than the tolerance the qualification asked for: at both degrees and
+  on **every** rank, the sharded call is BITWISE equal to the corresponding
+  columns of the unsharded G=8 call, on the expand path and the GEMV path
+  alike. Qualified degrees live in one place
+  (`_DSV4_BMM_QUALIFIED_SHARD_DEGREES`), and the refusal message enumerates
+  the whole qualified set rather than naming one geometry.
+- **Other passthrough formats are unchanged.** `mxfp4_e2m1_ue8m0_g32` and
+  `mxfp8_e4m3_e8m0_g32` have no sharded audit and keep refusing by name at
+  dispatch; mixed-format fused planes keep their own separate refusal.
+- **Contract v7.** A passthrough unit whose method branches on an execution
+  arm now publishes admission per arm, and a unit with a **law-admitted** arm
+  carries no unit-level `max_world_size`: one scalar cannot cover a
+  law-admitted arm and a capped arm at once. An armed unit whose every arm is
+  capped keeps its unit-level 1. The FP8-source dense arm
+  publishes `shard_admission` (`input_axis_group` 128, `output_axis_quantum`
+  128, `merged_roles` `per_role_group_multiple`); its BMM arm publishes the
+  same law plus `qualified_shard_degrees` `[1, 2, 4]`, keeping the pinned
+  geometry (which names the unsharded plane). `mxfp8_e4m3_e8m0_g32` moves to
+  the same shape with both arms still capped at 1 — no capability change.
+  Schema and `contract_version` move together to v8 / 8.
+
+### CB MoE expert stacks serve under expert parallelism (contract schema v8)
 
 Routed CB MoE now serves above one rank with `-tp N --enable-expert-parallel`.
 Tensor parallelism was never the right axis for it and still refuses: a CB

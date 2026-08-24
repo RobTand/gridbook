@@ -127,11 +127,15 @@ route unchanged; neither arm calls an activation quantizer or QDQ operation.
 - Load requires both the source extension and the owned grouped-BF16 bridge.
   Missing source, strict symbol, supported device, shape, or bridge capability
   is a load-time refusal. Grouped BMM is qualified only for DSV4's exact
-  per-group geometry `G=8, N=1024, K=4096` at `tp=1`; any near miss is refused
-  before extension resolution or adapter-marker installation. Dense source-FP8
-  Linears are a separate contract: they retain the alignment and scale-shape
-  gates above and are not restricted to the grouped `wo_a` geometry; this
-  release still admits them only at `tp=1`.
+  per-group geometry `G=8, N=1024, K=4096`, and only at a shard degree whose
+  group count was measured on the release device -- 1, 2 and 4, since
+  column-sharding a grouped plane divides the kernel's group count and each
+  divided count is its own qualification. Any near miss, and any unmeasured
+  degree (8 included, whose per-rank plane is perfectly aligned and still
+  refused), is rejected before extension resolution or adapter-marker
+  installation. Dense source-FP8 Linears are a separate contract: they retain
+  the alignment and scale-shape gates above, are not restricted to the grouped
+  `wo_a` geometry, and shard at any degree those gates admit.
 - Whole-layer dispatch stays behind an opaque custom op. `M` is selected when
   the operation executes. The unit gate covers dense CUDA-graph replay at actual
   flattened decode-token sizes `M in {1,2,4,8}`; `G` does not turn a grouped
@@ -1108,7 +1112,7 @@ too.
 
 | Path | Status |
 |---|---|
-| Source block-FP8 W8A16, dense + DSV4 grouped `wo_a` | **Implemented in 0.8.5; target-only DSV4 candidate load/generation passed on the exact 0.8.6 runtime; final clean-commit replay pending.** Raw E4M3/UE8M0 stays resident; BF16 activations are unchanged; actual flattened decode-token `M<=8` uses native CUDA GEMV and larger M uses bounded native BF16 expansion plus the owned CUTLASS grouped bridge. Grouped BMM is admitted only at `(G=8,N=1024,K=4096,tp=1)`; dense geometry is gated separately and also remains `tp=1` only. Direct MXFP8 g32 remains the separate opt-in W8A8 lane. DSpark is experimental and is not the release default; do not claim its served parity, graph, or 128k performance until the separate gates in RELEASING are recorded |
+| Source block-FP8 W8A16, dense + DSV4 grouped `wo_a` | **Implemented in 0.8.5; target-only DSV4 candidate load/generation passed on the exact 0.8.6 runtime; final clean-commit replay pending.** Raw E4M3/UE8M0 stays resident; BF16 activations are unchanged; actual flattened decode-token `M<=8` uses native CUDA GEMV and larger M uses bounded native BF16 expansion plus the owned CUTLASS grouped bridge. Grouped BMM is admitted only at `(G=8,N=1024,K=4096)` and only at the measured shard degrees 1, 2 and 4; dense geometry is gated separately and shards under the alignment law. Direct MXFP8 g32 remains the separate opt-in W8A8 lane. DSpark is experimental and is not the release default; do not claim its served parity, graph, or 128k performance until the separate gates in RELEASING are recorded |
 | FP8-CB decode (dense) | **Shipped**, at/above native parity |
 | FP4-CB v2 decode (dense) | **Shipped**: bit-matched CUDA GEMV (13/13 parity against the historical Triton result plus the independent expansion reference). The decode chain is compute-bound at GEMV shapes (ncu SM 71%/mem 44%) under the bit-exact contract — the measured ceiling, not a staging problem |
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |

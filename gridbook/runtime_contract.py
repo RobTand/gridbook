@@ -11,7 +11,7 @@ from importlib.resources import files
 from typing import Any, Mapping
 
 
-RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v7"
+RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v8"
 _RESOURCE_NAME = "runtime_contract.json"
 
 #: The vLLM package roots a ``top_level_loader_modules`` entry may name. The
@@ -53,11 +53,45 @@ _TP_ARMED_UNITS: dict[str, tuple[str, ...]] = {
     "mxfp8_e4m3_e8m0_g32": ("dense", "bmm"),
 }
 
+#: Arms whose serving method admits MORE than one rank under structural shard
+#: laws it enforces itself, keyed by (unit, arm) and pinned to the enforcement
+#: site's own constants.  The FP8-source W8A16 DENSE arm is the one entry
+#: (v7, 2026-08-23): ``gridbook/fp8_source_w8a16.py`` derives each Linear's
+#: shard degree from its ``create_weights`` arguments (never from
+#: ``layer.tp_size``, which vLLM stamps on replicated layers too) and refuses,
+#: before any parameter exists, any shard whose per-rank extent on the sharded
+#: axis is not a whole multiple of the 128-element source block — the exact
+#: condition under which vLLM's ``BlockQuantScaleParameter`` narrow indexes the
+#: UE8M0 block grid correctly.  Merged planes must satisfy it per fused role.
+#: An arm listed here publishes those LAWS and no numeric cap, because no
+#: enforcement site imposes one; an arm not listed here publishes a cap.
+_TP_LAW_ADMITTED_ARMS: dict[tuple[str, str], dict[str, Any]] = {
+    ("fp8_e4m3_ue8m0_block128", "dense"): {
+        "input_axis_group": 128,
+        "output_axis_quantum": 128,
+        "merged_roles": "per_role_group_multiple",
+    },
+    # The grouped arm obeys the same alignment law AND a closed list of
+    # measured shard degrees, because column-sharding a grouped plane divides
+    # the kernel's group count: alignment alone cannot admit a degree whose
+    # geometry nobody ran.  The list mirrors
+    # ``fp8_source_w8a16._DSV4_BMM_QUALIFIED_SHARD_DEGREES``.
+    ("fp8_e4m3_ue8m0_block128", "bmm"): {
+        "input_axis_group": 128,
+        "output_axis_quantum": 128,
+        "merged_roles": "per_role_group_multiple",
+        "qualified_shard_degrees": [1, 2, 4],
+    },
+}
+
 #: The exact grouped-BMM geometry each armed unit qualifies, keyed by
 #: (unit, arm).  Today only the FP8-source W8A16 BMM arm is pinned, to the
 #: constants in ``gridbook/fp8_source_w8a16.py`` (``_DSV4_BMM_GROUPS``,
-#: ``_DSV4_BMM_ROWS``, ``_DSV4_BMM_K``, enforced alongside
-#: ``_DSV4_RELEASE_TP``).  An arm without an entry here must omit
+#: ``_DSV4_BMM_ROWS``, ``_DSV4_BMM_K``).  The geometry is the UNSHARDED plane;
+#: which shard degrees of it are admitted is the separate
+#: ``qualified_shard_degrees`` list on the arm's ``shard_admission``, because
+#: column-sharding a grouped plane divides the kernel's group count and each
+#: degree is its own measurement.  An arm without an entry here must omit
 #: ``requires_geometry`` entirely.
 _TP_REQUIRED_GEOMETRY: dict[tuple[str, str], dict[str, int]] = {
     ("fp8_e4m3_ue8m0_block128", "bmm"): {
@@ -140,6 +174,12 @@ _EP_CB_ADMISSION: dict[str, str] = {
 _EP_REFUSED_UNITS: dict[str, int] = {
     "cb_moe_per_expert_format_groups": 1,
 }
+
+
+def _has_law_admitted_arm(unit_id: str, arms) -> bool:
+    """Whether any arm of *unit_id* is admitted above one rank by shard laws."""
+
+    return any((unit_id, arm) in _TP_LAW_ADMITTED_ARMS for arm in (arms or ()))
 
 
 class RuntimeContractError(ValueError):
@@ -265,9 +305,28 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
             expected = {"unit", "kind", "shard_admission"}
         elif kind == "source_passthrough_format":
             passthrough_units.add(unit_id)
-            expected = {"unit", "kind", "max_world_size"}
+            # Whether a unit is armed is a property of its enforcement sites,
+            # so a mismatch is named here rather than as a generic
+            # missing/unknown field.
+            armed = _TP_ARMED_UNITS.get(unit_id)
             if "arms" in row:
-                expected = expected | {"arms"}
+                if armed is None:
+                    _fail(f"{path}.arms",
+                          f"unit {unit_id!r} has one flat TP refusal site; "
+                          "publish one flat claim without 'arms'")
+                expected = {"unit", "kind", "arms"}
+            else:
+                if armed is not None:
+                    _fail(path,
+                          f"unit {unit_id!r} has per-arm TP refusal sites; it "
+                          f"must declare arms {sorted(armed)}")
+                expected = {"unit", "kind", "max_world_size"}
+            # A unit with a law-admitted arm publishes NO unit-level number:
+            # one scalar cannot cover an arm admitted by laws and an arm
+            # capped at one rank at the same time.  A unit whose every arm is
+            # capped keeps the cap, because a site does enforce it.
+            if not _has_law_admitted_arm(unit_id, armed):
+                expected = expected | {"max_world_size"}
         else:
             _fail(f"{path}.kind",
                   "must be 'cb_format_family' or 'source_passthrough_format'")
@@ -308,22 +367,16 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
                       "not divide evenly across ranks)")
             continue
 
-        cap = _positive_int(row["max_world_size"], f"{path}.max_world_size")
-        if cap != 1:
-            _fail(f"{path}.max_world_size",
-                  "must be 1; no enforcement site in this build allows more")
-
         required_arms = _TP_ARMED_UNITS.get(unit_id)
-        if "arms" not in row:
-            if required_arms is not None:
-                _fail(path,
-                      f"unit {unit_id!r} has per-arm TP refusal sites; it "
-                      f"must declare arms {sorted(required_arms)}")
-            continue
+        if "max_world_size" in row:
+            cap = _positive_int(row["max_world_size"],
+                                f"{path}.max_world_size")
+            if cap != 1:
+                _fail(f"{path}.max_world_size",
+                      "must be 1; no enforcement site in this build allows "
+                      "more")
         if required_arms is None:
-            _fail(f"{path}.arms",
-                  f"unit {unit_id!r} has one flat TP refusal site; publish "
-                  "one flat claim without 'arms'")
+            continue
         arms = row["arms"]
         if not isinstance(arms, list) or not arms:
             _fail(f"{path}.arms", "must be a non-empty JSON array")
@@ -331,25 +384,23 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
         for arm_index, arm_item in enumerate(arms):
             arm_path = f"{path}.arms[{arm_index}]"
             arm = _object(arm_item, arm_path)
-            arm_expected = {"arm", "max_world_size"}
+            arm_name = _string(arm.get("arm", ""), f"{arm_path}.arm")
+            law = _TP_LAW_ADMITTED_ARMS.get((unit_id, arm_name))
+            if law is None:
+                arm_expected = {"arm", "max_world_size"}
+            else:
+                arm_expected = {"arm", "shard_admission"}
             if "requires_geometry" in arm:
                 arm_expected = arm_expected | {"requires_geometry"}
             _keys(arm, arm_path, arm_expected)
-            arm_name = _string(arm["arm"], f"{arm_path}.arm")
             if arm_name not in required_arms:
                 _fail(f"{arm_path}.arm",
                       f"must be one of {sorted(required_arms)}")
             if arm_name in arm_names:
                 _fail(f"{path}.arms", f"duplicate arm {arm_name!r}")
             arm_names.append(arm_name)
-            arm_cap = _positive_int(arm["max_world_size"],
-                                    f"{arm_path}.max_world_size")
-            if arm_cap != 1:
-                _fail(f"{arm_path}.max_world_size",
-                      "must be 1; no enforcement site in this build allows "
-                      "more")
-            if arm_cap > cap:
-                _fail(f"{arm_path}.max_world_size", "exceeds the unit claim")
+            # The geometry pin is independent of how the arm is admitted: a
+            # law-admitted arm still names the unsharded plane it qualifies.
             geometry_key = (unit_id, arm_name)
             if geometry_key in _TP_REQUIRED_GEOMETRY:
                 pinned = _TP_REQUIRED_GEOMETRY[geometry_key]
@@ -360,6 +411,23 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
                 _fail(f"{arm_path}.requires_geometry",
                       f"is not pinned for {unit_id!r} arm {arm_name!r}; "
                       "omit it rather than under-specifying")
+            if law is not None:
+                admission_path = f"{arm_path}.shard_admission"
+                admission = _object(arm["shard_admission"], admission_path)
+                _keys(admission, admission_path, set(law))
+                for field, pinned in law.items():
+                    if admission[field] != pinned:
+                        _fail(f"{admission_path}.{field}",
+                              f"must equal {pinned!r} (the shard law "
+                              f"{unit_id!r} arm {arm_name!r} enforces at "
+                              "weight construction)")
+                continue
+            arm_cap = _positive_int(arm["max_world_size"],
+                                    f"{arm_path}.max_world_size")
+            if arm_cap != 1:
+                _fail(f"{arm_path}.max_world_size",
+                      "must be 1; no enforcement site in this build allows "
+                      "more")
         missing = sorted(set(required_arms) - set(arm_names))
         if missing:
             _fail(f"{path}.arms", f"missing arm claim(s): {missing}")
@@ -486,8 +554,8 @@ def validate_runtime_contract(contract: Any) -> None:
         _fail("contract.schema", f"must be {RUNTIME_CONTRACT_SCHEMA!r}")
     contract_version = _positive_int(
         root["contract_version"], "contract.contract_version")
-    if contract_version != 7:
-        _fail("contract.contract_version", "must be 7 for this schema")
+    if contract_version != 8:
+        _fail("contract.contract_version", "must be 8 for this schema")
 
     features = _object(root["abi_features"], "contract.abi_features")
     _keys(features, "contract.abi_features", {

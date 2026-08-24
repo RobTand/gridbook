@@ -3,10 +3,18 @@
 Since the shard-aware loading wave, dense CB Linears construct above one
 tensor-parallel rank under structural shard-alignment gates, while every
 other surface refuses by name at a numeric TP=1 ceiling.  As of schema
-``gridbook.runtime-contract.v7`` the packaged contract publishes exactly
+``gridbook.runtime-contract.v8`` the packaged contract publishes exactly
 that split as machine-readable per-unit rows, so a producer gate can branch
 on fields instead of prose (principle: an attested claim, never an asserted
 one).
+
+The same schema adds the second law-admitted surface: the FP8-source W8A16
+lane's DENSE arm, which enforces its own whole-128 shard laws at weight
+construction, while the same unit's grouped-BMM arm is admitted only at
+shard degrees whose divided group count was measured, because
+column-sharding a grouped plane divides the kernel's group count (a kernel
+qualification, not a law).  Admission for an armed unit is therefore
+published PER ARM.
 
 What is pinned here, without importing anything beyond the standard library,
 pytest, and the stdlib-only contract loader:
@@ -97,33 +105,61 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
     for fmt in ("fp8_e4m3_ue8m0_block128", "mxfp4_e2m1_ue8m0_g32",
                 "mxfp8_e4m3_e8m0_g32"):
         assert units[fmt]["kind"] == "source_passthrough_format"
-        assert units[fmt]["max_world_size"] == 1
         assert "shard_admission" not in units[fmt]
     # The two Gridbook-owned lanes branch on an execution arm with its own
-    # refusal site; the vLLM-native MXFP4 route does not.
+    # refusal site; the vLLM-native MXFP4 route does not.  An armed unit
+    # publishes admission per arm and carries NO unit-level number: one
+    # scalar cannot cover a law-admitted arm and a capped arm at once.
     assert "arms" not in units["mxfp4_e2m1_ue8m0_g32"]
+    assert units["mxfp4_e2m1_ue8m0_g32"]["max_world_size"] == 1
     for fmt in ("fp8_e4m3_ue8m0_block128", "mxfp8_e4m3_e8m0_g32"):
         arms = {arm["arm"]: arm for arm in units[fmt]["arms"]}
         assert set(arms) == {"dense", "bmm"}
-        assert all(arm["max_world_size"] == 1 for arm in arms.values())
-    # The one pinned execution geometry: FP8-source W8A16 grouped BMM.
-    bmm = {arm["arm"]: arm
-           for arm in units["fp8_e4m3_ue8m0_block128"]["arms"]}["bmm"]
+    # MXFP8 has no sharded audit on either arm: both stay numerically capped,
+    # and so the unit-level cap of 1 remains a number a site enforces.
+    mxfp8_arms = {arm["arm"]: arm
+                  for arm in units["mxfp8_e4m3_e8m0_g32"]["arms"]}
+    assert units["mxfp8_e4m3_e8m0_g32"]["max_world_size"] == 1
+    assert all(arm["max_world_size"] == 1 for arm in mxfp8_arms.values())
+    # The FP8-source unit publishes NO unit-level number: admission differs
+    # per arm, and one scalar could not carry both arms' rules.
+    assert "max_world_size" not in units["fp8_e4m3_ue8m0_block128"]
+    fp8_arms = {arm["arm"]: arm
+                for arm in units["fp8_e4m3_ue8m0_block128"]["arms"]}
+    # The one pinned execution geometry: FP8-source W8A16 grouped BMM.  The
+    # geometry names the UNSHARDED plane; the degrees say which shards of it
+    # were measured.  Both are needed -- alignment alone cannot admit a group
+    # count nobody ran.
+    bmm = fp8_arms["bmm"]
+    assert "max_world_size" not in bmm
     assert bmm["requires_geometry"] == {
         "bmm_groups": 8,
         "rows_per_group": 1024,
         "k": 4096,
     }
-    dense = {arm["arm"]: arm
-             for arm in units["fp8_e4m3_ue8m0_block128"]["arms"]}["dense"]
+    assert bmm["shard_admission"] == {
+        "input_axis_group": 128,
+        "output_axis_quantum": 128,
+        "merged_roles": "per_role_group_multiple",
+        "qualified_shard_degrees": [1, 2, 4],
+    }
+    # The dense arm publishes the same laws and NO degree list: alignment is
+    # the whole rule there, exactly like the dense CB families.
+    dense = fp8_arms["dense"]
+    assert "max_world_size" not in dense
     assert "requires_geometry" not in dense
+    assert dense["shard_admission"] == {
+        "input_axis_group": 128,
+        "output_axis_quantum": 128,
+        "merged_roles": "per_role_group_multiple",
+    }
 
 
 def test_schema_and_contract_version_move_together():
     contract = load_runtime_contract()
-    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v7"
+    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v8"
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 7
+    assert contract["contract_version"] == 8
 
 
 # --- 2. Closed-world reading: absence means REFUSED ---------------------------
@@ -135,10 +171,10 @@ def _permitted(table: dict, unit: str, world_size: int, *, arm=None,
 
     Exactly one row named *unit* must exist (and the exact *arm* row for an
     armed unit); a numeric claim must cover *world_size*, any pinned geometry
-    must match exactly, and a ``cb_format_family`` row publishes no numeric
-    claim at all — admission above one rank is decided by its published
-    shard-admission laws at the runtime's weight construction, which fail
-    closed.  Anything else is a refusal.  There is no default.
+    must match exactly, and a row (or arm) that publishes ``shard_admission``
+    publishes no numeric claim at all — admission above one rank is decided by
+    its laws at the runtime's weight construction, which fail closed.
+    Anything else is a refusal.  There is no default.
     """
     rows = [row for row in table["units"] if row["unit"] == unit]
     if len(rows) != 1:
@@ -148,16 +184,27 @@ def _permitted(table: dict, unit: str, world_size: int, *, arm=None,
         # Dense CB: no numeric cap exists to compare against; the table
         # defers to the construction-time alignment gates for any size.
         return geometry is None and "max_world_size" not in row
-    if world_size > row["max_world_size"]:
+    if "max_world_size" in row and world_size > row["max_world_size"]:
         return False
     if "arms" not in row:
         return geometry is None
+    # A unit with a law-admitted arm carries no unit-level number at all;
+    # either way the arm decides.
     if arm is None:
         return False
     matches = [a for a in row["arms"] if a["arm"] == arm]
     if len(matches) != 1:
         return False
     arm_row = matches[0]
+    if "shard_admission" in arm_row:
+        if "max_world_size" in arm_row:
+            return False
+        degrees = arm_row["shard_admission"].get("qualified_shard_degrees")
+        if degrees is not None and world_size not in degrees:
+            return False
+        if "requires_geometry" in arm_row:
+            return geometry == arm_row["requires_geometry"]
+        return geometry is None
     if world_size > arm_row["max_world_size"]:
         return False
     if "requires_geometry" in arm_row:
@@ -177,6 +224,10 @@ def test_closed_world_lookup_refuses_what_the_table_does_not_claim():
     assert _permitted(
         table, "fp8_e4m3_ue8m0_block128", 1, arm="bmm",
         geometry={"bmm_groups": 8, "rows_per_group": 1024, "k": 4096})
+    # The second lifted surface: the FP8-source DENSE arm above one rank
+    # (its whole-128 construction laws decide the rest).
+    assert _permitted(table, "fp8_e4m3_ue8m0_block128", 2, arm="dense")
+    assert _permitted(table, "fp8_e4m3_ue8m0_block128", 8, arm="dense")
 
     # An unknown unit id has no row -> REFUSED.
     assert not _permitted(table, "NVFP4_CB_K99", 1)
@@ -186,14 +237,32 @@ def test_closed_world_lookup_refuses_what_the_table_does_not_claim():
     # without any new machinery — absence IS the refusal.
     assert not _permitted(table, "NVFP4_CB_S", 1)
     assert not _permitted(table, "NVFP4_CB_S", 2)
-    # A world size no numeric claim covers -> REFUSED.  Every passthrough
-    # unit is still capped at 1; only the dense CB rows defer.
+    # A world size no numeric claim covers -> REFUSED.
     for capped in ("fp8_e4m3_ue8m0_block128", "mxfp4_e2m1_ue8m0_g32",
                    "mxfp8_e4m3_e8m0_g32"):
         assert not _permitted(table, capped, 2)
         assert not _permitted(table, capped, 8)
+    for arm in ("dense", "bmm"):
+        assert not _permitted(table, "mxfp8_e4m3_e8m0_g32", 2, arm=arm)
+    # The FP8-source BMM arm names the UNSHARDED plane, so a consumer asks
+    # with G=8 and the degree it wants; only measured degrees are admitted.
+    dsv4_wo_a = {"bmm_groups": 8, "rows_per_group": 1024, "k": 4096}
+    assert _permitted(
+        table, "fp8_e4m3_ue8m0_block128", 2, arm="bmm", geometry=dsv4_wo_a)
+    assert _permitted(
+        table, "fp8_e4m3_ue8m0_block128", 4, arm="bmm", geometry=dsv4_wo_a)
+    # A degree past the measured list -> REFUSED, however aligned it is.
     assert not _permitted(
-        table, "fp8_e4m3_ue8m0_block128", 2, arm="dense")
+        table, "fp8_e4m3_ue8m0_block128", 8, arm="bmm", geometry=dsv4_wo_a)
+    # The per-rank group count is NOT what the row publishes; asking with it
+    # is asking about a plane the table never claimed -> REFUSED.
+    assert not _permitted(
+        table, "fp8_e4m3_ue8m0_block128", 2, arm="bmm",
+        geometry={"bmm_groups": 4, "rows_per_group": 1024, "k": 4096})
+    # And the geometry still has to match: a different plane -> REFUSED.
+    assert not _permitted(
+        table, "fp8_e4m3_ue8m0_block128", 2, arm="bmm",
+        geometry={"bmm_groups": 8, "rows_per_group": 2048, "k": 4096})
     # An armed unit consulted without naming the arm -> REFUSED.
     assert not _permitted(table, "mxfp8_e4m3_e8m0_g32", 1)
     # An arm name the unit does not publish -> REFUSED.
@@ -308,6 +377,62 @@ def _drop_geometry_pin(contract):
     del bmm["requires_geometry"]
 
 
+def _fp8_arm(contract, name):
+    row = _units_by_id(contract)["fp8_e4m3_ue8m0_block128"]
+    return next(arm for arm in row["arms"] if arm["arm"] == name)
+
+
+def _restore_unit_cap_on_an_armed_row(contract):
+    # An armed unit's admission is per arm; a unit-level scalar could not
+    # cover a law-admitted arm and a capped arm at once.
+    _units_by_id(contract)["fp8_e4m3_ue8m0_block128"]["max_world_size"] = 1
+
+
+def _cap_the_law_admitted_arm(contract):
+    _fp8_arm(contract, "dense")["max_world_size"] = 8
+
+
+def _drop_the_dense_shard_law(contract):
+    del _fp8_arm(contract, "dense")["shard_admission"]
+
+
+def _corrupt_the_dense_input_axis_law(contract):
+    _fp8_arm(contract, "dense")["shard_admission"]["input_axis_group"] = 256
+
+
+def _relax_the_dense_merged_role_law(contract):
+    _fp8_arm(contract, "dense")["shard_admission"]["merged_roles"] = \
+        "even_division"
+
+
+def _law_on_an_unadmitted_arm(contract):
+    # MXFP8 has no sharded audit on either arm, so neither may publish a law
+    # in place of the number a site actually enforces.
+    row = _units_by_id(contract)["mxfp8_e4m3_e8m0_g32"]
+    row["arms"][0]["shard_admission"] = {
+        "input_axis_group": 128,
+        "output_axis_quantum": 128,
+        "merged_roles": "per_role_group_multiple",
+    }
+
+
+def _cap_the_bmm_arm_again(contract):
+    _fp8_arm(contract, "bmm")["max_world_size"] = 2
+
+
+def _widen_the_bmm_degrees(contract):
+    # TP=8 leaves one group per rank; the kernel was never run there.
+    _fp8_arm(contract, "bmm")["shard_admission"][
+        "qualified_shard_degrees"] = [1, 2, 4, 8]
+
+
+def _drop_the_bmm_degree_list(contract):
+    # Without it the arm would read as "any aligned degree", which is exactly
+    # the claim the grouped kernel does not support.
+    del _fp8_arm(contract, "bmm")["shard_admission"][
+        "qualified_shard_degrees"]
+
+
 def _invent_geometry_pin(contract):
     row = _units_by_id(contract)["mxfp8_e4m3_e8m0_g32"]
     row["arms"][1]["requires_geometry"] = {
@@ -337,6 +462,15 @@ def _invent_geometry_pin(contract):
         (_corrupt_geometry_pin, "must equal"),
         (_drop_geometry_pin, "must equal"),
         (_invent_geometry_pin, "not pinned"),
+        (_restore_unit_cap_on_an_armed_row, "unknown field.*max_world_size"),
+        (_cap_the_law_admitted_arm, "unknown field.*max_world_size"),
+        (_drop_the_dense_shard_law, "missing field.*shard_admission"),
+        (_corrupt_the_dense_input_axis_law, "must equal 128"),
+        (_relax_the_dense_merged_role_law, "must equal"),
+        (_law_on_an_unadmitted_arm, "unknown field.*shard_admission"),
+        (_cap_the_bmm_arm_again, "unknown field.*max_world_size"),
+        (_widen_the_bmm_degrees, "must equal"),
+        (_drop_the_bmm_degree_list, "missing field"),
     ],
 )
 def test_validator_rejects_tables_that_overclaim_or_underclaim(
@@ -500,22 +634,27 @@ def test_config_dispatch_policy_matches_the_published_split():
     assert len(cb_arms) == 3
 
 
-def test_fp8_source_geometry_rows_match_the_lane_constants():
-    """The geometry pin restates fp8_source_w8a16's own constants."""
-    source, tree = _source("gridbook/fp8_source_w8a16.py")
+def _lane_constants(tree, prefix: str) -> dict:
     constants = {}
     for node in tree.body:
         if (isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Constant)):
+                and isinstance(node.value, (ast.Constant, ast.Tuple))):
             name = node.targets[0].id
-            if name.startswith("_DSV4_"):
-                constants[name] = node.value.value
+            if name.startswith(prefix):
+                constants[name] = ast.literal_eval(node.value)
+    return constants
+
+
+def test_fp8_source_geometry_rows_match_the_lane_constants():
+    """The BMM geometry pin restates fp8_source_w8a16's own constants."""
+    source, tree = _source("gridbook/fp8_source_w8a16.py")
+    constants = _lane_constants(tree, "_DSV4_")
     assert constants == {
         "_DSV4_BMM_GROUPS": 8,
         "_DSV4_BMM_ROWS": 1024,
         "_DSV4_BMM_K": 4096,
-        "_DSV4_RELEASE_TP": 1,
+        "_DSV4_BMM_QUALIFIED_SHARD_DEGREES": (1, 2, 4),
     }
 
     row = _units_by_id(load_runtime_contract())["fp8_e4m3_ue8m0_block128"]
@@ -525,10 +664,73 @@ def test_fp8_source_geometry_rows_match_the_lane_constants():
         "rows_per_group": constants["_DSV4_BMM_ROWS"],
         "k": constants["_DSV4_BMM_K"],
     }
-    assert arms["dense"]["max_world_size"] == constants["_DSV4_RELEASE_TP"]
-    # The refusal texts those rows attest to.
+    # The BMM arm publishes the MEASURED shard degrees rather than a cap:
+    # sharding a grouped plane divides the kernel's group count, so each
+    # degree is its own qualification and the list is the enforcement site's.
+    assert "max_world_size" not in arms["bmm"]
+    assert arms["bmm"]["shard_admission"]["qualified_shard_degrees"] == \
+        list(constants["_DSV4_BMM_QUALIFIED_SHARD_DEGREES"])
     assert "qualified only for grouped" in source
-    assert "release-gated only" in source
+
+    # And the qualified table the refusal consults is built from exactly
+    # those constants, so a row cannot outlive the geometry it names.
+    qualified = _function(tree, "_qualified_bmm_geometries")
+    named = {node.id for node in ast.walk(qualified)
+             if isinstance(node, ast.Name)}
+    assert set(constants) <= named, \
+        "the qualified geometry table must be built from the pinned constants"
+
+
+def test_fp8_source_dense_shard_laws_match_the_lane_gate():
+    """The dense arm's published laws restate the lane's construction gate.
+
+    The lane is the enforcement site, so the number is derived from its
+    module constant rather than asserted here, and the structural facts the
+    law depends on -- degrees taken from ``create_weights``' arguments, not
+    from ``layer.tp_size``, and the refusal raised at construction -- are
+    pinned against the source.
+    """
+    source, tree = _source("gridbook/fp8_source_w8a16.py")
+    alignment = _lane_constants(tree, "_TP_SHARD_ALIGNMENT")
+    assert alignment == {"_TP_SHARD_ALIGNMENT": 128}
+    # The literal is tied to the source block size by an import-time guard,
+    # so it cannot drift away from the format it describes.
+    assert "if _TP_SHARD_ALIGNMENT != DS_BLOCK:" in source
+
+    error_cls = next((node for node in ast.walk(tree)
+                      if isinstance(node, ast.ClassDef)
+                      and node.name == "ShardAlignmentError"), None)
+    assert error_cls is not None, "the structured shard refusal must exist"
+    assert any(isinstance(base, ast.Name) and base.id == "ValueError"
+               for base in error_cls.bases), \
+        "callers may catch the structured refusal as ValueError"
+
+    create_weights = _function(tree, "create_weights")
+    called = {node.func.id for node in ast.walk(create_weights)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    assert {"_resolve_shard_plan", "_require_shard_alignment"} <= called, \
+        "weight construction must resolve and gate the shard plan"
+    # The degrees come from the ARGUMENTS.  vLLM stamps tp_size on replicated
+    # layers too (DSv4 has 64 of them), so tp_size cannot decide this.
+    plan = _function(tree, "_resolve_shard_plan")
+    plan_source = ast.get_source_segment(source, plan) or ""
+    assert "input_size_per_partition" in plan_source
+    assert "output_partition_sizes" in plan_source
+    assert "tp_size" not in plan_source
+
+    gate = _function(tree, "_require_shard_alignment")
+    gate_source = ast.get_source_segment(source, gate) or ""
+    assert "_TP_SHARD_ALIGNMENT" in gate_source
+    assert "row_degree" in gate_source and "col_degree" in gate_source
+
+    arms = {arm["arm"]: arm for arm
+            in _units_by_id(load_runtime_contract())[
+                "fp8_e4m3_ue8m0_block128"]["arms"]}
+    admission = arms["dense"]["shard_admission"]
+    assert admission["input_axis_group"] == alignment["_TP_SHARD_ALIGNMENT"]
+    assert admission["output_axis_quantum"] == alignment["_TP_SHARD_ALIGNMENT"]
+    assert admission["merged_roles"] == "per_role_group_multiple"
+    assert "max_world_size" not in arms["dense"]
 
 
 def test_mxfp8_bmm_row_matches_the_lane_audit_gate():

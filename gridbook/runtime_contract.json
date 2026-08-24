@@ -1,6 +1,6 @@
 {
-  "schema": "gridbook.runtime-contract.v7",
-  "contract_version": 7,
+  "schema": "gridbook.runtime-contract.v8",
+  "contract_version": 8,
   "abi_features": {
     "dspark_construction_physical_bridge": 1,
     "routed_moe_per_role_codebook_lut": 1,
@@ -147,15 +147,27 @@
       {
         "unit": "fp8_e4m3_ue8m0_block128",
         "kind": "source_passthrough_format",
-        "max_world_size": 1,
         "arms": [
           {
             "arm": "dense",
-            "max_world_size": 1
+            "shard_admission": {
+              "input_axis_group": 128,
+              "output_axis_quantum": 128,
+              "merged_roles": "per_role_group_multiple"
+            }
           },
           {
             "arm": "bmm",
-            "max_world_size": 1,
+            "shard_admission": {
+              "input_axis_group": 128,
+              "output_axis_quantum": 128,
+              "merged_roles": "per_role_group_multiple",
+              "qualified_shard_degrees": [
+                1,
+                2,
+                4
+              ]
+            },
             "requires_geometry": {
               "bmm_groups": 8,
               "rows_per_group": 1024,

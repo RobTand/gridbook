@@ -29,7 +29,7 @@ serving environment and `--no-deps` when its stack is already managed (see
 | **CUDA toolchain** | `nvcc` on `PATH` (or `CUDA_HOME` set) **in the serving process** | The kernels are JIT-compiled at runtime, not at install time. Missing `nvcc` may not fail package installation, but a required native serving operation fails closed when its extension cannot build. |
 | **PyTorch** | the build your vLLM uses | Measured: `2.11.0+cu130`. Installing gridbook into a fresh environment can pull a *generic* PyPI torch that does not match your CUDA — install into the vLLM environment instead. |
 | **vLLM** | already installed | Measured against `0.23.1rc1.dev764+g54b16d8a9`. |
-| **Parallelism** | `tp=1` for everything except dense CB Linears | Dense CB Linears shard at load time (superblock-aligned, structured refusal on illegal boundaries). MoE, delegated groups and passthrough units refuse above one. See [known limits](#known-limits). |
+| **Parallelism** | `tp=1` except for dense CB Linears and FP8 source-passthrough Linears | Dense CB Linears shard at load time (superblock-aligned, structured refusal on illegal boundaries); dense FP8 source-passthrough Linears shard on whole 128-element source blocks per fused role; grouped-BMM passthrough units shard only at the measured degrees 1, 2 and 4. MoE, delegated groups, quantized embeddings and mixed-format fused planes refuse above one. See [known limits](#known-limits). |
 
 ---
 
@@ -375,15 +375,24 @@ discrete GPU with its own VRAM, ordinary vLLM utilization guidance applies.
 
 ## Known limits
 
-- **Tensor parallel: dense CB Linears only above one rank.** Since
-  2026-08-23 dense CB Linears load shard-aware at `--tensor-parallel-size >
-  1` (whole packed rows on the output axis, superblock-aligned byte windows
-  on the input axis; a boundary that would split a group is a structured
-  construction-time refusal). Delegated compressed-tensors groups,
-  source-passthrough units, quantized embedding units and mixed-format fused
-  projections refuse at construction naming themselves.
-  No cross-node serve has been measured on this hardware; treat TP>1 as a
-  correctness feature for models that do not fit one box, not a speedup.
+- **Tensor parallel: dense CB and dense FP8-source Linears above one rank.**
+  Since 2026-08-23 dense CB Linears load shard-aware at
+  `--tensor-parallel-size > 1` (whole packed rows on the output axis,
+  superblock-aligned byte windows on the input axis; a boundary that would
+  split a group is a structured construction-time refusal), and dense
+  `fp8_e4m3_ue8m0_block128` source-passthrough Linears do the same under
+  their own law: each rank's extent on the sharded axis must be a whole
+  multiple of the 128-element source block, per fused role on a merged plane,
+  because vLLM narrows the UE8M0 scale plane over the block grid by ceil
+  division. The same format's **grouped-BMM** units shard only at the
+  degrees whose grouped geometry was measured (1, 2 and 4 — sharding a
+  grouped plane divides the kernel's group count, so each degree is its own
+  qualification); a degree outside that list is refused. Delegated
+  compressed-tensors groups, other source-passthrough formats, quantized
+  embedding units and mixed-format fused projections refuse at construction
+  naming themselves; routed CB MoE has its own axis, below. No cross-node
+  serve has been measured on this hardware; treat TP>1 as a correctness
+  feature for models that do not fit one box, not a speedup.
 - **Routed CB MoE needs `--enable-expert-parallel`, not `-tp` alone.** A CB
   expert stack's last dimension is superblock bytes, not input columns, so a
   tensor-parallel split would cut a packed superblock. Above one rank serve

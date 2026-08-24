@@ -130,10 +130,15 @@ def _assert_reassociated_close(got: torch.Tensor, expected: torch.Tensor,
 
 
 def _layer_for(q: torch.Tensor, scales: torch.Tensor, *, groups: int = 1,
-               monkeypatch=None):
+               monkeypatch=None, shard_degree: int = 1):
     method = build_fp8_source_w8a16_method(WIRE_FP8_BLOCK128)
     layer = torch.nn.Module()
-    layer.tp_size = 1
+    layer.tp_size = shard_degree
+    if shard_degree > 1:
+        # What create_weights would have stamped for a column-parallel plane
+        # at this degree; the finalize path reads the plan, never tp_size.
+        setattr(layer, source_lane._SHARD_ATTR,
+                source_lane.ShardPlan(row_degree=1, col_degree=shard_degree))
     layer.register_parameter(
         "weight", torch.nn.Parameter(q, requires_grad=False))
     layer.register_parameter(
@@ -171,9 +176,22 @@ def test_raw_gemv_m1_m2_m4_m8_matches_independent_oracle(m):
 
 
 @pytest.mark.parametrize("n,k", [
+    # Whole-model (TP=1) planes.
     (8192, 4096),
     (32768, 1024),
     (4096, 8192),
+    (2048, 4096),
+    (4096, 2048),
+    # The per-rank planes a TP=2 serve actually hands the kernel: wq_b
+    # (32768,1024) and wo_a (8192,4096) cut on the output axis, wo_b
+    # (4096,8192) and down_proj (4096,2048) cut on the input axis, and one
+    # shared-expert gate/up role (2048,4096) cut on the output axis. Every
+    # local extent is a multiple of the 128 source block, so these are the
+    # shapes the shard law admits rather than shapes chosen for coverage.
+    (16384, 1024),
+    (4096, 4096),
+    (4096, 1024),
+    (1024, 4096),
 ])
 def test_decode_covers_each_distinct_dsv4_source_shape(n, k):
     q, scales = _raw_planes(n, k, seed=n + k)
@@ -271,16 +289,101 @@ def test_grouped_whole_method_decode_and_prefill_are_isolated(monkeypatch):
     assert torch.count_nonzero(got[:, 4:]) == 0
 
 
-def test_exact_dsv4_wo_a_geometry_decode_and_prefill(monkeypatch):
+@pytest.mark.parametrize("shard_degree", [1, 2, 4])
+def test_exact_dsv4_wo_a_geometry_decode_and_prefill(monkeypatch,
+                                                    shard_degree):
+    """The whole-method path at every qualified shard degree.
+
+    Degree 1 is the whole plane; degrees 2 and 4 are one rank's contiguous
+    group slice, which is what the lane finalizes for a TP=2 / TP=4 serve.
+    Both the decode (m=1) and prefill (m=9) arms run.
+    """
+
     groups, rows, k = 8, 1024, 4096
     q, scales = _raw_planes(groups * rows, k, seed=61)
+    local_groups = groups // shard_degree
+    local_rows = local_groups * rows
+    q = q[:local_rows].contiguous()
+    scales = scales[:local_rows // 128].contiguous()
     method, layer = _layer_for(
-        q, scales, groups=groups, monkeypatch=monkeypatch)
+        q, scales, groups=local_groups, monkeypatch=monkeypatch,
+        shard_degree=shard_degree)
+    assert layer._fp8_source_shard_degree == shard_degree
+    assert layer._fp8_source_groups == local_groups
     for m in (1, 9):
-        x = torch.randn(m, groups, k, device=DEV, dtype=torch.bfloat16) * 0.125
+        x = torch.randn(
+            m, local_groups, k, device=DEV, dtype=torch.bfloat16) * 0.125
         got = method.apply(layer, x)
-        expected = _reference(x, q, scales, groups=groups)
+        expected = _reference(x, q, scales, groups=local_groups)
         _assert_reassociated_close(got, expected, limit=4e-3)
+
+
+# The DSv4 wo_a tolerance: the same 4e-3 the unsharded geometry above uses,
+# so a sharded call is held to the qualified call's bar and not a looser one.
+_DSV4_WO_A_REL_L2_LIMIT = 4e-3
+
+
+@pytest.mark.parametrize("shard_degree", [2, 4])
+def test_sharded_wo_a_reproduces_the_unsharded_group_slice(shard_degree):
+    """Column-sharding DSv4 `wo_a` is the same call over fewer groups.
+
+    vLLM narrows a column-parallel plane at `rank * N_local`, and the wo_a
+    plane is group-major with 1024 rows per group, so rank `r` of a degree-`d`
+    shard holds exactly groups `[r*G/d, (r+1)*G/d)` of the full G=8 plane.
+    This measures the claim the qualification rests on: every rank -- not just
+    rank 0, so the group-offset arithmetic is exercised -- reproduces its
+    columns of the *full* G=8 call, and agrees with the independent oracle on
+    its own slice.
+
+    Against the full call the bar is BITWISE on both paths: the group count is
+    the kernel's batch dimension and does not enter any single output's
+    K-reduction, so sharding may not perturb one bit.  Against the oracle the
+    bar stays the qualified tolerance, because that comparison is
+    reassociation-class by construction (a different reduction order, not a
+    different plane).
+    """
+
+    groups, rows, k = 8, 1024, 4096
+    q, scales = _raw_planes(groups * rows, k, seed=61)
+    local_groups = groups // shard_degree
+    local_rows = local_groups * rows
+    local_scale_rows = local_rows // 128
+    x = torch.randn(1, groups, k, device=DEV, dtype=torch.bfloat16) * 0.125
+
+    full_weight = SOURCE_EXT.fp8_source_expand_bf16(q, scales)
+    full_out = SOURCE_EXT.fp8_source_gemv(
+        x, q, scales, groups).reshape(1, groups, rows)
+
+    for rank in range(shard_degree):
+        value_rows = slice(rank * local_rows, (rank + 1) * local_rows)
+        # Exactly vLLM's block-scale narrow: start = rank * ceil(N_local/128).
+        scale_rows = slice(rank * local_scale_rows,
+                           (rank + 1) * local_scale_rows)
+        held_groups = slice(rank * local_groups, (rank + 1) * local_groups)
+        q_local = q[value_rows].contiguous()
+        scales_local = scales[scale_rows].contiguous()
+        x_local = x[:, held_groups].contiguous()
+
+        local_weight = SOURCE_EXT.fp8_source_expand_bf16(q_local, scales_local)
+        assert torch.equal(local_weight.view(torch.int16),
+                           full_weight[value_rows].view(torch.int16)), \
+            f"rank {rank} expand differs from the full plane's rows"
+        assert torch.equal(
+            local_weight.view(torch.int16),
+            _weight_oracle(q_local, scales_local).view(torch.int16))
+
+        local_out = SOURCE_EXT.fp8_source_gemv(
+            x_local, q_local, scales_local,
+            local_groups).reshape(1, local_groups, rows)
+        _assert_reassociated_close(
+            local_out, _reference(x_local, q_local, scales_local,
+                                  groups=local_groups),
+            limit=_DSV4_WO_A_REL_L2_LIMIT)
+        assert torch.equal(
+            local_out.view(torch.int16),
+            full_out[:, held_groups].view(torch.int16)), \
+            f"rank {rank} GEMV differs from the full call's columns"
+        assert torch.isfinite(local_out).all()
 
 
 def test_fullgraph_contains_only_the_outer_source_dispatch_node():

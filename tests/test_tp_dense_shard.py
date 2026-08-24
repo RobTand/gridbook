@@ -744,15 +744,47 @@ def test_delegated_stock_group_refuses_at_live_tp2(monkeypatch):
         cfg.get_quant_method(_linear_layer(), f"{_L0}.mlp.sometarget")
 
 
-def test_source_passthrough_unit_refuses_at_live_tp2(monkeypatch):
+def test_unsharded_source_passthrough_unit_refuses_at_live_tp2(monkeypatch):
+    """A passthrough format with NO sharded audit still refuses by name.
+
+    The MXFP8 dense lane has no shard laws of its own, so the config gate is
+    what keeps it at one rank.
+    """
     _world_size(monkeypatch, 2)
+    cfg = _resolved_config(extra={
+        "source_passthrough": {
+            "version": 1,
+            "units": {f"{_L0}.attn.wq_a": "mxfp8_e4m3_e8m0_g32"},
+        }})
+    with pytest.raises(ValueError, match="source-passthrough.*mxfp8"):
+        cfg.get_quant_method(_linear_layer(), f"{_L0}.attn.wq_a")
+
+
+def test_fp8_source_passthrough_unit_dispatches_at_live_tp2(monkeypatch):
+    """The lifted lane: dispatch no longer refuses; its own laws decide.
+
+    The FP8-source W8A16 lane enforces structural shard laws inside
+    ``create_weights``, so the config gate hands the unit through and the
+    per-rank legality is decided where the shapes are known.  The downstream
+    device/backend attestations are stubbed here: what is under test is the
+    DISPATCH decision, not the audit that follows it.
+    """
+    _world_size(monkeypatch, 2)
+    sentinel = object()
+    monkeypatch.setattr(config_mod, "_live_device_capability",
+                        lambda: (12, 1))
+    monkeypatch.setattr(config_mod, "_build_passthrough_method",
+                        lambda fmt, layer, prefix: sentinel)
+    monkeypatch.setattr(config_mod, "require_native_passthrough_backend",
+                        lambda **kwargs: None)
     cfg = _resolved_config(extra={
         "source_passthrough": {
             "version": 1,
             "units": {f"{_L0}.attn.wq_a": "fp8_e4m3_ue8m0_block128"},
         }})
-    with pytest.raises(ValueError, match="source-passthrough.*block128"):
-        cfg.get_quant_method(_linear_layer(), f"{_L0}.attn.wq_a")
+
+    assert cfg.get_quant_method(
+        _linear_layer(), f"{_L0}.attn.wq_a") is sentinel
 
 
 def test_moe_expert_stack_refuses_at_live_tp2_even_in_dense_artifact(
@@ -854,12 +886,12 @@ def test_refusal_message_carries_surface_name_prefix_and_degree(monkeypatch):
     cfg = _resolved_config(extra={
         "source_passthrough": {
             "version": 1,
-            "units": {f"{_L0}.attn.wq_a": "fp8_e4m3_ue8m0_block128"},
+            "units": {f"{_L0}.attn.wq_a": "mxfp8_e4m3_e8m0_g32"},
         }})
     with pytest.raises(ValueError) as exc:
         cfg.get_quant_method(_linear_layer(), f"{_L0}.attn.wq_a")
     message = str(exc.value)
-    assert "source-passthrough unit format 'fp8_e4m3_ue8m0_block128'" \
+    assert "source-passthrough unit format 'mxfp8_e4m3_e8m0_g32'" \
         in message
     assert f"'{_L0}.attn.wq_a'" in message
     assert "TP=3" in message

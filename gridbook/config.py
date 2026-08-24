@@ -50,6 +50,11 @@ from .source_passthrough import (
     parse_declaration as _parse_passthrough_declaration,
     require_audited_device as _require_passthrough_device,
 )
+from .fp8_source_w8a16 import (
+    # The ONE passthrough lane whose own weight construction enforces
+    # structural tensor-parallel shard laws; see _delegate_passthrough.
+    WIRE_FP8_BLOCK128 as _WIRE_FP8_BLOCK128_TP,
+)
 from .embedding import (
     EmbeddingFormat as _EmbeddingFormat,
     parse_declaration as _parse_embedding_declaration,
@@ -1489,15 +1494,21 @@ class PrismaQuantConfig(QuantizationConfig):
            ``self.mxfp4_backend`` / ``self.experts_cls``), so the check happens
            the moment the constructor returns — still model-load time, still
            before any weights are processed.
-        3. **Tensor parallel.**  Every passthrough lane is a Gridbook-owned
-           kernel contract attested at TP=1 only (the source-FP8 lane pins
-           TP=1 in its own release gate; the MXFP8 dense lane has no sharded
-           audit at all), so the lane refuses above one HERE rather than
-           discovering it after weights are copied.
+        3. **Tensor parallel.**  A passthrough lane may be served above one
+           rank only when the lane itself enforces structural shard laws at
+           weight construction.  The source-FP8 W8A16 lane does
+           (``fp8_source_w8a16._require_shard_alignment``: whole-128 local
+           extents on the sharded axis, per-role alignment on merged planes,
+           and its grouped-BMM arm admitted only at a MEASURED shard degree,
+           since column-sharding a grouped plane divides the kernel's group
+           count).  Every other passthrough format has no sharded audit at
+           all, so it refuses above one HERE rather than discovering it after
+           weights are copied.
         """
 
-        self._require_tp1_serving(
-            f"the source-passthrough unit format {fmt.id!r}", prefix)
+        if fmt.id != _WIRE_FP8_BLOCK128_TP:
+            self._require_tp1_serving(
+                f"the source-passthrough unit format {fmt.id!r}", prefix)
         _require_passthrough_device(
             fmt, prefix=prefix, capability=_live_device_capability())
         method = _build_passthrough_method(fmt, layer, prefix)
