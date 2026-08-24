@@ -333,9 +333,14 @@ def test_sharded_wo_a_reproduces_the_unsharded_group_slice(shard_degree):
     This measures the claim the qualification rests on: every rank -- not just
     rank 0, so the group-offset arithmetic is exercised -- reproduces its
     columns of the *full* G=8 call, and agrees with the independent oracle on
-    its own slice.  Bitwise on the expand path, since decode is elementwise;
-    within the qualified tolerance on the GEMV path, whose K-reduction may
-    reassociate.
+    its own slice.
+
+    Against the full call the bar is BITWISE on both paths: the group count is
+    the kernel's batch dimension and does not enter any single output's
+    K-reduction, so sharding may not perturb one bit.  Against the oracle the
+    bar stays the qualified tolerance, because that comparison is
+    reassociation-class by construction (a different reduction order, not a
+    different plane).
     """
 
     groups, rows, k = 8, 1024, 4096
@@ -374,8 +379,11 @@ def test_sharded_wo_a_reproduces_the_unsharded_group_slice(shard_degree):
             local_out, _reference(x_local, q_local, scales_local,
                                   groups=local_groups),
             limit=_DSV4_WO_A_REL_L2_LIMIT)
-        _assert_reassociated_close(local_out, full_out[:, held_groups],
-                                   limit=_DSV4_WO_A_REL_L2_LIMIT)
+        assert torch.equal(
+            local_out.view(torch.int16),
+            full_out[:, held_groups].view(torch.int16)), \
+            f"rank {rank} GEMV differs from the full call's columns"
+        assert torch.isfinite(local_out).all()
 
 
 def test_fullgraph_contains_only_the_outer_source_dispatch_node():
