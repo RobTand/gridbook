@@ -26,6 +26,7 @@ codec = pytest.importorskip(
     "gridbook.codec",
     reason="gridbook plugin not importable")
 from gridbook.cuda_ext import get_ext  # noqa: E402
+from gridbook.runtime_contract import load_runtime_contract  # noqa: E402
 from cb_torch_reference import (  # noqa: E402
     cb_linear_reference,
     decode_cb_values,
@@ -45,6 +46,24 @@ ART = "fp8cb_k44"
 PICK = ["model.layers.5.mlp.down_proj", "model.layers.5.mlp.gate_proj",
         "model.layers.0.self_attn.q_proj"]
 _REF_REL = 1e-2        # vs fp64 reconstruct (matches test_cb_kernels gate)
+
+
+def _fp8_producer_rungs() -> tuple[int, ...]:
+    """Read the physical correctness matrix from the packaged contract."""
+    row = next(
+        item for item in load_runtime_contract()["formats"]
+        if item["family"] == "FP8_CB_K"
+    )
+    return tuple(int(k) for k in row["producer_rungs"])
+
+
+_FP8_PRODUCER_RUNGS = _fp8_producer_rungs()
+# Keep physical probes for representative historical off-law reader rungs.
+# Producer coverage must never be inferred from this hand-picked set.
+_FP8_LEGACY_READER_PROBES = (29, 33, 42, 47)
+_FP8_PHYSICAL_RUNGS = tuple(sorted(
+    set(_FP8_PRODUCER_RUNGS) | set(_FP8_LEGACY_READER_PROBES)
+))
 
 
 def _assert_reference_close(y_cuda, y_reference, tag):
@@ -185,9 +204,16 @@ def test_gemv_matches_torch_reference_real_artifact(qname, M):
                             f"{qname} M={M}")
 
 
-@pytest.mark.parametrize("k", [29, 33, 36, 40, 42, 44, 47, 48])
+@pytest.mark.parametrize("k", _FP8_PHYSICAL_RUNGS,
+                         ids=[f"k{k}" for k in _FP8_PHYSICAL_RUNGS])
 @pytest.mark.parametrize("M", [1, 2, 4, 8, 16])
 def test_gemv_matches_torch_reference_all_rungs(k, M):
+    """Physically launch native decode at every contract producer rung.
+
+    The legacy probes keep reader compatibility exercised, while deriving the
+    producer half from ``runtime_contract.json`` prevents a ladder expansion
+    from outrunning physical correctness coverage again.
+    """
     p = _synth(k, seed=k)
     torch.manual_seed(k)
     x = torch.randn(M, p["K"], dtype=torch.bfloat16, device=DEV)
@@ -252,9 +278,14 @@ def test_fused_row_offset_two_roles():
                             "fused row-offset")
 
 
-@pytest.mark.parametrize("k", [29, 33, 36, 40, 42, 44, 47, 48])
+@pytest.mark.parametrize("k", _FP8_PHYSICAL_RUNGS,
+                         ids=[f"k{k}" for k in _FP8_PHYSICAL_RUNGS])
 def test_cuda_expand_bitexact_vs_torch_reference(k):
-    """The CUDA expander must match an independent packed-byte decode."""
+    """The CUDA expander must exactly decode every contract producer rung.
+
+    Historical irregular reader probes remain in the matrix as an independent
+    compatibility obligation.
+    """
     p = _synth(k, N=96, K=768, seed=100 + k)
     ref = decode_cb_values(
         p["qwp"], p["cb_flat"], p["row_off"], N=p["N"], K=p["K"],

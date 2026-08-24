@@ -154,7 +154,9 @@ def test_mixed_decode_contract_still_raises_before_the_role_check():
     """The pre-existing signature guard keeps its wording and its precedence."""
     cfg = _resolved([
         ([_leaf("gate_up_proj")], _scheme("cb.l1.w13.K28.sub0")),
-        ([_leaf("down_proj")], {**_scheme("cb.l1.down.K30.sub0"), "k": 30}),
+        ([_leaf("down_proj")], {
+            **_scheme("cb.l1.down.K30.sub0"), "k": 30, "type_size": 120,
+        }),
     ])
 
     with pytest.raises(ValueError, match="mixed CB decode/activation"):
@@ -470,6 +472,12 @@ def _distinct_books(k: int, count: int = 3):
     rounded book. Snapping makes these synthetic books legal inputs rather
     than suppressing the check with PRISMAQUANT_SKIP_CB_CAST_CHECK.
     """
+    # The callers invoke this helper before `_per_role_layer`, so keep the
+    # hardware prerequisite first.  Otherwise a CPU-only run without a
+    # PrismaQuant checkout reports a missing optional producer as the reason
+    # these physical-kernel tests did not run, hiding the real CUDA gate.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for per-role numerics")
     fmt = pytest.importorskip("prismaquant.nvfp4_cb_formats")
     from test_moe_grouped_fused import DEV
 
