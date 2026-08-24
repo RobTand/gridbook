@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from gridbook.cb_fill_guard import CB_FILLED_ATTR
+from gridbook.mixed_linear import MixedFusedShard
 from gridbook.moe_toplevel_loader import (
     _dspark_rename,
     _registered_mixed_source,
@@ -46,6 +47,14 @@ def _mixed_carrier(*, source: str, group: str) -> torch.Tensor:
     param._gridbook_mixed_fused_source = source
     param._gridbook_mixed_fused_group = group
     param._gridbook_mixed_fused_plane = "cb_qweight"
+    # The carrier ABI includes the narrowing law the real
+    # MixedFusedLinearMethod.create_weights stamps on every plane; the router
+    # refuses an unstamped carrier rather than assume a shard degree.  This
+    # stub is an unsharded, output_dim-less plane, which is what that method
+    # stamps for a bare tensor at tensor-parallel degree 1.
+    param._gridbook_mixed_fused_shard = MixedFusedShard(
+        col_degree=1, tp_rank=0, output_dim=None,
+        packed_dim=None, packed_factor=None)
     return param
 
 

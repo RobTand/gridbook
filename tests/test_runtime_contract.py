@@ -6,6 +6,7 @@ import copy
 import importlib.util
 import json
 import os
+import re
 from importlib.resources import files
 from pathlib import Path
 import subprocess
@@ -34,7 +35,7 @@ def test_packaged_contract_loads_and_validates():
     contract = load_runtime_contract()
     assert contract == raw
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 8
+    assert contract["contract_version"] == 9
     assert contract["abi_features"] == {
         "dspark_construction_physical_bridge": 1,
         "routed_moe_per_role_codebook_lut": 1,
@@ -245,3 +246,90 @@ def test_validation_rejects_incompatible_contracts(mutate, message):
     mutate(contract)
     with pytest.raises(RuntimeContractError, match=message):
         validate_runtime_contract(contract)
+
+
+# --- the version-pin set is derived, not remembered --------------------------
+
+#: Every file that pins the contract schema or its version number, relative to
+#: the repository root.  Bumping the schema means editing all of them in ONE
+#: commit: they are coupled by meaning, not by imports, so a missed one breaks
+#: nothing at the time and ships a stale pin instead.  The set was verified
+#: identical on both sides of the v7 -> v8 bump (T1/T2, 2026-08-23) and again
+#: at v8 -> v9; the literal below exists so that adding a NEW pin forces a
+#: conscious edit here rather than a silent miss at v10.
+_VERSION_PIN_FILES = frozenset({
+    "CHANGELOG.md",
+    "docs/PLUGIN.md",
+    "gridbook/runtime_contract.json",
+    "gridbook/runtime_contract.py",
+    "tests/test_runtime_contract.py",
+    "tests/test_runtime_contract_ep.py",
+    "tests/test_runtime_contract_tp.py",
+    # Added at v9.  This file asserts the SHAPE of every tensor-parallel row
+    # but pinned its schema only in a prose docstring, which no grep sees:
+    # the v8 bump left it reading "v7", and the v9 bump broke it for real
+    # (a third unit kind fell through its two-kind branch).  It now asserts
+    # the schema string, so it is in this set and the next bump must visit it.
+    "tests/test_target_namespace_compat.py",
+})
+
+#: The changelog is the ONE place a superseded schema string is still true:
+#: its entries are history and must keep naming the version they landed in.
+_STALE_SCHEMA_EXEMPT = frozenset({"CHANGELOG.md"})
+
+_PIN_PATTERN = re.compile(r"contract_version|runtime-contract\.v")
+_SCHEMA_PATTERN = re.compile(r"gridbook\.runtime-contract\.v(\d+)")
+_PIN_SUFFIXES = (".py", ".json", ".md")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _scan_for_version_pins() -> dict[str, str]:
+    """Every tracked-looking source file whose text pins the contract version.
+
+    Deliberately a walk rather than a shell-out: the point is that the set is
+    DERIVED from the tree at test time and compared against the literal above,
+    so a new pin cannot appear without this test failing.
+    """
+
+    root = _repo_root()
+    found: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if not name.startswith(".") and name != "__pycache__")
+        for filename in sorted(filenames):
+            if not filename.endswith(_PIN_SUFFIXES):
+                continue
+            path = Path(dirpath) / filename
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if _PIN_PATTERN.search(text):
+                found[str(path.relative_to(root))] = text
+    return found
+
+
+def test_every_contract_version_pin_is_in_the_declared_set():
+    assert set(_scan_for_version_pins()) == _VERSION_PIN_FILES
+
+
+def test_no_pin_file_carries_a_stale_schema_string():
+    """The current version is spelled out everywhere; older ones nowhere.
+
+    A pin that still names an older schema is the failure mode this guards:
+    it is not an import error, not a test failure anywhere else, and it ships.
+    """
+
+    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v9"
+    current = int(_SCHEMA_PATTERN.fullmatch(RUNTIME_CONTRACT_SCHEMA).group(1))
+
+    for name, text in _scan_for_version_pins().items():
+        assert RUNTIME_CONTRACT_SCHEMA in text, \
+            f"{name} pins the contract but never names {RUNTIME_CONTRACT_SCHEMA}"
+        if name in _STALE_SCHEMA_EXEMPT:
+            continue
+        stale = sorted({int(v) for v in _SCHEMA_PATTERN.findall(text)
+                        if int(v) < current})
+        assert not stale, \
+            f"{name} still names superseded contract schema version(s) {stale}"

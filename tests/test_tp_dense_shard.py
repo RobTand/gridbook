@@ -13,12 +13,15 @@ file pins the three facts that make that true instead of assumed:
    raises ``ShardGroupAlignmentError`` at weight construction, carrying
    qname / axis / group_size / tp_degree / shard_size as fields. Gates read
    the fields; ``str(exc)`` is rendered prose, never the contract.
-3. **The refusal lattice**: dense CB Linears construct at TP=2; MoE expert
-   stacks, delegated compressed-tensors groups, source-passthrough units,
-   quantized embeddings and mixed-format fused projections refuse AT
-   CONSTRUCTION naming themselves; unquantized (ignored) targets stay on
-   vLLM-native BF16 sharding; TP=1 and uninitialized-parallelism behave
-   exactly as before.
+3. **The refusal lattice**: dense CB Linears construct at TP=2, as do
+   qualified source-passthrough units and the mixed-format fused projections
+   composed from them (each role's own law gates its own carrier — see
+   ``test_fp8_source_w8a16_tp_shard.py`` and
+   ``test_mixed_fused_tp_shard.py``); MoE expert stacks, delegated
+   compressed-tensors groups, unqualified source-passthrough formats and
+   quantized embeddings refuse AT CONSTRUCTION naming themselves;
+   unquantized (ignored) targets stay on vLLM-native BF16 sharding; TP=1 and
+   uninitialized-parallelism behave exactly as before.
 
 Section 2 simulates the loader contract IN-PROCESS: there is one GPU in this
 box and no second rank, so vLLM's attested v2 narrowing arithmetic
@@ -809,8 +812,29 @@ def test_quantized_embedding_unit_refuses_at_live_tp2(monkeypatch):
         cfg.get_quant_method(embed, "model.embed_tokens")
 
 
-def test_mixed_format_fused_projection_refuses_at_live_tp2(monkeypatch):
+def test_mixed_format_fused_projection_dispatches_at_live_tp2(monkeypatch):
+    """The composite arm is admitted; each ROLE's own law gates it.
+
+    It used to refuse by name here.  It no longer owns a law of its own: the
+    composer derives the column degree from vLLM's constructor arguments and
+    builds each carrier at that role's whole-tensor output size, so the CB and
+    source-passthrough shard gates fire per role at ``create_weights``.  See
+    ``tests/test_mixed_fused_tp_shard.py`` for the byte placement.
+    """
+
+    from gridbook.mixed_linear import MixedFusedLinearMethod
+
     _world_size(monkeypatch, 2)
+    # As in the passthrough dispatch test above: the downstream device and
+    # backend attestations are stubbed, because what is under test here is
+    # the DISPATCH decision, not the audit that follows it.
+    sentinel = object()
+    monkeypatch.setattr(config_mod, "_live_device_capability",
+                        lambda: (12, 1))
+    monkeypatch.setattr(config_mod, "_build_passthrough_method",
+                        lambda fmt, layer, prefix: sentinel)
+    monkeypatch.setattr(config_mod, "require_native_passthrough_backend",
+                        lambda **kwargs: None)
     # up_proj must belong to exactly ONE vocabulary: it is the passthrough
     # role here, so leave it out of the CB group.
     cfg = _resolved_config(
@@ -821,8 +845,16 @@ def test_mixed_format_fused_projection_refuses_at_live_tp2(monkeypatch):
                 "version": 1,
                 "units": {f"{_L0}.mlp.up_proj": "fp8_e4m3_ue8m0_block128"},
             }})
+    cfg._has_mixed_fused_loader = types.MethodType(lambda self: True, cfg)
     # gate_proj stays CB, up_proj passthrough -> the composite arm.
-    with pytest.raises(ValueError, match="mixed-format fused projections"):
+    method = cfg.get_quant_method(_linear_layer(), f"{_L0}.mlp.gate_up_proj")
+    assert isinstance(method, MixedFusedLinearMethod)
+
+    # Without the top-level router the composite still refuses, because its
+    # loads cannot be addressed by the fused name; that refusal is about the
+    # loader ABI, not about the world size.
+    cfg._has_mixed_fused_loader = types.MethodType(lambda self: False, cfg)
+    with pytest.raises(RuntimeError, match="mixed-fused loader ABI 1"):
         cfg.get_quant_method(_linear_layer(), f"{_L0}.mlp.gate_up_proj")
 
 

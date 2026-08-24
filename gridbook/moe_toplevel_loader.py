@@ -396,6 +396,7 @@ _MIXED_GROUP_ATTR = "_gridbook_mixed_fused_group"
 _MIXED_SOURCE_ATTR = "_gridbook_mixed_fused_source"
 _MIXED_PLANE_ATTR = "_gridbook_mixed_fused_plane"
 _MIXED_FILLED_ATTR = "_gridbook_mixed_fused_filled"
+_MIXED_SHARD_ATTR = "_gridbook_mixed_fused_shard"
 _MIXED_CARRIER_MARKER = "._gridbook_mixed_roles."
 
 
@@ -461,6 +462,71 @@ def _mixed_plane_candidates(name: str) -> tuple[str, tuple[str, ...]] | None:
     if name.endswith(".scale"):
         return name[:-len(".scale")], ("weight_scale_inv", "weight_scale")
     return None
+
+
+def _narrow_mixed_plane(param_name: str, param, name: str,
+                        weight: torch.Tensor) -> torch.Tensor:
+    """This rank's slice of one WHOLE-tensor mixed fused checkpoint plane.
+
+    The checkpoint stores every role's plane whole; a rank above one must be
+    given the same slice of it that vLLM's own merged-column loader would have
+    given a standalone Linear of that role.  That loader narrows the incoming
+    tensor at ``(output_dim, tp_rank * shard_size, shard_size)`` AFTER it has
+    converted the offsets into the parameter's packed/block units — and for a
+    single-role carrier the converted ``shard_size`` is precisely the
+    destination's own extent along that axis.  So the destination extent IS
+    the narrowing law: no packing factor, block size or superblock count is
+    re-derived here, and none can drift out of step with the role method that
+    chose it.
+
+    A parameter with no ``output_dim`` (a per-tensor scalar) is replicated,
+    which is what vLLM's per-tensor scale loader does.  A plane that is not
+    exactly ``degree x`` the destination along the column axis is refused: at
+    degree 1 the loader must see byte-identical behaviour to the unsharded
+    path, and above it a plane that is ALREADY rank-local would otherwise be
+    copied whole onto every rank — a silent replicate of sharded weights,
+    which is the one failure this narrowing exists to prevent.
+    """
+
+    shard = getattr(param, _MIXED_SHARD_ATTR, None)
+    if shard is None:
+        raise ValueError(
+            f"mixed fused tensor {name!r} -> {param_name!r}: the carrier "
+            "parameter carries no shard stamp, so the rank-local slice of a "
+            "whole checkpoint plane is undefined. This parameter was not "
+            "built by MixedFusedLinearMethod.create_weights; refusing rather "
+            "than assuming a tensor-parallel degree.")
+    degree = int(shard.col_degree)
+    param_dim = getattr(param, "output_dim", None)
+    param_dim = None if param_dim is None else int(param_dim)
+    if param_dim != shard.output_dim:
+        raise ValueError(
+            f"mixed fused tensor {name!r} -> {param_name!r}: the parameter "
+            f"declares output_dim {param_dim} but was stamped with "
+            f"{shard.output_dim} at construction; refusing to narrow a plane "
+            "whose column axis moved between construction and load.")
+    if degree == 1 or param_dim is None:
+        return weight
+    if param_dim >= weight.ndim:
+        raise ValueError(
+            f"mixed fused tensor {name!r} -> {param_name!r}: checkpoint plane "
+            f"of rank {weight.ndim} has no column axis {param_dim} to shard "
+            f"at tensor-parallel degree {degree}")
+    local = int(param.shape[param_dim])
+    full = int(weight.shape[param_dim])
+    if full != local * degree:
+        raise ValueError(
+            f"mixed fused tensor {name!r} -> {param_name!r}: at "
+            f"tensor-parallel degree {degree} this rank needs a WHOLE "
+            f"checkpoint plane of extent {local * degree} along axis "
+            f"{param_dim}, but the streamed plane has extent {full} "
+            f"(shape {tuple(weight.shape)}, destination "
+            f"{tuple(param.shape)}). Gridbook's mixed fused router owns the "
+            "shard itself and is handed unsharded checkpoint tensors; a "
+            "plane that is already rank-local would be replicated onto every "
+            "rank. Load this module from the unsharded artifact planes, or "
+            "serve at tensor-parallel size 1.")
+    return weight.narrow(param_dim, shard.tp_rank * local, local)
 
 
 class _MixedFusedTransactions:
@@ -540,6 +606,10 @@ class _MixedFusedTransactions:
             raise ValueError(
                 f"mixed fused parameter {param_name!r} received duplicate "
                 f"checkpoint planes {pending[param_name][0]!r} and {name!r}")
+        # This rank's slice FIRST: everything below — the shape gate, the
+        # dtype preparation, the atomic commit — then reads the same tensor
+        # the copy will use.
+        weight = _narrow_mixed_plane(param_name, param, name, weight)
         if tuple(param.shape) != tuple(weight.shape):
             raise ValueError(
                 f"mixed fused tensor {name!r} -> {param_name!r}: checkpoint "

@@ -184,9 +184,9 @@ def test_admission_laws_name_real_enforcement_sites():
 
 def test_schema_and_contract_version_move_together():
     contract = load_runtime_contract()
-    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v8"
+    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v9"
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 8
+    assert contract["contract_version"] == 9
 
 
 # --- 2. Closed-world reading: absence means REFUSED ---------------------------

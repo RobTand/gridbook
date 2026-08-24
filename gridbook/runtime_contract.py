@@ -11,7 +11,7 @@ from importlib.resources import files
 from typing import Any, Mapping
 
 
-RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v8"
+RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v9"
 _RESOURCE_NAME = "runtime_contract.json"
 
 #: The vLLM package roots a ``top_level_loader_modules`` entry may name. The
@@ -118,6 +118,26 @@ _TP_REQUIRED_GEOMETRY: dict[tuple[str, str], dict[str, int]] = {
 _TP_CB_INPUT_AXIS_GROUP = 256
 _TP_CB_OUTPUT_AXIS_QUANTA: dict[str, int] = {"fp4": 8, "fp8": 16}
 _TP_CB_MERGED_ROLES = "even_division"
+
+#: The composite surface: one vLLM merged projection whose roles have
+#: DIFFERENT Gridbook formats (DeepSeek-V4's shared-expert ``gate_up_proj``
+#: fuses a CB gate with a block-FP8 source-passthrough up).  It is not a
+#: format, so it is neither a CB family nor a passthrough unit, and it has no
+#: alignment law of its own to publish: ``gridbook/mixed_linear.py`` derives
+#: the column degree from vLLM's own ``create_weights`` arguments, refuses a
+#: row-parallel split of a merged plane (hence ``axes``), and builds every
+#: role's carrier at that ROLE's whole-tensor output size so the role's
+#: existing gate — a CB family's ``shard_admission`` above, or a passthrough
+#: arm's — decides that carrier's legality.  ``per_role_law: "inherited"`` is
+#: that fact as data: a consumer pre-checking a mixed module evaluates each
+#: role against the role's own row, and there is no number here to check
+#: instead.  Publishing a numeric cap would assert more than any site
+#: enforces, which is the same reason the dense CB rows carry none.
+_TP_MIXED_FUSED_UNIT = "mixed_fused_projection"
+_TP_MIXED_FUSED_ADMISSION: dict[str, Any] = {
+    "axes": ["output"],
+    "per_role_law": "inherited",
+}
 
 #: Expert parallelism is a SECOND axis, not a relaxation of the first. The
 #: ``tensor_parallel`` table above is about splitting one unit's rows/columns
@@ -277,6 +297,10 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
       ``ShardGroupAlignmentError``.  A shard that violates them is refused
       by the runtime regardless of what any table says; the row exists so a
       producer can pre-check the same laws.
+    * the ``mixed_fused_projection`` unit is a COMPOSITE of the rows above,
+      not a format: it publishes the axis it admits and the fact that each
+      role's legality is the role's own row.  Neither a cap nor a law of its
+      own would be true of it.
     """
 
     tp = _object(root["tensor_parallel"], "contract.tensor_parallel")
@@ -295,6 +319,7 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
     seen: set[str] = set()
     cb_units: set[str] = set()
     passthrough_units: set[str] = set()
+    mixed_units: set[str] = set()
     for index, item in enumerate(units):
         path = f"contract.tensor_parallel.units[{index}]"
         row = _object(item, path)
@@ -327,14 +352,35 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
             # capped keeps the cap, because a site does enforce it.
             if not _has_law_admitted_arm(unit_id, armed):
                 expected = expected | {"max_world_size"}
+        elif kind == "mixed_fused_projection":
+            mixed_units.add(unit_id)
+            expected = {"unit", "kind", "shard_admission"}
         else:
             _fail(f"{path}.kind",
-                  "must be 'cb_format_family' or 'source_passthrough_format'")
+                  "must be 'cb_format_family', 'source_passthrough_format' "
+                  "or 'mixed_fused_projection'")
         _keys(row, path, expected)
         if unit_id in seen:
             _fail("contract.tensor_parallel.units",
                   f"duplicate unit {unit_id!r}")
         seen.add(unit_id)
+
+        if kind == "mixed_fused_projection":
+            if unit_id != _TP_MIXED_FUSED_UNIT:
+                _fail(f"{path}.unit",
+                      f"must be {_TP_MIXED_FUSED_UNIT!r}: there is one "
+                      "composite surface, and it is named for what it is "
+                      "rather than for any format")
+            admission_path = f"{path}.shard_admission"
+            admission = _object(row["shard_admission"], admission_path)
+            _keys(admission, admission_path, set(_TP_MIXED_FUSED_ADMISSION))
+            for field, pinned in _TP_MIXED_FUSED_ADMISSION.items():
+                if admission[field] != pinned:
+                    _fail(f"{admission_path}.{field}",
+                          f"must equal {pinned!r} (gridbook/mixed_linear.py "
+                          "admits the output axis only and inherits every "
+                          "role's own law)")
+            continue
 
         if kind == "cb_format_family":
             grid = family_grids.get(unit_id)
@@ -438,6 +484,11 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
               f"'cb_format_family' claim; missing "
               f"{sorted(set(family_grids) - cb_units)}, unknown "
               f"{sorted(cb_units - set(family_grids))}")
+    if mixed_units != {_TP_MIXED_FUSED_UNIT}:
+        _fail("contract.tensor_parallel.units",
+              "the composite mixed-format fused surface must carry exactly "
+              f"one {_TP_MIXED_FUSED_UNIT!r} claim; got "
+              f"{sorted(mixed_units)}")
     if passthrough_units != set(_PASSTHROUGH_TP_UNITS):
         _fail("contract.tensor_parallel.units",
               f"source-passthrough claims must equal {sorted(_PASSTHROUGH_TP_UNITS)}; "
@@ -554,8 +605,8 @@ def validate_runtime_contract(contract: Any) -> None:
         _fail("contract.schema", f"must be {RUNTIME_CONTRACT_SCHEMA!r}")
     contract_version = _positive_int(
         root["contract_version"], "contract.contract_version")
-    if contract_version != 8:
-        _fail("contract.contract_version", "must be 8 for this schema")
+    if contract_version != 9:
+        _fail("contract.contract_version", "must be 9 for this schema")
 
     features = _object(root["abi_features"], "contract.abi_features")
     _keys(features, "contract.abi_features", {

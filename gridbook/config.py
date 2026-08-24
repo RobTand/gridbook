@@ -1585,15 +1585,17 @@ class PrismaQuantConfig(QuantizationConfig):
                     return self._delegate_passthrough(
                         layer, prefix, owners[0].payload)
 
-                # The composite's loads ride the top-level mixed router, whose
-                # transaction copies are whole-checkpoint-plane; nothing in it
-                # narrows a rank's slice yet. This precedes the loader-ABI
-                # check because at TP>1 the surface is unsupported regardless
-                # of whether the wrapper is installed.
-                self._require_tp1_serving(
-                    "mixed-format fused projections (the top-level mixed "
-                    "loader copies whole checkpoint planes)", prefix)
-
+                # No blanket TP gate on this surface. The composite owns no
+                # law of its own beyond "a merged projection is column
+                # parallel": MixedFusedLinearMethod.create_weights derives the
+                # column degree from vLLM's constructor arguments and builds
+                # every carrier at that ROLE's whole-tensor output size, so
+                # each role's existing shard law — CB's group/quantum gate,
+                # the source lane's block gate, or whatever refusal
+                # _delegate_passthrough raises for an unqualified format —
+                # decides legality per role, before a parameter exists. The
+                # top-level mixed router then narrows each whole checkpoint
+                # plane to this rank.
                 if not self._has_mixed_fused_loader():
                     roles = ", ".join(
                         f"{owner.target} ({owner.kind})" for owner in owners)

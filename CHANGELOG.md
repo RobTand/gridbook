@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### Mixed-format fused projections serve above one tensor-parallel rank (contract schema v9)
+
+One vLLM `MergedColumnParallelLinear` whose roles have DIFFERENT Gridbook
+formats — DeepSeek-V4's shared-expert `gate_up_proj` fuses a CB gate with a
+block-FP8 source-passthrough up — no longer refuses at TP>1. It was the last
+refusing surface on the shipped DSv4 92 GB artifact.
+
+- **The composite owned the defect, not either role.**
+  `MixedFusedLinearMethod.create_weights` discarded `output_size` and handed
+  every carrier its own per-rank width as that role's whole-tensor size, so
+  each role's existing shard gate saw a degree-1 geometry and never fired. It
+  now derives `row_degree` and `col_degree` from vLLM's own constructor
+  arguments — never from `layer.tp_size`, which vLLM stamps on replicated
+  planes too — and builds each carrier at `width * col_degree`. The CB
+  `ShardGroupAlignmentError` and the source lane's `ShardAlignmentError` then
+  decide legality per role, with their own structured fields, before any
+  parameter exists.
+- **The one law the composite does own** is the axis: a merged projection is
+  column-parallel, and a row-parallel split of it would give every rank a
+  partial sum of every role, which no role's format was qualified against.
+  That is refused by name.
+- **Narrowing.** The top-level mixed router is handed WHOLE checkpoint planes
+  addressed by role name, so it takes this rank's slice before its shape gate:
+  `narrow(output_dim, tp_rank * extent, extent)` where the extent is the
+  destination parameter's own. That is exactly what vLLM's
+  `load_column_parallel_weight` computes after its packing and block
+  adjustment, so no packed factor, block size or superblock count is
+  re-derived — and none can drift out of step with the role method that chose
+  it. Per-tensor scalars replicate. A plane that is already rank-local is
+  REFUSED rather than copied identically onto every rank.
+- **Degree 1 is byte-identical.** The tensor-parallel rank is read once, in
+  `create_weights`, and only when the plane is actually sharded; a test makes
+  the accessor raise and requires construction to succeed.
+- **Contract v9.** A third claim shape joins the two above: the
+  `mixed_fused_projection` unit is a composite, not a format, so it publishes
+  `shard_admission` `{axes: ["output"], per_role_law: "inherited"}` — the axis
+  it admits, and the fact that each role's legality is that role's own row.
+  Neither a numeric cap nor a law of its own would be true of it. Schema and
+  `contract_version` move together to `gridbook.runtime-contract.v9` / 9.
+- **The pin set is derived, not remembered.** `tests/test_runtime_contract.py`
+  now walks the tree for every file that names `contract_version` or a schema
+  string, compares the result against an explicit list, and requires each of
+  them to name the CURRENT schema and (outside this changelog) no older one.
+  A new pin now fails a test instead of shipping stale.
+
+Measured on one process with the rank accessors pinned and construction run
+per rank — no engine, no collectives, no second device. Every carrier plane
+(CB `cb_qweight`/`weight_scale`, source `weight`/`weight_scale_inv`) is
+byte-identical to what the role's own method plus vLLM's real
+`load_column_parallel_weight` produce on that rank, at degrees 2 and 4, and
+the ranks' slices tile the checkpoint plane exactly. Un-interleaving the
+ranks' outputs reproduces the TP=1 output BITWISE for both roles, measured on
+the decoded planes and fp32 reference products rather than on the serving
+kernel. A two-node serve is not claimed.
+
 ### FP8 source passthrough serves above one tensor-parallel rank
 
 The `fp8_e4m3_ue8m0_block128` lane's dense arm no longer pins TP=1. The pin
@@ -54,7 +109,8 @@ law that makes that narrowing correct.
   the whole qualified set rather than naming one geometry.
 - **Other passthrough formats are unchanged.** `mxfp4_e2m1_ue8m0_g32` and
   `mxfp8_e4m3_e8m0_g32` have no sharded audit and keep refusing by name at
-  dispatch; mixed-format fused planes keep their own separate refusal.
+  dispatch. (Mixed-format fused planes kept their own separate refusal at the
+  time of this entry; it was lifted below.)
 - **Contract v7.** A passthrough unit whose method branches on an execution
   arm now publishes admission per arm, and a unit with a **law-admitted** arm
   carries no unit-level `max_world_size`: one scalar cannot cover a

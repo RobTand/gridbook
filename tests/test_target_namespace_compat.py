@@ -649,17 +649,27 @@ def test_live_tp2_admits_dense_cb_and_refuses_delegation(monkeypatch):
 def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
     """The packaged TP table claims only what the dispatch gates enforce.
 
-    Schema v7: dense CB rows publish shard-admission laws and no numeric cap
-    (dispatch admits them above one rank), and so does the FP8-source lane's
-    dense ARM; every other passthrough claim keeps its numeric cap of 1 — and
-    a live world size of 2 still refuses a delegated stock compressed-tensors
-    group at its choke point.
+    Dense CB rows publish shard-admission laws and no numeric cap (dispatch
+    admits them above one rank), and so does the FP8-source lane's dense ARM;
+    the mixed-format composite publishes the axis it shards on and inherits
+    each role's own law; every other passthrough claim keeps its numeric cap
+    of 1 — and a live world size of 2 still refuses a delegated stock
+    compressed-tensors group at its choke point.
+
+    This test reads the packaged table, so it pins the schema it was written
+    against.  Before ``gridbook.runtime-contract.v9`` that pin lived only in a
+    prose docstring, which no grep could see: the v8 bump left it reading "v7"
+    and nothing failed.  The assertion below is what puts this file in
+    ``tests/test_runtime_contract.py::_VERSION_PIN_FILES``, so the next bump
+    cannot miss it.
     """
     import json
     from importlib.resources import files as resource_files
 
     contract = json.loads(resource_files("gridbook").joinpath(
         "runtime_contract.json").read_text(encoding="utf-8"))
+    assert contract["schema"] == "gridbook.runtime-contract.v9"
+    assert contract["contract_version"] == 9
     table = contract["tensor_parallel"]
     assert table["axis"] == "vllm_tensor_parallel_world_size"
     assert table["semantics"] == "closed_world"
@@ -672,6 +682,19 @@ def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
                 "output_axis_quantum": 8 if row["unit"].startswith("NVFP4")
                 else 16,
                 "merged_roles": "even_division",
+            }
+        elif row["kind"] == "mixed_fused_projection":
+            # The composite publishes neither a cap nor a numeric law of its
+            # own: each role keeps its lane's law, so the whole claim is the
+            # axis it shards on plus the inheritance.  Spelled as its own
+            # branch rather than folded into the arms rule below, because a
+            # kind with no ``arms`` would otherwise fall through to the
+            # numeric-cap assertion and read as capped.
+            assert "max_world_size" not in row
+            assert "arms" not in row
+            assert row["shard_admission"] == {
+                "axes": ["output"],
+                "per_role_law": "inherited",
             }
         else:
             # A claim is either a number a site enforces or laws a site

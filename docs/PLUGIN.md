@@ -105,9 +105,9 @@ second runtime tree or maintain a parallel loader table.
   shard_size fields — input axis requires whole 256-weight superblocks;
   output axis requires the native kernel's 8-wide (fp4) or 16-wide (fp8) row
   quantum). Everything else keeps refusing at construction, naming itself:
-  delegated compressed-tensors groups, quantized embedding units and
-  mixed-format fused projections; routed CB MoE expert stacks refuse on this
-  axis and serve on the expert-parallel one instead (see below).
+  delegated compressed-tensors groups and quantized embedding units; routed
+  CB MoE expert stacks refuse on this axis and serve on the expert-parallel
+  one instead (see below).
   `fp8_e4m3_ue8m0_block128` source-passthrough units are no longer among the
   refusals: dense ones shard when every rank's extent on the sharded axis is
   a whole multiple of the 128-element source block (per fused role on a
@@ -155,7 +155,7 @@ second runtime tree or maintain a parallel loader table.
 
 ## Tensor-parallel capability
 
-As of contract schema `gridbook.runtime-contract.v8`, the packaged contract
+As of contract schema `gridbook.runtime-contract.v9`, the packaged contract
 carries a `tensor_parallel` section that publishes, per serving unit, what the
 runtime actually enforces. The table is an attestation: each row restates a
 refusal or admission site in this package, and
@@ -168,8 +168,10 @@ of that site.
   single number is true of every dispatch path; publishing one would assert
   more than any site enforces.
 - Each entry in `units` names one producer-addressable unit: a CB format family
-  (`NVFP4_CB_K`, `FP8_CB_K`) or one source-passthrough format id.
-  Two claim shapes exist, matching the two enforcement shapes in the runtime:
+  (`NVFP4_CB_K`, `FP8_CB_K`), one source-passthrough format id, or the single
+  composite surface `mixed_fused_projection`.
+  Three claim shapes exist, matching the three enforcement shapes in the
+  runtime:
   - **Dense CB families** publish `shard_admission` instead of a cap, because
     no dispatch path enforces a numeric ceiling for them — above one rank,
     admission IS the laws, evaluated per rank at weight construction and
@@ -211,6 +213,20 @@ of that site.
     measured on the release device on 2026-08-23 (every rank's call bitwise
     equal to the corresponding columns of the unsharded G=8 call); a degree
     outside the list is refused, however aligned the plane is.
+  - **The composite** (v9) is `mixed_fused_projection`: one vLLM
+    `MergedColumnParallelLinear` whose roles have DIFFERENT Gridbook formats,
+    such as a CB `gate_proj` fused with a block-FP8 source-passthrough
+    `up_proj`. It is not a format and owns no alignment law, so it publishes
+    `shard_admission` `{axes: ["output"], per_role_law: "inherited"}` and no
+    number. `axes` is the one law it does own: a merged projection is
+    column-parallel, and a row-parallel split of it is refused by name.
+    `per_role_law` `inherited` says where admission actually lives — the
+    composer derives the column degree from vLLM's own `create_weights`
+    arguments and builds each role's carrier at that ROLE's whole-tensor
+    output size, so each role's row above is what a producer pre-checks, role
+    by role, against the rank-local width that role will receive. Publishing a
+    cap here would assert a ceiling on every role at once that no site
+    enforces.
 - `semantics` is `closed_world`. A consumer must read the table with the same
   rule the validator enforces for publishers:
 
@@ -230,12 +246,14 @@ contract that omits a shipped unit, invents one, drops a mandatory field,
 caps the capless dense CB surface with a number, or publishes a numeric claim
 no enforcement site stands behind.
 
-**Compatibility rule:** `schema` and `contract_version` move together (v8 / 8),
-and readers match the schema string exactly. A producer pinned to
-`gridbook.runtime-contract.v7` must refuse a v8 contract whole — no partial
-parsing, no field-by-field salvage across versions — and keep producing against
-its pinned runtime until its pin is deliberately bumped. Reading a v7 contract
-with a v8 reader fails the same way.
+**Compatibility rule:** `schema` and `contract_version` move together (v9 / 9),
+and readers match the schema string exactly. A producer pinned to the previous
+schema (v8) must refuse a `gridbook.runtime-contract.v9` contract whole — no
+partial parsing, no field-by-field salvage across versions — and keep producing
+against its pinned runtime until its pin is deliberately bumped. Reading a v8
+contract with a v9 reader fails the same way. Only the CURRENT schema string is
+spelled in full anywhere outside the changelog, so a stale pin cannot hide in
+prose.
 
 ## Expert-parallel capability
 
