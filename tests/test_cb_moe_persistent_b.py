@@ -264,9 +264,11 @@ def _assert_reassociation_only(y, bf16_linear, fp32, label):
         f"than reassociation explains")
 
 
-# The rungs: k=12..24 spans odd and even k (the ceil-first split puts
+# The historical production rungs k=12..24 span odd and even k (the ceil-first
+# split puts
 # ceil(k/2) bits in the low half, so the two parities take different paths),
-# and k=24 is the largest LUT the format admits.  N=17 and N=33 are NOT
+# while the focused extension cases below cover the new K1/K25/K26/K32 edges.
+# N=17 and N=33 are NOT
 # multiples of 8 or 32, so the flat plane's rows do not line up with any
 # codeword or LUT-gather boundary.
 _RUNGS = [
@@ -313,6 +315,64 @@ def test_decode_probe_is_bit_identical_to_the_torch_reference(k, K, E, N,
     assert got.shape == (rows, K)
     assert got.dtype is torch.bfloat16
     assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
+@pytest.mark.parametrize("k", (1, 25, 26, 32), ids=lambda k: f"k{k}")
+def test_extended_rung_decode_is_bit_identical_to_the_torch_reference(k):
+    """Synthetic bytes isolate the low-level decoder from public admission.
+
+    K1 exercises the zero-bit second subindex; K25 is the former ceiling plus
+    one; K26 crosses the full-LUT shared-memory ceiling of the separate
+    expander; K32 exercises two exact 16-bit subindices.
+    """
+    K, E, N = 256, 2, 8
+    qw, lut, compose, type_size = _pack(
+        k, K, E, N, seed=70000 + k, source="synth", super_span=None)
+    rows = E * N
+    got = ext.cb_moe_persistent_b_decode(
+        qw.reshape(-1), lut, compose, 0, rows, K, k, type_size)
+    want = reconstruct_cb_weight(
+        qw.reshape(rows, -1), lut,
+        torch.zeros(rows, dtype=torch.int32, device=DEV),
+        torch.zeros(1, device=DEV), compose, N=rows, K=K, k_bits=k,
+        n_sub=2, type_size=type_size, is_fp4=True, is_v2=True)
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
+@pytest.mark.parametrize("k,expected", [
+    (1, (True, True, True, True)),
+    (25, (True, True, True, True)),
+    (26, (True, True, True, True)),
+    (29, (True, True, True, True)),
+    (30, (True, True, True, False)),
+    (31, (True, True, True, False)),
+    (32, (False, True, True, False)),
+], ids=lambda cell: f"k{cell}" if isinstance(cell, int) else None)
+def test_widened_fp4_cfg_eligibility_matches_the_two_cta_floor(k, expected):
+    type_size = 4 * k + 9
+    got = tuple(bool(ext.cb_moe_persistent_b_fp8_cfg_eligible(
+        cfg, type_size, False, False)) for cfg in range(1, 5))
+    assert got == expected
+
+
+def test_k32_d2r_keeps_every_config_eligible():
+    assert all(bool(ext.cb_moe_persistent_b_fp8_cfg_eligible(
+        cfg, 4 * 32 + 9, True, False)) for cfg in range(1, 5))
+
+
+def test_k32_auto_filters_ineligible_wide_tiles_before_launch():
+    """Low routed M initially prefers cfg4; K32 must step down to cfg2."""
+    k, K, E, N = 32, 256, 2, 64
+    qw, lut, compose, type_size = _pack(
+        k, K, E, N, seed=71032, source="synth", super_span=None)
+    a = torch.randn(4, K, dtype=torch.bfloat16, device=DEV)
+    ends = _ends([2, 2])
+    auto = _prefill(a, qw, lut, compose, ends, k, type_size, cfg=0)
+    eligible = _prefill(a, qw, lut, compose, ends, k, type_size, cfg=2)
+    assert torch.equal(auto.view(torch.int16), eligible.view(torch.int16))
+    for cfg in (1, 4):
+        with pytest.raises(RuntimeError, match="below two CTAs per SM"):
+            _prefill(a, qw, lut, compose, ends, k, type_size, cfg=cfg)
 
 
 @pytest.mark.parametrize("source", SOURCES)
@@ -811,8 +871,8 @@ _VIOLATIONS = [
      lambda c: {**c, "type_size": c["type_size"] + 1},
      "FP4-CB layout v2 requires"),
     ("k-bits-out-of-range",
-     lambda c: {**c, "k_bits": 25},
-     re.escape("k_bits in [1,24]")),
+     lambda c: {**c, "k_bits": 33},
+     re.escape("k_bits in [1,32]")),
     ("short-lut",
      lambda c: {**c, "lut": c["lut"][:-4].contiguous()},
      "flat product codebook must hold"),
@@ -919,8 +979,9 @@ def test_the_module_has_no_dense_entry_point():
                 # GEMM, so it cannot be a dense entry point.
                 "cb_moe_persistent_b_prepare",
                 "cb_moe_persistent_b_d2r_prepare",
-                # Host-only occupancy predicate for the FP8 tile configs
-                # (ints in, bool out). Consulted at model load by the lane.
+                # Host-only occupancy predicate for both format families and
+                # FP4 schedules (legacy FP8-named ABI; ints in, bool out).
+                # Consulted at model load by the lane.
                 "cb_moe_persistent_b_fp8_cfg_eligible"}
     exported = {name for name in dir(ext) if name.startswith("cb_")}
     assert exported == routed | non_gemm, (

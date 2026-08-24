@@ -448,6 +448,7 @@ _V2_SYMBOLS = (
     "cb_gemv_v2_prefers_inherited",
     "cb_gemv_v2_prepare",
     "cb_expand_v2",
+    "cb_expand_v2_stages_dictionary",
 )
 
 

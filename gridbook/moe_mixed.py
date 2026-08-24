@@ -455,8 +455,9 @@ class PrismaQuantMixedMoEMethod(FusedMoEMethodBase):
                 refs = scheme["codebook_ref"]
                 names = refs if isinstance(refs, list) else [refs]
                 subs = [codebooks[name].to(qparam.device) for name in names]
-                lane._cb_flat = codec.build_flat_codebook(
-                    subs, method.prefix, scheme["grid"]
+                lane._cb_flat = codec.build_flat_product_codebook(
+                    subs, method.k, method.n_sub, method.prefix,
+                    scheme["grid"],
                 )
                 lane._cb_compose = (
                     codec.build_compose_table(method._sub_table).to(qparam.device)

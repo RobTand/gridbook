@@ -11,20 +11,28 @@ from importlib.resources import files
 from typing import Any, Mapping
 
 
-RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v10"
+RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v11"
 _RESOURCE_NAME = "runtime_contract.json"
 
-#: v10 separates the reader domain from the canonical producer menu.  The
+#: v11 keeps the reader domain separate from the canonical producer menu.  The
 #: high FP8 rungs remain deliberately dense so artifacts written by older
 #: producers keep loading; new producers emit only the hardware-aligned
-#: multiples-of-four ladder.
+#: multiples-of-four ladder.  NVFP4 has no legacy artifacts above K25, so its
+#: public reader and producer ladders both stop immediately before the measured
+#: full-LUT residency cliff.  Generic CUDA bindings retain K26..K32 only as a
+#: direct research surface; low-level kernel coverage is not a wire-format
+#: compatibility promise and therefore does not appear in this contract.
 _FORMAT_RUNGS: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
-    "NVFP4_CB_K": (tuple(range(12, 25)), tuple(range(12, 25))),
+    "NVFP4_CB_K": (tuple(range(1, 26)), tuple(range(1, 26))),
     "FP8_CB_K": (
         (4, 8, 12, 16, 20, 24, *range(28, 49)),
         tuple(range(4, 49, 4)),
     ),
 }
+# Mapping order is serialization/validation plumbing, never a cross-family
+# preference.  AQUA resolves overlapping FP8/NVFP4 choices from registered
+# activation contracts; this runtime contract intentionally has no manual
+# "prefer FP8" field.
 
 _LANE_ELIGIBILITY_SCHEMA = "gridbook.lane-eligibility.v2"
 _LANE_STRUCTURES = ("dense", "routed_moe")
@@ -792,8 +800,8 @@ def validate_runtime_contract(contract: Any) -> None:
         _fail("contract.schema", f"must be {RUNTIME_CONTRACT_SCHEMA!r}")
     contract_version = _positive_int(
         root["contract_version"], "contract.contract_version")
-    if contract_version != 10:
-        _fail("contract.contract_version", "must be 10 for this schema")
+    if contract_version != 11:
+        _fail("contract.contract_version", "must be 11 for this schema")
 
     features = _object(root["abi_features"], "contract.abi_features")
     _keys(features, "contract.abi_features", {

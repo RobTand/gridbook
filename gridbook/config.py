@@ -739,75 +739,130 @@ class PrismaQuantConfig(QuantizationConfig):
     def _validate_cb_format_scheme(
         scheme: dict, target: str, runtime_contract: dict,
     ) -> None:
-        """Fail closed on an FP8-CB scheme outside the packaged reader ABI.
+        """Fail closed on a CB scheme outside the packaged reader ABI.
 
-        v10's ``formats[].rungs`` is the reader domain, intentionally broader
-        than ``producer_rungs`` so legacy irregular K28..K48 artifacts keep
-        loading.  Dense and routed constructors used to trust ``k``, ``n_sub``
-        and ``type_size`` independently; a low-rung typo could therefore size
-        a resident byte plane before the CUDA binding finally rejected it.
-        Resolve those three fields against the one packaged contract while the
-        sidecar is already being parsed.  NVFP4 is untouched here.
+        ``formats[].rungs`` is the reader domain.  It is intentionally broader
+        than ``producer_rungs`` for FP8 so legacy irregular K28..K48 artifacts
+        keep loading; NVFP4 has no such legacy artifacts and both lists stop at
+        K25.  Dense and routed constructors used to trust ``k``, ``n_sub``
+        and ``type_size`` independently; a typo could therefore size a resident
+        byte plane before the CUDA binding finally rejected it.  Resolve the
+        physical fields against the one packaged contract while the sidecar is
+        already being parsed.  For FP4, scale coding selects the v1 (16-byte)
+        or v2/two-tier (9-byte) scale plane.
         """
 
-        if scheme.get("grid") != "fp8":
-            return
+        grid = scheme.get("grid")
+        family_by_grid = {"fp4": "NVFP4_CB_K", "fp8": "FP8_CB_K"}
+        if grid not in family_by_grid:
+            raise ValueError(
+                f"CB target {target!r}: grid must be 'fp4' or 'fp8', got "
+                f"{grid!r}"
+            )
+        family = family_by_grid[grid]
         formats = [
             item for item in runtime_contract.get("formats", ())
-            if item.get("family") == "FP8_CB_K"
+            if item.get("family") == family
         ]
         if len(formats) != 1:
             raise ValueError(
                 f"CB target {target!r}: packaged runtime contract must carry "
-                "exactly one FP8_CB_K format row"
+                f"exactly one {family} format row"
             )
         fmt = formats[0]
         if scheme.get("mode") != fmt["mode"]:
             raise ValueError(
-                f"CB target {target!r}: FP8-CB mode must be {fmt['mode']!r}"
+                f"CB target {target!r}: {family} mode must be "
+                f"{fmt['mode']!r}"
             )
         for field in ("k", "n_sub", "type_size"):
             value = scheme.get(field)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError(
-                    f"CB target {target!r}: FP8-CB {field} must be an integer"
+                    f"CB target {target!r}: {family} {field} must be an integer"
                 )
         k = scheme["k"]
         if k not in fmt["rungs"]:
             raise ValueError(
-                f"CB target {target!r}: FP8_CB_K{k} is outside the packaged "
+                f"CB target {target!r}: {family}{k} is outside the packaged "
                 f"reader domain {fmt['rungs']}"
             )
         if scheme["n_sub"] != fmt["n_sub"]:
             raise ValueError(
-                f"CB target {target!r}: FP8_CB_K{k} requires "
+                f"CB target {target!r}: {family}{k} requires "
                 f"n_sub={fmt['n_sub']}, got {scheme['n_sub']}"
             )
-        if scheme["type_size"] != 4 * k:
+
+        scale_coding = scheme.get("scale_coding")
+        if isinstance(scale_coding, dict):
+            scale_coding = scale_coding.get("kind")
+            if not isinstance(scale_coding, str):
+                raise ValueError(
+                    f"CB target {target!r}: scale_coding.kind must be a "
+                    "string"
+                )
+        elif scale_coding is None:
+            scale_coding = "v1"
+        if not isinstance(scale_coding, str):
             raise ValueError(
-                f"CB target {target!r}: FP8_CB_K{k} requires "
-                f"type_size=4*k={4 * k}, got {scheme['type_size']}"
+                f"CB target {target!r}: scale_coding must be a string, an "
+                "object with a string 'kind', or absent"
+            )
+        if grid == "fp8":
+            if scale_coding != "v1":
+                raise ValueError(
+                    f"CB target {target!r}: FP8_CB_K{k} requires v1 scale "
+                    f"coding, got {scale_coding!r}"
+                )
+            expected_type_size = 4 * k
+            rule = "4*k"
+        else:
+            scale_bytes = {"v1": 16, "two_tier": 9}.get(scale_coding)
+            if scale_bytes is None:
+                raise ValueError(
+                    f"CB target {target!r}: NVFP4_CB_K{k} scale coding must "
+                    f"be 'v1' or 'two_tier', got {scale_coding!r}"
+                )
+            expected_type_size = 4 * k + scale_bytes
+            rule = f"4*k+{scale_bytes}"
+        if scheme["type_size"] != expected_type_size:
+            raise ValueError(
+                f"CB target {target!r}: {family}{k} with "
+                f"scale_coding={scale_coding!r} requires type_size={rule}="
+                f"{expected_type_size}, got {scheme['type_size']}"
             )
 
     @staticmethod
     def _require_cb_device_capability(scheme: dict, prefix: str) -> None:
-        """Reject an FP8-CB artifact before its first illegal prefill.
+        """Reject a CB artifact before its first architecture-illegal path.
 
         FP8-CB's shipping large-M path uses vLLM's native FP8 quantizer and
         CUTLASS scaled GEMM, whose hardware floor is sm_89.  The main decode
         extension itself can compile for sm_80, so a global capability floor
         would otherwise let an A100 load successfully and fail only when the
-        first prompt crosses the 16-token decode boundary.  FP4-CB retains the
-        broader BF16 transient fallback and is not rejected here.
+        first prompt crosses the 16-token decode boundary.  NVFP4-CB is a
+        Blackwell activation contract: an exact BF16 expansion primitive on
+        Ada does not make the format supported there, and AQUA must never see
+        an FP4 candidate on RTX 40.  Enforce both activation-family floors at
+        this one load-time choke point.
         """
 
-        if scheme.get("grid") != "fp8" or not torch.cuda.is_available():
+        if not torch.cuda.is_available():
+            return
+        grid = scheme.get("grid")
+        if grid == "fp8":
+            floor = (8, 9)
+            family = "FP8-CB"
+        elif grid == "fp4":
+            floor = (10, 0)
+            family = "NVFP4-CB"
+        else:
             return
         capability = tuple(torch.cuda.get_device_capability())
-        if capability < (8, 9):
+        if capability < floor:
             raise ValueError(
-                f"FP8-CB target {prefix!r} requires compute capability sm_89+ "
-                "for its shipping prefill path; "
+                f"{family} target {prefix!r} requires compute capability "
+                f"sm_{floor[0]}{floor[1]}+ for its activation contract; "
                 f"the current device reports sm_{capability[0]}{capability[1]}"
             )
 

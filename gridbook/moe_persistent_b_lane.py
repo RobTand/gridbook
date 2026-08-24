@@ -174,10 +174,13 @@ def supports(*, is_fp4: bool, is_v2: bool, n_sub: int, k_bits: int,
              type_size: int, hidden: int, inter: int) -> str | None:
     """``None`` when the lane can serve this layer, else the reason it cannot.
 
-    Mirrors ``cb_moe_persistent_b_prefill``'s own TORCH_CHECKs so a layer the
-    kernel would reject is diagnosed at model load with a readable sentence
-    instead of aborting a request.  Every clause is a shape/format fact known
-    at load; nothing here reads the routing or the device.
+    Applies the public K1..K25 format ceiling, then mirrors
+    ``cb_moe_persistent_b_prefill``'s shape checks so an unsupported layer is
+    diagnosed at model load with a readable sentence instead of aborting a
+    request.  The CUDA binding retains K26..K32 only for direct research tests;
+    low-level template coverage is not production-lane eligibility.  Every
+    clause is a shape/format fact known at load; nothing here reads routing or
+    the device.
     """
     if not is_fp4:
         return "format is not FP4-CB"
@@ -185,8 +188,8 @@ def supports(*, is_fp4: bool, is_v2: bool, n_sub: int, k_bits: int,
         return "format is not two-tier layout v2"
     if n_sub != 2:
         return f"n_sub={n_sub} is not the product-mode 2 the decode assumes"
-    if not 1 <= k_bits <= 24:
-        return f"k={k_bits} is outside the FP4-CB v2 range [1, 24]"
+    if not 1 <= k_bits <= 25:
+        return f"k={k_bits} is outside the supported FP4-CB v2 range [1, 25]"
     if type_size != 4 * k_bits + 9:
         return "serialized row type_size is not FP4-CB layout v2 (4*k+9)"
     # Superblock alignment (256) is the binding constraint and it implies the
@@ -239,7 +242,9 @@ def config(ext) -> list[list[int]]:
     return [list(map(int, row)) for row in ext.cb_moe_persistent_b_configs()]
 
 
-def resolve_cfg(ext, *, fp8_type_size: int | None = None) -> int:
+def resolve_cfg(ext, *, fp4_type_size: int | None = None,
+                fp8_type_size: int | None = None,
+                d2r: bool = False) -> int:
     """Validate ``PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG`` against this build.
 
     Called at model LOAD, like every other decision this lane makes.  A tile
@@ -249,15 +254,23 @@ def resolve_cfg(ext, *, fp8_type_size: int | None = None) -> int:
     from the shapes", which is the production setting; anything else is a
     measurement override.
 
-    ``fp8_type_size`` names the FP8-CB rung the layer serves, and adds the
-    2-CTAs/SM occupancy floor to the load-time validation: FP8's wider packed
-    superblocks push the wide tiles past the floor above k=33/k=31, and the
-    kernel TORCH_CHECKs exactly that at launch — which for an explicit
-    override would be the first routed request, the failure mode load-time
-    resolution exists to prevent.  The predicate is the extension's own
-    (``cb_moe_persistent_b_fp8_cfg_eligible``), never re-derived here.  FP4
-    passes ``None``: every compiled tile holds the floor at every FP4 rung.
+    ``fp4_type_size`` / ``fp8_type_size`` name the family and rung the layer
+    serves. Exactly one may be supplied. They add the 2-CTAs/SM occupancy floor
+    to load-time validation: widened FP4 loses cfg 4 at K30 and cfg 1 at K32,
+    while FP4 D2R keeps every config; FP8 has its own wide-rung exclusions.
+    The kernel TORCH_CHECKs the same fact at launch, which for an explicit
+    override would otherwise fail only on the first routed request. The
+    predicate is the extension's own (the backwards-compatible
+    ``cb_moe_persistent_b_fp8_cfg_eligible`` binding), never re-derived here.
     """
+    if fp4_type_size is not None and fp8_type_size is not None:
+        raise ValueError("persistent-B config resolution accepts one format "
+                         "family, not both fp4_type_size and fp8_type_size")
+    if d2r and fp8_type_size is not None:
+        raise ValueError("persistent-B D2R config resolution is FP4-CB-only")
+    if d2r and fp4_type_size is None:
+        raise ValueError("persistent-B D2R config resolution requires "
+                         "fp4_type_size")
     raw = os.environ.get("PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG", "").strip()
     if not raw:
         return 0
@@ -274,11 +287,18 @@ def resolve_cfg(ext, *, fp8_type_size: int | None = None) -> int:
             f"PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG={cfg} is not a compiled "
             f"tile config; this build offers 0 (auto) or 1..{len(compiled)} "
             f"({compiled})")
-    if cfg and fp8_type_size is not None and not bool(
-            ext.cb_moe_persistent_b_fp8_cfg_eligible(cfg, fp8_type_size)):
+    type_size = (fp4_type_size if fp4_type_size is not None
+                 else fp8_type_size)
+    is_fp8 = fp8_type_size is not None
+    if cfg and type_size is not None and not bool(
+            ext.cb_moe_persistent_b_fp8_cfg_eligible(
+                cfg, type_size, d2r, is_fp8)):
+        family = "FP8-CB" if is_fp8 else "FP4-CB"
+        schedule = " D2R" if d2r else ""
         raise ValueError(
             f"PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG={cfg} does not hold two "
-            f"CTAs per SM at this layer's FP8-CB type_size={fp8_type_size}; "
+            f"CTAs per SM at this layer's {family}{schedule} "
+            f"type_size={type_size}; "
             f"pick an eligible tile or 0 (auto), which filters on the same "
             f"predicate")
     return cfg

@@ -21,6 +21,7 @@ def _pack_row(codes: list[int], k_bits: int, tail: bytes = b"") -> torch.Tensor:
 
 _FP8_PRODUCER_RUNGS = tuple(range(4, 49, 4))
 _FP8_LEGACY_IRREGULAR_RUNGS = (29, 33, 47)
+_NVFP4_DIRECT_KERNEL_RUNGS = tuple(range(1, 33))
 
 
 @pytest.mark.parametrize("k_bits", _FP8_PRODUCER_RUNGS)
@@ -121,6 +122,56 @@ def test_uneven_product_decode_and_row_offsets():
                                             128 * 4 + (i1 + 1) * 4])))
         expected_rows.append(torch.cat(vectors))
     assert torch.equal(got, torch.stack(expected_rows))
+
+
+@pytest.mark.parametrize("k_bits", _NVFP4_DIRECT_KERNEL_RUNGS)
+def test_nvfp4_v2_decode_covers_direct_kernel_research_range(k_bits):
+    """Exercise public K1..K25 plus research-only K26..K32 primitives.
+
+    K1 has split widths (1,0), so sub1 is a real one-entry table selected by a
+    zero-bit index. K32 has widths (16,16), and the final codeword deliberately
+    selects both last entries with the full uint32 mask.
+    """
+
+    w0, w1 = (k_bits + 1) // 2, k_bits // 2
+    mask = (1 << k_bits) - 1
+    codes = [((vector + 1) * 0x9E3779B1) & mask for vector in range(32)]
+    codes[-1] = mask
+    scale_tail = bytes([127] + [0] * 8)
+    packed = _pack_row(codes, k_bits, scale_tail).reshape(1, -1)
+    assert packed.shape[1] == 4 * k_bits + 9
+
+    tables = []
+    for sub, width in enumerate((w0, w1)):
+        values = torch.arange((1 << width) * 4, dtype=torch.int64)
+        table = (((values % 29) - 14).float() * (0.125 + 0.125 * sub)
+                 ).to(torch.bfloat16)
+        tables.append(table)
+    codebook = torch.cat(tables)
+    offsets = torch.zeros(1, dtype=torch.int32)
+    compose = torch.zeros(256, 16)
+    compose[127, 0] = 1.0
+
+    got_codes = extract_codewords(
+        packed, N=1, K=256, k_bits=k_bits, type_size=4 * k_bits + 9)
+    assert torch.equal(got_codes[0, 0], torch.tensor(codes))
+    got = reconstruct_cb_weight(
+        packed, codebook, offsets, torch.zeros(1), compose.reshape(-1),
+        N=1, K=256, k_bits=k_bits, n_sub=2,
+        type_size=4 * k_bits + 9, is_fp4=True, is_v2=True)
+
+    expected = []
+    m0, m1 = (1 << w0) - 1, (1 << w1) - 1
+    for code in codes:
+        i0 = code & m0
+        i1 = (code >> w0) & m1
+        expected.extend(tables[0][i0 * 4:(i0 + 1) * 4])
+        expected.extend(tables[1][i1 * 4:(i1 + 1) * 4])
+    assert torch.equal(got[0], torch.stack(expected))
+    if k_bits == 1:
+        assert w1 == 0 and m1 == 0
+    if k_bits == 32:
+        assert codes[-1] == 0xFFFFFFFF
 
 
 def test_fp8_and_two_tier_weight_rounding():

@@ -179,6 +179,62 @@ def test_fp8_scheme_loader_rejects_incoherent_physical_fields(
         )
 
 
+@pytest.mark.parametrize("k_bits", range(1, 26))
+def test_nvfp4_scheme_loader_accepts_complete_v11_public_domain(k_bits):
+    from gridbook.runtime_contract import load_runtime_contract
+
+    PrismaQuantConfig._validate_cb_format_scheme(
+        {
+            "grid": "fp4", "mode": "product", "k": k_bits,
+            "n_sub": 2, "type_size": 4 * k_bits + 9,
+            "scale_coding": {"kind": "two_tier"},
+        },
+        "model.layers.0.mlp.down_proj",
+        load_runtime_contract(),
+    )
+
+
+@pytest.mark.parametrize("k_bits", [0, 26, 32, 33, 48])
+def test_nvfp4_scheme_loader_rejects_outside_v11_reader_domain(k_bits):
+    from gridbook.runtime_contract import load_runtime_contract
+
+    with pytest.raises(ValueError, match="outside the packaged reader domain"):
+        PrismaQuantConfig._validate_cb_format_scheme(
+            {
+                "grid": "fp4", "mode": "product", "k": k_bits,
+                "n_sub": 2, "type_size": 4 * k_bits + 9,
+                "scale_coding": "two_tier",
+            },
+            "model.layers.0.mlp.down_proj",
+            load_runtime_contract(),
+        )
+
+
+@pytest.mark.parametrize(
+    "scheme,message",
+    [
+        ({"grid": "fp4", "mode": "product", "k": 1, "n_sub": 1,
+          "type_size": 13, "scale_coding": "two_tier"},
+         "requires n_sub=2"),
+        ({"grid": "fp4", "mode": "product", "k": 25, "n_sub": 2,
+          "type_size": 108, "scale_coding": "two_tier"},
+         r"requires type_size=4\*k\+9=109"),
+        ({"grid": "fp4", "mode": "product", "k": 16, "n_sub": 2,
+          "type_size": 80, "scale_coding": "unknown"},
+         "scale coding must be 'v1' or 'two_tier'"),
+    ],
+)
+def test_nvfp4_scheme_loader_rejects_incoherent_physical_fields(
+    scheme, message
+):
+    from gridbook.runtime_contract import load_runtime_contract
+
+    with pytest.raises(ValueError, match=message):
+        PrismaQuantConfig._validate_cb_format_scheme(
+            scheme, "model.layers.0.mlp.down_proj", load_runtime_contract()
+        )
+
+
 def _checkpoint_header_method(source):
     quant_config = types.SimpleNamespace(_get_sidecar_source=lambda: source)
     method = object.__new__(PrismaQuantCBLinearMethod)

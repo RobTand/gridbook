@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### NVFP4-CB support expands to K1..K25 (contract schema v11)
+
+- NVFP4-CB readers, producers, artifact choosers, and SM120 lane rows accept
+  every integer rung K1..K25. There are no legacy K26..K32 artifacts to
+  preserve, so those values are outside the public format contract. K1's
+  ceil-first product split is the valid `(1, 0)` edge.
+- The inherited dense and routed decode kernels are explicitly gated for the
+  supported range. The exact BF16 transient expander stages the whole
+  dictionary through K25 (98,304 bytes). Its LUT copy now handles K1's valid
+  24-byte dictionary without an artificial 16-byte size rule. Direct CUDA
+  bindings also instantiate K26..K32 with global cached gathers for kernel
+  research only; that scaffolding is not reader or artifact support.
+- Optimized lanes remain independently qualified. A rung outside an optimized
+  lane's compiled/eligible subset takes the exact generic decode or
+  expand-plus-BF16 bridge; wire acceptance never implies fast-lane evidence.
+- Overlapping FP8/NVFP4 rates carry no manual family priority. AQUA selection
+  remains driven by registered activation contracts, not contract row order or
+  an implicit FP8 preference. Model load now enforces those activation-family
+  floors: FP8-CB requires `sm_89+`, while NVFP4-CB requires Blackwell
+  `sm_100+`, so RTX 40 cannot acquire an NVFP4 candidate through a generic
+  BF16-expansion fallback.
+- The lane table now records five closed-world SM120 cells for the canonical
+  K1..K25 public range, all `compile_only`: dense/routed decode are backed,
+  role-unsplit routed batch is backed by persistent-B, and both
+  expand-plus-BF16 routes are explicit fallbacks. The no-launch preflight also
+  cross-compiles the K26..K32 direct research templates and verifies all four
+  modules as exact `sm_120`/`sm_120a` SASS, without promoting those templates
+  into the public contract.
+- Schema and `contract_version` move together to
+  `gridbook.runtime-contract.v11` / 11. All tensor/expert-parallel and FP8
+  fields retain their v10 semantics.
+
 ### FP8-CB producer ladder expands to K4..K48/4 (contract schema v10)
 
 - `formats[].rungs` is now explicitly the accepted **reader** domain and the

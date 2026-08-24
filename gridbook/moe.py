@@ -658,8 +658,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
         def _flat(ref) -> torch.Tensor:
             names = ref if isinstance(ref, (list, tuple)) else [ref]
-            return codec.build_flat_codebook(
-                [codebooks[n].to(dev) for n in names], self.prefix, grid)
+            return codec.build_flat_product_codebook(
+                [codebooks[n].to(dev) for n in names], self.k, self.n_sub,
+                self.prefix, grid)
 
         # Per-role books (0.8.3). The resolver hands these back ONLY when the
         # artifact names different codebooks for gate/up/down; a uniform
@@ -856,7 +857,9 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
             # actually compiled: a bad index must fail the load, not the first
             # request that happens to carry routed rows.
             layer._cb_moe_persistent_b_cfg = persistent_b_resolve_cfg(
-                layer._cb_moe_persistent_b)
+                layer._cb_moe_persistent_b,
+                fp4_type_size=self.type_size,
+                d2r=persistent_b_d2r_on)
             if persistent_b_d2r_on:
                 if fused_fp4_moe_mode:
                     raise NativeKernelUnavailableError(

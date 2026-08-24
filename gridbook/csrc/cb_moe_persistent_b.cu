@@ -143,9 +143,11 @@
 // The codebook LUT stays in GLOBAL memory and is read through `__ldg`; see
 // `kSmemReservedPerCta` below for the measurement that rejected staging it.
 //
-// Compiled ladder, shared memory quoted at the largest rung (k=24, the widest
-// packed superblock).  `cb_moe_persistent_b_configs()` attests these at
-// runtime; python enumerates THAT, never this comment.
+// Compiled ladder, shared memory quoted at the historical k=24 reference rung.
+// K25..K32 use the same kernels, but their wider packed stages make tile
+// eligibility rung-dependent; `cb_moe_persistent_b_fp8_cfg_eligible()` is the
+// backwards-named ABI entry that attests the exact (family, schedule, rung)
+// predicate at runtime. Python enumerates/queries THAT, never this comment.
 //
 //  cfg  TM   TN  warps thr      A      B     pk    smem   CTAs/SM  accum/thr
 //  ---  ---  ---  ----- ---  ------  -----  -----  -----  -------  ---------
@@ -178,7 +180,7 @@
 // descriptor the mainloop is templated over:
 //
 // * FP4-CB two-tier v2 (`CbFp4V2Fmt`): product mode n_sub=2,
-//   `type_size == 4*k + 9`, k in [1,24].  This is the original K1.1 surface
+//   `type_size == 4*k + 9`, k in [1,32].  This is the original K1.1 surface
 //   and the quality path that has no fused alternative at any M.
 // * FP8-CB (`CbFp8Fmt`, K1.1's second payload family): product mode n_sub=4,
 //   `type_size == 4*k`, k in [1,48] — a flat e4m3 plane (converted ONCE at
@@ -469,7 +471,9 @@ DEVINL uint32_t cb_scale_pair(uint32_t q, float sc) {
 // loads per codeword and three width-4 shuffles -- no 4x bit/compose repeat,
 // no full-codeword broadcast, and no decoded B shared-memory exchange.
 //
-// k<=24 makes each half-index <=12 bits, so packing i0|i1<<16 is exact.
+// k<=32 makes each half-index <=16 bits, so packing i0|i1<<16 is exact. K32
+// is the hard boundary for this representation: a 17-bit half-index at K33
+// would overlap the other packed half.
 DEVINL uint2 cb_decode_k16_pairs(const uint32_t* __restrict__ s32,
                                 const uint8_t* __restrict__ sbytes,
                                 int c0,
@@ -1270,11 +1274,12 @@ constexpr int64_t kSmemPerSm = 102400;
 // reservation so no future config can repeat the mistake silently.
 constexpr int64_t kSmemReservedPerCta = 1024;
 
-// The 2-CTAs/SM floor as a per-config predicate.  For FP4 (type_size <= 105)
-// every compiled config passes at every legal rung, so this changes nothing
-// there; FP8's wider packed superblocks (type_size = 4k, k up to 48) push the
-// TN=64/TN=128 tiles past the floor above k=33/k=31 respectively, and a
-// config that would slip to one CTA per SM must be unselectable — auto
+// The 2-CTAs/SM floor as a per-config predicate. FP4 now reaches type_size=137:
+// all configs pass through K29; cfg 4 drops at K30, and cfgs 1/4 drop at K32.
+// D2R removes the decoded-B tile and keeps all four eligible through K32.
+// FP8's wider packed superblocks (type_size = 4k, k up to 48) push the
+// TN=64/TN=128 tiles past the floor above k=33/k=31 respectively. A config
+// that would slip to one CTA per SM must be unselectable — auto
 // selection filters on this, the launcher TORCH_CHECKs it, and the python
 // lane consults it at MODEL LOAD via `cb_moe_persistent_b_fp8_cfg_eligible`
 // so an explicit override naming an ineligible tile fails the load, not the
@@ -1298,11 +1303,11 @@ bool cfg_eligible(int i, int type_size, bool d2r, bool fp8) {
 // Measured on GB10 (docs/KERNELS.md): TM=64/TN=128 wins below ~64 mean rows,
 // TM=128/TN=64 through ~192, TM=256/TN=64 above.
 //
-// `cfg_eligible` is a HARD filter over the whole selection: for FP4 every
-// compiled config passes at every legal rung, so the FP4 result is
-// byte-identical to the pre-FP8 selector; for FP8 the wide tiles fall out
-// above k=33 (TN=64 A-heavy) / k=31 (TN=128) and the TN<=64/4-warp tiles
-// carry every rung to k=48, so the filtered set is never empty.
+// `cfg_eligible` is a HARD filter over the whole selection. For widened FP4,
+// cfgs 2/3 carry the baseline through K32 and every D2R config remains legal;
+// for FP8 the wide tiles fall out above k=33 (TN=64 A-heavy) / k=31 (TN=128)
+// and the TN<=64/4-warp tiles carry every rung to k=48. The filtered set is
+// never empty for either family/schedule.
 int pick_cfg(int64_t P, int64_t E, int64_t N, int type_size, bool d2r,
              bool fp8) {
   const int64_t mean_rows = P / E;
@@ -1389,21 +1394,30 @@ void pb_prepare_device(int device) {
               "cb_moe_persistent_b supports only native compute capability "
               "12.0/12.1, but cuda:", device, " reports ", prop.major, ".",
               prop.minor);
-  // The REAL requirement is the largest compiled tile at the widest rung, not
-  // the whole 99 KiB budget: gating on the budget would reject a device this
-  // schedule can serve. (Every cc-12.x part advertises the full 101,376 B, so
-  // this has never fired -- which is exactly why it should state the true
-  // bound rather than a convenient one.)
+  // The REAL requirement is the largest ELIGIBLE compiled tile over every
+  // legal rung/schedule, not the whole 99 KiB budget. A tile can be eligible at
+  // K31 and fall out at K32, so checking only the widest rung would understate
+  // the bound. Gating on the whole budget would instead reject a device this
+  // schedule can serve.
   int64_t need = 0;
   for (int i = 0; i < kNumCfgs; ++i) {
-    const int64_t s = cfg_smem_bytes(kCfgs[i], 4 * 24 + 9);
-    if (s > need) need = s;
-    // FP8's widest rung (k=48), counting only configs the selector can ever
-    // pick there — an ineligible tile never launches, so it must not gate
-    // the device.
-    if (cfg_eligible(i, 4 * 48, /*d2r=*/false, /*fp8=*/true)) {
-      const int64_t s8 = cfg_smem_bytes(kCfgs[i], 4 * 48, false, true);
-      if (s8 > need) need = s8;
+    for (int k = 1; k <= 32; ++k) {
+      const int ts = 4 * k + 9;
+      if (cfg_eligible(i, ts, /*d2r=*/false, /*fp8=*/false)) {
+        const int64_t s = cfg_smem_bytes(kCfgs[i], ts, false, false);
+        if (s > need) need = s;
+      }
+      if (cfg_eligible(i, ts, /*d2r=*/true, /*fp8=*/false)) {
+        const int64_t sd = cfg_smem_bytes(kCfgs[i], ts, true, false);
+        if (sd > need) need = sd;
+      }
+    }
+    for (int k = 1; k <= 48; ++k) {
+      const int ts = 4 * k;
+      if (cfg_eligible(i, ts, /*d2r=*/false, /*fp8=*/true)) {
+        const int64_t s8 = cfg_smem_bytes(kCfgs[i], ts, false, true);
+        if (s8 > need) need = s8;
+      }
     }
   }
   TORCH_CHECK(prop.sharedMemPerBlockOptin >= need,
@@ -1415,12 +1429,16 @@ void pb_prepare_device(int device) {
               "cb_moe_persistent_b sizes its tiles against ", kSmemPerSm,
               " B of shared memory per SM, but cuda:", device, " advertises ",
               prop.sharedMemPerMultiprocessor, " B");
+  const int max_dynamic_smem =
+      (int)((int64_t)prop.sharedMemPerBlockOptin < kSm120SmemCapacity
+                ? (int64_t)prop.sharedMemPerBlockOptin
+                : kSm120SmemCapacity);
 
 #define PB_SET_MAX_SMEM(TM_, TN_, W_)                                        \
   C10_CUDA_CHECK(cudaFuncSetAttribute(                                       \
       reinterpret_cast<const void*>(                                         \
           cb_moe_persistent_b_kernel<TM_, TN_, W_>),                         \
-      cudaFuncAttributeMaxDynamicSharedMemorySize, kSm120SmemCapacity))
+      cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem))
   PB_SET_MAX_SMEM(128, 64, 8);
   PB_SET_MAX_SMEM(64, 64, 4);
   PB_SET_MAX_SMEM(128, 32, 4);
@@ -1432,7 +1450,7 @@ void pb_prepare_device(int device) {
   C10_CUDA_CHECK(cudaFuncSetAttribute(                                       \
       reinterpret_cast<const void*>(                                         \
           cb_moe_persistent_b_kernel<TM_, TN_, W_, false, CbFp8Fmt>),        \
-      cudaFuncAttributeMaxDynamicSharedMemorySize, kSm120SmemCapacity))
+      cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem))
   PB_SET_MAX_SMEM_FP8(128, 64, 8);
   PB_SET_MAX_SMEM_FP8(64, 64, 4);
   PB_SET_MAX_SMEM_FP8(128, 32, 4);
@@ -1526,8 +1544,8 @@ void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
               "cb_moe_persistent_b: N must be a multiple of 8 BF16 elements, "
               "got ",
               N);
-  TORCH_CHECK(k_bits >= 1 && k_bits <= 24,
-              "cb_moe_persistent_b: FP4-CB v2 supports k_bits in [1,24], got ",
+  TORCH_CHECK(k_bits >= 1 && k_bits <= 32,
+              "cb_moe_persistent_b: FP4-CB v2 supports k_bits in [1,32], got ",
               k_bits);
   TORCH_CHECK(type_size == 4 * k_bits + 9,
               "cb_moe_persistent_b: FP4-CB layout v2 requires "
@@ -1875,8 +1893,8 @@ torch::Tensor run_decode_probe(torch::Tensor qw_flat,
               "256*16 FP32 table");
   TORCH_CHECK(K % kSuperblock == 0,
               "cb_moe_persistent_b_decode: K must be a multiple of 256");
-  TORCH_CHECK(k_bits >= 1 && k_bits <= 24 && type_size == 4 * k_bits + 9,
-              "cb_moe_persistent_b_decode: FP4-CB v2 requires k in [1,24] and "
+  TORCH_CHECK(k_bits >= 1 && k_bits <= 32 && type_size == 4 * k_bits + 9,
+              "cb_moe_persistent_b_decode: FP4-CB v2 requires k in [1,32] and "
               "type_size == 4*k+9");
   TORCH_CHECK(nrows >= 0 && row0 >= 0,
               "cb_moe_persistent_b_decode: row0/nrows must be non-negative");
@@ -1998,19 +2016,20 @@ torch::Tensor cb_moe_persistent_b_decode_fp8(
   return out;
 }
 
-// The 2-CTAs/SM floor as a host attestation, for the python lane to consult
-// at MODEL LOAD (an explicit PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG naming a
-// tile the FP8 rung cannot hold must fail the load, not the first routed
-// request — the FP4 rungs all pass everywhere, which is why this predicate
-// arrived with FP8).  `cfg` is 1-based like the CFG override; 0 (auto) is
-// always eligible because the selector filters on this same predicate.
-bool cb_moe_persistent_b_fp8_cfg_eligible(int64_t cfg, int64_t type_size) {
+// The 2-CTAs/SM floor as a host attestation, for the python lane to consult at
+// MODEL LOAD. The exported name is retained for ABI compatibility with the
+// FP8 arm that introduced it; `fp8=false` queries widened FP4 and `d2r=true`
+// queries its direct-to-register schedule. `cfg` is 1-based like the override;
+// 0 (auto) is always eligible because the selector filters on this predicate.
+bool cb_moe_persistent_b_fp8_cfg_eligible(int64_t cfg, int64_t type_size,
+                                          bool d2r, bool fp8) {
   TORCH_CHECK(cfg >= 0 && cfg <= kNumCfgs,
               "cb_moe_persistent_b_fp8_cfg_eligible: cfg must be 0 (auto) or "
               "1..", kNumCfgs, ", got ", cfg);
   if (cfg == 0) return true;
-  return cfg_eligible((int)cfg - 1, (int)type_size, /*d2r=*/false,
-                      /*fp8=*/true);
+  TORCH_CHECK(!(d2r && fp8),
+              "cb_moe_persistent_b_fp8_cfg_eligible: D2R is FP4-CB-only");
+  return cfg_eligible((int)cfg - 1, (int)type_size, d2r, fp8);
 }
 
 // Host-only attestation of what was actually compiled — no launch, no device
@@ -2117,9 +2136,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cb_moe_persistent_b_fp8_cfg_eligible",
         &cb_moe_persistent_b_fp8_cfg_eligible,
         "whether a 1-based tile config holds the 2-CTAs/SM floor at this "
-        "FP8-CB type_size (0 = auto, always eligible; the selector filters "
-        "on the same predicate). Consulted by the lane at MODEL LOAD.",
-        pybind11::arg("cfg"), pybind11::arg("type_size"));
+        "type_size and schedule (legacy FP8-named ABI; fp8=false queries "
+        "FP4-CB, d2r=true queries FP4 D2R; 0=auto is always eligible). "
+        "Consulted by the lane at MODEL LOAD.",
+        pybind11::arg("cfg"), pybind11::arg("type_size"),
+        pybind11::arg("d2r") = false, pybind11::arg("fp8") = true);
   m.def("cb_moe_persistent_b_d2r_decode_pairs",
         &cb_moe_persistent_b_d2r_decode_pairs,
         "Standalone probe of the exact cooperative pair helper used by D2R: "

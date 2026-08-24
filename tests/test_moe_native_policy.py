@@ -578,7 +578,8 @@ def test_moe_post_load_caches_distinct_attested_stage_scales(monkeypatch):
     monkeypatch.delenv("PRISMAQUANT_CB_FUSED_FP4_MOE", raising=False)
     monkeypatch.setattr(moe, "assert_cb_experts_filled", lambda *_args: None)
     monkeypatch.setattr(
-        moe.codec, "build_flat_codebook", lambda *_args: torch.zeros(1)
+        moe.codec, "build_flat_product_codebook",
+        lambda *_args: torch.zeros(1),
     )
     monkeypatch.setattr(
         moe.codec, "build_compose_table", lambda *_args: torch.zeros(1)
@@ -846,7 +847,7 @@ def _stub_load(monkeypatch, method):
     method.quant_config = QuantConfig()
     method._cuda_moe_ok = lambda _layer: True
     monkeypatch.setattr(moe, "assert_cb_experts_filled", lambda *_a: None)
-    monkeypatch.setattr(moe.codec, "build_flat_codebook",
+    monkeypatch.setattr(moe.codec, "build_flat_product_codebook",
                         lambda *_a: torch.zeros(1))
     monkeypatch.setattr(moe.codec, "build_compose_table",
                         lambda *_a: torch.zeros(1))

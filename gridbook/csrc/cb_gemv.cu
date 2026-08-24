@@ -87,7 +87,7 @@ constexpr int kSlotBytes = 208;          // >= max type_size (192) + 16 slack;
 constexpr float kFp8Max = 448.0f;
 constexpr float kMinScale = 1.0f / (448.0f * 512.0f);
 
-// v10 reader ABI: low canonical rungs plus the complete legacy high domain.
+// v11 reader ABI: low canonical rungs plus the complete legacy high domain.
 // Keep this independent of the producer law (K4..K48/4): old irregular
 // K28..K48 artifacts remain loadable, while never-produced K25..K27 and
 // arbitrary widths below K28 fail at the native binding as well as config
@@ -1199,6 +1199,8 @@ torch::Tensor cb_gemv_fp4_v2(torch::Tensor x, torch::Tensor qw_padded,
   TORCH_CHECK(n_sub == 2,
               "fp4-v2 GEMV: n_sub=2 (product) only; the signed n_sub=1 "
               "family was removed from the runtime");
+  TORCH_CHECK(k_bits >= 1 && k_bits <= 32,
+              "fp4-v2 GEMV: k_bits must be in [1,32], got ", k_bits);
   TORCH_CHECK(K % 256 == 0, "K must be a multiple of the 256 superblock");
   TORCH_CHECK(type_size == 4 * k_bits + 9,
               "fp4-v2 type_size must be 4k+9 (E8M0 super + 8 sub-nibble bytes)");
@@ -2066,6 +2068,8 @@ torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
   TORCH_CHECK(n_sub == 2,
               "fp4-v2 MoE GEMV: n_sub=2 (product) only; the signed n_sub=1 "
               "family was removed from the runtime");
+  TORCH_CHECK(k_bits >= 1 && k_bits <= 32,
+              "fp4-v2 MoE GEMV: k_bits must be in [1,32], got ", k_bits);
   TORCH_CHECK(type_size == 4 * k_bits + 9,
               "fp4-v2 type_size must be 4k+9 (E8M0 super + 8 sub-nibble bytes)");
   TORCH_CHECK(type_size <= kSlotBytes, "type_size exceeds the smem stage slot");

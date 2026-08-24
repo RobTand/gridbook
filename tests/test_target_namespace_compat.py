@@ -657,7 +657,7 @@ def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
     compressed-tensors group at its choke point.
 
     This test reads the packaged table, so it pins the schema it was written
-    against.  Before ``gridbook.runtime-contract.v10`` that pin lived only in a
+    against.  Before ``gridbook.runtime-contract.v11`` that pin lived only in a
     prose docstring, which no grep could see: the v8 bump left it reading "v7"
     and nothing failed.  The assertion below is what puts this file in
     ``tests/test_runtime_contract.py::_VERSION_PIN_FILES``, so the next bump
@@ -668,8 +668,8 @@ def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
 
     contract = json.loads(resource_files("gridbook").joinpath(
         "runtime_contract.json").read_text(encoding="utf-8"))
-    assert contract["schema"] == "gridbook.runtime-contract.v10"
-    assert contract["contract_version"] == 10
+    assert contract["schema"] == "gridbook.runtime-contract.v11"
+    assert contract["contract_version"] == 11
     table = contract["tensor_parallel"]
     assert table["axis"] == "vllm_tensor_parallel_world_size"
     assert table["semantics"] == "closed_world"
@@ -735,7 +735,7 @@ def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
                              "model.layers.0.mlp.unclaimed")
 
 
-def test_fp8_cb_rejects_sm80_before_the_first_prefill(monkeypatch):
+def test_cb_activation_families_enforce_their_device_floors(monkeypatch):
     import gridbook.config as config_mod
 
     cfg = PrismaQuantConfig(_config())
@@ -751,7 +751,13 @@ def test_fp8_cb_rejects_sm80_before_the_first_prefill(monkeypatch):
 
     fp4 = {**_SCHEME, "grid": "fp4"}
     monkeypatch.setattr(config_mod.torch.cuda, "get_device_capability",
-                        lambda: (8, 0))
+                        lambda: (8, 9))
+    with pytest.raises(ValueError, match=r"NVFP4-CB.*sm_100\+.*sm_89"):
+        cfg._require_cb_device_capability(fp4,
+                                          "model.layers.0.mlp.down_proj")
+
+    monkeypatch.setattr(config_mod.torch.cuda, "get_device_capability",
+                        lambda: (10, 0))
     cfg._require_cb_device_capability(fp4, "model.layers.0.mlp.down_proj")
 
 

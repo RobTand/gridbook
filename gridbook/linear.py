@@ -598,8 +598,9 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
             names = tuple(ref) if isinstance(ref, (list, tuple)) else (ref,)
             if names not in block_offsets:
                 subs = [codebooks[n].to(dev) for n in names]
-                flat = codec.build_flat_codebook(
-                    subs, self.prefix, "fp4" if self.is_fp4 else "fp8")
+                flat = codec.build_flat_product_codebook(
+                    subs, self.k, self.n_sub, self.prefix,
+                    "fp4" if self.is_fp4 else "fp8")
                 block_offsets[names] = cb_cumoffset
                 block_ids[names] = len(blocks)
                 block_ranges.append((cb_cumoffset, flat.numel()))

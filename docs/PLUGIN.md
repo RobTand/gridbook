@@ -50,7 +50,7 @@ gated activations are attested during model load and invoke their registered
 
 The producer/runtime boundary is machine-readable at
 `gridbook/runtime_contract.json` and loadable without torch or vLLM through
-`gridbook.runtime_contract.load_runtime_contract()`. Closed schema v10 also
+`gridbook.runtime_contract.load_runtime_contract()`. Closed schema v11 also
 attests `abi_features.source_fp8_block128_w8a16 = 1`,
 `abi_features.dspark_construction_physical_bridge = 1`, and a per-unit
 tensor-parallel capability table, so a producer can require the BF16-activation
@@ -88,9 +88,16 @@ second runtime tree or maintain a parallel loader table.
   `formats[FP8_CB_K].rungs` accepts K4/K8/K12/K16/K20/K24 and every integer
   K28..K48, retaining older irregular artifacts. `producer_rungs` is the
   hardware-aligned K4..K48 step-4 menu. A producer MUST choose from the latter;
-  a reader MUST continue to admit the former. NVFP4's two fields both remain
-  K12..K24. `type_size` is still exactly `4*k` for FP8, so no legacy byte
-  interpretation changed.
+  a reader MUST continue to admit the former. NVFP4 has no corresponding
+  legacy artifacts: its reader and producer lists are both exactly K1..K25.
+  K26..K32 remain low-level CUDA research templates after the measured
+  dictionary-residency cliff, not valid artifacts or chooser candidates. K1 is
+  the valid `(1,0)` split; K32 remains only the mathematical `(16,16)` E2M1
+  product-lattice ceiling. `type_size` is still exactly `4*k` for FP8, so no
+  legacy byte interpretation changed.
+- Overlapping FP8/NVFP4 rates do not encode a family preference. AQUA chooses
+  among registered activation contracts; contract row order and a manual
+  "prefer FP8" rule are not chooser inputs.
 - **Mixed containers are supported and shipping.** A config group carrying a
   `"scheme"` key is a CB group and is served by this plugin; a group without one
   uses the stock `compressed-tensors` vocabulary and is delegated to a real
@@ -164,7 +171,7 @@ second runtime tree or maintain a parallel loader table.
 
 ## Capability-scoped serving lanes
 
-Contract v10 adds `lane_eligibility` schema
+Contract v11 carries `lane_eligibility` schema
 `gridbook.lane-eligibility.v2`. It does not widen the byte reader domain; it
 states which exact platform/structure/regime/rung compositions have a native
 route and how far their qualification has progressed.
@@ -181,7 +188,16 @@ route and how far their qualification has progressed.
 - The initial SM89 dense FP8-CB decode (`cb_gemv_fp8`) and batch
   (`cb_expand_fp8` + direct vLLM CUTLASS W8A8) rows cover the producer ladder
   but remain `compile_only`. This contract therefore does **not** authorize a
-  4090 artifact yet.
+  4090 artifact yet. SM89 has no NVFP4 lane row or FP4 activation
+  registration; NVFP4-CB is wholly unsupported there.
+- The SM120 NVFP4-CB production rows cover K1..K25. Dense and routed decode are
+  `backed`;
+  routed batch is `backed` only when `role_split == false` selects
+  persistent-B. Dense batch and the generic routed expand-plus-BF16 bridge are
+  truthfully `fallback`. Every SM120 row is `compile_only`, so none authorizes
+  an RTX 50 artifact or a performance claim. The separate no-launch preflight
+  additionally compiles K26..K32 as direct-kernel research scaffolding; those
+  values have no format registration or production lane row.
 - `python -m gridbook.sm89_preflight --build-directory <dedicated-dir>
   --receipt <receipt.json>`
   cross-compiles the production generic module with explicit
@@ -190,6 +206,12 @@ route and how far their qualification has progressed.
   never uses the production extension cache. The emitted JSON says
   `qualification_ceiling: compile_only` and explicitly excludes device,
   performance and graph claims.
+- `python -m gridbook.sm120_preflight --build-directory <dedicated-dir>
+  --receipt <receipt.json>` performs the corresponding no-launch NVFP4 gate.
+  It compiles the generic decode/expand modules as `sm_120` and the
+  architecture-conditional persistent-B and BF16 bridge modules as `sm_120a`,
+  validates their complete symbol surfaces, and checks the emitted cubins.
+  The `a` suffix is a code-generation detail, not a second contract platform.
 - Gridbook intentionally carries no torch.compile or CUDA-graph configuration
   or attestation in this table. The serving producer owns its immutable graph
   requirement and references the per-run endpoint receipt that actually proved
@@ -197,7 +219,7 @@ route and how far their qualification has progressed.
 
 ## Tensor-parallel capability
 
-As of contract schema `gridbook.runtime-contract.v10`, the packaged contract
+As of contract schema `gridbook.runtime-contract.v11`, the packaged contract
 carries a `tensor_parallel` section that publishes, per serving unit, what the
 runtime actually enforces. The table is an attestation: each row restates a
 refusal or admission site in this package, and
@@ -288,12 +310,12 @@ contract that omits a shipped unit, invents one, drops a mandatory field,
 caps the capless dense CB surface with a number, or publishes a numeric claim
 no enforcement site stands behind.
 
-**Compatibility rule:** `schema` and `contract_version` move together (v10 / 10),
+**Compatibility rule:** `schema` and `contract_version` move together (v11 / 11),
 and readers match the schema string exactly. A producer pinned to the previous
-schema (v9) must refuse a `gridbook.runtime-contract.v10` contract whole — no
+schema (v10) must refuse a `gridbook.runtime-contract.v11` contract whole — no
 partial parsing, no field-by-field salvage across versions — and keep producing
-against its pinned runtime until its pin is deliberately bumped. Reading a v9
-contract with a v10 reader fails the same way. Only the CURRENT schema string is
+against its pinned runtime until its pin is deliberately bumped. Reading a v10
+contract with a v11 reader fails the same way. Only the CURRENT schema string is
 spelled in full anywhere outside the changelog, so a stale pin cannot hide in
 prose.
 

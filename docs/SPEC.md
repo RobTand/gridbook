@@ -24,6 +24,20 @@ two index-encoding modes.
 | `NVFP4_CB_K{k}` | FP4 / E2M1 | `{0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}` | W4A4 | group-16 E4M3, **in the weight bytes** | `k/8 + 0.5` (v1) |
 | `FP8_CB_K{k}` | FP8 / E4M3 | E4M3 grid, `‖·‖ ≤ 448` | W8A8 | **none in weight bytes** — per-output-channel FP32, separate tensor | `k/8` |
 
+**NVFP4 product rung domain.** `NVFP4_CB_K{k}` is publicly defined for every
+integer `1 ≤ k ≤ 25`, with `n_sub = 2` and the ceil-first split above. At K1 the split
+is `(1, 0)`: the second sub-codebook has one four-value entry and its index is
+the empty/zero bit string. At K32 the split is `(16, 16)`. E2M1 has 16 wire
+encodings but 15 distinct numeric values because its two zero encodings
+coincide, so a four-value subvector has `15^4 = 50,625` distinct numeric
+choices: more than `2^15`, but no more than `2^16`. Each K32 half can therefore
+contain the complete numeric lattice (with deterministic duplicate rows to
+fill its 65,536-entry table); a K33 half cannot add a new numeric lattice value.
+That mathematical ceiling motivates direct CUDA research instantiations
+through K32, but does not enlarge the format: reader, producer, and
+format-chooser domains are all exactly K1..K25. K26..K32 are not valid public
+artifact rungs.
+
 > **Removed family.** `NVFP4_CB_S{k}` (sign-magnitude half-grid, `mode:
 > "signed"`) was deleted from the runtime on 2026-08-23 — the producer had
 > stopped emitting it on 2026-08-17 because an `n_sub=1` codebook can never
@@ -197,7 +211,7 @@ integer K28..K48 artifact. New v10 producers emit exactly
 every accepted FP8 row still has exactly `4k` index bytes per 256 weights and
 uses the ceil-first four-way product split above. A runtime may support a
 broader format-valid research `k`, but it MUST NOT claim that value as part of
-Gridbook's v10 reader or producer profile.
+Gridbook's v11 reader or producer profile.
 Reconstruction:
 ```
 weight[i] = codeword_value[i] * weight_scale[row]
@@ -207,6 +221,7 @@ weight[i] = codeword_value[i] * weight_scale[row]
 
 | Grid | k | `type_size` v1 | `type_size` v2 (4-bit sub) | index bytes (4k) | scale bytes v1 / v2 |
 |---|---|---|---|---|---|
+| fp4 | 1  | 20  | 13  | 4   | 16 / 9 |
 | fp4 | 12 | 64  | 57  | 48  | 16 / 9 |
 | fp4 | 13 | 68  | 61  | 52  | 16 / 9 |
 | fp4 | 14 | 72  | 65  | 56  | 16 / 9 |
@@ -214,6 +229,9 @@ weight[i] = codeword_value[i] * weight_scale[row]
 | fp4 | 18 | 88  | 81  | 72  | 16 / 9 |
 | fp4 | 20 | 96  | 89  | 80  | 16 / 9 |
 | fp4 | 24 | 112 | 105 | 96  | 16 / 9 |
+| fp4 | 25 | 116 | 109 | 100 | 16 / 9 |
+| fp4 | 26 | 120 | 113 | 104 | 16 / 9 |
+| fp4 | 32 | 144 | 137 | 128 | 16 / 9 |
 | fp8 | 36 | 144 | —   | 144 | 0 |
 | fp8 | 40 | 160 | —   | 160 | 0 |
 | fp8 | 44 | 176 | —   | 176 | 0 |

@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 import os
 import sys
 
@@ -39,6 +40,45 @@ TWO_TIER_SUB_TABLE = (1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875,
 
 def type_size(k: int, is_fp4: bool) -> int:
     return 4 * int(k) + (16 if is_fp4 else 0)
+
+
+def product_subtable_shapes(k_bits: int, n_sub: int) -> tuple[tuple[int, int], ...]:
+    """Canonical ceil-first product-codebook tensor shapes.
+
+    A zero-bit part is intentional and has one entry.  In particular, NVFP4
+    K1/n_sub=2 is ``((2, 4), (1, 4))``; treating the second table as absent
+    would change all following flat-codebook offsets.
+    """
+
+    k_bits, n_sub = int(k_bits), int(n_sub)
+    if k_bits <= 0:
+        raise ValueError(f"k_bits must be positive, got {k_bits}")
+    if n_sub <= 0 or VEC_DIM % n_sub:
+        raise ValueError(
+            f"n_sub must be a positive divisor of {VEC_DIM}, got {n_sub}")
+    base, extra = divmod(k_bits, n_sub)
+    sub_dim = VEC_DIM // n_sub
+    return tuple((1 << (base + (1 if i < extra else 0)), sub_dim)
+                 for i in range(n_sub))
+
+
+def build_flat_product_codebook(
+    sub_tables: Sequence[torch.Tensor], k_bits: int, n_sub: int,
+    prefix: str = "codebook", grid: str | None = None,
+) -> torch.Tensor:
+    """Validate product table count/shapes, then build the kernel flat LUT."""
+
+    expected = product_subtable_shapes(k_bits, n_sub)
+    if len(sub_tables) != len(expected):
+        raise ValueError(
+            f"{prefix}: product K{k_bits} requires {len(expected)} "
+            f"sub-codebooks, got {len(sub_tables)}")
+    for index, (table, shape) in enumerate(zip(sub_tables, expected)):
+        if tuple(table.shape) != shape:
+            raise ValueError(
+                f"{prefix}: product K{k_bits} sub{index} must have shape "
+                f"{shape}, got {tuple(table.shape)}")
+    return build_flat_codebook(sub_tables, prefix, grid)
 
 
 # --- the FUSED mid-M lane's rung law (K1.2) --------------------------------
@@ -145,7 +185,7 @@ def validate_codebook_grid(raw: torch.Tensor, grid: str,
     raise ValueError(f"[prismaquant] {prefix}: unknown codebook grid {grid!r}")
 
 
-def build_flat_codebook(sub_tables: list[torch.Tensor],
+def build_flat_codebook(sub_tables: Sequence[torch.Tensor],
                         prefix: str = "codebook",
                         grid: str | None = None) -> torch.Tensor:
     """Concatenate product sub-tables (each (2^w, sub_dim)) into the flat layout

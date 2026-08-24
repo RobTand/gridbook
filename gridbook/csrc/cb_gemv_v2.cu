@@ -99,6 +99,24 @@ struct Split2 {
   }
 };
 
+// Copy a BF16 dictionary into dynamic shared memory without imposing a wire
+// alignment rule on its logical size.  K1 is the only product rung whose
+// complete dictionary is not a multiple of 16 bytes: split (1,0) contains
+// (2 + 1) * 4 BF16 values = 24 bytes.  CUDA allocations are vector-aligned,
+// so copy the uint4 body cooperatively and finish the logical tail byte-wise.
+// No source read crosses cb_bytes.
+template <int THREADS>
+DEVINL void cbv2_copy_dict_tail_safe(uint8_t* __restrict__ dst,
+                                     const uint8_t* __restrict__ src,
+                                     int cb_bytes) {
+  const int nv = cb_bytes >> 4;
+  const uint4* src4 = reinterpret_cast<const uint4*>(src);
+  uint4* dst4 = reinterpret_cast<uint4*>(dst);
+  for (int i = threadIdx.x; i < nv; i += THREADS) dst4[i] = src4[i];
+  for (int i = (nv << 4) + threadIdx.x; i < cb_bytes; i += THREADS)
+    dst[i] = src[i];
+}
+
 // One superblock of the per-lane FP4-CB dot product.  Keeping this helper
 // shared by the ordinary rowpack schedule and the exact DSV4 specialization
 // below makes the byte extraction, dictionary gather, weight rounding and FMA
@@ -265,12 +283,11 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_v2_kernel(
   uint16_t* dict = reinterpret_cast<uint16_t*>(smem);
   uint8_t* slots = smem + (size_t)stage_elems * 2;
 
-  // --- Phase 0: cooperative dict load (uint4-vectorized; cb_bytes % 16 == 0) -
+  // --- Phase 0: cooperative dict load (uint4 body + exact logical tail) ----
   if (DS != 0) {
-    const uint4* src = reinterpret_cast<const uint4*>(cb);
-    uint4* dst = reinterpret_cast<uint4*>(dict);
-    const int nv = (stage_elems * 2) >> 4;
-    for (int i = threadIdx.x; i < nv; i += WARPS * 32) dst[i] = src[i];
+    cbv2_copy_dict_tail_safe<WARPS * 32>(
+        reinterpret_cast<uint8_t*>(dict),
+        reinterpret_cast<const uint8_t*>(cb), stage_elems * 2);
     __syncthreads();
   }
 
@@ -371,7 +388,7 @@ __global__ __launch_bounds__(WARPS * 32) void cb_gemv_v2_kernel(
 // nvfp4_cb_reconstruct(...).to(bf16) and expand.expand_fp4_v2_to_weight
 // bit-for-bit. rows over [row0, row0+nrows) of the FLATTENED (E*Nout) stack.
 // ---------------------------------------------------------------------------
-template <int WARPS>
+template <int WARPS, bool STAGE_DICT>
 __global__ __launch_bounds__(WARPS * 32) void cb_expand_v2_kernel(
     const uint8_t* __restrict__ qw,        // flat [rows_total * row_bytes]
     const uint16_t* __restrict__ cb,
@@ -387,13 +404,12 @@ __global__ __launch_bounds__(WARPS * 32) void cb_expand_v2_kernel(
 
   extern __shared__ __align__(16) uint8_t smem[];
   uint16_t* dict = reinterpret_cast<uint16_t*>(smem);
-  {
-    const uint4* src = reinterpret_cast<const uint4*>(cb);
-    uint4* dst = reinterpret_cast<uint4*>(dict);
-    const int nv = (cb_elems * 2) >> 4;
-    for (int i = threadIdx.x; i < nv; i += WARPS * 32) dst[i] = src[i];
+  if constexpr (STAGE_DICT) {
+    cbv2_copy_dict_tail_safe<WARPS * 32>(
+        reinterpret_cast<uint8_t*>(dict),
+        reinterpret_cast<const uint8_t*>(cb), cb_elems * 2);
+    __syncthreads();
   }
-  __syncthreads();
 
   const Split2 sp(k_bits);
   const int scale_off = 4 * k_bits;
@@ -424,12 +440,24 @@ __global__ __launch_bounds__(WARPS * 32) void cb_expand_v2_kernel(
 
     const uint32_t i0 = (uint32_t)code & sp.m0;
     const uint32_t i1 = (uint32_t)(code >> sp.w0) & sp.m1;
+    uint2 q0, q1;
+    if constexpr (STAGE_DICT) {
+      q0 = *reinterpret_cast<const uint2*>(dict + (int64_t)i0 * 4);
+      q1 = *reinterpret_cast<const uint2*>(
+          dict + sp.e1 + (int64_t)i1 * 4);
+    } else {
+      q0 = __ldg(reinterpret_cast<const uint2*>(cb + (int64_t)i0 * 4));
+      q1 = __ldg(reinterpret_cast<const uint2*>(
+          cb + sp.e1 + (int64_t)i1 * 4));
+    }
+    const uint32_t q[4] = {q0.x, q0.y, q1.x, q1.y};
     uint16_t out[8];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      out[j] = f32_to_bf16_rn(bf16_to_f32(dict[(int64_t)i0 * 4 + j]) * sc);
-      out[4 + j] = f32_to_bf16_rn(bf16_to_f32(dict[sp.e1 + (int64_t)i1 * 4 + j])
-                                  * sc);
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t word = q[j >> 1];
+      const uint16_t value = (j & 1) ? (uint16_t)(word >> 16)
+                                     : (uint16_t)(word & 0xffffu);
+      out[j] = f32_to_bf16_rn(bf16_to_f32(value) * sc);
     }
     uint16_t* dst = w + (r - row0) * K + ((int64_t)s << 8) + (lane << 3);
 #pragma unroll
@@ -535,7 +563,7 @@ static void cbv2_prepare_device(int device) {
   CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 0, 16>));
   CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 1, 16>));
   CBV2_SET_MAX_SMEM((cb_gemv_v2_kernel<8, 2, 16>));
-  CBV2_SET_MAX_SMEM((cb_expand_v2_kernel<8>));
+  CBV2_SET_MAX_SMEM((cb_expand_v2_kernel<8, true>));
 #undef CBV2_SET_MAX_SMEM
 
   cbv2_prepared[device].store(true, std::memory_order_release);
@@ -586,8 +614,8 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
               x.device() == pair_expert.device() &&
               x.device() == pair_xrow.device(),
               "all CB-GEMV-v2 tensors must be on the same CUDA device");
-  TORCH_CHECK(k_bits > 0 && k_bits <= 24,
-              "k_bits must be in [1,24], got ", k_bits);
+  TORCH_CHECK(k_bits > 0 && k_bits <= 32,
+              "k_bits must be in [1,32], got ", k_bits);
   TORCH_CHECK(type_size == 4 * k_bits + 9, "fp4-v2 type_size must be 4k+9");
   TORCH_CHECK(dict_mode >= 0 && dict_mode <= 3,
               "dict_mode must be 0(auto), 1(global), 2(half), or 3(full)");
@@ -610,7 +638,6 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
   TORCH_CHECK(pair_xrow.numel() == P,
               "pair_expert and pair_xrow must have the same length");
   const int64_t cb_elems = cb_flat.numel();
-  TORCH_CHECK((cb_elems * 2) % 16 == 0, "cb bytes must be 16B-aligned");
   const int expect =
       (int)((4ll << ((k_bits + 1) / 2)) + (4ll << (k_bits / 2)));
   TORCH_CHECK(cb_elems == expect, "cb_flat elems ", cb_elems,
@@ -657,11 +684,21 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
   else if (dict_bytes <= 16 * 1024) ds = (K >= 2048) ? 2 : 0;
   else ds = (K <= 1536) ? 0 : 1;
 
-  const size_t stage_bytes = (ds == 2) ? dict_bytes
-                                       : ((ds == 1) ? half_bytes : 0);
-  const size_t smem = stage_bytes + slot_smem;
+  size_t stage_bytes = (ds == 2) ? dict_bytes
+                                 : ((ds == 1) ? half_bytes : 0);
+  size_t smem = stage_bytes + slot_smem;
+  // The measured K12..K24 policy chooses HALF for a large dictionary on long
+  // rows.  Once the wire domain reaches K27 that half alone can exceed the
+  // device budget.  AUTO must remain a total function over every valid rung:
+  // drop to the exact GLOBAL residency.  A forced HALF/FULL request is an A/B
+  // assertion and still fails loudly when it cannot fit.
+  if (dict_mode == 0 && smem > CBV2_SMEM_BUDGET) {
+    ds = 0;
+    stage_bytes = 0;
+    smem = slot_smem;
+  }
   TORCH_CHECK(smem <= CBV2_SMEM_BUDGET, "smem ", smem,
-              " exceeds the 99KB sm_121a cap");
+              " exceeds the 99KB cc12x cap");
 
   // rpb (rows/block) POLICY.  rpb only decides which warp of which block owns
   // output row n; the per-row superblock order, the FMA chain and the 32-lane
@@ -786,7 +823,7 @@ torch::Tensor cb_gemv_v2(torch::Tensor x, torch::Tensor qw_stack,
 // formula.
 bool cb_gemv_v2_prefers_inherited(int64_t k_bits, int64_t type_size,
                                   int64_t in_features) {
-  if (k_bits <= 0 || k_bits > 24) return true;         // keep shifts in range
+  if (k_bits <= 0 || k_bits > 32) return true;         // product ABI domain
   if (type_size != 4 * k_bits + 9) return true;        // not fp4-v2 product mode
   if (in_features <= 0 || in_features % 256 != 0) return true;
   const int64_t row_bytes = (in_features >> 8) * type_size;
@@ -814,8 +851,8 @@ torch::Tensor cb_expand_v2(torch::Tensor qw_flat, torch::Tensor cb_flat,
   TORCH_CHECK(qw_flat.device() == cb_flat.device() &&
               qw_flat.device() == compose.device(),
               "qw_flat, cb_flat and compose must share a CUDA device");
-  TORCH_CHECK(k_bits > 0 && k_bits <= 24,
-              "k_bits must be in [1,24], got ", k_bits);
+  TORCH_CHECK(k_bits > 0 && k_bits <= 32,
+              "k_bits must be in [1,32], got ", k_bits);
   TORCH_CHECK(type_size == 4 * k_bits + 9,
               "fp4-v2 type_size must be 4k+9");
   TORCH_CHECK(K > 0 && K % 256 == 0 &&
@@ -836,8 +873,6 @@ torch::Tensor cb_expand_v2(torch::Tensor qw_flat, torch::Tensor cb_flat,
       (4ll << ((k_bits + 1) / 2)) + (4ll << (k_bits / 2));
   TORCH_CHECK(cb_elems == expect, "cb_flat elems ", cb_elems,
               " != product-mode expectation ", expect, " for k=", k_bits);
-  TORCH_CHECK((cb_elems * 2) % 16 == 0,
-              "cb bytes must be 16B-aligned");
 
   const c10::cuda::OptionalCUDAGuard guard(qw_flat.device());
   cbv2_prepare_device(qw_flat.get_device());
@@ -847,19 +882,35 @@ torch::Tensor cb_expand_v2(torch::Tensor qw_flat, torch::Tensor cb_flat,
   if (nrows == 0) return w;
   constexpr int WARPS = 8;
   const size_t smem = (size_t)cb_elems * 2;
-  // The oracle always stages the FULL dict, so it has no residency fallback:
-  // say so at the API boundary rather than failing as an opaque launch error.
-  TORCH_CHECK(smem <= CBV2_SMEM_BUDGET, "cb_expand_v2 needs ", smem,
-              " B of shared memory for the flat codebook, over the 99KB "
-              "sm_121a cap (k=", k_bits, ")");
-  cb_expand_v2_kernel<WARPS><<<(unsigned)nrows, WARPS * 32, smem, stream>>>(
-      qw_flat.data_ptr<uint8_t>(),
-      reinterpret_cast<const uint16_t*>(cb_flat.data_ptr()),
-      compose.data_ptr<float>(),
-      reinterpret_cast<uint16_t*>(w.data_ptr()),
-      row0, nrows, K, (int)k_bits, (int)type_size, (int)cb_elems, rows_total);
+  if (smem <= CBV2_SMEM_BUDGET) {
+    cb_expand_v2_kernel<WARPS, true>
+        <<<(unsigned)nrows, WARPS * 32, smem, stream>>>(
+        qw_flat.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint16_t*>(cb_flat.data_ptr()),
+        compose.data_ptr<float>(),
+        reinterpret_cast<uint16_t*>(w.data_ptr()),
+        row0, nrows, K, (int)k_bits, (int)type_size, (int)cb_elems,
+        rows_total);
+  } else {
+    cb_expand_v2_kernel<WARPS, false>
+        <<<(unsigned)nrows, WARPS * 32, 0, stream>>>(
+        qw_flat.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint16_t*>(cb_flat.data_ptr()),
+        compose.data_ptr<float>(),
+        reinterpret_cast<uint16_t*>(w.data_ptr()),
+        row0, nrows, K, (int)k_bits, (int)type_size, (int)cb_elems,
+        rows_total);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return w;
+}
+
+bool cb_expand_v2_stages_dictionary(int64_t k_bits) {
+  TORCH_CHECK(k_bits >= 1 && k_bits <= 32,
+              "k_bits must be in [1,32], got ", k_bits);
+  const int64_t cb_elems =
+      (4ll << ((k_bits + 1) / 2)) + (4ll << (k_bits / 2));
+  return cb_elems * 2 <= CBV2_SMEM_BUDGET;
 }
 
 double bw_read(torch::Tensor a, int64_t iters) {
@@ -946,7 +997,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "validate the current GB10 device and configure all v2 kernels' "
         "opt-in dynamic shared-memory attributes once for that device");
   m.def("cb_expand_v2", &cb_expand_v2,
-        "bit-exactness oracle: decode rows [row0,row0+nrows) to bf16");
+        "exact transient expander: decode rows [row0,row0+nrows) to bf16; "
+        "full-dictionary shared-memory residency through K25, global cached "
+        "gathers at K26..K32");
+  m.def("cb_expand_v2_stages_dictionary",
+        &cb_expand_v2_stages_dictionary,
+        "true iff the K1..K32 product dictionary fits the 99KiB staged "
+        "expander policy (K1..K25)");
   m.def("bw_read", &bw_read, "peak read bandwidth probe (GB/s)");
   m.def("bw_triad", &bw_triad, "peak triad bandwidth probe (GB/s)");
 }

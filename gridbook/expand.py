@@ -146,9 +146,9 @@ def expand_fp4_v2_to_weight(
     row_bytes = _validate_packed_rows(
         cb_qweight_padded, N, K, type_size)
     _validate_row_offsets(cb_row_offset, N, cb_qweight_padded.device)
-    if not (0 < k_bits <= 24) or type_size != 4 * k_bits + 9:
+    if not (0 < k_bits <= 32) or type_size != 4 * k_bits + 9:
         raise NotImplementedError(
-            "native cb_expand_v2 requires k_bits in [1,24] and "
+            "native cb_expand_v2 requires k_bits in [1,32] and "
             f"type_size=4*k_bits+9; got {k_bits=} and {type_size=}")
     if n_sub != 2:
         raise NotImplementedError(

@@ -153,6 +153,8 @@ def _complete_stub():
     answers = {
         "cb_moe_persistent_b_configs": lambda: ((128, 64), (64, 128),
                                                 (128, 128)),
+        "cb_moe_persistent_b_fp8_cfg_eligible":
+            lambda _cfg, _type_size, _d2r=False, _fp8=True: True,
         "cb_moe_persistent_b_tile_k": lambda: 64,
         "cb_moe_persistent_b_is_moe_only": lambda: True,
     }
@@ -324,11 +326,11 @@ def test_supports_accepts_a_plain_fp4_cb_v2_layer():
     (dict(n_sub=1), "n_sub=1"),
     (dict(n_sub=4), "n_sub=4"),
     (dict(k_bits=0, type_size=9), "k=0"),
-    (dict(k_bits=25, type_size=109), "k=25"),
+    (dict(k_bits=26, type_size=113), "k=26"),
     (dict(type_size=72), "type_size"),
     (dict(hidden=2000), "2000"),
     (dict(inter=1000), "1000"),
-], ids=["fp8", "not-v2", "n_sub-1", "n_sub-4", "k-0", "k-25",
+], ids=["fp8", "not-v2", "n_sub-1", "n_sub-4", "k-0", "k-26",
         "type_size", "hidden-unaligned", "inter-unaligned"])
 def test_supports_rejects_with_a_readable_reason(override, mentions):
     """Every rejection is diagnosed at model load, never inside a request."""
@@ -340,14 +342,18 @@ def test_supports_rejects_with_a_readable_reason(override, mentions):
         f"({mentions!r}): {reason!r}")
 
 
-def test_supports_mirrors_the_kernels_own_shape_checks():
-    """The k range and the 4*k+9 row size are the kernel's TORCH_CHECKs."""
+def test_supports_is_narrower_than_the_direct_kernel_research_surface():
+    """Public lane eligibility stops at K25; direct bindings retain K32."""
     source = open(_source_path(), encoding="utf-8").read()
-    assert "k_bits >= 1 && k_bits <= 24" in source
+    assert "k_bits >= 1 && k_bits <= 32" in source
     assert "type_size == 4 * k_bits + 9" in source
-    for k_bits in (1, 24):
+    for k_bits in (1, 24, 25):
         assert lane.supports(**{**_GOOD_LAYER, "k_bits": k_bits,
                                 "type_size": 4 * k_bits + 9}) is None
+    for k_bits in (26, 32):
+        reason = lane.supports(**{**_GOOD_LAYER, "k_bits": k_bits,
+                                  "type_size": 4 * k_bits + 9})
+        assert "supported FP4-CB v2 range [1, 25]" in reason
 
 
 # The FP8-CB arm's twin (ROADMAP K1.2).  k=28 / type_size=112 is DSv4's
@@ -647,6 +653,66 @@ def test_cfg_refuses_an_index_this_build_did_not_compile(monkeypatch):
         lane.resolve_cfg(_complete_stub())
 
 
+def _cfg_eligibility_stub(predicate):
+    """Four compiled configs plus a recording form of the CUDA predicate."""
+    ext = _complete_stub()
+    ext.cb_moe_persistent_b_configs = lambda: (
+        (128, 64), (64, 64), (128, 32), (64, 128))
+    calls = []
+
+    def eligible(cfg, type_size, d2r=False, fp8=True):
+        calls.append((cfg, type_size, d2r, fp8))
+        return predicate(cfg, type_size, d2r, fp8)
+
+    ext.cb_moe_persistent_b_fp8_cfg_eligible = eligible
+    return ext, calls
+
+
+def test_cfg_refuses_an_ineligible_widened_fp4_tile_at_load(monkeypatch):
+    """K32 baseline cfg 1 would miss the two-CTA floor in the CUDA launcher."""
+    monkeypatch.setenv(_CFG_FLAG, "1")
+    ext, calls = _cfg_eligibility_stub(
+        lambda cfg, _ts, d2r, fp8: d2r or fp8 or cfg in (2, 3))
+    with pytest.raises(ValueError, match=r"FP4-CB type_size=137"):
+        lane.resolve_cfg(ext, fp4_type_size=4 * 32 + 9)
+    assert calls == [(1, 137, False, False)]
+
+
+def test_cfg_accepts_a_k32_baseline_tile_the_kernel_attests(monkeypatch):
+    monkeypatch.setenv(_CFG_FLAG, "2")
+    ext, calls = _cfg_eligibility_stub(
+        lambda cfg, _ts, _d2r, _fp8: cfg in (2, 3))
+    assert lane.resolve_cfg(ext, fp4_type_size=137) == 2
+    assert calls == [(2, 137, False, False)]
+
+
+def test_cfg_passes_d2r_to_the_kernel_owned_eligibility_law(monkeypatch):
+    """D2R removes B smem, so its K32 cfg 1 remains a legal measurement arm."""
+    monkeypatch.setenv(_CFG_FLAG, "1")
+    ext, calls = _cfg_eligibility_stub(
+        lambda _cfg, _ts, d2r, fp8: d2r and not fp8)
+    assert lane.resolve_cfg(ext, fp4_type_size=137, d2r=True) == 1
+    assert calls == [(1, 137, True, False)]
+
+
+def test_cfg_keeps_the_legacy_fp8_probe_semantics(monkeypatch):
+    monkeypatch.setenv(_CFG_FLAG, "3")
+    ext, calls = _cfg_eligibility_stub(
+        lambda _cfg, _ts, d2r, fp8: fp8 and not d2r)
+    assert lane.resolve_cfg(ext, fp8_type_size=192) == 3
+    assert calls == [(3, 192, False, True)]
+
+
+def test_cfg_rejects_ambiguous_family_or_fp8_d2r_arguments():
+    ext = _complete_stub()
+    with pytest.raises(ValueError, match="one format family"):
+        lane.resolve_cfg(ext, fp4_type_size=137, fp8_type_size=128)
+    with pytest.raises(ValueError, match="FP4-CB-only"):
+        lane.resolve_cfg(ext, fp8_type_size=128, d2r=True)
+    with pytest.raises(ValueError, match="requires fp4_type_size"):
+        lane.resolve_cfg(ext, d2r=True)
+
+
 @requires_vllm
 def test_cfg_is_fixed_on_the_layer_at_load(monkeypatch):
     """The two GEMM stages of one forward cannot see different tile configs.
@@ -668,6 +734,8 @@ def test_cfg_is_fixed_on_the_layer_at_load(monkeypatch):
 
     load = inspect.getsource(Method.process_weights_after_loading)
     assert "persistent_b_resolve_cfg" in load
+    assert "fp4_type_size=self.type_size" in load
+    assert "d2r=persistent_b_d2r_on" in load
 
 
 @requires_vllm

@@ -63,8 +63,8 @@ def test_d2r_cfg_attestation_matches_every_existing_tile_and_drops_only_b_smem()
         assert base_smem - direct_smem == tn * 64 * 2
 
 
-@pytest.mark.parametrize("k", range(1, 25), ids=lambda k: f"k{k}")
-def test_cooperative_pair_probe_is_bit_exact_on_every_format_rung(k):
+@pytest.mark.parametrize("k", range(1, 33), ids=lambda k: f"k{k}")
+def test_cooperative_pair_probe_is_bit_exact_on_direct_research_range(k):
     K, E, N = 512, 2, 5
     qw, lut, compose, type_size = _pack(
         k, K, E, N, seed=91000 + k, source="synth", super_span=None)
@@ -78,6 +78,29 @@ def test_cooperative_pair_probe_is_bit_exact_on_every_format_rung(k):
         qw.reshape(rows, -1), lut,
         torch.zeros(rows, dtype=torch.int32, device=DEV),
         torch.zeros(1, device=DEV), compose, N=rows, K=K, k_bits=k,
+        n_sub=2, type_size=type_size, is_fp4=True, is_v2=True)
+    assert torch.equal(got.view(torch.int16), established.view(torch.int16))
+    assert torch.equal(got.view(torch.int16), independent.view(torch.int16))
+
+
+@pytest.mark.parametrize("k", (1, 32), ids=lambda k: f"k{k}")
+def test_boundary_rungs_decode_all_one_codewords_exactly(k):
+    """Force the maximal index, including K32's two 0xffff subindices."""
+    K, E, N = 256, 1, 8
+    qw, lut, compose, type_size = _pack(
+        k, K, E, N, seed=91500 + k, source="synth", super_span=None)
+    qw = qw.clone()
+    blocks = qw.view(E, N, K // 256, type_size)
+    blocks[..., :4 * k] = 0xff
+    flat = qw.reshape(-1)
+    got = ext.cb_moe_persistent_b_d2r_decode_pairs(
+        flat, lut, compose, 0, E * N, K, k, type_size)
+    established = ext.cb_moe_persistent_b_decode(
+        flat, lut, compose, 0, E * N, K, k, type_size)
+    independent = reconstruct_cb_weight(
+        qw.reshape(E * N, -1), lut,
+        torch.zeros(E * N, dtype=torch.int32, device=DEV),
+        torch.zeros(1, device=DEV), compose, N=E * N, K=K, k_bits=k,
         n_sub=2, type_size=type_size, is_fp4=True, is_v2=True)
     assert torch.equal(got.view(torch.int16), established.view(torch.int16))
     assert torch.equal(got.view(torch.int16), independent.view(torch.int16))
@@ -100,6 +123,23 @@ def test_identity_activation_proves_every_fragment_coordinate_and_m_loop(cfg):
         qw.reshape(-1), lut, compose, 0, N, K, k, type_size)
     got = _run("cb_moe_persistent_b_prefill_d2r", a, qw, lut, compose,
                ends, k, type_size, cfg)
+    assert torch.equal(got.view(torch.int16),
+                       decoded.t().contiguous().view(torch.int16))
+
+
+@pytest.mark.parametrize("k", (1, 32), ids=lambda k: f"k{k}")
+@pytest.mark.parametrize("cfg", range(1, len(BASE_CONFIGS) + 1),
+                         ids=lambda cfg: f"cfg{cfg}")
+def test_extended_edges_keep_every_d2r_fragment_bit_exact(k, cfg):
+    """K1's zero-bit half and K32's full 16-bit halves, on every D2R tile."""
+    K, E, N = 256, 1, 64
+    qw, lut, compose, type_size = _pack(
+        k, K, E, N, seed=92500 + k, source="synth", super_span=None)
+    a = torch.eye(K, dtype=torch.bfloat16, device=DEV)
+    decoded = ext.cb_moe_persistent_b_d2r_decode_pairs(
+        qw.reshape(-1), lut, compose, 0, N, K, k, type_size)
+    got = _run("cb_moe_persistent_b_prefill_d2r", a, qw, lut, compose,
+               _ends([K]), k, type_size, cfg)
     assert torch.equal(got.view(torch.int16),
                        decoded.t().contiguous().view(torch.int16))
 
@@ -197,7 +237,7 @@ def test_every_cfg_handles_independent_expert_boundaries():
 
 
 @pytest.mark.parametrize("field,value,match", [
-    ("k", 25, r"k_bits in \[1,24\]"),
+    ("k", 33, r"k_bits in \[1,32\]"),
     ("cfg", len(BASE_CONFIGS) + 1, "cfg must be 0"),
 ], ids=["unsupported-rung", "unsupported-cfg"])
 def test_candidate_binding_fails_closed(field, value, match):

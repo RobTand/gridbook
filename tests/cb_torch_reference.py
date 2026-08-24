@@ -274,8 +274,8 @@ def synth_two_tier_v2_plane(
     rows, K, k_bits = int(rows), int(K), int(k_bits)
     if K <= 0 or K % SUPERBLOCK:
         raise ValueError("K must be a positive multiple of 256")
-    if not 0 < k_bits <= 24:
-        raise ValueError("FP4-CB layout v2 codewords are 1..24 bits")
+    if not 0 < k_bits <= 32:
+        raise ValueError("FP4-CB layout v2 codewords are 1..32 bits")
     type_size = two_tier_v2_type_size(k_bits)
     n_sb = K // SUPERBLOCK
     generator = torch.Generator().manual_seed(int(seed))

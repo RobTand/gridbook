@@ -104,6 +104,52 @@ FP4-v1 dense layer is format-valid where applicable but has
 no complete owned every-M native operation. The public method rejects bias;
 model load rejects the unsupported FP4 families.
 
+**NVFP4 public K1..K25 and direct research through K32.** The inherited dense
+and grouped FP4-v2 GEMVs use global cached LUT gathers across the public rungs.
+For `M > 8`, `cb_expand_v2` produces the exact BF16 transient and stages the
+K1..K25 dictionary in the cc12x 101,376-byte opt-in block budget (K25 is
+98,304 bytes). Low-level bindings additionally instantiate K26..K32 and use
+the same uint2 gathers from global/read-only cache with no dictionary
+shared-memory allocation. Those templates are direct kernel research, not
+public reader or artifact support. The packed stream and output rounding are
+identical between the two expander residencies. Optimized fused lanes remain
+separately compiled and qualified subsets: their default/off selectors use the
+exact supported route, while an explicitly required but ineligible optimized
+lane fails the load rather than borrowing research evidence.
+`python -m gridbook.sm120_preflight` cross-compiles the generic main/v2
+modules, persistent-B, and the grouped BF16 bridge with exact RTX 50 targets
+and verifies their symbols/cubins without launching them. Its receipt is
+permanently compile-only; GB10 execution cannot qualify RTX 50 correctness or
+performance.
+
+Reader, producer, chooser, and SM120 lane domains all stop at K25. K26..K32
+retain direct generic kernels and compile preflight for research and future
+requalification, but are invalid public artifacts and have no lane attestation.
+
+The 2026-08-24 GB10 synthetic shoulder probe used a 5120x5120 exact expansion,
+M1/N5120/K5120 dense decode, and E8/P8/N1024/K4096 grouped decode. Times are
+CUDA-event medians; they are directional GB10 evidence, not RTX 50 claims:
+
+| rung | dictionary route | expand ms | dense decode ms | grouped decode ms |
+|---:|---|---:|---:|---:|
+| K24 | 64 KiB staged | 0.415 | 0.143 | 0.153 |
+| K25 | 96 KiB staged | 0.465 | 0.182 | 0.211 |
+| K26 | 128 KiB global | 0.602 | 0.230 | 0.273 |
+| K27 | 192 KiB global | 0.628 | 0.221 | 0.265 |
+| K28 | 256 KiB global | 0.655 | 0.260 | 0.275 |
+| K29 | 384 KiB global | 0.669 | 0.235 | 0.279 |
+| K30 | 512 KiB global | 0.675 | 0.238 | 0.285 |
+| K31 | 768 KiB global | 0.681 | 0.240 | 0.287 |
+| K32 | 1 MiB global | 0.691 | 0.243 | 0.289 |
+
+The expander has a visible K25->K26 residency cliff (+29% latency), followed
+by only +15% from K26 to K32. K32 versus K24 was +67% expansion, +70% dense
+decode, and +89% grouped decode in these cells. These measurements retain
+K26..K32 as direct kernel research only; public support and the canonical
+chooser end at K25. The direct v2 HALF schedule was promising at K26 in this
+synthetic probe; a future format-range expansion requires a new
+production-shape A/B and an explicit contract change.
+
 ### Source block-FP8 W8A16 (`fp8_e4m3_ue8m0_block128`)
 
 This source-passthrough wire is a **weight-storage contract**, not permission to
@@ -1119,13 +1165,13 @@ too.
 |---|---|
 | Source block-FP8 W8A16, dense + DSV4 grouped `wo_a` | **Implemented in 0.8.5; target-only DSV4 candidate load/generation passed on the exact 0.8.6 runtime; final clean-commit replay pending.** Raw E4M3/UE8M0 stays resident; BF16 activations are unchanged; actual flattened decode-token `M<=8` uses native CUDA GEMV and larger M uses bounded native BF16 expansion plus the owned CUTLASS grouped bridge. Grouped BMM is admitted only at `(G=8,N=1024,K=4096)` and only at the measured shard degrees 1, 2 and 4; dense geometry is gated separately and shards under the alignment law. Direct MXFP8 g32 remains the separate opt-in W8A8 lane. DSpark is experimental and is not the release default; do not claim its served parity, graph, or 128k performance until the separate gates in RELEASING are recorded |
 | FP8-CB decode (dense) | **Shipped**, at/above native parity |
-| FP4-CB v2 decode (dense) | **Shipped**: bit-matched CUDA GEMV (13/13 parity against the historical Triton result plus the independent expansion reference). The decode chain is compute-bound at GEMV shapes (ncu SM 71%/mem 44%) under the bit-exact contract — the measured ceiling, not a staging problem |
+| FP4-CB v2 decode (dense) | **Public format and SM120 lane surface K1..K25**: inherited CUDA GEMV plus exact transient expansion with the full dictionary in shared memory. Direct bindings retain global-cached K26..K32 templates for research only; those values are not supported artifacts. Historical speed/quality measurements cover the old K12..K24 cells only and are not generalized to new rungs |
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
 | MoE grouped decode GEMV, smem-resident dictionary | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_GEMV`; `inherited` is the kill switch and never probes or builds): v2 engages only where the compiled occupancy predicate says it wins, and an unavailable extension degrades loudly to inherited. On the K=2048/4096 shapes (8/16 superblocks) the compile-time virtual-warp specialization is bit-exact to the inherited default for every rung — with all `PRISMAQUANT_CB_W2_*` overrides absent — and measured 1.8175–1.9977x in the final-source captured v1 direct-op benchmark; the same-process DSV4 quality gate produced zero full-vocabulary KL/NLL/PPL/target-logprob delta over 240 positions. Other widths retain rowpack order and may reassociate against inherited — on those the predicate is the only gate and no served A/B exists. The compiled predicate still routes k24 at K≥2048 to inherited. Historical Laguna validation measured +5.97% |
 | MoE grouped decode GEMV, routed FP8 whole-row sibling | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_FP8_GEMV_V2`) for exactly K28/4/112 at K=2048/4096 — off-cell stacks keep the inherited kernel with the reason logged; `1`/`require` is the strict A/B-arm spelling under which unsupported uniform FP8 cells and per-expert mixed FP8-CB groups fail closed. The final-source operator gate passed 17/17; the exact-artifact eager same-engine gate produced zero full-vocabulary and router-route delta over 240 positions; the final-binary served rerun (B-v3, 2026-08-14, FULL_DECODE_ONLY graphs, route census, quiesced host) measured **+8.62% decode** with acceptance parity, attributing the earlier held signal's integrity failure to host interference. Soak and high-concurrency protocols have not run as named gates |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
 | FP8-CB fused decode-in-prologue prefill | The established K28/K32/K36/K40/K44/K48 cells are **bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128** on the sm12x lane; native transient expansion + CUTLASS serves ineligible and large-M shapes. Selection is load-time auto on cc 12.0/12.1 only: SM89 never invokes the Blackwell fused loader and uses native GEMV at M≤8 / native expand+W8A8 CUTLASS above it; explicit fused-on on SM89 fails the load. v10 expands the **source/compiled rung law to K4..K48 step 4**, the complete producer set admitted by the packed-B TMA box (`type_size = 4k` must be 16-byte aligned) and uniform `CbSubW = k/4` decode. K4..K24 are compile/source coverage only and remain device-unqualified; no old high-rung result is evidence for them. Legacy irregular K28..K48 reader rungs use generic GEMV + expand/CUTLASS. The loaded set is reported by `cb_fused_kbits()` rather than duplicated in dispatch |
-| FP4-CB v2 fused mid-M prefill (dense) | **Opt-in** (`PRISMAQUANT_CB_FP4_FUSED_MIDM`), contract-preserving. The in-prologue decode is proven **bit-identical to `cb_expand_v2` for the whole decoded tile at all 13 K12–K24 rungs** (one-hot read-out, no tolerance), so only the FP32 reduction order moves. Measured 1.06–4.37× the shipping expand + bridge route at M ∈ {9,16,32,64,128} on 27B/DSV4-class shapes, every cell bit-equal to the same-config oracle — a wider band than the fp8 twin because the fp4 quality expand writes BF16 (4× the fp8 expand's transient bytes). Served NATIVE-PARITY protocol **not run**; an unexplained M ≤ 12 latency cliff is open. Ineligible shapes (M ≤ 8, M > 128, multi-dictionary fused modules, uncompiled rungs) fall through to today's exact path unchanged |
+| FP4-CB v2 fused mid-M prefill (dense) | **Opt-in K12..K24 optimized subset** (`PRISMAQUANT_CB_FP4_FUSED_MIDM`), contract-preserving. Its old K12..K24 evidence remains unchanged; public K1..K11/K25 use exact expand + bridge. Unsupported K26..K32 exist only in direct generic-kernel research and inherit no fused-lane speed claim |
 | NVFP4-CB fused native-FP4 prefill (dense and MoE) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, MoE routed-quality, and p95 served gates remain open |
 | MoE persistent-B decode-in-mainloop prefill (FP4-CB v2 + stock FP8-CB) | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_MOE_PERSISTENT_B`; `1`/`require` keeps the fail-load A/B-integrity semantics, `0`/`off` the kill switch), ROADMAP K1.1 both payload families. Decodes each expert weight tile once and streams that expert's exact routed segment through it, eliminating the `[E,N,K]` BF16 transient and all work for unrouted experts. Weight decode bit-identical to the expanders (`torch.equal`); reduction-order-class output difference vs the bridge. Whole-routed-operator microbenchmark wins every cell (FP4 1.05–3.36×; FP8 15.8–18.4× at DSv4 shapes); served: FP4 same-session A/B kl_mean −0.051% / PPL −0.30%, plus the 0.8.9 default-state served KL/PPL leg on the shipped clean 87 GB body. Per-role FP8-CB split books are outside the FP8 arm and keep the bridge under auto (announced). **Staging vectorization proposed and REJECTED (2026-08-21)**: u32-interior copies with funnel-shift edges (odd `4k+9` phases) + whole-slot zeroing were byte-neutral per the staging theorem but measured +7…+11% whole-operator slower at the DSv4-dominant k=12 (`__noinline__` spelling worse still, +14%); the byte-granular loop remains |
 | Persistent-N large-M dense prefill | **RETIRED FROM SERVING; MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. The serving selector, custom op, package loader, and switch are deleted. The `.cu` remains accessible only to the explicit direct research test. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |
