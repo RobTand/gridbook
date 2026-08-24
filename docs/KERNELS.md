@@ -925,20 +925,21 @@ longer CTA, never a serialized grid.
 `csrc/tools/persistent_b_probe.cu`). `TK` is fixed at 64 BF16 columns = 128 B
 per row = the 8 sixteen-byte chunks an XOR swizzle needs to make `ldmatrix`
 conflict-free over 8 rows, and it divides the 256-column CB superblock evenly.
-Bytes quoted at `k=24`, the widest packed superblock:
+Bytes quoted at public ceiling `k=25`, the widest supported packed
+superblock:
 
 | cfg | TM | TN | warps | A | B | packed | smem | CTAs/SM | accum regs/thread |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 128 | 64 | 8 | 32,768 | 8,192 | 7,424 | 48,384 | 2 | 32 |
-| 2 | 64 | 64 | 4 | 16,384 | 8,192 | 7,424 | 32,000 | 3 | 32 |
-| 3 | 128 | 32 | 4 | 32,768 | 4,096 | 3,712 | 40,576 | 2 | 32 |
-| 4 | 64 | 128 | 8 | 16,384 | 16,384 | 14,848 | 47,616 | 2 | 32 |
+| 1 | 128 | 64 | 8 | 32,768 | 8,192 | 7,680 | 48,640 | 2 | 32 |
+| 2 | 64 | 64 | 4 | 16,384 | 8,192 | 7,680 | 32,256 | 3 | 32 |
+| 3 | 128 | 32 | 4 | 32,768 | 4,096 | 3,840 | 40,704 | 2 | 32 |
+| 4 | 64 | 128 | 8 | 16,384 | 16,384 | 15,360 | 48,128 | 2 | 32 |
 
 Every compiled config holds **≥2 CTAs/SM including the ~1 KiB the hardware
 reserves per CTA**, and the binding `TORCH_CHECK`s exactly that — the lesson
 W4 paid for when its first collective wanted 75,776 B and got one CTA per SM.
-Two wider tiles were compiled, measured and **dropped**: `128×128` (64,000 B)
-and `256×64` (81,152 B) both fall to 1 CTA/SM and neither won a single sweep
+Two wider tiles were compiled, measured and **dropped**: `128×128` (64,512 B)
+and `256×64` (81,408 B) both fall to 1 CTA/SM and neither won a single sweep
 cell — `256×64` halves the decode repetition at large rows-per-expert, exactly
 the regime it should own, and still lost there (18.6 vs 7.8 ms, DSV4 `w2`,
 `T=2048`). Occupancy dominates decode amortization on this device. A resident

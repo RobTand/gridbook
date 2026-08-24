@@ -143,18 +143,19 @@
 // The codebook LUT stays in GLOBAL memory and is read through `__ldg`; see
 // `kSmemReservedPerCta` below for the measurement that rejected staging it.
 //
-// Compiled ladder, shared memory quoted at the historical k=24 reference rung.
-// K25..K32 use the same kernels, but their wider packed stages make tile
-// eligibility rung-dependent; `cb_moe_persistent_b_fp8_cfg_eligible()` is the
-// backwards-named ABI entry that attests the exact (family, schedule, rung)
-// predicate at runtime. Python enumerates/queries THAT, never this comment.
+// Compiled ladder, shared memory quoted at K25, the public NVFP4-CB ceiling.
+// K26..K32 use the same direct research kernels, but their wider packed stages
+// make tile eligibility rung-dependent; `cb_moe_persistent_b_fp8_cfg_eligible()`
+// is the backwards-named ABI entry that attests the exact (family, schedule,
+// rung) predicate at runtime. Python enumerates/queries THAT, never this
+// comment.
 //
 //  cfg  TM   TN  warps thr      A      B     pk    smem   CTAs/SM  accum/thr
 //  ---  ---  ---  ----- ---  ------  -----  -----  -----  -------  ---------
-//   1   128   64    8   256  32,768  8,192  7,424  48,384    2         32
-//   2    64   64    4   128  16,384  8,192  7,424  32,000    3         32
-//   3   128   32    4   128  32,768  4,096  3,712  40,576    2         32
-//   4    64  128    8   256  16,384 16,384 14,848  47,616    2         32
+//   1   128   64    8   256  32,768  8,192  7,680  48,640    2         32
+//   2    64   64    4   128  16,384  8,192  7,680  32,256    3         32
+//   3   128   32    4   128  32,768  4,096  3,840  40,704    2         32
+//   4    64  128    8   256  16,384 16,384 15,360  48,128    2         32
 //
 // Every config holds >= 2 CTAs/SM INCLUDING the ~1 KiB the hardware reserves
 // per CTA, and `run_persistent_b` enforces that as a TORCH_CHECK so a future
@@ -576,6 +577,8 @@ DEVINL void cp_async_wait() {
 // `ldmatrix` tile touches land on 8 distinct chunk columns: conflict-free.
 // ---------------------------------------------------------------------------
 constexpr int kTK = 64;                 // BF16 columns per mainloop stage
+constexpr int kPublicNvfp4MaxK = 25;
+constexpr int kPublicNvfp4MaxTypeSize = 4 * kPublicNvfp4MaxK + 9;
 constexpr int kChunks = kTK / 8;        // 16-byte chunks per row
 constexpr int kSuperblock = 256;        // CB v2 columns per superblock
 constexpr int kStagesPerSb = kSuperblock / kTK;
@@ -2033,21 +2036,22 @@ bool cb_moe_persistent_b_fp8_cfg_eligible(int64_t cfg, int64_t type_size,
 }
 
 // Host-only attestation of what was actually compiled — no launch, no device
-// needed.  Per config: [tm, tn, warps, threads, smem_at_k24, capacity].
+// needed. Per config: [tm, tn, warps, threads, smem_at_public_k25, capacity].
 std::vector<std::vector<int64_t>> cb_moe_persistent_b_configs() {
   std::vector<std::vector<int64_t>> out;
   for (int i = 0; i < kNumCfgs; ++i) {
     const TileCfg c = kCfgs[i];
     out.push_back({int64_t(c.tm), int64_t(c.tn), int64_t(c.warps),
                    int64_t(c.warps) * 32,
-                   cfg_smem_bytes(c, 4 * 24 + 9),
+                   cfg_smem_bytes(c, kPublicNvfp4MaxTypeSize),
                    int64_t(kSm120SmemCapacity)});
   }
   return out;
 }
 
 // Candidate attestation.  Per row:
-// [tm, tn, warps, threads, smem_at_k24, capacity, wn, wm, matom, natom].
+// [tm, tn, warps, threads, smem_at_public_k25, capacity, wn, wm, matom,
+// natom].
 // All four rows have 4*matom*natom == 32 accumulator registers/thread.
 std::vector<std::vector<int64_t>> cb_moe_persistent_b_d2r_configs() {
   std::vector<std::vector<int64_t>> out;
@@ -2059,7 +2063,7 @@ std::vector<std::vector<int64_t>> cb_moe_persistent_b_d2r_configs() {
     const int natom = (c.tn / wn) / 8;
     out.push_back({int64_t(c.tm), int64_t(c.tn), int64_t(c.warps),
                    int64_t(c.warps) * 32,
-                   cfg_smem_bytes(c, 4 * 24 + 9, true),
+                   cfg_smem_bytes(c, kPublicNvfp4MaxTypeSize, true),
                    int64_t(kSm120SmemCapacity), int64_t(wn), int64_t(wm),
                    int64_t(matom), int64_t(natom)});
   }
@@ -2157,15 +2161,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "cudaFuncSetAttribute happens inside a first forward or a graph "
         "capture.");
   m.def("cb_moe_persistent_b_configs", &cb_moe_persistent_b_configs,
-        "compiled tile configs: [tm, tn, warps, threads, smem_bytes_at_k24, "
+        "compiled tile configs: [tm, tn, warps, threads, "
+        "smem_bytes_at_public_k25, "
         "sm120 capacity] each (enumerate THIS, never a hardcoded list)");
   m.def("cb_moe_persistent_b_d2r_prepare",
         &cb_moe_persistent_b_d2r_prepare,
         "load-time device attestation for the experimental D2R sibling");
   m.def("cb_moe_persistent_b_d2r_configs",
         &cb_moe_persistent_b_d2r_configs,
-        "D2R configs: [tm,tn,warps,threads,smem_k24,capacity,wn,wm,matom,"
-        "natom]; same cfg indices as persistent-B");
+        "D2R configs: [tm,tn,warps,threads,smem_public_k25,capacity,wn,wm,"
+        "matom,natom]; same cfg indices as persistent-B");
   m.def("cb_moe_persistent_b_tile_k", &cb_moe_persistent_b_tile_k,
         "mainloop K-stage width in BF16 columns");
   m.def("cb_moe_persistent_b_is_moe_only", &cb_moe_persistent_b_is_moe_only,

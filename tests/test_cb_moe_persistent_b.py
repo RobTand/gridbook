@@ -99,6 +99,17 @@ MIN_TN = min(cfg[1] for cfg in CONFIGS)
 MAX_TN = max(cfg[1] for cfg in CONFIGS)
 
 
+def test_config_metadata_is_sized_at_the_public_k25_ceiling():
+    """The advertised smem column must describe the strictest public rung."""
+
+    type_size = 4 * 25 + 9
+    ts_pad = ((type_size + 3) // 4) * 4 + 8
+    for tm, tn, _warps, _threads, smem, capacity in CONFIGS:
+        expected = 2 * tm * TILE_K * 2 + tn * TILE_K * 2 + tn * ts_pad
+        assert smem == expected
+        assert smem <= capacity
+
+
 @contextlib.contextmanager
 def _true_fp32_matmul():
     """The fp32 reference must be a REAL fp32 reference, not TF32.
