@@ -265,6 +265,12 @@ _VERSION_PIN_FILES = frozenset({
     "tests/test_runtime_contract.py",
     "tests/test_runtime_contract_ep.py",
     "tests/test_runtime_contract_tp.py",
+    # Added at v9.  This file asserts the SHAPE of every tensor-parallel row
+    # but pinned its schema only in a prose docstring, which no grep sees:
+    # the v8 bump left it reading "v7", and the v9 bump broke it for real
+    # (a third unit kind fell through its two-kind branch).  It now asserts
+    # the schema string, so it is in this set and the next bump must visit it.
+    "tests/test_target_namespace_compat.py",
 })
 
 #: The changelog is the ONE place a superseded schema string is still true:
