@@ -28,6 +28,7 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import os
 from importlib.resources import files
 from pathlib import Path
 
@@ -40,7 +41,28 @@ from gridbook.runtime_contract import (
     validate_runtime_contract,
 )
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+def _repo_root() -> Path:
+    """The source checkout whose enforcement sites this file reads.
+
+    In-tree that is this file's grandparent. The installed-wheel release gate
+    stages ``tests/`` outside the checkout so the local package cannot shadow
+    the wheel, and exports ``GRIDBOOK_SOURCE_ROOT`` as a data-file locator
+    (never on ``PYTHONPATH``); ``GITHUB_WORKSPACE`` is the CI spelling.
+    """
+    roots = [Path(__file__).resolve().parents[1]]
+    for variable in ("GRIDBOOK_SOURCE_ROOT", "GITHUB_WORKSPACE"):
+        value = os.environ.get(variable)
+        if value:
+            roots.append(Path(value).expanduser())
+    for root in roots:
+        if (root / "gridbook" / "__init__.py").is_file():
+            return root.resolve()
+    raise FileNotFoundError(
+        "no Gridbook source checkout: run in-tree or set GRIDBOOK_SOURCE_ROOT")
+
+
+_REPO_ROOT = _repo_root()
 
 
 def _packaged_contract() -> dict:

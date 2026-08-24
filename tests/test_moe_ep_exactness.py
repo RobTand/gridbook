@@ -60,6 +60,9 @@ import pytest
 import torch
 
 codec = pytest.importorskip("gridbook.codec")
+# gridbook.moe / gridbook.moe_ep subclass vLLM's fused-MoE bases at import
+# time; without vLLM (the installed-wheel CPU gate) nothing here can run.
+pytest.importorskip("vllm")
 
 from gridbook.moe import MOE_PREFILL_M_THRESHOLD, _CB_ROLES  # noqa: E402
 from gridbook.moe_ep import (  # noqa: E402

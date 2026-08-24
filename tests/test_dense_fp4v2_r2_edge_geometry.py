@@ -102,7 +102,10 @@ def test_r2_default_is_off():
     early-exit for that regime or an explicit measured n_sb crossover.
     """
     import pathlib
-    src = pathlib.Path(__file__).resolve().parents[1] / "gridbook" / "csrc" / "cb_gemv.cu"
+    from gridbook.cuda_ext import csrc_dir
+    # The source the loader actually compiles: the checkout's in-tree, the
+    # wheel's when the tests are staged outside the checkout (release gate).
+    src = pathlib.Path(csrc_dir()) / "cb_gemv.cu"
     text = src.read_text()
     assert 'pq_env_bool01("PRISMAQUANT_CB_FP4V2_DENSE_R2", false)' in text, (
         "PRISMAQUANT_CB_FP4V2_DENSE_R2 defaults to ON, but the documented "

@@ -29,7 +29,7 @@ serving environment and `--no-deps` when its stack is already managed (see
 | **CUDA toolchain** | `nvcc` on `PATH` (or `CUDA_HOME` set) **in the serving process** | The kernels are JIT-compiled at runtime, not at install time. Missing `nvcc` may not fail package installation, but a required native serving operation fails closed when its extension cannot build. |
 | **PyTorch** | the build your vLLM uses | Measured: `2.11.0+cu130`. Installing gridbook into a fresh environment can pull a *generic* PyPI torch that does not match your CUDA — install into the vLLM environment instead. |
 | **vLLM** | already installed | Measured against `0.23.1rc1.dev764+g54b16d8a9`. |
-| **Parallelism** | `tp=1` except for dense CB Linears and FP8 source-passthrough Linears | Dense CB Linears shard at load time (superblock-aligned, structured refusal on illegal boundaries); dense FP8 source-passthrough Linears shard on whole 128-element source blocks per fused role; grouped-BMM passthrough units shard only at the measured degrees 1, 2 and 4. A mixed-format fused projection shards when every one of its roles does. MoE, delegated groups and quantized embeddings refuse above one. See [known limits](#known-limits). |
+| **Parallelism** | `-tp N` for dense CB and FP8 source-passthrough Linears; `-tp N --enable-expert-parallel` for routed CB MoE | Dense CB Linears shard at load time (superblock-aligned, structured refusal on illegal boundaries); dense FP8 source-passthrough Linears shard on whole 128-element source blocks per fused role; grouped-BMM passthrough units shard only at the measured degrees 1, 2 and 4. A mixed-format fused projection shards when every one of its roles does. Routed CB MoE shards on the expert axis under `--enable-expert-parallel`. Delegated groups, other passthrough formats and quantized embeddings refuse above one. Measured two-node on DeepSeek-V4 (2026-08-23); see [known limits](#known-limits). |
 
 ---
 
@@ -395,9 +395,11 @@ discrete GPU with its own VRAM, ordinary vLLM utilization guidance applies.
   its own carrier, with its own error, before any parameter exists. Delegated
   compressed-tensors groups, other source-passthrough formats and quantized
   embedding units refuse at construction naming themselves; routed CB MoE has
-  its own axis, below. No cross-node
-  serve has been measured on this hardware; treat TP>1 as a correctness
-  feature for models that do not fit one box, not a speedup.
+  its own axis, below. A two-node serve has been measured (2026-08-23: the
+  DeepSeek-V4 92 GB CB artifact at `-tp 2 --enable-expert-parallel` across
+  two DGX Sparks over dual 200G RoCE, KL against single-box serves within the
+  CB kernel's nondeterminism floor). TP>1 is a capacity feature for models
+  that do not fit one box; no CB decode speedup is claimed.
 - **Routed CB MoE needs `--enable-expert-parallel`, not `-tp` alone.** A CB
   expert stack's last dimension is superblock bytes, not input columns, so a
   tensor-parallel split would cut a packed superblock. Above one rank serve
@@ -407,7 +409,8 @@ discrete GPU with its own VRAM, ordinary vLLM utilization guidance applies.
   names the flag; so do data-/pipeline-context-/sequence-parallel EP, EPLB,
   and mixed per-expert-format stacks
   ([details](TROUBLESHOOTING.md#expert-parallel--tp-n---enable-expert-parallel)).
-  The two-node gate has not been run, so this is correctness-only too.
+  The two-node gate has run (2026-08-23: 43 of 43 DeepSeek-V4 MoE layers
+  admitted at 128 of 256 experts per rank, same measurement as above).
 - **Dense CB Linears are biasless.** A public dense CB call with non-`None`
   bias is rejected because the opaque native operation has no owned biased
   kernel in 0.5.

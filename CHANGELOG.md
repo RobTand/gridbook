@@ -1,6 +1,56 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-08-23
+
+**Tensor parallelism is supported.** Gridbook artifacts serve above one rank
+as a plain vLLM plugin — no forked runtime, no exported-byte change:
+
+- **Dense CB Linears and dense FP8 source-passthrough Linears** shard at
+  `--tensor-parallel-size N`.
+- **Routed CB MoE expert stacks** shard on the expert axis at
+  `--tensor-parallel-size N --enable-expert-parallel`; `-tp N` alone refuses
+  at construction and names the flag.
+- **Mixed-format fused projections** (a CB gate fused with a block-FP8 up)
+  shard when every one of their roles does.
+
+Measured, not simulated (2026-08-23): the DeepSeek-V4-Flash 92 GB CB artifact
+— 176 dense CB Linears, 125 FP8 source-passthrough units, four mixed-format
+fused projections and 43 routed CB MoE layers of 256 experts — served at
+`-tp 2 --enable-expert-parallel` across two GB10 DGX Sparks (Ray, dual 200G
+RoCE, the pinned vLLM `0.26.1rc1.dev693` image with Gridbook as a plugin).
+Every MoE layer was admitted under expert parallelism with 128 of 256 experts
+per rank, weights per rank fell to 41.9 GiB (about 82 GiB on one box), the
+KV cache held 72,683 tokens at an 8k context, CUDA-graph capture completed,
+greedy generation was coherent, and the same-corpus KL against two single-box
+serves (889 positions, 746 BF16-confident) was 0.0505–0.0537 at 94.5–95.8%
+top-1 agreement — inside the CB kernel's own nondeterminism floor (TP=2
+same-session A/A 0.0405; single-box cross-session A/A 0.0483). Batch-1 decode
+ran at 48.9 ms/token on GPUs shared with other work, against 47.6 ms/token
+idle on one box: decode works, and no throughput claim is made for CB
+artifacts.
+
+Still refused above one rank, each by its own named gate: quantized-embedding
+units (the Qwen3.8-27B CB artifacts), delegated compressed-tensors groups and
+MXFP4/MXFP8 source passthrough. Grouped-BMM passthrough shards only at the
+measured degrees 1, 2 and 4; expert parallelism is plain `use_ep` with the
+MoE layer's own `tp_size` 1 (no all2all topologies, EPLB or
+`skip_final_all_reduce`). Pipeline parallelism above one on DeepSeek-V4 is
+blocked in stock vLLM (vllm-project/vllm#42769), independent of Gridbook —
+use tensor parallelism. The contract schema is
+`gridbook.runtime-contract.v9`; a producer pinned to an older schema refuses
+this release whole until its pin is bumped deliberately.
+
+Release-gate repair, tests only: five of this cycle's test files could not
+run from the installed-wheel layout the release workflow uses (tests staged
+outside the checkout, no vLLM). The three contract-enforcement tests now
+locate the source checkout through `GRIDBOOK_SOURCE_ROOT` /
+`GITHUB_WORKSPACE` like the other source-reading tests; the DSpark loader
+and TP shard tests skip, by name, only the cases that need vLLM's linear
+bases or compressed-tensors' `should_ignore_layer`; the EP exactness file
+skips whole without vLLM. Runtime code is unchanged.
+
+The sections below are the per-milestone record; where one says no two-node
+serve has been measured, the measurement above supersedes it.
 
 ### Mixed-format fused projections serve above one tensor-parallel rank (contract schema v9)
 
@@ -55,7 +105,9 @@ byte-identical to what the role's own method plus vLLM's real
 the ranks' slices tile the checkpoint plane exactly. Un-interleaving the
 ranks' outputs reproduces the TP=1 output BITWISE for both roles, measured on
 the decoded planes and fp32 reference products rather than on the serving
-kernel. A two-node serve is not claimed.
+kernel. A two-node serve was not claimed here; it was measured on 2026-08-23
+(the DeepSeek-V4 artifact's mixed-format fused projections served at TP=2) —
+see the 0.9.0 lead above.
 
 ### FP8 source passthrough serves above one tensor-parallel rank
 
@@ -171,6 +223,10 @@ full world size, which is vLLM's own split.
   different alias targets), the remapped decode capturing and replaying as a
   CUDA graph, and per-rank partials summing to the whole-layer answer.
   Expert-parallel serving is correctness-only until the two-node gate runs.
+- **2026-08-23 addendum**: the two-node gate has since run — the DeepSeek-V4
+  92 GB CB artifact at `-tp 2 --enable-expert-parallel` across two DGX
+  Sparks, every MoE layer admitted, KL against single-box serves within the
+  CB kernel's nondeterminism floor. See the 0.9.0 lead above.
 
 ### Signed CB family (NVFP4_CB_S) deleted from the runtime
 
@@ -316,6 +372,9 @@ computed over each rank's local K window at TP>1 (as with stock W8A8
 schemes), so served logits are not bit-identical to TP=1; quality claims
 belong to the standing same-session KL gate. Loader-contract tests simulate
 vLLM's attested narrowing in-process; no distributed run exists yet.
+*(2026-08-23: superseded in part — the two-node serve has been measured, and
+the link is dual 200G RoCE, not the 10 GbE assumed above; see the 0.9.0
+lead. The activation-scale caveat stands.)*
 
 ### Measured negative result: the R2 default flip was attempted and REVERTED
 

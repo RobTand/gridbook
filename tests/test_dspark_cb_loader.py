@@ -18,7 +18,15 @@ import pytest
 import torch
 
 from gridbook.cb_fill_guard import CB_FILLED_ATTR
-from gridbook.mixed_linear import MixedFusedShard
+try:
+    from gridbook.mixed_linear import MixedFusedShard
+except ModuleNotFoundError as exc:
+    # gridbook.mixed_linear subclasses vLLM's linear bases at import time.
+    # Without vLLM (the installed-wheel CPU gate) only the mixed-fusion cases
+    # below are unreachable; the rest of this file stays collected.
+    if not (exc.name or "").startswith("vllm"):
+        raise
+    MixedFusedShard = None
 from gridbook.moe_toplevel_loader import (
     _dspark_rename,
     _registered_mixed_source,
@@ -43,6 +51,9 @@ def _sharded_param(rows: int) -> torch.Tensor:
 
 
 def _mixed_carrier(*, source: str, group: str) -> torch.Tensor:
+    if MixedFusedShard is None:
+        pytest.skip("the mixed-fused carrier ABI lives in gridbook.mixed_linear, "
+                    "which needs vLLM's linear bases; not installed here")
     param = torch.zeros(HID, BYTES, dtype=torch.uint8)
     param._gridbook_mixed_fused_source = source
     param._gridbook_mixed_fused_group = group

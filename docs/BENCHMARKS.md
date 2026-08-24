@@ -18,7 +18,8 @@ Why it exists: DeepSeek-V4's `wo_a` is a grouped-BMM source-passthrough unit,
 and column-sharding it for tensor parallelism divides the kernel's group count
 (G 8 -> 4 at TP=2). That is a new kernel geometry, so it was measured before
 the lane admitted it. **This is a kernel microbenchmark, not a served result**:
-no two-node serve has been run, and nothing here is a TP speedup claim.
+nothing here is a TP speedup claim (the two-node serve that ran later the
+same day is recorded in the changelog, not here).
 
 Execution identity: GB10 `sm_121`, image `gridbook:0.8.12-r2ab`, branch
 `tp-passthrough`. Geometry is the DSv4 `wo_a` plane — 1024 rows per group,

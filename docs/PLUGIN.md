@@ -116,8 +116,9 @@ second runtime tree or maintain a parallel loader table.
   divided group count was measured on the release device — 1, 2 and 4 at the
   DSv4 `wo_a` geometry; an unmeasured degree is refused even when perfectly
   aligned. Ignored (BF16) Linears stay on vLLM-native sharding. Dense
-  TP>1 remains **correctness-only**: no two-node serve has been measured on
-  this hardware yet, so nothing here claims a decode win. The fact is
+  TP>1 was measured two-node on 2026-08-23 (the DeepSeek-V4 92 GB CB
+  artifact across two DGX Sparks, KL within the CB kernel's nondeterminism
+  floor); nothing here claims a decode win for CB artifacts. The fact is
   published, not prose: every serving unit carries a `tensor_parallel` row
   in the contract (see [Tensor-parallel capability](#tensor-parallel-capability)).
   `--enforce-eager` is the published-model configuration; mode-0
@@ -141,8 +142,9 @@ second runtime tree or maintain a parallel loader table.
   declared over global expert ids. The capability is published per unit in the
   contract's `expert_parallel` section (see
   [Expert-parallel capability](#expert-parallel-capability)). Like dense TP>1,
-  this is **correctness-only**: no two-node serve has been measured on this
-  hardware, so nothing here claims a throughput result.
+  this was measured two-node on 2026-08-23 (43 of 43 DeepSeek-V4 MoE layers
+  admitted under EP, 128 of 256 experts per rank); nothing here claims a
+  throughput result.
 - **BF16 activations only** — the shipping CUDA dense and grouped-MoE bindings
   require BF16. Gridbook no longer advertises FP16 to vLLM and therefore fails
   at dtype validation instead of crashing or changing dtype at a dispatch
@@ -287,10 +289,14 @@ checks every row against the source text of its enforcement site.
   consumer can tell *refused* from *unknown*. Today that is
   `cb_moe_per_expert_format_groups`, capped at 1.
 
-**Not yet measured:** every claim here is single-box. The two-node gate — a
-real `-tp 2 --enable-expert-parallel` serve across two hosts, with generation
-and a KL check against the single-rank artifact — has not been run, and until
-it has, expert-parallel serving is correctness-only.
+**Measured 2026-08-23:** the two-node gate — a real
+`-tp 2 --enable-expert-parallel` serve of the DeepSeek-V4 92 GB CB artifact
+across two DGX Sparks (Ray, dual 200G RoCE), with greedy generation and a
+same-corpus KL check against two single-box serves — has run: every MoE
+layer admitted, KL 0.0505–0.0537 at 94.5–95.8% top-1 agreement over 746
+BF16-confident positions, inside the CB kernel's own nondeterminism floor
+(A/A 0.0405–0.0483). Capacity is established; no throughput result is
+claimed.
 
 ## Layout / registration
 

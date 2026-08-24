@@ -283,7 +283,23 @@ _PIN_SUFFIXES = (".py", ".json", ".md")
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+    """The source checkout to walk for pins.
+
+    In-tree that is this file's grandparent. The installed-wheel release gate
+    stages ``tests/`` outside the checkout so the local package cannot shadow
+    the wheel, and exports ``GRIDBOOK_SOURCE_ROOT`` as a data-file locator
+    (never on ``PYTHONPATH``); ``GITHUB_WORKSPACE`` is the CI spelling.
+    """
+    roots = [Path(__file__).resolve().parents[1]]
+    for variable in ("GRIDBOOK_SOURCE_ROOT", "GITHUB_WORKSPACE"):
+        value = os.environ.get(variable)
+        if value:
+            roots.append(Path(value).expanduser())
+    for root in roots:
+        if (root / "gridbook" / "__init__.py").is_file():
+            return root.resolve()
+    raise FileNotFoundError(
+        "no Gridbook source checkout: run in-tree or set GRIDBOOK_SOURCE_ROOT")
 
 
 def _scan_for_version_pins() -> dict[str, str]:

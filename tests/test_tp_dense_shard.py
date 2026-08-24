@@ -103,9 +103,20 @@ def _install_vllm_stubs():
     parameter.PerTensorScaleParameter = _StubParam
 
 
+def _require_real_vllm():
+    """Cases that reach ``PrismaQuantConfig._is_ignored`` need the real thing:
+    it delegates to compressed-tensors' ``should_ignore_layer`` (deliberately —
+    a local near-copy once made one ignore list mean two things), which the
+    minimal stubs above do not recreate."""
+    if globals().get("VLLM_IS_STUBBED"):
+        pytest.skip("reaches config._is_ignored, which delegates to "
+                    "compressed-tensors' should_ignore_layer; needs real vLLM")
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _runtime_modules(isolated_gridbook_runtime_imports):
     del isolated_gridbook_runtime_imports
+    stubbed = False
     try:
         from vllm.model_executor.parameter import ModelWeightParameter  # noqa: F401
         from vllm.model_executor.layers.linear import LinearMethodBase  # noqa: F401
@@ -114,6 +125,8 @@ def _runtime_modules(isolated_gridbook_runtime_imports):
             if name == "vllm" or name.startswith("vllm."):
                 sys.modules.pop(name, None)
         _install_vllm_stubs()
+        stubbed = True
+    globals()["VLLM_IS_STUBBED"] = stubbed
 
     from gridbook import codec as codec_module
     from gridbook.config import PrismaQuantConfig as config_class
@@ -734,6 +747,7 @@ def test_dense_cb_fused_single_method_constructs_at_live_tp2(monkeypatch):
 
 
 def test_delegated_stock_group_refuses_at_live_tp2(monkeypatch):
+    _require_real_vllm()
     _world_size(monkeypatch, 2)
     cfg = _resolved_config()
     sentinel = object()
@@ -862,6 +876,7 @@ def test_ignored_target_stays_on_native_bf16_sharding_at_live_tp2(
         monkeypatch):
     """Ignored Linears are vLLM-native surface; they must NOT refuse — every
     shipped artifact carries some (sub-quantum GDN scalers)."""
+    _require_real_vllm()
     _world_size(monkeypatch, 2)
     cfg = PrismaQuantConfig.from_config(_artifact_config(extra={
         "ignore": ["lm_head", f"{_L0}.linear_attn.in_proj_a"]}))
@@ -874,6 +889,7 @@ def test_ignored_target_stays_on_native_bf16_sharding_at_live_tp2(
 def test_delegation_and_dense_construction_survive_at_live_tp1(monkeypatch):
     """TP=1 behaviour is unchanged: delegation still delegates, dense still
     constructs, and the world-size read is LATCHED after the first 1."""
+    _require_real_vllm()
     calls = []
 
     def _live():

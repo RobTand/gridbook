@@ -503,10 +503,13 @@ embedding units. An artifact mixing those surfaces with dense CB therefore
 fails on its first unsupported layer.
 Ignored (BF16) Linears keep vLLM's own sharding.
 
-Two honest caveats: no two-node serve has been measured yet (the reference
-hardware is single-GPU DGX Spark; cross-node TP over 10 GbE without RDMA is
-expected to lose at batch-1 decode), so dense TP>1 is a correctness feature
-for models that do not fit one box, not a measured speedup. And per-token
+Two honest caveats. A two-node serve has been measured (2026-08-23: two DGX
+Sparks over dual 200G RoCE, the DeepSeek-V4 92 GB CB artifact at
+`-tp 2 --enable-expert-parallel`; batch-1 decode 48.9 ms/token on GPUs
+shared with other work, against 47.6 ms/token idle on one box), so dense
+TP>1 is a capacity feature for models that do not fit one box — no CB decode
+speedup is claimed, and an earlier note here that assumed 10 GbE without
+RDMA was wrong about the hardware. And per-token
 dynamic FP8 activation scales are computed over each rank's local K window
 on row-parallel layers at TP>1, exactly as stock W8A8 schemes behave — so
 served logits are not bit-identical to TP=1; quality comparison belongs to
@@ -550,13 +553,15 @@ Other refusals on this path, and what each means:
 | `expert_map is not a bijection` / `is not monotone` | The placement this rank was given does not name each of its local slots exactly once in ascending order. Both stock placement strategies (`linear`, `round_robin`) satisfy this; a custom one may not. |
 | `per-expert format groups` | A mixed-format expert stack. Its format partition is declared over *global* expert ids and each per-format sub-stack is sized from that partition, so a rank owning an arbitrary subset can neither size nor fill them. Export the layer as a single CB format. |
 
-**The honest caveat**: no two-node serve has been measured. Everything above is
-established on one box by simulating the split in-process — byte-identical
-per-rank stacks, bitwise-inert remote pairs through the real kernels, and
-per-rank partials that sum to the whole-layer answer
-(`tests/test_moe_ep_exactness.py`). Treat expert-parallel serving as a
-correctness feature for models that do not fit one box, not a measured
-speedup, until that gate runs.
+**The honest caveat**: everything above was first established on one box by
+simulating the split in-process — byte-identical per-rank stacks,
+bitwise-inert remote pairs through the real kernels, and per-rank partials
+that sum to the whole-layer answer (`tests/test_moe_ep_exactness.py`) — and
+then measured two-node on 2026-08-23: the DeepSeek-V4 92 GB CB artifact
+across two DGX Sparks, 43 of 43 MoE layers admitted at 128 of 256 experts
+per rank, KL against single-box serves within the CB kernel's
+nondeterminism floor. Expert-parallel serving is a capacity feature for
+models that do not fit one box; no speedup is claimed.
 
 ---
 
