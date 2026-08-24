@@ -137,6 +137,14 @@ def test_static_lsq_out_nondefault_stream_and_graph(ext):
     scales = torch.empty(32, device="cuda", dtype=torch.float32)
 
     stream = torch.cuda.Stream()
+    # Order the side stream behind the default stream that produced ``x``
+    # (the ``randn`` above) and owns the output buffers. Without this the
+    # kernel can read ``x`` before ``randn`` has written it: a race that never
+    # shows on an idle GPU and missed once under a contended one (2026-08-23,
+    # suite run beside a TP=2 serve and other tenants; the stream half, not
+    # the graph half). Cross-stream ordering is the caller's contract — the
+    # kernel launches on the current stream, exactly as it should.
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         ext.cb_nvfp4_quantize_static_lsq_out(
             x, global_scale, packed, sfa, scales

@@ -155,6 +155,11 @@ def test_rowwise_quant_out_nondefault_stream_and_graph(ext):
     sfa = torch.empty(128 * 64, device="cuda", dtype=torch.uint8)
     scales = torch.empty(32, device="cuda", dtype=torch.float32)
     stream = torch.cuda.Stream()
+    # Same choreography as test_nvfp4_static_lsq_quant.py: the side stream
+    # must wait for the default stream that produced ``x``, or the kernel can
+    # read ``x`` before ``randn`` wrote it. This twin never missed itself; it
+    # is fixed with the static-LSQ test because it carries the identical race.
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         ext.cb_nvfp4_quantize_rows_out(x, packed, sfa, scales, 448.0)
     stream.synchronize()
