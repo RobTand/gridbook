@@ -10,12 +10,14 @@ K in {512,1024} x M in {1,8}. That leaves the surface R2 actually changed
 under-tested: the aligned-down u64 burst staging has a LAST-SUPERBLOCK
 fallback and a slot-bound guard, and ``type_size`` moves with every rung, so
 the staging boundary lands differently for each k. This module sweeps that
-boundary -- every shipped rung, both warp branches (n_sb % 8 vs % 4), odd and
+boundary -- every public NVFP4-CB rung K1..K25, both warp branches
+(n_sb % 8 vs % 4), odd and
 tiny row counts, non-power-of-2 M (runtime ``m`` tail), and both schedules.
 
-Origin: dq-runs/r2-kernel-2026-08-23 ran this as a 1728-config fuzz with zero
-mismatches before the default was flipped. Kept here so a future edit to the
-staging path cannot silently break the property the flip depends on.
+Origin: dq-runs/r2-kernel-2026-08-23 ran the then-supported K12..K20 range as
+a 1728-config fuzz with zero mismatches.  The K1..K25 expansion widens that
+same permanent gate to 4800 configurations so a future edit to the staging
+path cannot silently break the property the selector depends on.
 """
 import itertools
 
@@ -63,7 +65,7 @@ def _run(p, xq):
 # n_sb = K >> 8 -> 2, 4, 8, 12: covers the use4 branch (n_sb % 8 != 0 and
 # n_sb % 4 == 0 and n_sb < 48) and the 8-warp branch on both sides.
 @pytest.mark.parametrize("K", [512, 1024, 2048, 3072])
-@pytest.mark.parametrize("k", [12, 13, 14, 15, 16, 17, 18, 19, 20])
+@pytest.mark.parametrize("k", range(1, 26))
 def test_r2_bit_identical_across_edge_geometry(k, K, monkeypatch):
     """Every shipped rung x both warp branches x odd/tiny N x non-power-of-2 M
     x both schedules: the R2 and legacy instantiations agree bitwise."""

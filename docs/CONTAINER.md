@@ -101,8 +101,8 @@ serving image, using [`docker/Dockerfile.gridbook-pinned`](../docker/Dockerfile.
 docker build \
   -f docker/Dockerfile.gridbook-pinned \
   --build-arg BASE_IMAGE=gridbook:local \
-  --build-arg GRIDBOOK_REF=v0.9.0 \
-  -t gridbook:v0.9.0-pinned .
+  --build-arg GRIDBOOK_REF=v0.9.1 \
+  -t gridbook:v0.9.1-pinned .
 ```
 
 `GRIDBOOK_REF` is parameterized so the same recipe works for a release tag or,

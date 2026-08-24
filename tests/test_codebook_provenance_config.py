@@ -106,7 +106,17 @@ def _full_config(expected: str | None, *, codebook_file="cb_codebooks.pqcb"):
         "config_groups": {
             "cb": {
                 "targets": ["model.layers.0.mlp.down_proj"],
-                "scheme": {"grid": "fp4", "mode": "product", "k": 16},
+                # Keep this provenance fixture format-valid under the v11
+                # reader contract.  The test intentionally exercises only
+                # sidecar resolution, but config resolution now validates the
+                # complete physical scheme before opening that sidecar.
+                "scheme": {
+                    "grid": "fp4",
+                    "mode": "product",
+                    "k": 16,
+                    "n_sub": 2,
+                    "type_size": 80,
+                },
             },
         },
         "ignore": [],

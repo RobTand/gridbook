@@ -15,8 +15,8 @@ authors:
 repository-code: "https://github.com/RobTand/gridbook"
 url: "https://github.com/RobTand/gridbook"
 license: Apache-2.0
-version: "0.9.0"
-date-released: 2026-08-23
+version: "0.9.1"
+date-released: 2026-08-24
 keywords:
   - quantization
   - vector-quantization

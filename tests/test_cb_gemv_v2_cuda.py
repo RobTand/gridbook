@@ -6,7 +6,9 @@ GB10 device family on which the experimental kernel is admitted.
 """
 from __future__ import annotations
 
+import json
 import os
+import struct
 from contextlib import contextmanager
 
 import pytest
@@ -53,6 +55,32 @@ def _env(**values):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+def _write_bf16_safetensors(path, tensors):
+    """Write the tiny producer fixture without safetensors' NumPy writer.
+
+    Gridbook's installed-wheel test closure deliberately excludes NumPy.  The
+    exporter-consumer seam only needs a legal source checkpoint, so serialize
+    its single BF16 tensor directly using the documented safetensors layout.
+    """
+
+    header = {}
+    payload = bytearray()
+    for name, tensor in tensors.items():
+        data = tensor.detach().to(device="cpu", dtype=torch.bfloat16)
+        data = data.contiguous()
+        raw = bytes(data.view(torch.uint8).reshape(-1).tolist())
+        start = len(payload)
+        payload.extend(raw)
+        header[name] = {
+            "dtype": "BF16",
+            "shape": list(data.shape),
+            "data_offsets": [start, len(payload)],
+        }
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * (-len(encoded) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
 
 
 def _case(k: int, K: int, *, seed: int = 1, E: int = 3, N: int = 17):
@@ -152,6 +180,108 @@ def test_direct_nvfp4_research_range_inherited_dense_grouped_and_expand(k):
         for expert, xrow in zip(pair_expert.cpu(), pair_xrow.cpu())
     ])
     assert torch.allclose(grouped.float(), grouped_ref.float(), rtol=8e-3,
+                          atol=2e-2)
+
+
+@pytest.mark.parametrize("k", (1, 25), ids=lambda k: f"k{k}")
+@pytest.mark.parametrize("exporter_name", ("resident", "streaming"))
+def test_exported_public_endpoint_bytes_execute_in_cuda_consumer(
+    k, exporter_name, tmp_path,
+):
+    """Close the producer/export/runtime seam at both public endpoints.
+
+    The all-rung kernel gate above deliberately synthesizes legal bytes so it
+    can retain K26..K32 as a research surface.  This companion test runs the
+    real PrismaQuant resident and streaming exporters, reloads their
+    safetensors and sidecars, validates the exact K1/K25 product-table geometry
+    with Gridbook, and feeds those exported bytes to both the shipping expander
+    and dense CUDA GEMV.
+    """
+
+    from safetensors.torch import load_file
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+    from prismaquant.export_nvfp4_cb_streaming import export_nvfp4_cb_streaming
+
+    qname = "model.layers.0.self_attn.q_proj"
+    device = torch.device("cuda")
+    source = tmp_path / f"source-{exporter_name}-k{k}"
+    output = tmp_path / f"output-{exporter_name}-k{k}"
+    source.mkdir()
+    generator = torch.Generator(device="cpu").manual_seed(60_000 + k)
+    weight = (torch.randn(8, 256, generator=generator) * 0.25).to(
+        torch.bfloat16
+    )
+    _write_bf16_safetensors(
+        source / "model.safetensors", {f"{qname}.weight": weight}
+    )
+    (source / "config.json").write_text(json.dumps({"hidden_size": 256}))
+    assignment = tmp_path / f"assignment-{exporter_name}-k{k}.json"
+    assignment.write_text(json.dumps({qname: f"NVFP4_CB_K{k}"}))
+    exporter = (
+        export_nvfp4_cb
+        if exporter_name == "resident"
+        else export_nvfp4_cb_streaming
+    )
+
+    with _env(PRISMAQUANT_CB_ENCODE_COMPILE="0",
+              PRISMAQUANT_CB_LDLQ="0"):
+        exporter(
+            source,
+            assignment,
+            output,
+            {qname: torch.linspace(0.5, 1.5, 256)},
+            shared_codebook_spec={"source": "lattice"},
+            device="cpu",
+            allow_unstamped_research=True,
+        )
+
+    quant_config = json.loads((output / "quant_config.json").read_text())
+    group = next(
+        item for item in quant_config["config_groups"].values()
+        if qname in item["targets"]
+    )
+    scheme = group["scheme"]
+    assert (scheme["k"], scheme["n_sub"], scheme["type_size"]) == (
+        k, 2, 4 * k + 9
+    )
+    tensors = load_file(str(output / "model.safetensors"))
+    sidecar = load_file(str(output / quant_config["codebook_file"]))
+    refs = scheme["codebook_ref"]
+    names = list(refs) if isinstance(refs, list) else [refs]
+    tables = [sidecar[name].to(device) for name in names]
+    cb_flat = codec.build_flat_product_codebook(
+        tables, k, 2, prefix=f"exported NVFP4_CB_K{k}", grid="fp4"
+    )
+    packed = tensors[f"{qname}.cb_qweight"].to(device).contiguous()
+    rows, row_bytes = packed.shape
+    type_size = int(scheme["type_size"])
+    K = (row_bytes // type_size) * 256
+    compose = codec.build_compose_table(codec.TWO_TIER_SUB_TABLE).to(device)
+    row_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
+
+    expanded = v2ext.cb_expand_v2(
+        packed.reshape(-1), cb_flat, compose, 0, rows, K, k, type_size
+    )
+    padded = codec.pad_qweight(packed)
+    reference_w = reconstruct_cb_weight(
+        padded, cb_flat, row_offsets, torch.zeros(1, device=device), compose,
+        N=rows, K=K, k_bits=k, n_sub=2, type_size=type_size,
+        is_fp4=True, is_v2=True,
+    )
+    assert torch.equal(expanded.view(torch.uint16),
+                       reference_w.view(torch.uint16))
+
+    x = torch.randn(3, K, generator=generator, dtype=torch.bfloat16).to(device)
+    got = inherited.cb_gemv_fp4_v2(
+        x, padded, cb_flat, row_offsets, compose,
+        rows, K, k, 2, type_size,
+    )
+    expected = cb_linear_reference(
+        x, padded, cb_flat, row_offsets, torch.zeros(1, device=device), compose,
+        N=rows, K=K, k_bits=k, n_sub=2, type_size=type_size,
+        is_fp4=True, is_v2=True,
+    )
+    assert torch.allclose(got.float(), expected.float(), rtol=8e-3,
                           atol=2e-2)
 
 

@@ -90,7 +90,7 @@ second runtime tree or maintain a parallel loader table.
   hardware-aligned K4..K48 step-4 menu. A producer MUST choose from the latter;
   a reader MUST continue to admit the former. NVFP4 has no corresponding
   legacy artifacts: its reader and producer lists are both exactly K1..K25.
-  K26..K32 remain low-level CUDA research templates after the measured
+  K26..K32 remain a low-level CUDA research call surface after the measured
   dictionary-residency cliff, not valid artifacts or chooser candidates. K1 is
   the valid `(1,0)` split; K32 remains only the mathematical `(16,16)` E2M1
   product-lattice ceiling. `type_size` is still exactly `4*k` for FP8, so no

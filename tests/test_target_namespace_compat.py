@@ -761,6 +761,100 @@ def test_cb_activation_families_enforce_their_device_floors(monkeypatch):
     cfg._require_cb_device_capability(fp4, "model.layers.0.mlp.down_proj")
 
 
+def test_mixed_nvfp4_expert_subgroup_enforces_the_same_sm100_floor(
+    monkeypatch,
+):
+    """The per-expert mixed branch must not bypass NVFP4 admission."""
+
+    import gridbook.config as config_mod
+
+    prefix = "model.layers.0.mlp.experts"
+    groups = {
+        "fp4_w13": {
+            "format": "NVFP4_CB_K1",
+            "targets": [prefix + ".gate_up_proj.format_group_0"],
+            "scheme": {
+                "grid": "fp4", "mode": "product", "k": 1,
+                "n_sub": 2, "type_size": 13,
+                "scale_coding": "two_tier", "codebook_ref": "fp4",
+            },
+        },
+        "fp8_w13": {
+            "format": "FP8_CB_K4",
+            "targets": [prefix + ".gate_up_proj.format_group_1"],
+            "scheme": {
+                "grid": "fp8", "mode": "product", "k": 4,
+                "n_sub": 4, "type_size": 16,
+                "scale_coding": "v1", "codebook_ref": "fp8",
+            },
+        },
+        "fp4_w2": {
+            "format": "NVFP4_CB_K1",
+            "targets": [prefix + ".down_proj.format_group_0"],
+            "scheme": {
+                "grid": "fp4", "mode": "product", "k": 1,
+                "n_sub": 2, "type_size": 13,
+                "scale_coding": "two_tier", "codebook_ref": "fp4",
+            },
+        },
+        "fp8_w2": {
+            "format": "FP8_CB_K4",
+            "targets": [prefix + ".down_proj.format_group_1"],
+            "scheme": {
+                "grid": "fp8", "mode": "product", "k": 4,
+                "n_sub": 4, "type_size": 16,
+                "scale_coding": "v1", "codebook_ref": "fp8",
+            },
+        },
+    }
+    declaration = {
+        "version": 1,
+        "layers": {"0": {
+            "w13": [
+                {
+                    "format_wire_id": "NVFP4_CB_K1",
+                    "expert_ids": [0],
+                    "tensor_prefix": groups["fp4_w13"]["targets"][0],
+                },
+                {
+                    "format_wire_id": "FP8_CB_K4",
+                    "expert_ids": [1],
+                    "tensor_prefix": groups["fp8_w13"]["targets"][0],
+                },
+            ],
+            "w2": [
+                {
+                    "format_wire_id": "NVFP4_CB_K1",
+                    "expert_ids": [0],
+                    "tensor_prefix": groups["fp4_w2"]["targets"][0],
+                },
+                {
+                    "format_wire_id": "FP8_CB_K4",
+                    "expert_ids": [1],
+                    "tensor_prefix": groups["fp8_w2"]["targets"][0],
+                },
+            ],
+        }},
+    }
+    cfg = PrismaQuantConfig.from_config({
+        "quant_method": "gridbook",
+        "format": "mixed-precision",
+        "codebook_file": "unused",
+        "config_groups": groups,
+        "ignore": [],
+        "per_expert_format_groups": declaration,
+    })
+    cfg._ensure_resolved()
+    monkeypatch.setattr(config_mod.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        config_mod.torch.cuda, "get_device_capability", lambda: (8, 9)
+    )
+    layer = object.__new__(config_mod.RoutedExperts)
+    layer.moe_config = types.SimpleNamespace(num_experts=2)
+    with pytest.raises(ValueError, match=r"NVFP4-CB.*sm_100\+.*sm_89"):
+        cfg.get_quant_method(layer, prefix)
+
+
 _SUBSET_ENTRIES = ["model.layers.1.mlp.gate", "model.layers.1.mlp", "lm_head",
                    "mlp.down_proj", "model.layers.1"]
 _SUBSET_NAMES = ["model.layers.1.mlp.gate", "model.layers.1.mlp.gate_proj",

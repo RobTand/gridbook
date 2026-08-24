@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.1 — 2026-08-24
 
 ### NVFP4-CB support expands to K1..K25 (contract schema v11)
 
@@ -12,7 +12,7 @@
   supported range. The exact BF16 transient expander stages the whole
   dictionary through K25 (98,304 bytes). Its LUT copy now handles K1's valid
   24-byte dictionary without an artificial 16-byte size rule. Direct CUDA
-  bindings also instantiate K26..K32 with global cached gathers for kernel
+  bindings also admit K26..K32 runtime calls with global cached gathers for kernel
   research only; that scaffolding is not reader or artifact support.
 - Optimized lanes remain independently qualified. A rung outside an optimized
   lane's compiled/eligible subset takes the exact generic decode or
@@ -27,7 +27,7 @@
   K1..K25 public range, all `compile_only`: dense/routed decode are backed,
   role-unsplit routed batch is backed by persistent-B, and both
   expand-plus-BF16 routes are explicit fallbacks. The no-launch preflight also
-  cross-compiles the K26..K32 direct research templates and verifies all four
+  cross-compiles the modules carrying the K26..K32 direct research surface and verifies all four
   modules as exact `sm_120`/`sm_120a` SASS, without promoting those templates
   into the public contract.
 - Schema and `contract_version` move together to

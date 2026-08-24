@@ -1827,6 +1827,31 @@ class PrismaQuantConfig(QuantizationConfig):
                         "per_expert_format_groups declares a partition of "
                         f"{mixed_groups.num_experts} experts"
                     )
+                # Every CB subgroup carries its own activation family.  This
+                # mixed-stack branch does not pass through the uniform
+                # ``scheme`` arm below, so enforce the same architecture floor
+                # explicitly for each subgroup before constructing any
+                # resident buffers.  In particular, one NVFP4 subgroup makes
+                # the whole stack illegal on SM89 even when its siblings are
+                # FP8-CB; the later v2-expander attestation is not a substitute
+                # for the format-family load choke point.
+                for family in ("w13", "w2"):
+                    for group in mixed_groups.groups(family):
+                        if group.is_passthrough:
+                            continue
+                        target = self._per_expert_serving_prefixes[
+                            group.tensor_prefix
+                        ]
+                        try:
+                            group_scheme = self.target_scheme[target]
+                        except KeyError:
+                            raise ValueError(
+                                f"MoE stack {prefix}: CB subgroup {target!r} "
+                                "has no resolved scheme"
+                            ) from None
+                        self._require_cb_device_capability(
+                            group_scheme, target
+                        )
                 # Single-format CB expert stacks now serve above one rank
                 # under expert parallelism (see _require_ep_moe_serving). A
                 # MIXED stack does not, and refuses here — before any buffer

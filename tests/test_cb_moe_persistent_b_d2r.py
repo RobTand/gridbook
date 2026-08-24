@@ -127,11 +127,11 @@ def test_identity_activation_proves_every_fragment_coordinate_and_m_loop(cfg):
                        decoded.t().contiguous().view(torch.int16))
 
 
-@pytest.mark.parametrize("k", (1, 32), ids=lambda k: f"k{k}")
+@pytest.mark.parametrize("k", (1, 25, 32), ids=lambda k: f"k{k}")
 @pytest.mark.parametrize("cfg", range(1, len(BASE_CONFIGS) + 1),
                          ids=lambda cfg: f"cfg{cfg}")
 def test_extended_edges_keep_every_d2r_fragment_bit_exact(k, cfg):
-    """K1's zero-bit half and K32's full 16-bit halves, on every D2R tile."""
+    """Public endpoints plus K32's full 16-bit halves, on every D2R tile."""
     K, E, N = 256, 1, 64
     qw, lut, compose, type_size = _pack(
         k, K, E, N, seed=92500 + k, source="synth", super_span=None)

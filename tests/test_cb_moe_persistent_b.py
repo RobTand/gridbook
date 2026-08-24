@@ -441,14 +441,18 @@ def test_decode_probe_zero_rows_is_a_well_formed_empty_result():
 # 2. Whole-operator numerics: reassociation, and nothing else.
 # ===========================================================================
 @pytest.mark.parametrize("counts,k,K,N", [
+    ([1, 3], 1, 256, MIN_TN),
     ([10, 0, 130, 3], 16, 1024, 256),
     ([200, 1, 0], 13, 512, 128),
     ([1, 1], 24, 1024, 64),
+    ([2, 1], 25, 256, MIN_TN),
     ([0, 0, 5], 20, 768, 40),
     ([64, 64, 64, 64, 64], 12, 2048, 512),
     ([3, 0, 4], 12, 256, MIN_TN),
-], ids=["empty-middle-longtail", "skewed-trailing-empty", "one-row-each",
-        "leading-empty-ragged-n", "exact-tile-multiples", "narrowest-tile-n"])
+], ids=["k1-public-floor", "empty-middle-longtail",
+        "skewed-trailing-empty", "one-row-each", "k25-public-ceiling",
+        "leading-empty-ragged-n", "exact-tile-multiples",
+        "narrowest-tile-n"])
 @pytest.mark.parametrize("source", SOURCES)
 def test_whole_operator_error_matches_a_per_segment_bf16_reference(
         counts, k, K, N, source):
@@ -561,8 +565,8 @@ def test_zero_routed_rows_returns_a_well_formed_empty_output():
 def _config_case(source="synth"):
     """The widest rung on purpose.
 
-    Shared memory per CTA grows with ``type_size``, so k=24 is the strictest
-    case a config has to survive — and it is the rung
+    Shared memory per CTA grows with ``type_size``, so K25 is the strictest
+    public case a config has to survive — and it is the rung
     ``cb_moe_persistent_b_configs()`` quotes its ``smem`` figure at.  Running
     every attested config here therefore gates ATTESTATION AGAINST REALITY: a
     tile the module advertises but would refuse to launch (over the sm_120
@@ -570,7 +574,7 @@ def _config_case(source="synth"):
     instead of at a serving call.
     """
     counts = [0, 5, 200, 1, 0, 70]
-    k, K, N = 24, 1024, 200            # N % 8 == 0, N % 32 != 0
+    k, K, N = 25, 1024, 200            # N % 8 == 0, N % 32 != 0
     E, P = len(counts), sum(counts)
     qw, lut, compose, type_size = _pack(k, K, E, N, seed=1234, source=source)
     torch.manual_seed(9090)
