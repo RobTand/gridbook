@@ -1,6 +1,6 @@
 {
-  "schema": "gridbook.runtime-contract.v6",
-  "contract_version": 6,
+  "schema": "gridbook.runtime-contract.v7",
+  "contract_version": 7,
   "abi_features": {
     "dspark_construction_physical_bridge": 1,
     "routed_moe_per_role_codebook_lut": 1,
@@ -183,6 +183,48 @@
             "max_world_size": 1
           }
         ]
+      }
+    ]
+  },
+  "expert_parallel": {
+    "axis": "vllm_expert_parallel_size",
+    "semantics": "closed_world",
+    "requires": {
+      "vllm_flag": "--enable-expert-parallel",
+      "moe_tensor_parallel_size": 1,
+      "all2all_kernels": false,
+      "expert_load_balancing": false,
+      "skip_final_all_reduce": false
+    },
+    "units": [
+      {
+        "unit": "FP8_CB_K",
+        "kind": "cb_moe_expert_stack",
+        "expert_admission": {
+          "shard_axis": "expert",
+          "sharded_dims": "none",
+          "placement": "monotone_bijection",
+          "checkpoint_leading_dim": "global_expert_count",
+          "remote_pair_handling": "zero_weight_alias",
+          "cross_rank_reduction": "vllm_final_all_reduce"
+        }
+      },
+      {
+        "unit": "NVFP4_CB_K",
+        "kind": "cb_moe_expert_stack",
+        "expert_admission": {
+          "shard_axis": "expert",
+          "sharded_dims": "none",
+          "placement": "monotone_bijection",
+          "checkpoint_leading_dim": "global_expert_count",
+          "remote_pair_handling": "zero_weight_alias",
+          "cross_rank_reduction": "vllm_final_all_reduce"
+        }
+      },
+      {
+        "unit": "cb_moe_per_expert_format_groups",
+        "kind": "cb_moe_expert_stack_refused",
+        "max_world_size": 1
       }
     ]
   },

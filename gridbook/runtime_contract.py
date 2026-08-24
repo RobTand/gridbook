@@ -11,7 +11,7 @@ from importlib.resources import files
 from typing import Any, Mapping
 
 
-RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v6"
+RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v7"
 _RESOURCE_NAME = "runtime_contract.json"
 
 #: The vLLM package roots a ``top_level_loader_modules`` entry may name. The
@@ -84,6 +84,62 @@ _TP_REQUIRED_GEOMETRY: dict[tuple[str, str], dict[str, int]] = {
 _TP_CB_INPUT_AXIS_GROUP = 256
 _TP_CB_OUTPUT_AXIS_QUANTA: dict[str, int] = {"fp4": 8, "fp8": 16}
 _TP_CB_MERGED_ROLES = "even_division"
+
+#: Expert parallelism is a SECOND axis, not a relaxation of the first. The
+#: ``tensor_parallel`` table above is about splitting one unit's rows/columns
+#: across ranks; this one is about splitting a routed MoE layer's EXPERTS,
+#: leaving every expert whole. A CB expert stack cannot appear in the first
+#: table — its last dimension is superblock bytes, not input columns — and
+#: needs no shard laws in this one, because nothing is sharded within an
+#: expert.
+_EP_AXIS = "vllm_expert_parallel_size"
+
+#: The topology predicate ``config.py::_require_ep_moe_serving`` enforces at
+#: method construction, restated field by field. Each entry is one refusal
+#: branch there: ``use_ep`` must be on (``vllm_flag``); the MoE layer's own
+#: ``tp_size`` must be 1; ``use_all2all_kernels`` must be false, which is
+#: vLLM's own way of saying dp/pcp/sequence-parallel EP is off and no
+#: dispatch/combine token exchange is expected of the method; EPLB must be off
+#: (Gridbook holds whole stacks resident and cannot follow a re-placement);
+#: and ``skip_final_all_reduce`` must be off, because Gridbook returns this
+#: rank's partial and relies on vLLM's stock final all-reduce
+#: (``fused_moe/runner/moe_runner.py::_maybe_reduce_final_output``) to sum the
+#: ranks.
+_EP_REQUIRES: dict[str, object] = {
+    "vllm_flag": "--enable-expert-parallel",
+    "moe_tensor_parallel_size": 1,
+    "all2all_kernels": False,
+    "expert_load_balancing": False,
+    "skip_final_all_reduce": False,
+}
+
+#: The per-unit admission laws for a CB MoE expert stack above one rank. Every
+#: value names an enforcement site: ``placement`` and
+#: ``checkpoint_leading_dim`` are ``moe_ep.local_expert_gather_index`` and
+#: ``moe_ep.gather_expert_major`` (both loaders funnel through the latter);
+#: ``remote_pair_handling`` is ``moe_ep.remap_local_expert_ids``, applied
+#: inside the opaque custom op before every forward path;
+#: ``cross_rank_reduction`` is vLLM's, not Gridbook's. ``sharded_dims: none``
+#: is the substantive claim — a rank's expert bytes are byte-identical to the
+#: corresponding slice of the world-size-1 stack, so per-expert numerics do
+#: not change with the world size.
+_EP_CB_ADMISSION: dict[str, str] = {
+    "shard_axis": "expert",
+    "sharded_dims": "none",
+    "placement": "monotone_bijection",
+    "checkpoint_leading_dim": "global_expert_count",
+    "remote_pair_handling": "zero_weight_alias",
+    "cross_rank_reduction": "vllm_final_all_reduce",
+}
+
+#: Units this build refuses above one rank on the expert-parallel axis, with
+#: the cap each publishes. Mixed per-expert-format stacks declare their format
+#: partition over GLOBAL expert ids, so a rank owning a subset can neither
+#: size nor fill the per-format sub-stacks
+#: (``config.py``, the ``per-expert format groups`` refusal site).
+_EP_REFUSED_UNITS: dict[str, int] = {
+    "cb_moe_per_expert_format_groups": 1,
+}
 
 
 class RuntimeContractError(ValueError):
@@ -322,20 +378,116 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
               f"unknown {sorted(passthrough_units - set(_PASSTHROUGH_TP_UNITS))}")
 
 
+def _validate_expert_parallel(root: Mapping[str, Any],
+                              family_grids: Mapping[str, str]) -> None:
+    """Validate the expert-parallel capability table.
+
+    Same doctrine as ``_validate_tensor_parallel`` — attestation, closed
+    world, no default or wildcard — on a different axis. A consumer asking
+    "can this build serve unit *U* with ``--enable-expert-parallel``?" looks up
+    exactly one row named *U*: a ``cb_moe_expert_stack`` row is a yes under the
+    published ``requires`` topology and ``expert_admission`` laws, a
+    ``cb_moe_expert_stack_refused`` row is an explicit no above its cap, and no
+    row at all is a refusal.
+
+    Unlike the tensor-parallel table, admission here is TOPOLOGY-wide as well
+    as per-unit: expert parallelism only keeps whole experts if no other
+    parallel axis is also splitting the layer, so ``requires`` is validated
+    against the exact predicate the refusal site enforces.
+    """
+
+    ep = _object(root["expert_parallel"], "contract.expert_parallel")
+    _keys(ep, "contract.expert_parallel",
+          {"axis", "semantics", "requires", "units"})
+    if ep["axis"] != _EP_AXIS:
+        _fail("contract.expert_parallel.axis", f"must be {_EP_AXIS!r}")
+    if ep["semantics"] != "closed_world":
+        _fail("contract.expert_parallel.semantics",
+              "must be 'closed_world': an unclaimed unit is refused, never "
+              "permitted by default")
+    requires = _object(ep["requires"], "contract.expert_parallel.requires")
+    _keys(requires, "contract.expert_parallel.requires", set(_EP_REQUIRES))
+    for key, pinned in _EP_REQUIRES.items():
+        got = requires[key]
+        if got != pinned or type(got) is not type(pinned):
+            _fail(f"contract.expert_parallel.requires.{key}",
+                  f"must be {pinned!r} (config.py::_require_ep_moe_serving "
+                  "refuses otherwise)")
+
+    units = ep["units"]
+    if not isinstance(units, list) or not units:
+        _fail("contract.expert_parallel.units",
+              "must be a non-empty JSON array")
+    seen: set[str] = set()
+    cb_units: set[str] = set()
+    refused_units: dict[str, int] = {}
+    for index, item in enumerate(units):
+        path = f"contract.expert_parallel.units[{index}]"
+        row = _object(item, path)
+        unit_id = _string(row["unit"], f"{path}.unit")
+        kind = _string(row["kind"], f"{path}.kind")
+        if kind == "cb_moe_expert_stack":
+            cb_units.add(unit_id)
+            _keys(row, path, {"unit", "kind", "expert_admission"})
+            if unit_id not in family_grids:
+                _fail(f"{path}.unit",
+                      f"no CB format family {unit_id!r} in contract.formats")
+            admission_path = f"{path}.expert_admission"
+            admission = _object(row["expert_admission"], admission_path)
+            _keys(admission, admission_path, set(_EP_CB_ADMISSION))
+            for key, pinned in _EP_CB_ADMISSION.items():
+                if admission[key] != pinned:
+                    _fail(f"{admission_path}.{key}", f"must be {pinned!r}")
+        elif kind == "cb_moe_expert_stack_refused":
+            _keys(row, path, {"unit", "kind", "max_world_size"})
+            cap = _positive_int(row["max_world_size"],
+                                f"{path}.max_world_size")
+            expected_cap = _EP_REFUSED_UNITS.get(unit_id)
+            if expected_cap is None:
+                _fail(f"{path}.unit",
+                      f"unknown refused expert-parallel unit {unit_id!r}")
+            if cap != expected_cap:
+                _fail(f"{path}.max_world_size",
+                      f"must be {expected_cap} for {unit_id!r}")
+            refused_units[unit_id] = cap
+        else:
+            _fail(f"{path}.kind",
+                  "must be 'cb_moe_expert_stack' or "
+                  "'cb_moe_expert_stack_refused'")
+        if unit_id in seen:
+            _fail("contract.expert_parallel.units",
+                  f"duplicate unit {unit_id!r}")
+        seen.add(unit_id)
+
+    if cb_units != set(family_grids):
+        _fail("contract.expert_parallel.units",
+              f"every CB format family must carry exactly one "
+              f"'cb_moe_expert_stack' claim; missing "
+              f"{sorted(set(family_grids) - cb_units)}, unknown "
+              f"{sorted(cb_units - set(family_grids))}")
+    if set(refused_units) != set(_EP_REFUSED_UNITS):
+        _fail("contract.expert_parallel.units",
+              f"refused expert-parallel claims must equal "
+              f"{sorted(_EP_REFUSED_UNITS)}; missing "
+              f"{sorted(set(_EP_REFUSED_UNITS) - set(refused_units))}, "
+              f"unknown {sorted(set(refused_units) - set(_EP_REFUSED_UNITS))}")
+
+
 def validate_runtime_contract(contract: Any) -> None:
     """Raise :class:`RuntimeContractError` unless *contract* is self-consistent."""
 
     root = _object(contract, "contract")
     _keys(root, "contract", {
         "schema", "contract_version", "abi_features", "quant_method",
-        "packing", "layout", "formats", "tensor_parallel", "producer_profiles",
+        "packing", "layout", "formats", "tensor_parallel", "expert_parallel",
+        "producer_profiles",
     })
     if root["schema"] != RUNTIME_CONTRACT_SCHEMA:
         _fail("contract.schema", f"must be {RUNTIME_CONTRACT_SCHEMA!r}")
     contract_version = _positive_int(
         root["contract_version"], "contract.contract_version")
-    if contract_version != 6:
-        _fail("contract.contract_version", "must be 6 for this schema")
+    if contract_version != 7:
+        _fail("contract.contract_version", "must be 7 for this schema")
 
     features = _object(root["abi_features"], "contract.abi_features")
     _keys(features, "contract.abi_features", {
@@ -509,6 +661,7 @@ def validate_runtime_contract(contract: Any) -> None:
             _fail(path, "moe_layout_versions must be a subset of layout_versions")
 
     _validate_tensor_parallel(root, family_grids)
+    _validate_expert_parallel(root, family_grids)
 
     profiles = _object(root["producer_profiles"],
                        "contract.producer_profiles")

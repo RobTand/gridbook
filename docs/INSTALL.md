@@ -379,11 +379,21 @@ discrete GPU with its own VRAM, ordinary vLLM utilization guidance applies.
   2026-08-23 dense CB Linears load shard-aware at `--tensor-parallel-size >
   1` (whole packed rows on the output axis, superblock-aligned byte windows
   on the input axis; a boundary that would split a group is a structured
-  construction-time refusal). MoE expert stacks, delegated compressed-tensors
-  groups, source-passthrough units, quantized embedding units and
-  mixed-format fused projections refuse at construction naming themselves.
+  construction-time refusal). Delegated compressed-tensors groups,
+  source-passthrough units, quantized embedding units and mixed-format fused
+  projections refuse at construction naming themselves.
   No cross-node serve has been measured on this hardware; treat TP>1 as a
   correctness feature for models that do not fit one box, not a speedup.
+- **Routed CB MoE needs `--enable-expert-parallel`, not `-tp` alone.** A CB
+  expert stack's last dimension is superblock bytes, not input columns, so a
+  tensor-parallel split would cut a packed superblock. Above one rank serve
+  routed CB MoE with `-tp N --enable-expert-parallel`: each rank holds a
+  disjoint subset of whole experts, byte-identical to the corresponding slice
+  of a single-rank stack. `-tp N` without the flag refuses at construction and
+  names the flag; so do data-/pipeline-context-/sequence-parallel EP, EPLB,
+  and mixed per-expert-format stacks
+  ([details](TROUBLESHOOTING.md#expert-parallel--tp-n---enable-expert-parallel)).
+  The two-node gate has not been run, so this is correctness-only too.
 - **Dense CB Linears are biasless.** A public dense CB call with non-`None`
   bias is rejected because the opaque native operation has no owned biased
   kernel in 0.5.

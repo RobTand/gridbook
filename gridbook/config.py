@@ -577,8 +577,87 @@ class PrismaQuantConfig(QuantizationConfig):
             self._tp_world_size = 1
         return world_size
 
+    def _require_ep_moe_serving(self, surface: str, prefix: str,
+                                layer) -> str:
+        """Admit stacked CB expert stacks above one rank ONLY under EP.
+
+        Expert parallelism is the one multi-rank MoE mode Gridbook serves. A CB
+        expert stack is a byte tensor whose last dimension is
+        ``(in/256)·type_size`` — superblock bytes, not input columns — so
+        vLLM's tensor-parallel intermediate split would cut a superblock in
+        half and there is no partial-superblock decode. Expert parallelism
+        instead gives each rank a disjoint subset of WHOLE experts: whole
+        stacks, whole superblocks, and the identical per-expert numerics the
+        same artifact serves at world size 1.
+
+        Everything else above one rank refuses here, at method construction,
+        before a single buffer is sized — including the expert-parallel
+        topologies whose premise Gridbook has not established. The premise is
+        that this rank computes its own experts and vLLM's stock final
+        all-reduce sums the per-rank partials
+        (``fused_moe/runner/moe_runner.py`` ``_maybe_reduce_final_output``:
+        fires when ``ep_size > 1``, and is skipped under sequence parallelism
+        or ``skip_final_all_reduce``). Data-, pipeline-context- and
+        sequence-parallel EP also switch vLLM to all2all dispatch/combine
+        kernels, which expect a MoE method that exchanges tokens; Gridbook has
+        none.
+
+        Returns the admitted mode, for the load-time announcement.
+        """
+        world_size = self._tensor_parallel_world_size()
+        if world_size is None or world_size == 1:
+            return "single_rank"
+        where = f" at {prefix!r}" if prefix else ""
+        cfg = getattr(layer, "moe_config", None)
+        par = getattr(cfg, "moe_parallel_config", None)
+
+        def _refuse(reason: str, fix: str) -> None:
+            raise ValueError(
+                f"Gridbook serves {surface}{where} above one rank only under "
+                f"expert parallelism; the live vLLM worker reports "
+                f"TP={world_size} and {reason}. {fix} A CB expert stack is a "
+                "byte tensor whose last dimension is superblock bytes rather "
+                "than input columns, so tensor-parallel sharding would cut a "
+                "superblock; expert parallelism keeps whole experts per rank "
+                "and is the supported multi-rank MoE mode."
+            )
+
+        if par is None:
+            _refuse("its MoE parallel configuration is unreadable",
+                    "Serve with -tp N --enable-expert-parallel.")
+        if not bool(getattr(par, "use_ep", False)):
+            _refuse("expert parallelism is off for this MoE layer",
+                    "Add --enable-expert-parallel to the serve command; "
+                    "-tp N alone tensor-parallelizes the expert stacks.")
+        moe_tp = int(getattr(par, "tp_size", 1))
+        if moe_tp != 1:
+            _refuse(f"the MoE layer is still tensor-parallel "
+                    f"(moe tp_size={moe_tp})",
+                    "Expert parallelism must own the whole MoE axis.")
+        if bool(getattr(par, "use_all2all_kernels", False)):
+            _refuse(
+                f"this is an all2all expert-parallel topology "
+                f"(dp_size={int(getattr(par, 'dp_size', 1))}, "
+                f"pcp_size={int(getattr(par, 'pcp_size', 1))}, "
+                f"sp_size={int(getattr(par, 'sp_size', 1))})",
+                "Gridbook's CB MoE method computes this rank's own experts "
+                "and relies on vLLM's stock final all-reduce; it implements "
+                "no dispatch/combine token exchange. Serve with "
+                "data-parallel, pipeline-context-parallel and "
+                "sequence-parallel sizes of 1.")
+        if bool(getattr(par, "enable_eplb", False)):
+            _refuse("expert-load-balancing (EPLB) is enabled",
+                    "Gridbook holds whole CB expert stacks resident and "
+                    "cannot follow a live re-placement; serve without EPLB.")
+        if bool(getattr(cfg, "skip_final_all_reduce", False)):
+            _refuse("skip_final_all_reduce is set",
+                    "Per-rank expert partials would never be summed. Gridbook "
+                    "does not reduce its own output.")
+        return f"expert_parallel(ep_size={int(getattr(par, 'ep_size', world_size))})"
+
     def _require_tp1_serving(self, surface: str,
-                             prefix: str | None = None) -> None:
+                             prefix: str | None = None,
+                             note: str | None = None) -> None:
         """Fail closed for every serving surface that is still TP=1-only.
 
         Dense CB Linears are the ONE admitted surface above a single rank:
@@ -597,6 +676,7 @@ class PrismaQuantConfig(QuantizationConfig):
             f"Gridbook serves {surface}{where} at tensor-parallel size 1 "
             f"only; the live vLLM worker reports TP={world_size}. Dense CB "
             "Linears are the only supported tensor-parallel surface."
+            + (f" {note}" if note else "")
         )
 
     def _has_mixed_fused_loader(self) -> bool:
@@ -1621,27 +1701,50 @@ class PrismaQuantConfig(QuantizationConfig):
                         "per_expert_format_groups declares a partition of "
                         f"{mixed_groups.num_experts} experts"
                     )
-                # Out of scope by campaign decision (moetp.md): expert stacks
-                # need expert-id remap plus shard-aware stacked copies; EP is
-                # the right first target there. Refuse before any buffer is
-                # sized with per-rank geometry the loaders cannot fill.
+                # Single-format CB expert stacks now serve above one rank
+                # under expert parallelism (see _require_ep_moe_serving). A
+                # MIXED stack does not, and refuses here — before any buffer
+                # is sized with per-rank geometry the loaders cannot fill.
                 self._require_tp1_serving(
-                    "CB MoE expert stacks (per-expert format groups)", prefix)
+                    "CB MoE expert stacks (per-expert format groups)", prefix,
+                    note=(
+                        "Expert parallelism (-tp N --enable-expert-parallel) "
+                        "serves single-format CB expert stacks above one rank, "
+                        "but not per-expert format groups: the format "
+                        "partition is declared over GLOBAL expert ids and each "
+                        "per-format sub-stack is sized from that global "
+                        "partition, so a rank owning an arbitrary subset can "
+                        "neither size nor fill them, and the resident formats "
+                        "would differ per rank. Export this layer as one CB "
+                        "format to serve it expert-parallel."
+                    ))
                 from .moe_mixed import PrismaQuantMixedMoEMethod
                 return PrismaQuantMixedMoEMethod(
                     self, layer.moe_config, mixed_groups, prefix
                 )
             if scheme is not None:
                 self._require_cb_device_capability(scheme, prefix)
-                # Out of scope by campaign decision (moetp.md): the stacked
-                # CB loaders copy whole (E, rows, bytes) checkpoint tensors
-                # under a strict shape-equality contract while vLLM's FusedMoE
-                # allocates intermediate-sharded buffers at TP>1, so serving
-                # would die mid-load even with the dense gates lifted. The
-                # refusal stays here, naming the surface.
-                self._require_tp1_serving(
+                # Above one rank this surface admits ONLY expert parallelism.
+                # Tensor parallelism still refuses: vLLM's FusedMoE allocates
+                # intermediate-SHARDED buffers at moe tp_size > 1, while a CB
+                # stack's last dimension is superblock bytes, so the stacked
+                # whole-tensor loaders could not fill them. Expert parallelism
+                # shards the EXPERT axis instead, which is the axis a stack is
+                # already indexed on: the loaders gather this rank's experts
+                # (moe_ep.gather_expert_major) and the forward relabels router
+                # ids inside the custom op (moe_ep.remap_local_expert_ids).
+                ep_mode = self._require_ep_moe_serving(
                     "CB MoE expert stacks (stacked whole-tensor loader)",
-                    prefix)
+                    prefix, layer)
+                if ep_mode != "single_rank":
+                    # Announced, not merely permitted: which parallel mode
+                    # admitted a layer is the fact an operator needs when a
+                    # two-node serve behaves unlike the single-rank one.
+                    print(f"[prismaquant-cb] moe_admission {prefix} -> "
+                          f"{ep_mode}; this rank holds "
+                          f"{int(layer.moe_config.num_local_experts)} of "
+                          f"{int(layer.moe_config.num_experts)} experts",
+                          flush=True)
                 from .moe import PrismaQuantCBMoEMethod
                 return PrismaQuantCBMoEMethod(
                     self, layer.moe_config, scheme, prefix)
