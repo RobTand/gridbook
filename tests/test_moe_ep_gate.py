@@ -31,6 +31,7 @@ from gridbook.config import PrismaQuantConfig  # noqa: E402
 _L0 = "model.layers.0"
 _SCHEME = {
     "grid": "fp8",
+    "mode": "product",
     "k": 28,
     "n_sub": 4,
     "type_size": 112,
@@ -204,8 +205,15 @@ def test_mixed_format_expert_stacks_refuse_under_expert_parallelism(
             },
             "experts_fp4": {
                 "format": "NVFP4_CB_K16",
-                "scheme": {"grid": "fp4", "k": 16, "n_sub": 2,
-                           "type_size": 73, "codebook_ref": "cb1"},
+                "scheme": {
+                    "grid": "fp4",
+                    "mode": "product",
+                    "k": 16,
+                    "n_sub": 2,
+                    "scale_coding": "two_tier",
+                    "type_size": 73,
+                    "codebook_ref": "cb1",
+                },
                 "targets": [
                     f"{_L0}.mlp.experts.gate_up_proj.format_group_1",
                     f"{_L0}.mlp.experts.down_proj.format_group_1",
