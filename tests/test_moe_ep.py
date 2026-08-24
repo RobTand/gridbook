@@ -324,3 +324,44 @@ def test_a_data_dependent_alternative_would_fail_that_check():
             keep = torch.nonzero(
                 fem.index_select(0, fids.reshape(-1).long()) >= 0)
             _ = int(keep.numel())
+
+
+# --- default-device context ---------------------------------------------------
+# vLLM constructs the model inside ``torch.device(<gpu>)``; every device-less
+# constructor in a construction-time path then lands on the GPU. The gather
+# index moves the map to the CPU on purpose, so its comparison tensor must be
+# built on the CPU explicitly or ``torch.equal`` refuses the cross-device
+# compare. The first two-node DSv4 serve died exactly there (2026-08-23).
+
+def _contiguous_rank1_of_2(e_global: int = 8) -> torch.Tensor:
+    em = torch.full((e_global,), -1, dtype=torch.int64)
+    em[e_global // 2:] = torch.arange(e_global // 2, dtype=torch.int64)
+    return em
+
+
+def test_gather_index_is_built_under_a_meta_default_device():
+    em = _contiguous_rank1_of_2()
+    plain = local_expert_gather_index(em, 4, surface="s", prefix="p")
+    with torch.device("meta"):
+        under_context = local_expert_gather_index(
+            em, 4, surface="s", prefix="p")
+    assert under_context.device.type == "cpu"
+    assert torch.equal(under_context, plain)
+
+
+def test_gather_index_refusals_still_fire_under_a_default_device_context():
+    em = _contiguous_rank1_of_2()
+    with torch.device("meta"), pytest.raises(ExpertParallelError,
+                                             match="not a bijection"):
+        local_expert_gather_index(em, 3, surface="s", prefix="lay.0")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_gather_index_is_built_under_a_cuda_default_device_from_a_cuda_map():
+    em = _contiguous_rank1_of_2().cuda()
+    plain = local_expert_gather_index(em.cpu(), 4, surface="s", prefix="p")
+    with torch.device("cuda"):
+        under_context = local_expert_gather_index(
+            em, 4, surface="s", prefix="p")
+    assert under_context.device.type == "cpu"
+    assert torch.equal(under_context, plain)

@@ -119,7 +119,12 @@ def local_expert_gather_index(
     e_local = int(local_num_experts)
     owned = torch.nonzero(em >= 0, as_tuple=False).reshape(-1)
     slots = em.index_select(0, owned)
-    expected = torch.arange(e_local, dtype=torch.int64)
+    # Explicit device: vLLM builds the model inside a ``torch.device(<gpu>)``
+    # context, under which a device-less constructor lands on the GPU while
+    # ``em`` was deliberately moved to the CPU — ``torch.equal`` then refuses
+    # the cross-device compare and construction dies on every rank
+    # (observed on the first two-node DSv4 serve, 2026-08-23).
+    expected = torch.arange(e_local, dtype=torch.int64, device="cpu")
     if int(owned.numel()) != e_local or not torch.equal(
             torch.sort(slots).values, expected):
         raise ExpertParallelError(
