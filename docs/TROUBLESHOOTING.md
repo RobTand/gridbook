@@ -489,10 +489,18 @@ grouped plane divides the kernel's group count, so degrees 1, 2 and 4 are
 qualified (DSv4 `wo_a`: G=8, 1024 rows/group, K=4096) and anything else is
 refused by name.
 
+A **mixed-format fused projection** shards when every one of its roles does.
+The composer owns no alignment law of its own: it derives the column degree
+from vLLM's constructor arguments, refuses a row-parallel split of a merged
+plane, and builds each role's carrier at that role's whole-tensor output size,
+so the CB and source-passthrough gates above refuse per role with their own
+errors. A role width that is legal whole but illegal per rank therefore names
+itself and its own quantum.
+
 Everything else still refuses at construction, naming itself: delegated
-compressed-tensors groups, other source-passthrough formats, quantized
-embedding units and mixed-format fused projections. An artifact mixing those
-surfaces with dense CB therefore fails on its first unsupported layer.
+compressed-tensors groups, other source-passthrough formats and quantized
+embedding units. An artifact mixing those surfaces with dense CB therefore
+fails on its first unsupported layer.
 Ignored (BF16) Linears keep vLLM's own sharding.
 
 Two honest caveats: no two-node serve has been measured yet (the reference

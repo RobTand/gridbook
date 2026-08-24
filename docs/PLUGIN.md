@@ -105,9 +105,9 @@ second runtime tree or maintain a parallel loader table.
   shard_size fields — input axis requires whole 256-weight superblocks;
   output axis requires the native kernel's 8-wide (fp4) or 16-wide (fp8) row
   quantum). Everything else keeps refusing at construction, naming itself:
-  delegated compressed-tensors groups, quantized embedding units and
-  mixed-format fused projections; routed CB MoE expert stacks refuse on this
-  axis and serve on the expert-parallel one instead (see below).
+  delegated compressed-tensors groups and quantized embedding units; routed
+  CB MoE expert stacks refuse on this axis and serve on the expert-parallel
+  one instead (see below).
   `fp8_e4m3_ue8m0_block128` source-passthrough units are no longer among the
   refusals: dense ones shard when every rank's extent on the sharded axis is
   a whole multiple of the 128-element source block (per fused role on a

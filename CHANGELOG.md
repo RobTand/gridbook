@@ -54,7 +54,8 @@ law that makes that narrowing correct.
   the whole qualified set rather than naming one geometry.
 - **Other passthrough formats are unchanged.** `mxfp4_e2m1_ue8m0_g32` and
   `mxfp8_e4m3_e8m0_g32` have no sharded audit and keep refusing by name at
-  dispatch; mixed-format fused planes keep their own separate refusal.
+  dispatch. (Mixed-format fused planes kept their own separate refusal at the
+  time of this entry; it was lifted below.)
 - **Contract v7.** A passthrough unit whose method branches on an execution
   arm now publishes admission per arm, and a unit with a **law-admitted** arm
   carries no unit-level `max_world_size`: one scalar cannot cover a

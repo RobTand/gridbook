@@ -604,19 +604,23 @@ def test_config_dispatch_policy_matches_the_published_split():
         assert parts, f"refusal at line {node.lineno} must name its surface"
         fragments.extend(parts)
     joined = "\n".join(fragments)
-    # Five, not six: the stacked whole-tensor CB MoE lane moved off the TP=1
-    # helper onto the expert-parallel gate below. The MIXED per-expert-format
-    # MoE site stays, which is why "CB MoE expert stacks" still appears here.
-    assert len(refusals) == 5
+    # Four, not six: the stacked whole-tensor CB MoE lane moved off the TP=1
+    # helper onto the expert-parallel gate below, and mixed-format fused
+    # projections moved off it entirely — that composite owns no law of its
+    # own, so each role's existing shard gate refuses per role instead. The
+    # MIXED per-expert-format MoE site stays, which is why "CB MoE expert
+    # stacks" still appears here.
+    assert len(refusals) == 4
     for surface in (
             "source-passthrough unit format",
             "delegated stock compressed-tensors groups",
-            "mixed-format fused projections",
             "quantized embedding units",
             "CB MoE expert stacks",
     ):
         assert surface in joined, \
             f"no refusal site names the {surface!r} surface"
+    assert "mixed-format fused projections" not in joined, \
+        "the mixed fused surface is admitted per role; no site may gate it"
     assert "dense CB" not in joined and "CB Linear" not in joined, \
         "no refusal site may name the admitted dense CB surface"
     # T6: the surviving MoE refusal must say what DOES serve above one rank,
