@@ -6,20 +6,56 @@ K4 last-codeword shared-memory boundary that motivated the guarded word load.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
+
+import pytest
 
 from gridbook import codec
 from gridbook.runtime_contract import load_runtime_contract
 
 
-_ROOT = Path(__file__).resolve().parent.parent
+def _source_root(test_file: Path | None = None) -> Path:
+    """Locate source files in-tree or from the installed-wheel test gate."""
+    location = Path(__file__) if test_file is None else Path(test_file)
+    roots = [location.resolve().parents[1]]
+    for variable in ("GRIDBOOK_SOURCE_ROOT", "GITHUB_WORKSPACE"):
+        value = os.environ.get(variable)
+        if value:
+            roots.append(Path(value).expanduser())
+    for root in roots:
+        if (root / "gridbook" / "__init__.py").is_file():
+            return root.resolve()
+    raise FileNotFoundError(
+        "no Gridbook source checkout: run in-tree or set GRIDBOOK_SOURCE_ROOT")
+
+
+_ROOT = _source_root()
 _PRODUCER_RUNGS = tuple(range(4, 49, 4))
 _READER_RUNGS = (4, 8, 12, 16, 20, 24, *range(28, 49))
 
 
 def _source(relative: str) -> str:
     return (_ROOT / relative).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "variable", ("GRIDBOOK_SOURCE_ROOT", "GITHUB_WORKSPACE")
+)
+def test_source_root_honors_installed_wheel_locator(
+    monkeypatch, tmp_path, variable,
+):
+    source_root = tmp_path / "checkout"
+    package = source_root / "gridbook"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.delenv("GRIDBOOK_SOURCE_ROOT", raising=False)
+    monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
+    monkeypatch.setenv(variable, str(source_root))
+
+    staged_test = tmp_path / "wheel-tests" / "tests" / "test_surface.py"
+    assert _source_root(staged_test) == source_root.resolve()
 
 
 def test_contract_codec_and_fused_translation_unit_share_one_rung_law():
