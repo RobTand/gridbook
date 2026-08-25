@@ -1,4 +1,4 @@
-"""Public K1..K25 laws and direct-kernel research laws through K32."""
+"""Public NVFP4 K12..K24 laws and direct-kernel research through K32."""
 from __future__ import annotations
 
 import pytest
@@ -11,22 +11,23 @@ from gridbook.runtime_contract import load_runtime_contract
 def test_runtime_publishes_only_the_supported_product_domain():
     row = next(item for item in load_runtime_contract()["formats"]
                if item["family"] == "NVFP4_CB_K")
-    assert row["rungs"] == list(range(1, 26))
-    assert row["producer_rungs"] == list(range(1, 26))
+    assert row["rungs"] == list(range(12, 25))
+    assert row["producer_rungs"] == list(range(12, 25))
     assert row["mode"] == "product"
     assert row["n_sub"] == 2
 
 
-def test_k26_k32_are_below_the_public_contract():
+def test_direct_kernel_only_rungs_are_outside_the_public_contract():
     row = next(item for item in load_runtime_contract()["formats"]
                if item["family"] == "NVFP4_CB_K")
-    assert set(range(26, 33)).isdisjoint(row["rungs"])
-    assert set(range(26, 33)).isdisjoint(row["producer_rungs"])
+    research_only = {*range(1, 12), *range(25, 33)}
+    assert research_only.isdisjoint(row["rungs"])
+    assert research_only.isdisjoint(row["producer_rungs"])
 
 
 @pytest.mark.parametrize("k_bits", range(1, 33))
 def test_product_subtable_shapes_and_flat_size(k_bits):
-    """Exercise the codec primitive, including research-only K26..K32."""
+    """Exercise the codec primitive across the direct research range."""
     shapes = codec.product_subtable_shapes(k_bits, 2)
     assert shapes == (
         (1 << ((k_bits + 1) // 2), 4),
@@ -63,7 +64,7 @@ def test_product_codebook_shape_mismatch_fails_before_cuda():
 def test_strict_product_builder_preserves_legacy_flat_bytes(k_bits, n_sub):
     """The strict loader is an ABI check, not a new flat representation.
 
-    Canonical sidecars keep producing exactly the tensor the historical
+    Public and research callers get exactly the tensor the historical
     ``build_flat_codebook`` path did, including dtype, order and contiguity.
     Tuple input is intentional: callers have never been required to allocate
     a mutable list merely to flatten an ordered product book.

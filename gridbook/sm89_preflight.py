@@ -33,7 +33,9 @@ from .runtime_contract import load_runtime_contract
 
 SM89_CAPABILITY = (8, 9)
 SM89_GENCODE = cuda_ext._gencode_flag(SM89_CAPABILITY, accelerated=False)
-_FP8_PRODUCER_RUNGS = tuple(range(4, 49, 4))
+_FP8_READER_RUNGS = tuple(range(28, 49))
+_FP8_PRODUCER_RUNGS = (40, 44, 48)
+_FP8_DIRECT_KERNEL_RUNGS = (4, 8, 12, 16, 20, 24, *range(28, 49))
 
 
 def _sha256(path: Path) -> str:
@@ -51,21 +53,26 @@ def _dense_fp8_format_row() -> dict[str, Any]:
     if len(rows) != 1:
         raise RuntimeError("runtime contract must contain one FP8_CB_K row")
     row = rows[0]
-    if tuple(row["producer_rungs"]) != _FP8_PRODUCER_RUNGS:
-        raise RuntimeError(
-            "SM89 preflight producer law drift: expected "
-            f"{list(_FP8_PRODUCER_RUNGS)}, got {row['producer_rungs']}"
-        )
+    expected = {
+        "rungs": _FP8_READER_RUNGS,
+        "producer_rungs": _FP8_PRODUCER_RUNGS,
+    }
+    for field, law in expected.items():
+        if tuple(row[field]) != law:
+            raise RuntimeError(
+                f"SM89 preflight {field} law drift: expected "
+                f"{list(law)}, got {row[field]}"
+            )
     return row
 
 
 def _validate_dense_fp8_source(source: Path) -> None:
-    """Refuse a source tree whose generic Ada surface predates low rungs."""
+    """Attest the wider direct research surface without promoting artifacts."""
 
     text = source.read_text(encoding="utf-8")
     required = (
-        "fp8_reader_kbits_supported(k_bits)",
-        '"fp8 k_bits is outside the v10 accepted reader domain"',
+        "fp8_direct_kernel_kbits_supported(k_bits)",
+        '"fp8 k_bits is outside the direct-kernel domain"',
         "type_size == 4 * k_bits",
         "type_size <= 192",
         "fp8_load_codeword_words(",
@@ -75,7 +82,7 @@ def _validate_dense_fp8_source(source: Path) -> None:
     missing = [fragment for fragment in required if fragment not in text]
     if missing:
         raise RuntimeError(
-            f"{source} does not expose the v10 dense FP8-CB generic surface; "
+            f"{source} does not expose the required FP8-CB direct surface; "
             f"missing source guards/bindings {missing}"
         )
 
@@ -134,7 +141,9 @@ def compile_dense_fp8_sm89_preflight(
         "capability": list(SM89_CAPABILITY),
         "qualification_ceiling": "compile_only",
         "device_executed": False,
+        "reader_rungs": list(_FP8_READER_RUNGS),
         "producer_rungs": list(_FP8_PRODUCER_RUNGS),
+        "direct_kernel_research_rungs": list(_FP8_DIRECT_KERNEL_RUNGS),
         "gridbook_extension": {
             "source": "gridbook/csrc/cb_gemv.cu",
             "source_sha256": source_sha256,
@@ -151,6 +160,7 @@ def compile_dense_fp8_sm89_preflight(
             "device_performance",
             "torch_compile",
             "vllm_cudagraph",
+            "artifact_compatibility_fp8_k4_k24",
         ],
     }
 

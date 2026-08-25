@@ -50,12 +50,17 @@ def test_sm89_preflight_uses_explicit_arch_and_never_queries_a_device(
     ]
     assert abi == ["dense FP8-CB SM89 compile-only preflight"]
     assert receipt["capability"] == [8, 9]
-    assert receipt["producer_rungs"] == list(range(4, 49, 4))
+    assert receipt["reader_rungs"] == list(range(28, 49))
+    assert receipt["producer_rungs"] == [40, 44, 48]
+    assert receipt["direct_kernel_research_rungs"] == [
+        4, 8, 12, 16, 20, 24, *range(28, 49),
+    ]
     assert receipt["qualification_ceiling"] == "compile_only"
     assert receipt["device_executed"] is False
     assert receipt["vllm_native_abi"]["status"] == "present_not_executed"
     assert {"device_correctness", "device_performance", "torch_compile",
-            "vllm_cudagraph"} == set(receipt["claims_excluded"])
+            "vllm_cudagraph", "artifact_compatibility_fp8_k4_k24"} == set(
+                receipt["claims_excluded"])
 
 
 def test_sm89_preflight_refuses_an_incomplete_production_module(
@@ -74,7 +79,7 @@ def test_sm89_preflight_refuses_an_incomplete_production_module(
         sm89_preflight.compile_dense_fp8_sm89_preflight(tmp_path / "bad")
 
 
-def test_sm89_preflight_source_guard_covers_low_rungs_and_dense_routes():
+def test_sm89_preflight_source_guard_covers_direct_research_and_dense_routes():
     source = Path(cuda_ext.csrc_dir()) / "cb_gemv.cu"
     sm89_preflight._validate_dense_fp8_source(source)
 

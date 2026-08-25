@@ -741,10 +741,11 @@ class PrismaQuantConfig(QuantizationConfig):
     ) -> None:
         """Fail closed on a CB scheme outside the packaged reader ABI.
 
-        ``formats[].rungs`` is the reader domain.  It is intentionally broader
-        than ``producer_rungs`` for FP8 so legacy irregular K28..K48 artifacts
-        keep loading; NVFP4 has no such legacy artifacts and both lists stop at
-        K25.  Dense and routed constructors used to trust ``k``, ``n_sub``
+        ``formats[].rungs`` is the reader domain.  NVFP4 reads and produces
+        K12..K24.  FP8 reads every integer K28..K48 for historical artifacts,
+        while new producers emit only K40/K44/K48.  Wider low-level CUDA
+        ranges are research capabilities, not sidecar authority.  Dense and
+        routed constructors used to trust ``k``, ``n_sub``
         and ``type_size`` independently; a typo could therefore size a resident
         byte plane before the CUDA binding finally rejected it.  Resolve the
         physical fields against the one packaged contract while the sidecar is

@@ -787,38 +787,38 @@ def test_mixed_nvfp4_expert_subgroup_enforces_the_same_exact_cc12_domain(
     prefix = "model.layers.0.mlp.experts"
     groups = {
         "fp4_w13": {
-            "format": "NVFP4_CB_K1",
+            "format": "NVFP4_CB_K12",
             "targets": [prefix + ".gate_up_proj.format_group_0"],
             "scheme": {
-                "grid": "fp4", "mode": "product", "k": 1,
-                "n_sub": 2, "type_size": 13,
+                "grid": "fp4", "mode": "product", "k": 12,
+                "n_sub": 2, "type_size": 57,
                 "scale_coding": "two_tier", "codebook_ref": "fp4",
             },
         },
         "fp8_w13": {
-            "format": "FP8_CB_K4",
+            "format": "FP8_CB_K40",
             "targets": [prefix + ".gate_up_proj.format_group_1"],
             "scheme": {
-                "grid": "fp8", "mode": "product", "k": 4,
-                "n_sub": 4, "type_size": 16,
+                "grid": "fp8", "mode": "product", "k": 40,
+                "n_sub": 4, "type_size": 160,
                 "scale_coding": "v1", "codebook_ref": "fp8",
             },
         },
         "fp4_w2": {
-            "format": "NVFP4_CB_K1",
+            "format": "NVFP4_CB_K12",
             "targets": [prefix + ".down_proj.format_group_0"],
             "scheme": {
-                "grid": "fp4", "mode": "product", "k": 1,
-                "n_sub": 2, "type_size": 13,
+                "grid": "fp4", "mode": "product", "k": 12,
+                "n_sub": 2, "type_size": 57,
                 "scale_coding": "two_tier", "codebook_ref": "fp4",
             },
         },
         "fp8_w2": {
-            "format": "FP8_CB_K4",
+            "format": "FP8_CB_K40",
             "targets": [prefix + ".down_proj.format_group_1"],
             "scheme": {
-                "grid": "fp8", "mode": "product", "k": 4,
-                "n_sub": 4, "type_size": 16,
+                "grid": "fp8", "mode": "product", "k": 40,
+                "n_sub": 4, "type_size": 160,
                 "scale_coding": "v1", "codebook_ref": "fp8",
             },
         },
@@ -828,24 +828,24 @@ def test_mixed_nvfp4_expert_subgroup_enforces_the_same_exact_cc12_domain(
         "layers": {"0": {
             "w13": [
                 {
-                    "format_wire_id": "NVFP4_CB_K1",
+                    "format_wire_id": "NVFP4_CB_K12",
                     "expert_ids": [0],
                     "tensor_prefix": groups["fp4_w13"]["targets"][0],
                 },
                 {
-                    "format_wire_id": "FP8_CB_K4",
+                    "format_wire_id": "FP8_CB_K40",
                     "expert_ids": [1],
                     "tensor_prefix": groups["fp8_w13"]["targets"][0],
                 },
             ],
             "w2": [
                 {
-                    "format_wire_id": "NVFP4_CB_K1",
+                    "format_wire_id": "NVFP4_CB_K12",
                     "expert_ids": [0],
                     "tensor_prefix": groups["fp4_w2"]["targets"][0],
                 },
                 {
-                    "format_wire_id": "FP8_CB_K4",
+                    "format_wire_id": "FP8_CB_K40",
                     "expert_ids": [1],
                     "tensor_prefix": groups["fp8_w2"]["targets"][0],
                 },

@@ -71,26 +71,29 @@ def test_sm120_preflight_uses_exact_generic_and_accelerated_targets(
         "-gencode=arch=compute_120a,code=sm_120a")
     assert by_key["bf16_bridge"]["extra_cuda_cflags"][-1] == (
         "-gencode=arch=compute_120a,code=sm_120a")
-    assert receipt["reader_rungs"] == list(range(1, 26))
-    assert receipt["producer_rungs"] == list(range(1, 26))
+    assert receipt["reader_rungs"] == list(range(12, 25))
+    assert receipt["producer_rungs"] == list(range(12, 25))
     assert receipt["direct_kernel_research_rungs"] == list(range(1, 33))
-    assert receipt["fp8_reader_rungs"] == [
+    assert receipt["fp8_reader_rungs"] == list(range(28, 49))
+    assert receipt["fp8_producer_rungs"] == [40, 44, 48]
+    assert receipt["fp8_direct_kernel_research_rungs"] == [
         4, 8, 12, 16, 20, 24, *range(28, 49),
     ]
-    assert receipt["fp8_producer_rungs"] == list(range(4, 49, 4))
     assert receipt["vllm_native_fp8_abi"] == {
         "required_ops": list(sm120_preflight._REQUIRED_OPS),
         "status": "present_not_executed",
     }
     assert native_abi_calls == ["CB SM120 compile-only preflight"]
-    assert "artifact_compatibility_k26_k32" in receipt["claims_excluded"]
+    assert "artifact_compatibility_nvfp4_k1_k11_k25_k32" in (
+        receipt["claims_excluded"])
+    assert "artifact_compatibility_fp8_k4_k24" in receipt["claims_excluded"]
     assert receipt["qualification_ceiling"] == "compile_only"
     assert receipt["device_executed"] is False
     assert set(receipt["modules"]) == {
         "main", "v2", "persistent_b", "bf16_bridge"}
 
 
-def test_sm120_source_guard_pins_full_range_and_global_expander():
+def test_sm120_source_guard_pins_direct_research_and_global_expander():
     src = Path(cuda_ext.csrc_dir())
     sm120_preflight._validate_sources({
         "main": src / "cb_gemv.cu",

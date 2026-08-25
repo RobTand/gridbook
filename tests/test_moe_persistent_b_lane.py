@@ -325,12 +325,12 @@ def test_supports_accepts_a_plain_fp4_cb_v2_layer():
     (dict(is_v2=False), "v2"),
     (dict(n_sub=1), "n_sub=1"),
     (dict(n_sub=4), "n_sub=4"),
-    (dict(k_bits=0, type_size=9), "k=0"),
-    (dict(k_bits=26, type_size=113), "k=26"),
+    (dict(k_bits=11, type_size=53), "k=11"),
+    (dict(k_bits=25, type_size=109), "k=25"),
     (dict(type_size=72), "type_size"),
     (dict(hidden=2000), "2000"),
     (dict(inter=1000), "1000"),
-], ids=["fp8", "not-v2", "n_sub-1", "n_sub-4", "k-0", "k-26",
+], ids=["fp8", "not-v2", "n_sub-1", "n_sub-4", "k-11", "k-25",
         "type_size", "hidden-unaligned", "inter-unaligned"])
 def test_supports_rejects_with_a_readable_reason(override, mentions):
     """Every rejection is diagnosed at model load, never inside a request."""
@@ -343,17 +343,25 @@ def test_supports_rejects_with_a_readable_reason(override, mentions):
 
 
 def test_supports_is_narrower_than_the_direct_kernel_research_surface():
-    """Public lane eligibility stops at K25; direct bindings retain K32."""
+    """Public K12..K24 eligibility is narrower than direct K1..K32."""
     source = open(_source_path(), encoding="utf-8").read()
     assert "k_bits >= 1 && k_bits <= 32" in source
     assert "type_size == 4 * k_bits + 9" in source
-    for k_bits in (1, 24, 25):
+    for k_bits in (12, 16, 24):
         assert lane.supports(**{**_GOOD_LAYER, "k_bits": k_bits,
                                 "type_size": 4 * k_bits + 9}) is None
-    for k_bits in (26, 32):
+    for k_bits in (1, 11, 25, 32):
         reason = lane.supports(**{**_GOOD_LAYER, "k_bits": k_bits,
                                   "type_size": 4 * k_bits + 9})
-        assert "supported FP4-CB v2 range [1, 25]" in reason
+        assert "supported FP4-CB v2 range [12, 24]" in reason
+
+
+def test_compiled_config_metadata_is_priced_at_public_k24():
+    """The host attestation must not price the retired public K25 candidate."""
+    source = open(_source_path(), encoding="utf-8").read()
+    assert "constexpr int kPublicNvfp4MaxK = 24;" in source
+    assert "smem_bytes_at_public_k24" in source
+    assert "smem_bytes_at_public_k25" not in source
 
 
 # The FP8-CB arm's twin (ROADMAP K1.2).  k=28 / type_size=112 is DSv4's
@@ -371,12 +379,13 @@ def test_supports_fp8_accepts_a_stock_fp8_cb_layer():
     (dict(is_fp4=True), "FP4"),
     (dict(role_split=True), "per-role"),
     (dict(n_sub=2), "n_sub=2"),
-    (dict(k_bits=0, type_size=0), "k=0"),
+    (dict(k_bits=24, type_size=96), "k=24"),
+    (dict(k_bits=27, type_size=108), "k=27"),
     (dict(k_bits=49, type_size=196), "k=49"),
     (dict(type_size=113), "type_size"),
     (dict(hidden=2000), "2000"),
     (dict(inter=1000), "1000"),
-], ids=["fp4", "role-split", "n_sub-2", "k-0", "k-49", "type_size",
+], ids=["fp4", "role-split", "n_sub-2", "k-24", "k-27", "k-49", "type_size",
         "hidden-unaligned", "inter-unaligned"])
 def test_supports_fp8_rejects_with_a_readable_reason(override, mentions):
     """Every FP8 rejection is diagnosed at model load, never in a request —
@@ -391,14 +400,19 @@ def test_supports_fp8_rejects_with_a_readable_reason(override, mentions):
         f"({mentions!r}): {reason!r}")
 
 
-def test_supports_fp8_mirrors_the_kernels_own_shape_checks():
-    """The k range and the 4*k row size are the FP8 entry's TORCH_CHECKs."""
+def test_supports_fp8_is_narrower_than_the_direct_kernel_surface():
+    """Public readers are K28..K48; direct C++ research remains K1..K48."""
     source = open(_source_path(), encoding="utf-8").read()
     assert "k_bits >= 1 && k_bits <= 48" in source
     assert "type_size == 4 * k_bits," in source
-    for k_bits in (1, 28, 48):
+    for k_bits in (28, 40, 48):
         assert lane.supports_fp8(**{**_GOOD_FP8_LAYER, "k_bits": k_bits,
                                     "type_size": 4 * k_bits}) is None
+    for k_bits in (1, 24, 27):
+        reason = lane.supports_fp8(**{
+            **_GOOD_FP8_LAYER, "k_bits": k_bits, "type_size": 4 * k_bits,
+        })
+        assert "FP8-CB reader range [28, 48]" in reason
 
 
 # ---------------------------------------------------------------------------
@@ -803,13 +817,14 @@ def test_prefill_still_requires_bf16_activations(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_persistent_b_loader_is_one_additive_block_at_the_end_of_cuda_ext():
-    """The loader is appended, never interleaved.
+def test_persistent_b_loader_is_one_contiguous_additive_block():
+    """The loader is contiguous and later additive blocks remain isolated.
 
     Every line of this lane's IMPLEMENTATION lives between two marker comments
-    at the very end of the file, so the module keeps a single contiguous,
-    self-contained diff surface: no code above the BEGIN marker mentions the
-    lane, and nothing follows the END marker.
+    so the module keeps a single contiguous, self-contained diff surface: no
+    code outside the markers mentions the lane.  A separately delimited
+    additive block may follow it; this preserves the same revertibility
+    property when another isolated research lane is appended later.
 
     PROSE IS EXEMPT (2026-08-02). The check used to reject any mention at all,
     which put it in direct conflict with the module docstring's job of
@@ -855,12 +870,28 @@ def test_persistent_b_loader_is_one_additive_block_at_the_end_of_cuda_ext():
             f"additive block: {line.strip()!r}")
 
     trailer = lines[end[0] + 1:]
-    for line in trailer:
+    additive_depth = 0
+    for offset, line in enumerate(trailer, start=end[0] + 2):
         stripped = line.strip()
-        assert not stripped or set(stripped) <= set("#= "), (
-            f"{stripped!r} follows the persistent-B block; the block must be "
-            f"the last thing in cuda_ext.py so concurrent edits above it "
-            f"cannot conflict")
+        if "BEGIN ADDITIVE BLOCK —" in line:
+            assert additive_depth == 0, (
+                f"cuda_ext.py:{offset} nests an additive block")
+            additive_depth = 1
+            continue
+        if "END ADDITIVE BLOCK —" in line:
+            assert additive_depth == 1, (
+                f"cuda_ext.py:{offset} ends no additive block")
+            additive_depth = 0
+            continue
+        if additive_depth == 0:
+            assert not stripped or set(stripped) <= set("#= "), (
+                f"cuda_ext.py:{offset} has code after the persistent-B block "
+                f"outside a separately delimited additive block: {stripped!r}")
+        code = line.split("#", 1)[0].lower()
+        assert "persistent_b" not in code and "persistent-b" not in code, (
+            f"cuda_ext.py:{offset} references the persistent-B lane in CODE "
+            f"after its additive block: {stripped!r}")
+    assert additive_depth == 0, "cuda_ext.py ends inside an additive block"
 
     block = "\n".join(lines[begin[0]:end[0]])
     for name in ("_MOE_PERSISTENT_B_BUILD_INPUTS", "_MOE_PERSISTENT_B_SYMBOLS",

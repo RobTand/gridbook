@@ -14,19 +14,17 @@ from typing import Any, Mapping
 RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v11"
 _RESOURCE_NAME = "runtime_contract.json"
 
-#: v11 keeps the reader domain separate from the canonical producer menu.  The
-#: high FP8 rungs remain deliberately dense so artifacts written by older
-#: producers keep loading; new producers emit only the hardware-aligned
-#: multiples-of-four ladder.  NVFP4 has no legacy artifacts above K25, so its
-#: public reader and producer ladders both stop immediately before the measured
-#: full-LUT residency cliff.  Generic CUDA bindings retain K26..K32 only as a
-#: direct research surface; low-level kernel coverage is not a wire-format
-#: compatibility promise and therefore does not appear in this contract.
+#: v11 keeps the historical reader domain separate from the canonical producer
+#: menu.  The broad low-rung expansion developed after v0.9.0 never shipped and
+#: is deliberately absent here: NVFP4 reads and produces K12..K24, while FP8
+#: reads every integer K28..K48 and produces only K40/K44/K48.  Generic CUDA
+#: bindings retain wider direct-kernel ranges for research, but low-level kernel
+#: coverage is not artifact authority and therefore does not appear here.
 _FORMAT_RUNGS: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
-    "NVFP4_CB_K": (tuple(range(1, 26)), tuple(range(1, 26))),
+    "NVFP4_CB_K": (tuple(range(12, 25)), tuple(range(12, 25))),
     "FP8_CB_K": (
-        (4, 8, 12, 16, 20, 24, *range(28, 49)),
-        tuple(range(4, 49, 4)),
+        tuple(range(28, 49)),
+        (40, 44, 48),
     ),
 }
 # Mapping order is serialization/validation plumbing, never a cross-family

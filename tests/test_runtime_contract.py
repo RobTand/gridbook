@@ -22,9 +22,10 @@ from gridbook.runtime_contract import (
 )
 
 
-_FP8_READER_RUNGS = [4, 8, 12, 16, 20, 24, *range(28, 49)]
-_FP8_PRODUCER_RUNGS = list(range(4, 49, 4))
-_NVFP4_PUBLIC_RUNGS = list(range(1, 26))
+_FP8_READER_RUNGS = list(range(28, 49))
+_FP8_PRODUCER_RUNGS = [40, 44, 48]
+_NVFP4_READER_RUNGS = list(range(12, 25))
+_NVFP4_PRODUCER_RUNGS = list(range(12, 25))
 
 
 def _plugin_source() -> Path:
@@ -136,13 +137,21 @@ def test_contract_pins_current_format_ladders_and_layout_restrictions():
     # The signed NVFP4_CB_S family was removed from the runtime (2026-08-23);
     # a row for it must not outlive its enforcement sites.
     assert "NVFP4_CB_S" not in by_family
-    assert by_family["NVFP4_CB_K"]["rungs"] == _NVFP4_PUBLIC_RUNGS
+    assert by_family["NVFP4_CB_K"]["rungs"] == _NVFP4_READER_RUNGS
     assert (by_family["NVFP4_CB_K"]["producer_rungs"]
-            == _NVFP4_PUBLIC_RUNGS)
+            == _NVFP4_PRODUCER_RUNGS)
     assert by_family["NVFP4_CB_K"]["layout_versions"] == [1, 2]
     assert by_family["NVFP4_CB_K"]["moe_layout_versions"] == [2]
     assert by_family["FP8_CB_K"]["rungs"] == _FP8_READER_RUNGS
     assert by_family["FP8_CB_K"]["producer_rungs"] == _FP8_PRODUCER_RUNGS
+    # Historical FP8 readers remain independently loadable even when they are
+    # not canonical producer choices.  The pre-release low-rung candidates are
+    # absent from both artifact domains.
+    assert {28, 32, 36} <= (
+        set(_FP8_READER_RUNGS) - set(_FP8_PRODUCER_RUNGS))
+    assert set((4, 8, 12, 16, 20, 24)).isdisjoint(_FP8_READER_RUNGS)
+    assert set(range(1, 12)).isdisjoint(_NVFP4_READER_RUNGS)
+    assert 25 not in _NVFP4_READER_RUNGS
     assert by_family["FP8_CB_K"]["layout_versions"] == [1]
     assert by_family["FP8_CB_K"]["moe_layout_versions"] == [1]
     assert load_runtime_contract()["packing"] == {
@@ -202,7 +211,7 @@ def test_platform_lanes_pin_structural_routes_without_device_claims():
         ("routed_moe", "batch", "backed"),
         ("routed_moe", "batch", "fallback"),
     }
-    assert all(cell["rungs"] == _NVFP4_PUBLIC_RUNGS
+    assert all(cell["rungs"] == _NVFP4_PRODUCER_RUNGS
                for cell in sm120_nvfp4)
 
     sm120_fp8 = [cell for cell in by_id.values()

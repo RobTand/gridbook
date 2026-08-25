@@ -19,14 +19,18 @@ def _pack_row(codes: list[int], k_bits: int, tail: bytes = b"") -> torch.Tensor:
     return torch.tensor(list(index_bytes + tail), dtype=torch.uint8)
 
 
-_FP8_PRODUCER_RUNGS = tuple(range(4, 49, 4))
+_FP8_DIRECT_ALIGNED_RUNGS = tuple(range(4, 49, 4))
 _FP8_LEGACY_IRREGULAR_RUNGS = (29, 33, 47)
 _NVFP4_DIRECT_KERNEL_RUNGS = tuple(range(1, 33))
 
 
-@pytest.mark.parametrize("k_bits", _FP8_PRODUCER_RUNGS)
-def test_fp8_product_decode_covers_every_v10_producer_rung(k_bits):
-    """Exact 4*k-byte rows decode at K4..K48 without implicit tail bytes."""
+@pytest.mark.parametrize("k_bits", _FP8_DIRECT_ALIGNED_RUNGS)
+def test_fp8_product_decode_covers_aligned_direct_kernel_surface(k_bits):
+    """Direct research rows decode without implicit tail bytes.
+
+    K4..K24 are intentionally not public artifacts; their continued coverage
+    proves only the generic packed primitive used by kernel research.
+    """
 
     mask = (1 << k_bits) - 1
     codes = [((vector * 0x9E3779B1) ^ (mask >> (vector % 5))) & mask
@@ -64,7 +68,7 @@ def test_fp8_product_decode_covers_every_v10_producer_rung(k_bits):
 
 @pytest.mark.parametrize("k_bits", _FP8_LEGACY_IRREGULAR_RUNGS)
 def test_fp8_legacy_irregular_reader_keeps_ceil_first_split(k_bits):
-    """v10 producer law narrows; the older K28..K48 reader ABI does not."""
+    """The K40/K44/K48 producer menu does not narrow historical readers."""
 
     widths = [k_bits // 4 + (1 if i < k_bits % 4 else 0)
               for i in range(4)]
@@ -126,7 +130,7 @@ def test_uneven_product_decode_and_row_offsets():
 
 @pytest.mark.parametrize("k_bits", _NVFP4_DIRECT_KERNEL_RUNGS)
 def test_nvfp4_v2_decode_covers_direct_kernel_research_range(k_bits):
-    """Exercise public K1..K25 plus research-only K26..K32 primitives.
+    """Exercise public K12..K24 plus research-only direct primitives.
 
     K1 has split widths (1,0), so sub1 is a real one-entry table selected by a
     zero-bit index. K32 has widths (16,16), and the final codeword deliberately

@@ -99,10 +99,10 @@ MIN_TN = min(cfg[1] for cfg in CONFIGS)
 MAX_TN = max(cfg[1] for cfg in CONFIGS)
 
 
-def test_config_metadata_is_sized_at_the_public_k25_ceiling():
+def test_config_metadata_is_sized_at_the_public_k24_ceiling():
     """The advertised smem column must describe the strictest public rung."""
 
-    type_size = 4 * 25 + 9
+    type_size = 4 * 24 + 9
     ts_pad = ((type_size + 3) // 4) * 4 + 8
     for tm, tn, _warps, _threads, smem, capacity in CONFIGS:
         expected = 2 * tm * TILE_K * 2 + tn * TILE_K * 2 + tn * ts_pad
@@ -278,7 +278,7 @@ def _assert_reassociation_only(y, bf16_linear, fp32, label):
 # The historical production rungs k=12..24 span odd and even k (the ceil-first
 # split puts
 # ceil(k/2) bits in the low half, so the two parities take different paths),
-# while the focused extension cases below cover the new K1/K25/K26/K32 edges.
+# while the focused direct-research cases below cover K1/K25/K26/K32 edges.
 # N=17 and N=33 are NOT
 # multiples of 8 or 32, so the flat plane's rows do not line up with any
 # codeword or LUT-gather boundary.
@@ -332,9 +332,9 @@ def test_decode_probe_is_bit_identical_to_the_torch_reference(k, K, E, N,
 def test_extended_rung_decode_is_bit_identical_to_the_torch_reference(k):
     """Synthetic bytes isolate the low-level decoder from public admission.
 
-    K1 exercises the zero-bit second subindex; K25 is the former ceiling plus
-    one; K26 crosses the full-LUT shared-memory ceiling of the separate
-    expander; K32 exercises two exact 16-bit subindices.
+    K1 exercises the zero-bit second subindex; K25 is the first rung above the
+    public K24 ceiling; K26 crosses the full-LUT shared-memory ceiling of the
+    separate expander; K32 exercises two exact 16-bit subindices.
     """
     K, E, N = 256, 2, 8
     qw, lut, compose, type_size = _pack(
@@ -460,8 +460,8 @@ def test_decode_probe_zero_rows_is_a_well_formed_empty_result():
     ([0, 0, 5], 20, 768, 40),
     ([64, 64, 64, 64, 64], 12, 2048, 512),
     ([3, 0, 4], 12, 256, MIN_TN),
-], ids=["k1-public-floor", "empty-middle-longtail",
-        "skewed-trailing-empty", "one-row-each", "k25-public-ceiling",
+], ids=["k1-direct-research", "empty-middle-longtail",
+        "skewed-trailing-empty", "one-row-each", "k25-direct-research",
         "leading-empty-ragged-n", "exact-tile-multiples",
         "narrowest-tile-n"])
 @pytest.mark.parametrize("source", SOURCES)
@@ -576,7 +576,7 @@ def test_zero_routed_rows_returns_a_well_formed_empty_output():
 def _config_case(source="synth"):
     """The widest rung on purpose.
 
-    Shared memory per CTA grows with ``type_size``, so K25 is the strictest
+    Shared memory per CTA grows with ``type_size``, so K24 is the strictest
     public case a config has to survive — and it is the rung
     ``cb_moe_persistent_b_configs()`` quotes its ``smem`` figure at.  Running
     every attested config here therefore gates ATTESTATION AGAINST REALITY: a
@@ -585,7 +585,7 @@ def _config_case(source="synth"):
     instead of at a serving call.
     """
     counts = [0, 5, 200, 1, 0, 70]
-    k, K, N = 25, 1024, 200            # N % 8 == 0, N % 32 != 0
+    k, K, N = 24, 1024, 200            # N % 8 == 0, N % 32 != 0
     E, P = len(counts), sum(counts)
     qw, lut, compose, type_size = _pack(k, K, E, N, seed=1234, source=source)
     torch.manual_seed(9090)

@@ -180,7 +180,7 @@ the code and untested**.
 | GPU class | Dense small-M (M ≤ 8) | FP8-CB M = 9–128 | Native general / FP4 quality path | Verdict |
 |---|---|---|---|---|
 | **GB10 / DGX Spark, `sm_121`** | native CUDA GEMV | fused CUTLASS when eligible; otherwise CUDA expand → CUTLASS W8A8 | FP8: CUDA expand → CUTLASS; FP4 M>8: native BF16 expand → Gridbook CUTLASS grouped GEMM (`E=1`); fused native-NVFP4 remains opt-in | **MEASURED target.** Published results below predate the final native-only dispatch and remain tied to their recorded commits. |
-| **RTX 50 family, `sm_120`** | public NVFP4 rows cover K1..K25 and FP8-CB rows cover K4..K48 step 4; direct NVFP4 CUDA bindings admit K26..K32 calls for research only | optimized subsets where independently eligible; otherwise exact expansion | the generic modules cross-compile as exact `sm_120` SASS, persistent-B/BF16 bridge as `sm_120a`, and the native vLLM FP8/CUTLASS ABI resolves without execution | **BOTH CB FAMILIES ARE COMPILE-ONLY ON RTX 50, NOT DEVICE-QUALIFIED.** K26..K32 are unsupported NVFP4 artifact values, despite the retained low-level call surface. A 5090 user reported an older 27B path working ([issue #1](https://github.com/RobTand/gridbook/issues/1)); smaller cards have no physical correctness, graph, memory, or speed receipt yet. Contract v11 keeps all SM120 cells `compile_only`; dense NVFP4 expansion is a fallback, while dense FP8 expansion plus native CUTLASS W8A8 is structurally backed. |
+| **RTX 50 family, `sm_120`** | public NVFP4 rows cover K12..K24; FP8-CB readers cover K28..K48 and producer-facing rows cover K40/K44/K48; wider generic bindings are research only | optimized subsets where independently eligible; otherwise exact expansion | the generic modules cross-compile as exact `sm_120` SASS, persistent-B/BF16 bridge as `sm_120a`, and the native vLLM FP8/CUTLASS ABI resolves without execution | **BOTH CB FAMILIES ARE COMPILE-ONLY ON RTX 50, NOT DEVICE-QUALIFIED.** Values outside the public reader sets remain unsupported artifacts despite retained low-level kernels. A 5090 user reported an older 27B path working ([issue #1](https://github.com/RobTand/gridbook/issues/1)); smaller cards have no physical correctness, graph, memory, or speed receipt yet. Contract v11 keeps all SM120 cells `compile_only`; dense NVFP4 expansion is a fallback, while dense FP8 expansion plus native CUTLASS W8A8 is structurally backed. |
 | **RTX 4090 / L40S, `sm_89`** | FP8-CB CUDA GEMV cross-compiles; an FP4-CB layer is rejected at weight load | Blackwell fused kernel is load-time auto-off; CUDA expand → native CUTLASS W8A8 is the intended route | FP8 main extension + direct CUTLASS ABI cross-compile/registration preflight passed; FP4 has no SM89 activation registration and v2 expander prepare rejects the device | **FP8 COMPILE-ONLY, NOT DEVICE-QUALIFIED.** No physical Ada correctness, graph, memory or speed gate has run; contract v11 cells remain `compile_only`. NVFP4-CB is wholly unsupported. |
 | **H100, `sm_90`** | FP8-CB decode is expected to work; an FP4-CB layer is rejected at weight load | Blackwell fused kernel ineligible; CUDA expand → CUTLASS expected for FP8 | FP8 native expansion + CUTLASS expected; FP4 unavailable because v2 expander prepare rejects the device | **FP8-ONLY IS INFERRED / UNTESTED.** No SM90 cross-compile or device gate is claimed. FP4-CB is unsupported. |
 | **A100 `sm_80`** | no complete production lane: FP8 prefill needs `sm_89+`, and FP4 load requires cc 12.0/12.1 | FP8-CB rejected | grouped BF16 GEMM supports SM80, but the required FP4-v2 expander rejects the device | **UNSUPPORTED FOR PRODUCTION CB SERVING IN 0.5.** No slow fallback is selected. |
@@ -239,11 +239,15 @@ unsigned product rung with v2 scale coding (the signed S-rung family was
 deleted from the runtime on 2026-08-23). A non-`None` bias or FP4-v1 dense
 layer is never routed through an unowned framework operation: the public dense
 method rejects bias, and model load rejects the unsupported FP4-v1 family.
-The unsigned NVFP4 public domain is every integer K1..K25: readers, producers,
-artifact choosers, and SM120 lane rows use the same closed set. Generic CUDA
-bindings retain direct K26..K32 calls solely for kernel research; they do
-not make those values valid artifacts. Each optimized fused lane retains its
-own narrower evidence-backed eligibility.
+The unsigned NVFP4 public domain is every integer K12..K24: readers, producers,
+artifact choosers, and SM120 lane rows use the same closed set. FP8-CB readers
+retain every integer K28..K48 for historical artifacts, while new producers
+emit only K40/K44/K48. The broader K1..K25 NVFP4 and K4..K48/4 FP8 menus were
+pre-release candidates and were retracted before the planned 0.9.1 release.
+Generic CUDA bindings retain NVFP4 K1..K32 and aligned low FP8 calls solely for kernel
+research; they do not make those values valid artifacts. Each optimized fused
+lane retains its own evidence-backed reader eligibility, including historical
+FP8 K28/K32/K36.
 See [`docs/MOTIVATION.md`](docs/MOTIVATION.md) for the
 full argument and [`docs/KERNELS.md`](docs/KERNELS.md) for the kernel design.
 

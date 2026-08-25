@@ -25,18 +25,21 @@ two index-encoding modes.
 | `FP8_CB_K{k}` | FP8 / E4M3 | E4M3 grid, `‖·‖ ≤ 448` | W8A8 | **none in weight bytes** — per-output-channel FP32, separate tensor | `k/8` |
 
 **NVFP4 product rung domain.** `NVFP4_CB_K{k}` is publicly defined for every
-integer `1 ≤ k ≤ 25`, with `n_sub = 2` and the ceil-first split above. At K1 the split
-is `(1, 0)`: the second sub-codebook has one four-value entry and its index is
-the empty/zero bit string. At K32 the split is `(16, 16)`. E2M1 has 16 wire
+integer `12 ≤ k ≤ 24`, with `n_sub = 2` and the ceil-first split above. The
+packing primitive mechanically extends to direct-kernel research K1..K32: at
+K1 the split is `(1, 0)`, so the second sub-codebook has one four-value entry
+and its index is the empty/zero bit string; at K32 the split is `(16, 16)`.
+E2M1 has 16 wire
 encodings but 15 distinct numeric values because its two zero encodings
 coincide, so a four-value subvector has `15^4 = 50,625` distinct numeric
 choices: more than `2^15`, but no more than `2^16`. Each K32 half can therefore
 contain the complete numeric lattice (with deterministic duplicate rows to
 fill its 65,536-entry table); a K33 half cannot add a new numeric lattice value.
-That mathematical ceiling motivates direct CUDA research instantiations
-through K32, but does not enlarge the format: reader, producer, and
-format-chooser domains are all exactly K1..K25. K26..K32 are not valid public
-artifact rungs.
+That mathematical ceiling motivates the direct CUDA research instantiations,
+but does not enlarge the format: reader, producer, format-chooser, and
+producer-facing lane domains are all exactly K12..K24. K1..K11 and K25..K32
+are not valid public artifact rungs. The briefly developed K1..K25 public
+expansion was retracted before the planned 0.9.1 release.
 
 > **Removed family.** `NVFP4_CB_S{k}` (sign-magnitude half-grid, `mode:
 > "signed"`) was deleted from the runtime on 2026-08-23 — the producer had
@@ -203,21 +206,26 @@ deterministic on the scale path (identical input bytes → identical output).
 The FP8 grid has **no per-superblock scale plane**. `type_size = 4k`. Its scales
 are **per-output-channel FP32**, shipped in a separate tensor (§4).
 
-The v10 Gridbook runtime profile distinguishes a wire **reader domain** from a
-canonical **producer menu**. FP8-CB readers accept
-`k ∈ {4,8,12,16,20,24} ∪ [28,48]`; this preserves every previously emitted
-integer K28..K48 artifact. New v10 producers emit exactly
-`k ∈ {4,8,12,…,48}` (step four). These sets do not change the packing rule:
+The Gridbook runtime profile distinguishes a wire **reader domain** from a
+canonical **producer menu**. FP8-CB readers accept every integer
+`k ∈ [28,48]`, preserving historical artifacts. New producers emit exactly
+`k ∈ {40,44,48}`. These sets do not change the packing rule:
 every accepted FP8 row still has exactly `4k` index bytes per 256 weights and
 uses the ceil-first four-way product split above. A runtime may support a
-broader format-valid research `k`, but it MUST NOT claim that value as part of
-Gridbook's v11 reader or producer profile.
+broader direct-kernel research `k` (the generic implementation retains aligned
+K4..K24), but it MUST NOT claim that value as part of Gridbook's v11 reader or
+producer profile. The pre-release K4..K48/4 producer expansion was retracted
+before the planned 0.9.1 release.
 Reconstruction:
 ```
 weight[i] = codeword_value[i] * weight_scale[row]
 ```
 
 ### 1.4 `type_size` and effective bits (normative; asserted by producers)
+
+Rows outside the producer menus above are arithmetic examples for historical
+readers or direct-kernel research; their presence in this table does not make
+them legal producer outputs.
 
 | Grid | k | `type_size` v1 | `type_size` v2 (4-bit sub) | index bytes (4k) | scale bytes v1 / v2 |
 |---|---|---|---|---|---|

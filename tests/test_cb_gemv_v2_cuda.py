@@ -144,7 +144,7 @@ def _run_inherited(case, k):
 
 @pytest.mark.parametrize("k", range(1, 33))
 def test_direct_nvfp4_research_range_inherited_dense_grouped_and_expand(k):
-    """Low-level CUDA coverage: public K1..K25 plus research-only K26..K32."""
+    """Low-level CUDA coverage: public K12..K24 plus direct research rungs."""
 
     case = _synthetic_case(k, seed=30_000 + k)
     x, qw, cb, compose, pair_expert, pair_xrow, type_size = case

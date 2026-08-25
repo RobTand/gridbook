@@ -46,6 +46,7 @@ SDIST_REQUIRED_UTILITIES = (
     "scripts/validate_moe_persistent_b_ab.py",
     "scripts/validate_moe_gemv_v2_ab.py",
     "scripts/validate_moe_fp8_gemv_v2_ab.py",
+    "scripts/bench_trellis_r256.py",
 )
 
 # The wheel must carry every source cuda_ext.py JIT-compiles. Same floor as
@@ -61,6 +62,7 @@ WHEEL_REQUIRED = (
     "cb_fused_fp4_gemm.cu",
     "cb_fused_fp4v2_gemm.cu",
     "cb_moe_persistent_b.cu",
+    "trellis_r256.cu",
     # Gridbook-owned headers. Each is a declared ``_*_BUILD_INPUTS`` entry, so
     # it is #included by a JIT-compiled translation unit AND hashed into that
     # module's build identity; a wheel without it cannot build the lane.

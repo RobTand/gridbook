@@ -10,14 +10,15 @@ K in {512,1024} x M in {1,8}. That leaves the surface R2 actually changed
 under-tested: the aligned-down u64 burst staging has a LAST-SUPERBLOCK
 fallback and a slot-bound guard, and ``type_size`` moves with every rung, so
 the staging boundary lands differently for each k. This module sweeps that
-boundary -- every public NVFP4-CB rung K1..K25, both warp branches
+boundary -- every direct candidate K1..K25 (public artifacts are K12..K24),
+both warp branches
 (n_sb % 8 vs % 4), odd and
 tiny row counts, non-power-of-2 M (runtime ``m`` tail), and both schedules.
 
 Origin: dq-runs/r2-kernel-2026-08-23 ran the then-supported K12..K20 range as
-a 1728-config fuzz with zero mismatches.  The K1..K25 expansion widens that
-same permanent gate to 4800 configurations so a future edit to the staging
-path cannot silently break the property the selector depends on.
+a 1728-config fuzz with zero mismatches.  The pre-release K1..K25 expansion
+widened that direct-kernel gate to 4800 configurations; the extra coverage is
+retained as research and must not be read as artifact authority.
 """
 import itertools
 
@@ -67,7 +68,7 @@ def _run(p, xq):
 @pytest.mark.parametrize("K", [512, 1024, 2048, 3072])
 @pytest.mark.parametrize("k", range(1, 26))
 def test_r2_bit_identical_across_edge_geometry(k, K, monkeypatch):
-    """Every shipped rung x both warp branches x odd/tiny N x non-power-of-2 M
+    """Every direct candidate x both warp branches x odd/tiny N x non-power-of-2 M
     x both schedules: the R2 and legacy instantiations agree bitwise."""
     pq = pytest.importorskip("prismaquant.nvfp4_cb_formats")
     for N in (1, 17, 48, 96):

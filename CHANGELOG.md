@@ -2,7 +2,25 @@
 
 ## 0.9.1 — 2026-08-24
 
-### NVFP4-CB support expands to K1..K25 (contract schema v11)
+### Pre-release broad-ladder retraction (intended 0.9.1 surface)
+
+- Before the planned 0.9.1 release, Gridbook retracted the candidate public
+  ladder expansions below because no released artifact or reader-compatibility
+  need justified them. Contract schema v11 remains the authority without
+  another schema bump: NVFP4-CB reads and produces exactly K12..K24; FP8-CB
+  reads every integer K28..K48 and produces exactly K40/K44/K48.
+- Lane-eligibility cells describe producer-facing routes and are narrowed to
+  those producer sets. Historical FP8 fused readers
+  K28/K32/K36/K40/K44/K48 remain compiled, including K28/K32/K36 reader-only
+  compatibility paths. Generic NVFP4 K1..K32 and aligned low FP8 direct calls
+  remain research primitives only; they cannot authorize a sidecar, chooser,
+  producer, or lane claim.
+- The two pre-release candidate sections immediately below are retained as
+  development history, including their dated compile receipts and measurement
+  evidence, but are superseded by this retraction and do not describe the
+  intended public surface.
+
+### Pre-release candidate (retracted above): NVFP4-CB K1..K25 expansion
 
 - NVFP4-CB readers, producers, artifact choosers, and SM120 lane rows accept
   every integer rung K1..K25. There are no legacy K26..K32 artifacts to
@@ -39,7 +57,7 @@
   FP8 format-ladder semantics retain their v10 meaning; lane eligibility gains
   the five compile-only SM120 FP8 cells above.
 
-### FP8-CB producer ladder expands to K4..K48/4 (contract schema v10)
+### Pre-release candidate (retracted above): FP8-CB K4..K48/4 expansion
 
 - `formats[].rungs` is now explicitly the accepted **reader** domain and the
   new `formats[].producer_rungs` field is the canonical writer menu. FP8-CB

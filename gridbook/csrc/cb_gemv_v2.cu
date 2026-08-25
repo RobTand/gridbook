@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // FP4-CB v2 decode/expand — staged dictionaries on Blackwell cc12.0/12.1.
-// Public artifacts use K1..K25; direct K26..K32 instantiations are retained
-// only for kernel research.
+// Public artifacts read and produce K12..K24.  Direct K1..K32 instantiations
+// are retained only for kernel research and are not sidecar authority.
 //
 // PRIOR ART IN THIS TREE. Staging the codebook in shared memory is NOT a new
 // idea here: cutlass_fork/sm120_cb_fused_mma.hpp:140-196 already does it for
@@ -36,7 +36,7 @@
 // (cb_gemv.cu:1445, `if (rp_smem <= 48 * 1024)`, else it falls through to the
 // non-rowpack schedule) and never calls cudaFuncSetAttribute. This kernel opts
 // in to the cc12x 99 KB dynamic-smem budget explicitly, which makes K25 the
-// last whole-dictionary public rung.
+// last whole-dictionary DIRECT rung.  The public contract stops at K24.
 //
 // NUMERICS. The byte format, decode semantics and wv rounding are identical to
 // cb_gemv.cu (v1: w = bf16_rn(f32(cb)*sc); v2 contract: raw values with sc
@@ -1004,7 +1004,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cb_expand_v2_stages_dictionary",
         &cb_expand_v2_stages_dictionary,
         "true iff the K1..K32 product dictionary fits the 99KiB staged "
-        "expander policy (K1..K25)");
+        "direct-kernel policy (K1..K25; public artifacts are K12..K24)");
   m.def("bw_read", &bw_read, "peak read bandwidth probe (GB/s)");
   m.def("bw_triad", &bw_triad, "peak triad bandwidth probe (GB/s)");
 }

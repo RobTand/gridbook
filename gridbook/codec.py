@@ -81,15 +81,15 @@ def build_flat_product_codebook(
     return build_flat_codebook(sub_tables, prefix, grid)
 
 
-# --- the FUSED mid-M lane's rung law (K1.2) --------------------------------
+# --- the historical FUSED mid-M reader surface (K1.2) ----------------------
 #
-# The accepted FP8-CB reader ladder is K4/K8/K12/K16/K20/K24 plus every
-# INTEGER k in [28, 48].  The dense high-range reader domain preserves legacy
-# irregular artifacts; v10 producers emit K4..K48 step 4.  Gridbook serves the
-# complete reader domain through decode GEMV and the expand+GEMM quality
-# bridge. The decode-in-prologue FUSED lane
-# (csrc/cb_fused_gemm.cu) backs a strict SUBSET, and that is a property of the
-# format and of TMA rather than a build option:
+# The accepted FP8-CB reader ladder is every INTEGER k in [28, 48], preserving
+# historical artifacts.  New producers emit only K40/K44/K48.  The optimized
+# decode-in-prologue FUSED lane predates that narrower producer menu and keeps
+# its six historical compiled readers K28/K32/K36/K40/K44/K48.  This surface
+# is a strict subset of the reader domain and is independent of producer
+# authority.  Its multiples-of-four constraint is a property of the format and
+# of TMA rather than a build option:
 #
 #   * type_size = 4*k is the packed-B TMA box's contiguous extent, and TMA
 #     requires it to be a 16-byte multiple -> k % 4 == 0; and
@@ -104,7 +104,7 @@ def build_flat_product_codebook(
 # a question), and then CONFIRMS against `cuda_ext.fused_fp8_kbits(ext)`, which
 # is what the loaded module actually compiled. tests/test_fused_prefill.py pins
 # the law to the built module's `cb_fused_kbits()`, so the two cannot drift.
-FP8_FUSED_KBITS_LO = 4
+FP8_FUSED_KBITS_LO = 28
 FP8_FUSED_KBITS_HI = 48
 FP8_FUSED_KBITS_STEP = 4
 FP8_FUSED_KBITS = tuple(

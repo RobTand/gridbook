@@ -23,8 +23,9 @@
  *     asserted at the python layer).
  *
  * INV-1: the dense fp8 tile exists only as one [TileN, TileK] smem buffer.
- * The k-bit width is a compile-time policy parameter (KBits in K4..K48,
- * step 4); type_size = 4*KBits bytes, n_sub = 4.
+ * The k-bit width is a compile-time policy parameter over the historical
+ * optimized reader subset K28/K32/K36/K40/K44/K48; type_size = 4*KBits
+ * bytes, n_sub = 4.
  **************************************************************************************************/
 #pragma once
 
@@ -140,16 +141,16 @@ struct CollectiveMma<
 
   // --- codebook LUT smem residency policy (R6) ---------------------------
   // The flat codebook is 4 sub-tables x 2^CbSubW rows x 2 e4m3 bytes, i.e.
-  // 8 << CbSubW logical bytes: k4 16 B ... k28 1 KB, k44 16 KB, k48
-  // 32 KB. Low logical prefixes reserve one aligned KiB. Staging in smem
+  // 8 << CbSubW logical bytes: k28 1 KB, k44 16 KB, k48 32 KB. The smallest
+  // historical rung reserves one aligned KiB. Staging in smem
   // removes the decode gathers' dependence on whatever L1 the kernel's own
   // ~75 KB smem carve-out leaves behind (measured: the k48 32 KB table falls
   // off that cliff -- decode-ALU 0.091 ms at k44 vs 0.779 ms at k48).
   //
   // Feasibility (GemmKernel::SharedStorageSize vs sm_120's 101,376 B ceiling,
   // TileN=64/TileK=128/Stages=2; measured by csrc/tools/smem_probe_tilem.cu):
-  //   TileM=128 supports every K4..K48/4 rung after the LUT carve.
-  //   TileM=256 supports K4..K32 after the LUT carve.
+  //   TileM=128 supports every historical K28..K48/4 reader rung.
+  //   TileM=256 supports K28/K32 after the LUT carve.
   // The pre-R6 base is exactly TileM*TileK*Stages + TileN*CbTypeSize*Stages +
   // 19,456 B of fixed overhead (decoded-B buffer + epilogue + pipelines), so
   // the headroom a rung can spend on the LUT is:
@@ -172,9 +173,9 @@ struct CollectiveMma<
       (TileM <= 128) ? ((4 * CbSubBytes <= 16384) ? 4 : 2)
                      : ((4 * CbSubBytes <= 1024) ? 4 : 0);
   static constexpr int CbLutLogicalBytes = CbLutResidentSubs * CbSubBytes;
-  // TensorStorage's following A/B buffers are 1024-aligned.  Low-rung LUTs
-  // are only 16..512 logical bytes, so reserve one aligned KiB while copying
-  // only the logical prefix; zero-sized stages still cost exactly zero.
+  // TensorStorage's following A/B buffers are 1024-aligned. Reserve whole KiB
+  // units while copying only the logical prefix; zero-sized stages still cost
+  // exactly zero.
   static constexpr int CbLutSmemBytes =
       CbLutLogicalBytes == 0 ? 0 : ((CbLutLogicalBytes + 1023) / 1024) * 1024;
   static_assert(CbLutSmemBytes % 1024 == 0,
@@ -200,8 +201,8 @@ struct CollectiveMma<
   static constexpr int TileN = size<1>(TileShape{});
   static constexpr int TileK = size<2>(TileShape{});
   static_assert(TileK == 128, "CB fused mainloop assumes TileK = 128 (half a 256-weight superblock)");
-  static_assert(KBits >= 4 && KBits <= 48 && KBits % 4 == 0,
-                "fp8-CB fused rungs are K4..K48 step 4");
+  static_assert(KBits >= 28 && KBits <= 48 && KBits % 4 == 0,
+                "fp8-CB fused readers are K28..K48 step 4");
   static_assert(CbTypeSize % 16 == 0, "type_size must be a 16-byte multiple (TMA box)");
 
   static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");

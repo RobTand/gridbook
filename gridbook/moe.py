@@ -1892,12 +1892,12 @@ class PrismaQuantCBMoEMethod(FusedMoEMethodBase):
 
           * fp8-CB only (the fused kernel's LUT is the 4-sub-table e4m3
             codebook; fp4 two-tier composes a scale the prologue can't);
-          * k on the fused lane's RUNG LAW (``codec.FP8_FUSED_KBITS``:
-            K4..K48 step 4), uniform per layer by the export union-find, and then
-            CONFIRMED against what this build compiled
-            (``fp8_fused_lane.rung_eligible``). The v10 producer ladder is the
-            multiples of 4; legacy irregular K28..K48 artifacts remain in the
-            reader domain and use the quality bridge because
+          * k on the fused lane's historical reader surface
+            (``codec.FP8_FUSED_KBITS``: K28..K48 step 4), uniform per layer by
+            the export union-find, and then CONFIRMED against what this build
+            compiled (``fp8_fused_lane.rung_eligible``). Current producers emit
+            only K40/K44/K48; K28/K32/K36 remain optimized historical readers,
+            while other K28..K48 artifacts use the quality bridge because
             type_size = 4k must be a 16-byte TMA box multiple and the
             mainloop's single CbSubW = k/4 sub-table width is the format's
             real layout only then (see csrc/cb_fused_gemm.cu's rung law). The

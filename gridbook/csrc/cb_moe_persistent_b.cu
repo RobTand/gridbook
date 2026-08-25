@@ -143,12 +143,12 @@
 // The codebook LUT stays in GLOBAL memory and is read through `__ldg`; see
 // `kSmemReservedPerCta` below for the measurement that rejected staging it.
 //
-// Compiled ladder, shared memory quoted at K25, the public NVFP4-CB ceiling.
-// K26..K32 use the same direct research kernels, but their wider packed stages
-// make tile eligibility rung-dependent; `cb_moe_persistent_b_fp8_cfg_eligible()`
-// is the backwards-named ABI entry that attests the exact (family, schedule,
-// rung) predicate at runtime. Python enumerates/queries THAT, never this
-// comment.
+// Historical measurement ladder, shared memory quoted at K25.  The public
+// NVFP4-CB ceiling is now K24; every direct K1..K11/K25..K32 instantiation is
+// kernel research only.  Wider packed stages make tile eligibility
+// rung-dependent; `cb_moe_persistent_b_fp8_cfg_eligible()` is the
+// backwards-named ABI entry that attests the exact (family, schedule, rung)
+// predicate at runtime. Python enumerates/queries THAT, never this comment.
 //
 //  cfg  TM   TN  warps thr      A      B     pk    smem   CTAs/SM  accum/thr
 //  ---  ---  ---  ----- ---  ------  -----  -----  -----  -------  ---------
@@ -181,12 +181,15 @@
 // descriptor the mainloop is templated over:
 //
 // * FP4-CB two-tier v2 (`CbFp4V2Fmt`): product mode n_sub=2,
-//   `type_size == 4*k + 9`, k in [1,32].  This is the original K1.1 surface
-//   and the quality path that has no fused alternative at any M.
+//   `type_size == 4*k + 9`, direct kernels k in [1,32].  Public reader and
+//   producer authority is K12..K24; all other instantiations are research.
 // * FP8-CB (`CbFp8Fmt`, K1.1's second payload family): product mode n_sub=4,
-//   `type_size == 4*k`, k in [1,48] — a flat e4m3 plane (converted ONCE at
+//   `type_size == 4*k`, direct kernels k in [1,48] — a flat e4m3 plane
+//   (converted ONCE at
 //   load to an exact FP32 table by torch, so e4m3->f32 is torch's own
 //   conversion by construction) plus a per-(expert, output-row) FP32 scale.
+//   Public artifacts read K28..K48 and producers emit K40/K44/K48; K1..K27
+//   exists here only for direct kernel research.
 //   `cb_decode_codeword_fp8` is a line-by-line transcription of
 //   `cb_gemv.cu::cb_expand_fp8_kernel`'s inner body (the same SubSplit<4,2>
 //   ceil-first ragged split, the same aligned-u32 window) followed by the
@@ -577,7 +580,7 @@ DEVINL void cp_async_wait() {
 // `ldmatrix` tile touches land on 8 distinct chunk columns: conflict-free.
 // ---------------------------------------------------------------------------
 constexpr int kTK = 64;                 // BF16 columns per mainloop stage
-constexpr int kPublicNvfp4MaxK = 25;
+constexpr int kPublicNvfp4MaxK = 24;
 constexpr int kPublicNvfp4MaxTypeSize = 4 * kPublicNvfp4MaxK + 9;
 constexpr int kChunks = kTK / 8;        // 16-byte chunks per row
 constexpr int kSuperblock = 256;        // CB v2 columns per superblock
@@ -1548,7 +1551,8 @@ void run_persistent_b(torch::Tensor out, torch::Tensor a, torch::Tensor qw,
               "got ",
               N);
   TORCH_CHECK(k_bits >= 1 && k_bits <= 32,
-              "cb_moe_persistent_b: FP4-CB v2 supports k_bits in [1,32], got ",
+              "cb_moe_persistent_b: FP4-CB v2 direct kernel supports k_bits "
+              "in [1,32] (public artifacts: K12..K24), got ",
               k_bits);
   TORCH_CHECK(type_size == 4 * k_bits + 9,
               "cb_moe_persistent_b: FP4-CB layout v2 requires "
@@ -1759,7 +1763,8 @@ void run_persistent_b_fp8(torch::Tensor out, torch::Tensor a,
               "elements, got ",
               N);
   TORCH_CHECK(k_bits >= 1 && k_bits <= 48,
-              "cb_moe_persistent_b_fp8: FP8-CB supports k_bits in [1,48], "
+              "cb_moe_persistent_b_fp8: FP8-CB direct kernel supports k_bits "
+              "in [1,48] (public readers: K28..K48), "
               "got ",
               k_bits);
   TORCH_CHECK(type_size == 4 * k_bits,
@@ -1982,8 +1987,8 @@ torch::Tensor cb_moe_persistent_b_decode_fp8(
   TORCH_CHECK(K % kSuperblock == 0,
               "cb_moe_persistent_b_decode_fp8: K must be a multiple of 256");
   TORCH_CHECK(k_bits >= 1 && k_bits <= 48 && type_size == 4 * k_bits,
-              "cb_moe_persistent_b_decode_fp8: FP8-CB requires k in [1,48] "
-              "and type_size == 4*k");
+              "cb_moe_persistent_b_decode_fp8: FP8-CB direct kernel requires "
+              "k in [1,48] and type_size == 4*k (public readers: K28..K48)");
   TORCH_CHECK(nrows >= 0 && row0 >= 0,
               "cb_moe_persistent_b_decode_fp8: row0/nrows must be "
               "non-negative");
@@ -2036,7 +2041,7 @@ bool cb_moe_persistent_b_fp8_cfg_eligible(int64_t cfg, int64_t type_size,
 }
 
 // Host-only attestation of what was actually compiled — no launch, no device
-// needed. Per config: [tm, tn, warps, threads, smem_at_public_k25, capacity].
+// needed. Per config: [tm, tn, warps, threads, smem_at_public_k24, capacity].
 std::vector<std::vector<int64_t>> cb_moe_persistent_b_configs() {
   std::vector<std::vector<int64_t>> out;
   for (int i = 0; i < kNumCfgs; ++i) {
@@ -2050,7 +2055,7 @@ std::vector<std::vector<int64_t>> cb_moe_persistent_b_configs() {
 }
 
 // Candidate attestation.  Per row:
-// [tm, tn, warps, threads, smem_at_public_k25, capacity, wn, wm, matom,
+// [tm, tn, warps, threads, smem_at_public_k24, capacity, wn, wm, matom,
 // natom].
 // All four rows have 4*matom*natom == 32 accumulator registers/thread.
 std::vector<std::vector<int64_t>> cb_moe_persistent_b_d2r_configs() {
@@ -2162,14 +2167,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "capture.");
   m.def("cb_moe_persistent_b_configs", &cb_moe_persistent_b_configs,
         "compiled tile configs: [tm, tn, warps, threads, "
-        "smem_bytes_at_public_k25, "
+        "smem_bytes_at_public_k24, "
         "sm120 capacity] each (enumerate THIS, never a hardcoded list)");
   m.def("cb_moe_persistent_b_d2r_prepare",
         &cb_moe_persistent_b_d2r_prepare,
         "load-time device attestation for the experimental D2R sibling");
   m.def("cb_moe_persistent_b_d2r_configs",
         &cb_moe_persistent_b_d2r_configs,
-        "D2R configs: [tm,tn,warps,threads,smem_public_k25,capacity,wn,wm,"
+        "D2R configs: [tm,tn,warps,threads,smem_public_k24,capacity,wn,wm,"
         "matom,natom]; same cfg indices as persistent-B");
   m.def("cb_moe_persistent_b_tile_k", &cb_moe_persistent_b_tile_k,
         "mainloop K-stage width in BF16 columns");

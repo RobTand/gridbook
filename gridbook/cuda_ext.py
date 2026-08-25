@@ -19,8 +19,9 @@ Build cache: ``PRISMAQUANT_CB_EXT_DIR`` if set, else ``~/.cache/prismaquant-
 cb-ext``. EVERY module builds in its own subdirectory of that root — ``main``,
 ``v2``, ``bf16_grouped/<identity>``, ``fused/<identity>``,
 ``fused_fp4/<identity>``, ``fused_fp4v2/<identity>``,
-``mxfp8_dense/<identity>``, ``fp8_source_w8a16/<identity>`` and
-``moe_persistent_b/<identity>``, nine in all — so no two ninja workspaces share
+``mxfp8_dense/<identity>``, ``fp8_source_w8a16/<identity>``,
+``moe_persistent_b/<identity>`` and research-only
+``trellis_r256/<identity>``, ten in all — so no two ninja workspaces share
 artefacts. Inside the container the root is ephemeral, so a cold start
 pays ONE build per module it actually reaches; mount a host dir over it to
 persist those builds across restarts. Never ``/tmp``. There is deliberately no
@@ -28,7 +29,7 @@ single build-time figure here: the modules differ by more than an order of
 magnitude in compile cost (the CUTLASS collectives dominate the hand-written
 CUDA), what a given serve reaches depends on format and opt-in flags, and the
 one measurement this docstring used to quote was taken against a single module
-before seven of the nine existed. ``docs/CONTAINER.md`` carries the measured
+before eight of the ten existed. ``docs/CONTAINER.md`` carries the measured
 image-build numbers.
 
 Architecture: every module is compiled for exactly the live device's compute
@@ -47,12 +48,13 @@ module. Strict call contracts use :func:`_require_symbols`; fused FP4 uses
 independent symbol families because its dense and grouped call sites are
 separately guarded. An incompatible module would otherwise fail with
 ``AttributeError`` mid-forward, or silently disable a probed fast path. The
-seven digest-keyed modules — ``fused`` (FP8), ``fused_fp4``, ``bf16_grouped``,
+eight digest-keyed modules — ``fused`` (FP8), ``fused_fp4``, ``bf16_grouped``,
 ``fused_fp4v2``, ``mxfp8_dense``, ``fp8_source_w8a16`` and
-``moe_persistent_b`` — additionally hash their packaged
+``moe_persistent_b`` and research-only ``trellis_r256`` — additionally hash
+their packaged
 sources, Gridbook headers (transitively: a header reached only through another
 Gridbook header counts), target, compiled-in lane macros and toolchain ABI
-into the module name and build directory, so a loaded module of those seven is
+into the module name and build directory, so a loaded module of those eight is
 always built from the current sources. ``main`` and ``v2`` are not keyed that
 way: they include no Gridbook header, so torch's own versioner over the
 ``.cu`` is already complete for them.
@@ -1381,13 +1383,13 @@ _FUSED_SYMBOLS = (
 def fused_fp8_kbits(ext) -> tuple[int, ...]:
     """The k_bits rungs the loaded fused FP8 module actually COMPILED.
 
-    K1.2. v10 producers emit K4..K48 step 4, while the accepted reader domain
-    also preserves legacy irregular K28..K48 artifacts.  The fused mid-M lane
-    backs the producer law — the format + TMA law spelled out at the top of
-    ``csrc/cb_fused_gemm.cu``. Dispatch must still ASK the module rather than
-    carry a literal ladder: a duplicated literal is exactly how a call site
-    silently misses a compiled rung (or offers an uncompiled one) when the
-    kernel's surface moves.
+    K1.2. Readers accept every K28..K48 artifact and producers emit
+    K40/K44/K48. The fused mid-M lane preserves the historical optimized
+    reader subset K28/K32/K36/K40/K44/K48 — the format + TMA law spelled out
+    at the top of ``csrc/cb_fused_gemm.cu``. Dispatch must still ASK the module
+    rather than carry a literal ladder: a duplicated literal is exactly how a
+    call site silently misses a compiled rung (or offers an uncompiled one)
+    when the kernel's surface moves.
 
     Read ONCE and memoized on the module object, like
     ``fp4v2_fused_midm_lane._facts`` — the cache then dies exactly when the
@@ -2194,4 +2196,125 @@ def _load_moe_persistent_b_ext_locked():
 _PRELOAD_FAMILIES.append(("moe_persistent_b", "get_moe_persistent_b_ext"))
 # ===========================================================================
 # END ADDITIVE BLOCK — persistent-B grouped MoE loader
+# ===========================================================================
+
+# ===========================================================================
+# BEGIN ADDITIVE BLOCK — research-only TCQ R256 decoder/dequant-GEMV
+#
+# This is intentionally outside _PRELOAD_FAMILIES and outside the runtime
+# contract.  Merely importing Gridbook cannot compile or claim this research
+# format; an explicit low-level caller must request it.
+# ===========================================================================
+_trellis_r256 = None
+_trellis_r256_tried = False
+_trellis_r256_lock = threading.Lock()
+_TRELLIS_R256_ABI_SCHEMA = 2
+_TRELLIS_R256_WIRE_SCHEMA = "gridbook.trellis.wire.v1"
+_TRELLIS_R256_SYMBOLS = (
+    "trellis_r256_validate_wire",
+    "trellis_r256_decode_codes",
+    "trellis_r256_decode_native_packed_prevalidated_out",
+    "trellis_r256_expand",
+    "trellis_r256_dequant_gemv",
+    "trellis_r256_wire_schema",
+    "trellis_r256_abi_schema",
+)
+
+
+def _trellis_r256_build_identity(torch, *, source: str,
+                                 capability: tuple[int, int]):
+    """Source/toolchain identity for the isolated research module."""
+    payload = {
+        "abi_schema": _TRELLIS_R256_ABI_SCHEMA,
+        "wire_schema": _TRELLIS_R256_WIRE_SCHEMA,
+        "source_sha256": _sha256_file(source),
+        "capability": list(capability),
+        "torch": getattr(torch, "__version__", None),
+        "torch_cuda": getattr(getattr(torch, "version", None), "cuda", None),
+        "python_soabi": sysconfig.get_config_var("SOABI"),
+        "cxx": _compiler_identity(os.environ.get("CXX") or "c++"),
+        "nvcc": _compiler_identity(os.environ.get("NVCC") or "nvcc"),
+        "symbols": list(_TRELLIS_R256_SYMBOLS),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest(), payload
+
+
+def get_trellis_r256_ext():
+    """Return the research TCQ module, or ``None`` when it cannot build."""
+    if _trellis_r256_tried:
+        return _trellis_r256
+    with _trellis_r256_lock:
+        if _trellis_r256_tried:
+            return _trellis_r256
+        return _load_trellis_r256_ext_locked()
+
+
+def require_trellis_r256_ext(operation: str = "this operation"):
+    """Return the dedicated research TCQ module or fail closed."""
+    ext = get_trellis_r256_ext()
+    if ext is None:
+        raise NativeKernelUnavailableError(
+            f"{operation} requires Gridbook's research-only TCQ R256 CUDA "
+            "extension (trellis_r256.cu), but it is unavailable. There is no "
+            f"Triton or CB-symbol fallback. To enable the native path: {_NVCC_HINT}.")
+    return ext
+
+
+def _load_trellis_r256_ext_locked():
+    global _trellis_r256, _trellis_r256_tried
+    build_dir = "<unresolved>"
+    try:
+        import torch
+        from torch.utils.cpp_extension import load
+
+        src_dir = _require_csrc("trellis_r256.cu")
+        source = os.path.join(src_dir, "trellis_r256.cu")
+        cc = _target_capability(
+            "the research TCQ R256 extension (trellis_r256.cu)")
+        identity, _payload = _trellis_r256_build_identity(
+            torch, source=source, capability=cc)
+        module_name = f"gridbook_trellis_r256_{identity}"
+        build_root = os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext")
+        build_dir = os.path.join(build_root, "trellis_r256", identity)
+        os.makedirs(build_dir, exist_ok=True)
+        mod = load(
+            name=module_name, sources=[source], build_directory=build_dir,
+            extra_cuda_cflags=[
+                "-O3", _gencode_flag(cc, accelerated=False)], verbose=False)
+        mod = _require_symbols(
+            mod, _TRELLIS_R256_SYMBOLS, build_dir=build_dir,
+            source="trellis_r256.cu")
+        if mod.trellis_r256_wire_schema() != _TRELLIS_R256_WIRE_SCHEMA:
+            raise StaleExtensionError(_mismatch_message(
+                mod, build_dir=build_dir, source="trellis_r256.cu",
+                requirement="wire schema identity mismatch"))
+        if mod.trellis_r256_abi_schema() != _TRELLIS_R256_ABI_SCHEMA:
+            raise StaleExtensionError(_mismatch_message(
+                mod, build_dir=build_dir, source="trellis_r256.cu",
+                requirement="native ABI schema identity mismatch"))
+        mod.__gridbook_jit_identity__ = identity
+        mod.__gridbook_jit_capability__ = tuple(cc)
+        mod.__gridbook_jit_abi_schema__ = _TRELLIS_R256_ABI_SCHEMA
+        _trellis_r256 = mod
+    except StaleExtensionError as exc:
+        print("[gridbook-trellis] ERROR: incompatible research TCQ R256 "
+              f"extension — {exc}", file=sys.stderr, flush=True)
+        _trellis_r256 = None
+    except IncompleteInstallError as exc:
+        print(f"[gridbook-trellis] ERROR: broken gridbook install — {exc}",
+              file=sys.stderr, flush=True)
+        _trellis_r256 = None
+    except Exception as exc:  # noqa: BLE001 — explicit research probe is soft
+        print("[gridbook-trellis] WARNING: research TCQ R256 extension "
+              f"unavailable ({type(exc).__name__}: {exc}). To build it: "
+              f"{_NVCC_HINT}.", file=sys.stderr, flush=True)
+        _trellis_r256 = None
+    finally:
+        _trellis_r256_tried = True
+    return _trellis_r256
+
+# ===========================================================================
+# END ADDITIVE BLOCK — research-only TCQ R256 decoder/dequant-GEMV
 # ===========================================================================

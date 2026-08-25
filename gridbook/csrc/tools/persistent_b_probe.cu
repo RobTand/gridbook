@@ -39,7 +39,8 @@ namespace {
 // that disagrees with `cb_moe_persistent_b_configs()`, which the test suite
 // pins against the kernel itself.
 constexpr int kTK = 64;                       // BF16 columns per K stage
-constexpr int kPublicNvfp4MaxK = 25;
+constexpr int kPublicNvfp4MaxK = 24;
+constexpr int kHistoricalRejectedProbeK = 25;
 constexpr long kSm120SmemCapacity = 101376;   // 99 KiB opt-in per CTA
 constexpr long kSmemPerSm = 102400;           // 100 KiB per SM
 constexpr long kSmemReservedPerCta = 1024;
@@ -120,14 +121,17 @@ int main() {
               "second CTA (see kSmemReservedPerCta in the kernel).\n",
               kSmemPerSm, kSmemReservedPerCta);
 
-  // The public FP4-CB v2 rung ladder: type_size == 4*k + 9. K25 is the
-  // widest public packed superblock and therefore the sizing authority.
-  for (int k : {1, 12, 16, 20, 24, kPublicNvfp4MaxK}) {
-    report("COMPILED LADDER", kCfgs, kNumCfgs, 4 * k + 9, k);
+  // Public FP4-CB v2 rungs use type_size == 4*k + 9 and end at K24.
+  for (int k : {12, 16, 20, kPublicNvfp4MaxK}) {
+    report("PUBLIC LADDER", kCfgs, kNumCfgs, 4 * k + 9, k);
+  }
+  // Wider compiled templates are direct kernel research, not artifact rows.
+  for (int k : {1, 25, 32}) {
+    report("DIRECT RESEARCH", kCfgs, kNumCfgs, 4 * k + 9, k);
   }
   report("COMPILED, MEASURED, DROPPED (1 CTA/SM; never won a sweep cell)",
-         kRejected, kNumRejected, 4 * kPublicNvfp4MaxK + 9,
-         kPublicNvfp4MaxK);
+         kRejected, kNumRejected, 4 * kHistoricalRejectedProbeK + 9,
+         kHistoricalRejectedProbeK);
 
   std::printf("\nEvery compiled config must show CTAs/SM >= 2 at public "
               "ceiling k=%d; run_persistent_b TORCH_CHECKs exactly that.\n",

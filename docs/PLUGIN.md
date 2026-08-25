@@ -84,17 +84,18 @@ second runtime tree or maintain a parallel loader table.
   contract row, and the SPEC definition are gone, and a `"mode": "signed"`
   scheme now fails closed everywhere. No published artifact encodes an
   S-rung. Full mode: spec-reserved, unimplemented.
-- **FP8-CB v10 reader and producer domains are intentionally different.**
-  `formats[FP8_CB_K].rungs` accepts K4/K8/K12/K16/K20/K24 and every integer
-  K28..K48, retaining older irregular artifacts. `producer_rungs` is the
-  hardware-aligned K4..K48 step-4 menu. A producer MUST choose from the latter;
-  a reader MUST continue to admit the former. NVFP4 has no corresponding
-  legacy artifacts: its reader and producer lists are both exactly K1..K25.
-  K26..K32 remain a low-level CUDA research call surface after the measured
-  dictionary-residency cliff, not valid artifacts or chooser candidates. K1 is
-  the valid `(1,0)` split; K32 remains only the mathematical `(16,16)` E2M1
+- **Reader and producer domains are intentionally distinct where history
+  requires it.** `formats[FP8_CB_K].rungs` accepts every integer K28..K48,
+  retaining historical artifacts; `producer_rungs` is exactly K40/K44/K48. A
+  producer MUST choose from the latter, while a reader MUST continue to admit
+  the former. NVFP4 has no broader historical reader set: its reader and
+  producer lists are both exactly K12..K24. The pre-release NVFP4 K1..K25 and
+  FP8 K4..K48/4 public expansions were retracted before the planned 0.9.1
+  release. Generic NVFP4 K1..K32 and aligned low FP8 calls remain low-level CUDA research
+  surfaces, not valid artifacts or chooser candidates. K1 is the direct
+  primitive's `(1,0)` edge; K32 is the mathematical `(16,16)` E2M1
   product-lattice ceiling. `type_size` is still exactly `4*k` for FP8, so no
-  legacy byte interpretation changed.
+  historical byte interpretation changed.
 - Overlapping FP8/NVFP4 rates do not encode a family preference. AQUA chooses
   among registered activation contracts; contract row order and a manual
   "prefer FP8" rule are not chooser inputs.
@@ -186,19 +187,19 @@ route and how far their qualification has progressed.
   `qualification` is independent: `compile_only` proves no device execution
   and is never producer-legal; `device_qualified` requires the physical gate.
 - The initial SM89 dense FP8-CB decode (`cb_gemv_fp8`) and batch
-  (`cb_expand_fp8` + direct vLLM CUTLASS W8A8) rows cover the producer ladder
+  (`cb_expand_fp8` + direct vLLM CUTLASS W8A8) rows cover K40/K44/K48
   but remain `compile_only`. This contract therefore does **not** authorize a
   4090 artifact yet. SM89 has no NVFP4 lane row or FP4 activation
   registration; NVFP4-CB is wholly unsupported there.
-- The SM120 NVFP4-CB production rows cover K1..K25. Dense and routed decode are
+- The SM120 NVFP4-CB production rows cover K12..K24. Dense and routed decode are
   `backed`;
   routed batch is `backed` only when `role_split == false` selects
   persistent-B. Dense batch and the generic routed expand-plus-BF16 bridge are
   truthfully `fallback`. Every SM120 row is `compile_only`, so none authorizes
   an RTX 50 artifact or a performance claim. The separate no-launch preflight
-  additionally compiles K26..K32 as direct-kernel research scaffolding; those
-  values have no format registration or production lane row.
-- The SM120 FP8-CB rows cover the complete K4..K48 step-four producer ladder.
+  additionally compiles K1..K32 as a direct-kernel research surface; values
+  outside K12..K24 have no format registration or production lane row.
+- The SM120 FP8-CB rows cover the K40/K44/K48 producer menu.
   Dense and routed decode are `backed`; dense batch uses exact expansion plus
   native CUTLASS W8A8 and is `backed`; routed batch uses persistent-B when
   `role_split == false`, with exact expansion plus the grouped BF16 bridge as

@@ -26,10 +26,12 @@
 //           scale = max(amax/448, 1/(448*512)) -> clamp -> e4m3 rn-satfinite
 //           -> f32 -> * scale -> bf16_rn).
 //
-// Scope: fp8 grid, `product` mode, n_sub=4 (sub_dim=2) — the v10 K4..K48
-// multiples-of-four producer ladder plus legacy irregular K28..K48 readers.
-// Unsupported contracts fail before launch;
-// Gridbook has no alternate Triton implementation.
+// Scope: fp8 grid, `product` mode, n_sub=4 (sub_dim=2).  Runtime artifacts are
+// governed by runtime_contract.json: historical readers K28..K48, canonical
+// producers K40/K44/K48.  This low-level module deliberately retains aligned
+// K4..K24 as a DIRECT KERNEL RESEARCH surface only; that capability does not
+// authorize a sidecar, producer, or public lane.  Gridbook has no alternate
+// Triton implementation.
 // Compiled by torch.utils.cpp_extension WITHOUT fast-math (division and
 // conversion rounding must match torch exactly).
 
@@ -87,12 +89,11 @@ constexpr int kSlotBytes = 208;          // >= max type_size (192) + 16 slack;
 constexpr float kFp8Max = 448.0f;
 constexpr float kMinScale = 1.0f / (448.0f * 512.0f);
 
-// v11 reader ABI: low canonical rungs plus the complete legacy high domain.
-// Keep this independent of the producer law (K4..K48/4): old irregular
-// K28..K48 artifacts remain loadable, while never-produced K25..K27 and
-// arbitrary widths below K28 fail at the native binding as well as config
-// resolution.
-inline bool fp8_reader_kbits_supported(int k_bits) {
+// Direct-kernel domain, intentionally wider than artifact authority.  Public
+// readers are K28..K48 and public producers are K40/K44/K48; aligned K4..K24
+// remains here solely so kernel research can exercise the generic word loader.
+// Public sidecars are rejected earlier by config/runtime_contract.
+inline bool fp8_direct_kernel_kbits_supported(int k_bits) {
   return (k_bits >= 4 && k_bits <= 24 && k_bits % 4 == 0) ||
          (k_bits >= 28 && k_bits <= 48);
 }
@@ -695,8 +696,8 @@ torch::Tensor cb_gemv_fp8(torch::Tensor x, torch::Tensor qw_padded,
   TORCH_CHECK(scale.scalar_type() == torch::kFloat32);
   TORCH_CHECK(n_sub == 4, "CUDA GEMV supports the fp8 n_sub=4 rungs only");
   TORCH_CHECK(K % 256 == 0, "K must be a multiple of the 256 superblock");
-  TORCH_CHECK(fp8_reader_kbits_supported(k_bits),
-              "fp8 k_bits is outside the v10 accepted reader domain");
+  TORCH_CHECK(fp8_direct_kernel_kbits_supported(k_bits),
+              "fp8 k_bits is outside the direct-kernel domain");
   TORCH_CHECK(type_size <= 192, "type_size beyond the fp8 rung range (<=K48)");
   TORCH_CHECK(type_size == 4 * k_bits, "fp8 type_size must equal 4*k");
   // Widest sub-table (ceil-first split) must stay within the shipped range.
@@ -1199,6 +1200,8 @@ torch::Tensor cb_gemv_fp4_v2(torch::Tensor x, torch::Tensor qw_padded,
   TORCH_CHECK(n_sub == 2,
               "fp4-v2 GEMV: n_sub=2 (product) only; the signed n_sub=1 "
               "family was removed from the runtime");
+  // Direct-kernel research guard. Public sidecars are restricted to K12..K24
+  // by config/runtime_contract before this low-level binding is reachable.
   TORCH_CHECK(k_bits >= 1 && k_bits <= 32,
               "fp4-v2 GEMV: k_bits must be in [1,32], got ", k_bits);
   TORCH_CHECK(K % 256 == 0, "K must be a multiple of the 256 superblock");
@@ -1924,8 +1927,8 @@ torch::Tensor cb_moe_gemv_fp8(torch::Tensor xq, torch::Tensor qw_stack,
   TORCH_CHECK(pair_expert.scalar_type() == torch::kInt32);
   TORCH_CHECK(pair_xrow.scalar_type() == torch::kInt32);
   TORCH_CHECK(n_sub == 4);
-  TORCH_CHECK(fp8_reader_kbits_supported(k_bits),
-              "fp8 k_bits is outside the v10 accepted reader domain");
+  TORCH_CHECK(fp8_direct_kernel_kbits_supported(k_bits),
+              "fp8 k_bits is outside the direct-kernel domain");
   TORCH_CHECK((k_bits + n_sub - 1) / n_sub <= 12 && type_size == 4 * k_bits &&
               type_size <= 192);
   const int64_t Nout = qw_stack.size(1);
@@ -2068,6 +2071,7 @@ torch::Tensor cb_moe_gemv_fp4_v2(torch::Tensor xq, torch::Tensor qw_stack,
   TORCH_CHECK(n_sub == 2,
               "fp4-v2 MoE GEMV: n_sub=2 (product) only; the signed n_sub=1 "
               "family was removed from the runtime");
+  // Direct-kernel research guard; public artifact authority is K12..K24.
   TORCH_CHECK(k_bits >= 1 && k_bits <= 32,
               "fp4-v2 MoE GEMV: k_bits must be in [1,32], got ", k_bits);
   TORCH_CHECK(type_size == 4 * k_bits + 9,
@@ -2291,8 +2295,8 @@ static void cb_expand_fp8_launch(const torch::Tensor& qw_padded,
   TORCH_CHECK(cb_row_offset.scalar_type() == torch::kInt32 &&
               cb_row_offset.numel() == N);
   TORCH_CHECK(n_sub == 4);
-  TORCH_CHECK(fp8_reader_kbits_supported(k_bits),
-              "fp8 k_bits is outside the v10 accepted reader domain");
+  TORCH_CHECK(fp8_direct_kernel_kbits_supported(k_bits),
+              "fp8 k_bits is outside the direct-kernel domain");
   TORCH_CHECK(K % 256 == 0 && type_size == 4 * k_bits && type_size <= 192);
   TORCH_CHECK(qw_padded.dim() == 2 && qw_padded.size(0) == N &&
               qw_padded.stride(1) == 1);

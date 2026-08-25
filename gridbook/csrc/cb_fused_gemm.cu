@@ -29,8 +29,9 @@
 //    REFERENCE for the fused kernel (identical TiledMma/layout config).
 //  - cb_fused_prefill_mm: the decode-in-prologue FP8_CB GEMM — B is the
 //    PACKED byte stream + a global e4m3-byte LUT; the dense tile never
-//    exists in HBM. KBits template-dispatched over the RUNG LAW below
-//    (K4..K48 step 4) — the canonical v10 producer ladder;
+//    exists in HBM. KBits template-dispatched over the historical optimized
+//    reader surface K28/K32/K36/K40/K44/K48; K28/K32/K36 remain for old
+//    artifacts even though current producers emit only K40/K44/K48;
 //    cb_fused_kbits() reports what this build carries.
 //  - smem_report: per-config SharedStorage sizes (budget sanity).
 //
@@ -87,11 +88,12 @@ using ClusterShape = Shape<_1, _1, _1>;
 // ===========================================================================
 // THE FUSED RUNG LAW (K1.2, established 2026-08-02).
 //
-// The v10 producer's FP8-CB ladder is every multiple of four from K4 through
-// K48. The accepted READER domain additionally retains every integer K28..K48
-// so legacy irregular artifacts remain loadable; those off-law readers use
-// generic GEMV/expand and are not producer rungs. The fused mid-M lane serves
-// the MULTIPLES OF 4 and no others, and the K1.2
+// The accepted READER domain is every integer K28..K48 so historical artifacts
+// remain loadable; current producers emit only K40/K44/K48.  The fused mid-M
+// lane preserves its historical optimized subset K28/K32/K36/K40/K44/K48.
+// Reader rungs off that subset use generic GEMV/expand.  The fused lane's
+// multiple-of-four constraint, and the exclusion of every irregular rung, are
+// not missing template instantiations: the K1.2
 // investigation established that this is a property of the FORMAT and of TMA
 // — not a missing template instantiation that could be added:
 //
@@ -113,15 +115,16 @@ using ClusterShape = Shape<_1, _1, _1>;
 //     widths are (10,9,9,9) with non-uniform table offsets, so a uniform
 //     decode would be WRONG, not merely unaligned.
 //
-// The two laws coincide exactly, which is why one predicate expresses both.
-// Consequence for dispatch: the legacy irregular reader domain is NOT fully
+// The two layout laws coincide exactly. Applying them within the historical
+// reader domain yields the six compiled rungs below. Consequence for dispatch:
+// the reader domain is NOT fully
 // backed by this lane, and Python must therefore ASK for the backed set rather than
 // carry a literal (`cb_fused_kbits()` below). ROADMAP K1.2 offers exactly two
 // arms — instantiate every product rung, or "encode the concrete route so the
 // allocator cannot price an unbacked fast path". Arm one is closed by the
 // laws above; this file implements arm two, and makes the surface queryable.
 // ===========================================================================
-constexpr int64_t kFusedKbLo = 4;
+constexpr int64_t kFusedKbLo = 28;
 constexpr int64_t kFusedKbHi = 48;
 constexpr int64_t kFusedKbStep = 4;   // = 16 / gcd(4, 16), i.e. law 1 above.
 
@@ -131,10 +134,10 @@ constexpr bool fused_kbits_supported(int64_t kb) {
 }
 
 // THE one rung list. Every switch, every report and every binding below is
-// generated from it, because 21-case switches hand-written N times is a bug
+// generated from it, because even six-case switches hand-written N times are a
 // farm — the whole point of K1.2's dispatch half.
 #define PQ_FUSED_RUNGS(X) \
-  X(4) X(8) X(12) X(16) X(20) X(24) X(28) X(32) X(36) X(40) X(44) X(48)
+  X(28) X(32) X(36) X(40) X(44) X(48)
 
 // ...and the list is proved equal to the law in BOTH directions: every member
 // satisfies the predicate, and the member count equals the law's cardinality.
@@ -386,8 +389,8 @@ void check_fused_kbits(int64_t k_bits) {
       "multiple for the packed-B TMA box, and the mainloop's single "
       "CbSubW = k_bits/4 sub-table width is only the format's real layout when "
       "k_bits % 4 == 0 (csrc/cb_gemv.cu SubSplit splits raggedly otherwise). "
-      "Legacy irregular rungs 28..48 are still served by Gridbook through the "
-      "decode GEMV and expand+GEMM bridge, but are reader-only off this lane. "
+      "Other reader rungs 28..48 are still served by Gridbook through the "
+      "decode GEMV and expand+GEMM bridge, but are off this optimized lane. "
       "Enumerate cb_fused_kbits() rather than assuming a ladder.");
 }
 
@@ -591,8 +594,10 @@ constexpr int64_t kMoeTileM = size<0>(TileF{});
 //   256  103424 105472 107520 109568                    none FIT
 //   384  >101376 at every rung                          none FIT
 //
-// So the compiled matrix is TileM=128 x every producer rung, plus TileM=256 x
-// K4..K32. TileM=384 is infeasible at every rung and is not compiled.
+// The K4..K24 columns above are retained pre-release measurement evidence, not
+// current instantiations. The compiled matrix is TileM=128 x the six historical
+// reader rungs, plus TileM=256 x K28/K32. TileM=384 is infeasible at every
+// current rung and is not compiled.
 // (TileM must be a multiple of the TiledMma's 128-row M, so 128/256/384 are the
 // only candidates at all — there is no 192 rung to rescue the high k_bits.)
 // NOTE: TileM=256/k_bits=32 lands on EXACTLY the 101376-byte ceiling (zero
@@ -775,10 +780,10 @@ int64_t cb_fused_moe_tile_m() { return kMoeTileM; }
 
 // THE compiled rung set, as the build actually carries it. Python must
 // enumerate this instead of duplicating a literal ladder: the fused lane backs
-// the canonical producer ladder (and a strict subset of the legacy accepted
-// reader domain); a duplicated literal is how dispatch silently misses a
-// compiled rung or selects an uncompiled one. Generated from the same list the
-// switches are.
+// the six-rung historical optimized reader subset (independent of the narrower
+// K40/K44/K48 producer menu); a duplicated literal is how dispatch silently
+// misses a compiled rung or selects an uncompiled one. Generated from the same
+// list the switches are.
 std::vector<int64_t> cb_fused_kbits() {
 #define PQ_RUNG_VALUE(KB) KB,
   return {PQ_FUSED_RUNGS(PQ_RUNG_VALUE)};
@@ -905,8 +910,8 @@ static void push_rung(std::vector<int64_t>& out) {
 // Flat [k_bits, SharedStorageSize, lut_smem_bytes, resident_sub_tables] per
 // COMPILED rung — generated from the one rung list, so it can never fall behind
 // the dispatch (it did: this used to be a hand-written six-call sequence).
-// "All the rungs" here means the v10 producer ladder; legacy irregular reader
-// rungs cannot be instantiated by this uniform-subtable TMA lane.
+// "All the rungs" here means the historical optimized reader subset; other
+// reader rungs cannot be instantiated by this uniform-subtable TMA lane.
 std::vector<int64_t> smem_report_rungs() {
   std::vector<int64_t> out;
 #define PQ_PUSH_RUNG(KB) push_rung<KB>(out);
@@ -949,8 +954,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("out") = py::none(), py::arg("n_offset") = 0);
   m.def("cb_fused_kbits", &cb_fused_kbits,
         "the k_bits rungs this build actually COMPILED for the fused mid-M "
-        "lane, ascending. The v10 producer ladder is K4..K48 step 4; legacy "
-        "irregular K28..K48 values remain readable through generic routes. "
+        "lane, ascending: historical readers K28/K32/K36/K40/K44/K48. "
+        "Current producers emit K40/K44/K48; other K28..K48 readers remain "
+        "loadable through generic routes. "
         "The fused lane serves multiples of 4 because type_size = 4*k "
         "must be a 16-byte TMA box multiple AND the mainloop's single "
         "CbSubW = k/4 sub-table width is the format's real layout only then. "

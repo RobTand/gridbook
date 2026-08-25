@@ -1387,15 +1387,16 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # and rounds once to bf16 — the same rounding ORDER as
         # cutlass_scaled_mm (the older unscaled entry rounded first and scaled
         # in python, which moved served prompt logprobs by up to 0.86 nats).
-        # RUNG COVERAGE (K1.2). The lane serves the v10 producer rung LAW —
-        # codec.FP8_FUSED_KBITS, K4..K48 step 4 — and never a literal ladder
+        # RUNG COVERAGE (K1.2). The lane preserves the historical optimized
+        # reader surface — codec.FP8_FUSED_KBITS, K28..K48 step 4 — independent
+        # of the narrower K40/K44/K48 producer menu, and never a literal ladder
         # copied from the .cu (this used to be an inline
         # `self.k in (28, 32, 36, 40, 44, 48)`, one of two copies that could
         # each drift from the kernel independently). The law is the cheap gate
         # because asking the MODULE first would force a JIT build at first
         # forward for rungs that can never take this path; once the module is
         # in hand, `fused_fp8_kbits` is the authority and the law is only a
-        # filter over it. Legacy irregular reader rungs off the law are not
+        # filter over it. Other reader rungs off the law are not
         # "unsupported" — they take the exact expand + CUTLASS route below.
         # ONE latched read (see ``_fp8_fused_midm_mode``), taken on the
         # dispatch path as well as at load so a mid-serve change RAISES instead

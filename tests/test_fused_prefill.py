@@ -11,7 +11,8 @@ Container-only (JIT-builds two extensions; needs nvcc + /artifacts):
 Contracts pinned:
   * cb_fused_prefill_mm == (cb_expand_fp8 tile -> fork64 passthrough GEMM)
     BIT-IDENTICAL — the decoded smem tile is provably the same bytes through
-    the same MMA config. All four rungs + non-multiple N/M + real artifact.
+    the same MMA config. All six historical rungs + non-multiple N/M + real
+    artifact.
   * chunked-overlap driver (N-chunks through the SAME fork config) ==
     monolithic fork GEMM BIT-IDENTICAL — the property cutlass_scaled_mm
     lacks (its heuristics reconfigure on narrow N), which is what makes
@@ -51,9 +52,9 @@ COMPILED_RUNGS = sorted(int(k) for k in fused.cb_fused_kbits())
 # ---------------------------------------------------------------------------
 # K1.2 — the RUNG SURFACE itself.
 #
-# The v10 producer ladder is K4..K48 step 4; the accepted reader domain also
-# retains irregular K28..K48 artifacts. This lane backs the multiples of 4,
-# because type_size = 4k must be a 16-byte TMA box multiple AND
+# The accepted reader domain is every integer K28..K48, while producers emit
+# K40/K44/K48. This lane preserves historical K28/K32/K36/K40/K44/K48 because
+# type_size = 4k must be a 16-byte TMA box multiple AND
 # the mainloop's single CbSubW = k/4 sub-table width is the format's real layout
 # only then (csrc/cb_gemv.cu `SubSplit` splits raggedly otherwise). Three things
 # then have to agree, forever: the kernel's compiled set, the Python law
@@ -72,9 +73,9 @@ def test_compiled_rungs_are_exactly_the_law():
     assert tuple(COMPILED_RUNGS) == codec.FP8_FUSED_KBITS
 
 
-def test_law_is_the_multiples_of_four_in_the_product_range():
+def test_law_is_the_historical_multiples_of_four_reader_subset():
     """...and the law is the FORMAT's law, stated independently of the kernel."""
-    assert COMPILED_RUNGS == [k for k in range(4, 49) if 4 * k % 16 == 0]
+    assert COMPILED_RUNGS == [k for k in range(28, 49) if 4 * k % 16 == 0]
     # The ragged-split half of the law: n_sub=4 gives one uniform sub-table
     # width only on these rungs (csrc/cb_gemv.cu SubSplit: base + (i < extra)).
     for k in COMPILED_RUNGS:

@@ -1,11 +1,12 @@
 """One answer about the FP8-CB fused mid-M lane's RUNG surface (K1.2).
 
 ``linear.py`` (dense) and ``moe.py`` (routed) both decide whether a layer's
-``k_bits`` can take the decode-in-prologue fused path. Before K1.2 each carried
-its own literal ``(28, 32, 36, 40, 44, 48)``, so the kernel's compiled surface
-was transcribed twice and could drift from it — and from itself — silently.
-This module owns the decision, the way ``bf16_grouped_lane`` and
-``fp4v2_fused_midm_lane`` own theirs.
+``k_bits`` can take the decode-in-prologue fused path.  Its historical reader
+surface is ``(28, 32, 36, 40, 44, 48)``: K28/K32/K36 remain load-compatible
+optimized paths even though the canonical producer menu is now K40/K44/K48.
+Before K1.2 the literal was transcribed at both call sites and could drift from
+the compiled module.  This module owns the decision, the way
+``bf16_grouped_lane`` and ``fp4v2_fused_midm_lane`` own theirs.
 
 TWO-STEP, DELIBERATELY. The law (``codec.fp8_fused_rung_supported``, over
 ``codec.FP8_FUSED_KBITS``) is checked first because it is free: it needs no

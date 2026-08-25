@@ -18,6 +18,7 @@ include scripts/validate_fused_nvfp4_three_arm.py
 include scripts/validate_moe_persistent_b_ab.py
 include scripts/validate_moe_gemv_v2_ab.py
 include scripts/validate_moe_fp8_gemv_v2_ab.py
+include scripts/bench_trellis_r256.py
 
 # Developer tools that live inside the package directory but are NOT package
 # data: standalone main() binaries (gridbook/csrc/tools/) that nothing loads at

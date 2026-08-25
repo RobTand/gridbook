@@ -4,12 +4,12 @@ The physical qualification host is a GB10 (compute 12.1), so it cannot prove
 RTX 50 device correctness or speed.  This callable instead cross-compiles the
 four CUDA modules with explicit ``sm_120`` / ``sm_120a`` SASS, checks their
 complete binding contracts, verifies the emitted cubin targets, and loads the
-native vLLM FP8/CUTLASS ABI without invoking it.  Public NVFP4 format support
-is K1..K25; FP8-CB uses its K4..K48 step-four producer ladder.  The bindings
-intentionally retain NVFP4 K26..K32 templates as a direct research surface;
-compiling those templates does not make them reader-, producer-, lane-, or
-artifact-supported.  The preflight never queries a live device and never
-invokes an operator.
+native vLLM FP8/CUTLASS ABI without invoking it.  Public NVFP4 reader and
+producer support is K12..K24.  FP8-CB reads every integer K28..K48 and produces
+only K40/K44/K48.  The bindings intentionally retain wider NVFP4 K1..K32 and
+FP8 direct-kernel templates for research; compiling those templates does not
+make them reader-, producer-, lane-, or artifact-supported.  The preflight
+never queries a live device and never invokes an operator.
 
 A passing receipt has a permanent ``compile_only`` ceiling.  Run it in the
 pinned CUDA serving toolchain with an explicit, non-production build directory::
@@ -39,31 +39,33 @@ SM120_GENERIC_GENCODE = cuda_ext._gencode_flag(
     SM120_CAPABILITY, accelerated=False)
 SM120_ACCELERATED_GENCODE = cuda_ext._gencode_flag(
     SM120_CAPABILITY, accelerated=True)
-_NVFP4_PUBLIC_RUNGS = tuple(range(1, 26))
+_NVFP4_READER_RUNGS = tuple(range(12, 25))
+_NVFP4_PRODUCER_RUNGS = tuple(range(12, 25))
 _NVFP4_DIRECT_KERNEL_RUNGS = tuple(range(1, 33))
-_FP8_READER_RUNGS = (4, 8, 12, 16, 20, 24, *range(28, 49))
-_FP8_PRODUCER_RUNGS = tuple(range(4, 49, 4))
+_FP8_READER_RUNGS = tuple(range(28, 49))
+_FP8_PRODUCER_RUNGS = (40, 44, 48)
+_FP8_DIRECT_KERNEL_RUNGS = (4, 8, 12, 16, 20, 24, *range(28, 49))
 _SM120_CELL_LAWS = {
     "nvfp4_cb_dense_sm120_decode_cuda_gemv": (
         "NVFP4_CB_K", "dense", "decode", "backed",
-        _NVFP4_PUBLIC_RUNGS, (),
+        _NVFP4_PRODUCER_RUNGS, (),
     ),
     "nvfp4_cb_dense_sm120_batch_expand_bf16": (
         "NVFP4_CB_K", "dense", "batch", "fallback",
-        _NVFP4_PUBLIC_RUNGS, (),
+        _NVFP4_PRODUCER_RUNGS, (),
     ),
     "nvfp4_cb_routed_sm120_decode_cuda_gemv": (
         "NVFP4_CB_K", "routed_moe", "decode", "backed",
-        _NVFP4_PUBLIC_RUNGS, (),
+        _NVFP4_PRODUCER_RUNGS, (),
     ),
     "nvfp4_cb_routed_sm120_batch_persistent_b": (
         "NVFP4_CB_K", "routed_moe", "batch", "backed",
-        _NVFP4_PUBLIC_RUNGS,
+        _NVFP4_PRODUCER_RUNGS,
         ({"fact": "role_split", "op": "equals", "value": False},),
     ),
     "nvfp4_cb_routed_sm120_batch_expand_bf16": (
         "NVFP4_CB_K", "routed_moe", "batch", "fallback",
-        _NVFP4_PUBLIC_RUNGS, (),
+        _NVFP4_PRODUCER_RUNGS, (),
     ),
     "fp8_cb_dense_sm120_decode_cuda_gemv": (
         "FP8_CB_K", "dense", "decode", "backed",
@@ -104,8 +106,8 @@ def _nvfp4_format_row() -> dict[str, Any]:
         raise RuntimeError("runtime contract must contain one NVFP4_CB_K row")
     row = rows[0]
     expected = {
-        "rungs": _NVFP4_PUBLIC_RUNGS,
-        "producer_rungs": _NVFP4_PUBLIC_RUNGS,
+        "rungs": _NVFP4_READER_RUNGS,
+        "producer_rungs": _NVFP4_PRODUCER_RUNGS,
     }
     for field, law in expected.items():
         if tuple(row[field]) != law:
@@ -172,8 +174,8 @@ def _validate_sources(sources: dict[str, Path]) -> None:
         "main": (
             '"fp4-v2 GEMV: k_bits must be in [1,32]',
             '"fp4-v2 MoE GEMV: k_bits must be in [1,32]',
-            "fp8_reader_kbits_supported(k_bits)",
-            '"fp8 k_bits is outside the v10 accepted reader domain"',
+            "fp8_direct_kernel_kbits_supported(k_bits)",
+            '"fp8 k_bits is outside the direct-kernel domain"',
             'm.def("cb_gemv_fp4_v2"',
             'm.def("cb_moe_gemv_fp4_v2"',
             'm.def("cb_gemv_fp8"',
@@ -186,7 +188,7 @@ def _validate_sources(sources: dict[str, Path]) -> None:
             'm.def("cb_expand_v2_stages_dictionary"',
         ),
         "persistent_b": (
-            '"cb_moe_persistent_b: FP4-CB v2 supports k_bits in [1,32]',
+            '"cb_moe_persistent_b: FP4-CB v2 direct kernel supports k_bits "',
             "k<=32 makes each half-index <=16 bits",
             'm.def("cb_moe_persistent_b_prefill"',
         ),
@@ -228,7 +230,7 @@ def _sass_targets(shared_object: str | os.PathLike[str]) -> list[str]:
 def compile_nvfp4_sm120_preflight(
     build_directory: str | os.PathLike[str], *, verbose: bool = False,
 ) -> dict[str, Any]:
-    """Cross-compile both CB ladders plus research NVFP4 K26..K32, no launch."""
+    """Cross-compile public contracts plus wider direct research kernels."""
 
     _nvfp4_format_row()
     _fp8_format_row()
@@ -334,11 +336,12 @@ def compile_nvfp4_sm120_preflight(
         "capability": list(SM120_CAPABILITY),
         "qualification_ceiling": "compile_only",
         "device_executed": False,
-        "reader_rungs": list(_NVFP4_PUBLIC_RUNGS),
-        "producer_rungs": list(_NVFP4_PUBLIC_RUNGS),
+        "reader_rungs": list(_NVFP4_READER_RUNGS),
+        "producer_rungs": list(_NVFP4_PRODUCER_RUNGS),
         "direct_kernel_research_rungs": list(_NVFP4_DIRECT_KERNEL_RUNGS),
         "fp8_reader_rungs": list(_FP8_READER_RUNGS),
         "fp8_producer_rungs": list(_FP8_PRODUCER_RUNGS),
+        "fp8_direct_kernel_research_rungs": list(_FP8_DIRECT_KERNEL_RUNGS),
         "modules": modules,
         "vllm_native_fp8_abi": {
             "required_ops": list(_REQUIRED_OPS),
@@ -349,7 +352,8 @@ def compile_nvfp4_sm120_preflight(
             "device_performance",
             "torch_compile",
             "vllm_cudagraph",
-            "artifact_compatibility_k26_k32",
+            "artifact_compatibility_nvfp4_k1_k11_k25_k32",
+            "artifact_compatibility_fp8_k4_k24",
         ],
     }
 

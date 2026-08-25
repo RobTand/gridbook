@@ -71,9 +71,9 @@ still describe some of them as future work.
   remaining upside needs vLLM to capture drafter CUDA graphs — upstream work, see
   below.)
 - **Every accepted reader rung** across both families (NVFP4-CB K12–K24;
-  FP8-CB K4/K8/K12/K16/K20/K24 plus every K28–K48), with ceil-first uneven
-  index splits, encoder-anchored and frozen. v10's FP8 producer menu is the
-  K4..K48 step-4 subset.
+  FP8-CB every K28–K48), with ceil-first uneven index splits,
+  encoder-anchored and frozen. Producers use K12..K24 for NVFP4-CB and
+  K40/K44/K48 for FP8-CB.
 - **Packaging.** The CUDA sources ship inside the Python package, so a
   non-editable `pip install` produces a working CUDA path. Previously any
   non-editable install silently degraded to the Triton fallback in retired
@@ -242,19 +242,22 @@ Two things banked from an attempt that was reverted before it shipped:
   microbenchmark measures 15.8–18.4× at DSv4 shapes. Per-role FP8-CB split
   books remain outside the FP8 arm (bridge under auto, announced). See
   [KERNELS](docs/KERNELS.md#persistent-b-decode-in-mainloop-default-auto-prismaquant_cb_moe_persistent_b).
-- [x] **K1.2 — Cover the complete FP8-CB mid-M production rung surface.
-  RESOLVED (2026-08-02; producer law expanded 2026-08-24).** The v10 producer
-  menu is K4..K48 step 4, while the reader retains every legacy K28..K48.
-  Reader-only irregular rungs remain closed to this collective by a
+- [x] **K1.2 — Preserve the complete historical optimized FP8-CB mid-M
+  reader surface. RESOLVED (2026-08-02; pre-release expansion developed
+  2026-08-24 and retracted before 0.9.1).** The reader retains every historical
+  K28..K48 artifact, producers emit K40/K44/K48, and the collective preserves
+  K28/K32/K36/K40/K44/K48. Reader rungs outside those six remain closed by a
   **format + TMA law**, not by effort: `type_size = 4k` is the packed-B TMA box's
   contiguous extent and must be a 16-byte multiple (`k % 4 == 0`), and the fused
   mainloop's single `CbSubW = k/4` sub-table width is the format's real layout
   only on those same rungs — the format splits `k` over `n_sub = 4` raggedly
   (`csrc/cb_gemv.cu` `SubSplit`), so a uniform decode at k37 would be *wrong*,
-  not merely unaligned. Every canonical producer rung is now instantiated;
-  K4..K24 remain compile/source coverage only until their physical Blackwell
-  gates run. The published 27B artifact's legacy 8-rung K36–K47 ladder still
-  hits exactly the three multiples of 4 it contains.
+  not merely unaligned. Every canonical producer rung is instantiated, and
+  K28/K32/K36 stay as optimized reader-only compatibility paths. The briefly
+  developed K4..K24 fused/source expansion never gained physical qualification
+  or public artifact authority and is retracted. The published 27B artifact's
+  legacy 8-rung K36–K47 ladder still hits exactly the three multiples of 4 it
+  contains.
   **The concrete-route arm remains implemented:** the compiled set is queryable
   (`cb_fused_kbits()`), Python gates on the derived law and confirms against the
   module instead of carrying duplicated literals, every kernel switch is

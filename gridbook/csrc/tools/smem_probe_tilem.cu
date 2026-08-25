@@ -118,11 +118,12 @@ void row() {
          est <= cutlass::arch::sm120_smem_capacity_bytes ? "FIT" : "OVER");
 }
 
-// THE RUNG LAW (K1.2; v10 producer extension 2026-08-24).
+// THE HISTORICAL OPTIMIZED READER LAW (K1.2).
 //
-// v10 producers emit K4..K48 step 4. The accepted reader domain also retains
-// every integer K28..K48 for legacy artifacts. The fused mid-M collective can
-// serve only the multiples of 4, a property of the FORMAT and of TMA:
+// The accepted reader domain is every integer K28..K48, current producers emit
+// K40/K44/K48, and the fused mid-M collective preserves its six historical
+// multiple-of-four readers. That alignment restriction is a property of the
+// FORMAT and of TMA:
 //
 //   1. TMA BOX. Packed B is read by SM90_TMA_LOAD with a box of
 //      (TileN, CbTypeSize) bytes over the [N, n_sb*CbTypeSize] byte stream,
@@ -139,10 +140,9 @@ void row() {
 //      offsets. A uniform-width decode would therefore be WRONG, not merely
 //      unaligned, for every rung with k_bits % 4 != 0.
 //
-// Both laws bite at the same place, so the probe walks the canonical producer
-// rungs. Legacy irregular reader rungs cannot instantiate this collective and
-// use the generic decode/expand paths instead.
-constexpr int kKbLo = 4;
+// Both laws bite at the same place, so the probe walks the six historical
+// optimized readers. Other reader rungs use generic decode/expand instead.
+constexpr int kKbLo = 28;
 constexpr int kKbHi = 48;
 constexpr int kKbStep = 4;
 constexpr int kKbCount = (kKbHi - kKbLo) / kKbStep + 1;

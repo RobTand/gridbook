@@ -104,14 +104,14 @@ FP4-v1 dense layer is format-valid where applicable but has
 no complete owned every-M native operation. The public method rejects bias;
 model load rejects the unsupported FP4 families.
 
-**NVFP4 public K1..K25 and direct research through K32.** The inherited dense
-and grouped FP4-v2 GEMVs use global cached LUT gathers across the public rungs.
-For `M > 8`, `cb_expand_v2` produces the exact BF16 transient and stages the
-K1..K25 dictionary in the cc12x 101,376-byte opt-in block budget (K25 is
-98,304 bytes). Low-level bindings additionally admit K26..K32 runtime calls and use
-the same uint2 gathers from global/read-only cache with no dictionary
-shared-memory allocation. Those templates are direct kernel research, not
-public reader or artifact support. The packed stream and output rounding are
+**NVFP4 public K12..K24 and direct research K1..K32.** The inherited dense and
+grouped FP4-v2 GEMVs use global cached LUT gathers across the public rungs.
+For `M > 8`, `cb_expand_v2` produces the exact BF16 transient. Its direct
+research surface stages whole dictionaries through K25 in the cc12x
+101,376-byte opt-in block budget (K25 is 98,304 bytes); K26..K32 use the same
+uint2 gathers from global/read-only cache with no dictionary shared-memory
+allocation. Values outside K12..K24 are direct kernel research, not public
+reader or artifact support. The packed stream and output rounding are
 identical between the two expander residencies. Optimized fused lanes remain
 separately compiled and qualified subsets: their default/off selectors use the
 exact supported route, while an explicitly required but ineligible optimized
@@ -131,10 +131,10 @@ produced
 `abbe14915133a01a19c98d644f71c17be0166cac32b93642b9909098e41ae2d1`),
 with `device_executed: false` and exact `sm_120`/`sm_120a` cubins.
 
-NVFP4 reader, producer, chooser, and SM120 lane domains all stop at K25.
-K26..K32 retain direct generic kernels and compile preflight for research and
-future requalification, but are invalid public artifacts and have no lane
-attestation. FP8-CB independently uses its K4..K48 step-four producer ladder.
+NVFP4 reader, producer, chooser, and SM120 lane domains are exactly K12..K24.
+K1..K11 and K25..K32 retain direct generic kernels and compile preflight for
+research, but are invalid public artifacts and have no lane attestation.
+FP8-CB independently reads K28..K48 and produces K40/K44/K48.
 
 The 2026-08-24 GB10 synthetic shoulder probe used a 5120x5120 exact expansion,
 M1/N5120/K5120 dense decode, and E8/P8/N1024/K4096 grouped decode. Times are
@@ -165,8 +165,9 @@ source hashes, and immutable container identity are in
 `293760999abcd885f449f49e7971ccfc5d8e5c758c41237e58f12f18a813943d`);
 the exact benchmark program has SHA-256
 `cdc40bd243a55d6f2e1a143bb4813f36a8c04d2561f073e9f7b15fd4afff2104`.
-These synthetic measurements retain K26..K32 as direct kernel research only;
-public support and the canonical chooser end at K25. A future format-range
+These synthetic measurements retain values outside K12..K24 as direct kernel
+research only; public support and the canonical chooser are exactly K12..K24.
+The pre-release K1..K25 expansion was retracted. Any future format-range
 expansion requires a new production-shape A/B and an explicit contract change.
 
 ### Source block-FP8 W8A16 (`fp8_e4m3_ue8m0_block128`)
@@ -393,11 +394,11 @@ before kernel dispatch rather than inventing runtime scales.
 
 #### Rung coverage: what this lane can and cannot serve (K1.2)
 
-The v10 FP8-CB **producer** ladder is every multiple of four from K4 through
-K48. The accepted **reader** domain is broader:
-`{4,8,12,16,20,24} ∪ [28,48]`, retaining all older irregular K28..K48
-artifacts. The fused source surface instantiates the 12 producer rungs and no
-reader-only irregular rung. That is a property of the format and of TMA, not a
+The FP8-CB **reader** domain is every integer K28..K48, retaining historical
+artifacts; the **producer** menu is K40/K44/K48. The fused source preserves its
+historical optimized reader subset K28/K32/K36/K40/K44/K48, so K28/K32/K36
+remain compiled reader-only paths. Other reader rungs cannot use this
+collective. That restriction is a property of the format and of TMA, not a
 missing template instantiation:
 
 1. **TMA box.** Packed B is fetched with a box of `(TileN, type_size)` *bytes*,
@@ -410,25 +411,27 @@ missing template instantiation:
    the true widths are `(10, 9, 9, 9)` with non-uniform offsets. A uniform decode
    would be *wrong*, not merely unaligned.
 
-Both conditions coincide, so one law expresses them, and the 12 producer rungs
-are the complete set this collective admits. Supporting a legacy irregular rung would
+Both conditions coincide, so one law expresses them; within the historical
+reader domain they yield the six optimized rungs this collective admits.
+Supporting another reader rung would
 need a different packed-B TMA schedule (a box spanning 4 superblocks is the
 smallest 16-byte-aligned one for odd `k`, and its shared-memory cost is far over
 budget) *and* a ragged-width decode — i.e. a new kernel and a producer-layout
 conversation, not an instantiation.
 
-Consequence for dispatch, and what ROADMAP K1.2 actually delivered: its first
-arm ("instantiate every producer rung") is now represented in source, while
-the concrete loaded set remains *queryable*
+Consequence for dispatch, and what ROADMAP K1.2 actually delivered: every
+current producer rung and the three historical reader-only optimized rungs are
+represented in source, while the concrete loaded set remains *queryable*
 (`cb_fused_kbits()`), Python gates on the derived law
 (`codec.FP8_FUSED_KBITS`) and then confirms against the module rather than
 carrying a duplicated literal, every switch in the kernel is generated from one
 rung list, and an off-law rung is refused with a message naming the law and
 pointing at the routes that do serve it. Reader rungs off the law are not
 unsupported — they take the decode GEMV and expand + CUTLASS quality bridge,
-exactly as before. K4..K24 are newly instantiated source cells and remain
-device-unqualified until the Blackwell physical parity/performance gates run;
-the older high-rung evidence below must not be generalized to them.
+exactly as before. The briefly developed K4..K24 fused cells were part of the
+pre-release public-ladder candidate and are no longer instantiated. Their
+closed-form arithmetic remains below solely as research history; the older
+high-rung evidence must not be generalized to them.
 
 The source-pinned shared-memory closed form at TileN=64 / TileK=128 / Stages=2
 against the 101,376 B `sm_120` ceiling is:
@@ -444,22 +447,23 @@ against the 101,376 B `sm_120` ceiling is:
 | 256 | 103,424 | 105,472 | 107,520 | 109,568 |
 
 The K28..K48 values retain the 2026-08-02 measured provenance. K4..K24 are
-derived from the same allocation law and pinned as compile-time expectations;
-they are not presented as a completed GPU probe. TileM=128 is within the
-closed-form ceiling at every producer rung; **TileM=256 is within it through
-k32**, whose cell lands on *exactly* the ceiling (zero margin), so the selector will
-not choose it until it is launch-verified. TileM must be a multiple of the
+derived pre-release research values pinned as closed-form expectations; they
+are neither current instantiations nor a completed GPU probe. TileM=128 is
+within the closed-form ceiling at every compiled historical rung;
+**TileM=256 is within it through k32**, whose cell lands on *exactly* the
+ceiling (zero margin), so the selector will not choose it until it is
+launch-verified. TileM must be a multiple of the
 TiledMma's 128-row M, so 128/256/384 are the only candidates at all and 384 is
 infeasible everywhere (`smem_A` alone is 98,304 B). The kernel encodes this as a
 closed form that is `static_assert`ed cell-by-cell against all 24 expected
 numbers, so a storage-policy change becomes a compile error rather than a stale
 table once the translation unit is compiled.
 
-Build surface: the old six-rung matrix had 20 instantiations. The v10 source has
-12 × (dense unscaled, dense scaled, grouped-128) plus grouped-256 at K4..K32,
-for 44. The prior ~76 s GB10 cold-JIT measurement applies only to the old
-20-cell build; the expanded build time is unmeasured until the assigned
-Blackwell compile gate runs.
+Build surface: the historical six-rung matrix has 20 instantiations. The
+pre-release candidate briefly expanded that to 12 × (dense unscaled, dense
+scaled, grouped-128) plus grouped-256 at K4..K32, or 44, before the expansion
+was retracted. The ~76 s GB10 cold-JIT measurement applies to the current
+20-cell build; no measurement was recorded for the retracted 44-cell candidate.
 
 #### Measured status
 
@@ -1185,13 +1189,13 @@ too.
 |---|---|
 | Source block-FP8 W8A16, dense + DSV4 grouped `wo_a` | **Implemented in 0.8.5; target-only DSV4 candidate load/generation passed on the exact 0.8.6 runtime; final clean-commit replay pending.** Raw E4M3/UE8M0 stays resident; BF16 activations are unchanged; actual flattened decode-token `M<=8` uses native CUDA GEMV and larger M uses bounded native BF16 expansion plus the owned CUTLASS grouped bridge. Grouped BMM is admitted only at `(G=8,N=1024,K=4096)` and only at the measured shard degrees 1, 2 and 4; dense geometry is gated separately and shards under the alignment law. Direct MXFP8 g32 remains the separate opt-in W8A8 lane. DSpark is experimental and is not the release default; do not claim its served parity, graph, or 128k performance until the separate gates in RELEASING are recorded |
 | FP8-CB decode (dense) | **Shipped**, at/above native parity |
-| FP4-CB v2 decode (dense) | **Public format and SM120 lane surface K1..K25**: inherited CUDA GEMV plus exact transient expansion with the full dictionary in shared memory. Direct bindings retain global-cached K26..K32 calls for research only; those values are not supported artifacts. Historical speed/quality measurements cover the old K12..K24 cells only and are not generalized to new rungs |
+| FP4-CB v2 decode (dense) | **Public format and SM120 lane surface K12..K24**: inherited CUDA GEMV plus exact transient expansion with the full dictionary in shared memory. Direct bindings retain K1..K32 calls for research only; values outside K12..K24 are not supported artifacts |
 | MoE grouped decode GEMV | **Shipped**: fp8 66–95% of peak; fp4-v2 w2 schedule redesigned (+50%, 37–47% of peak; reassociation served-gated with an env-switched legacy path). A rowpack variant measured NEGATIVE and stays opt-in-off as a documented result |
 | MoE grouped decode GEMV, smem-resident dictionary | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_GEMV`; `inherited` is the kill switch and never probes or builds): v2 engages only where the compiled occupancy predicate says it wins, and an unavailable extension degrades loudly to inherited. On the K=2048/4096 shapes (8/16 superblocks) the compile-time virtual-warp specialization is bit-exact to the inherited default for every rung — with all `PRISMAQUANT_CB_W2_*` overrides absent — and measured 1.8175–1.9977x in the final-source captured v1 direct-op benchmark; the same-process DSV4 quality gate produced zero full-vocabulary KL/NLL/PPL/target-logprob delta over 240 positions. Other widths retain rowpack order and may reassociate against inherited — on those the predicate is the only gate and no served A/B exists. The compiled predicate still routes k24 at K≥2048 to inherited. Historical Laguna validation measured +5.97% |
 | MoE grouped decode GEMV, routed FP8 whole-row sibling | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_FP8_GEMV_V2`) for exactly K28/4/112 at K=2048/4096 — off-cell stacks keep the inherited kernel with the reason logged; `1`/`require` is the strict A/B-arm spelling under which unsupported uniform FP8 cells and per-expert mixed FP8-CB groups fail closed. The final-source operator gate passed 17/17; the exact-artifact eager same-engine gate produced zero full-vocabulary and router-route delta over 240 positions; the final-binary served rerun (B-v3, 2026-08-14, FULL_DECODE_ONLY graphs, route census, quiesced host) measured **+8.62% decode** with acceptance parity, attributing the earlier held signal's integrity failure to host interference. Soak and high-concurrency protocols have not run as named gates |
 | Transient-expand prefill (dense) | **Shipped**; ~1.44× native at large M (traffic-bound) |
-| FP8-CB fused decode-in-prologue prefill | The established K28/K32/K36/K40/K44/K48 cells are **bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128** on the sm12x lane; native transient expansion + CUTLASS serves ineligible and large-M shapes. Selection is load-time auto on cc 12.0/12.1 only: SM89 never invokes the Blackwell fused loader and uses native GEMV at M≤8 / native expand+W8A8 CUTLASS above it; explicit fused-on on SM89 fails the load. v10 expands the **source/compiled rung law to K4..K48 step 4**, the complete producer set admitted by the packed-B TMA box (`type_size = 4k` must be 16-byte aligned) and uniform `CbSubW = k/4` decode. K4..K24 are compile/source coverage only and remain device-unqualified; no old high-rung result is evidence for them. Legacy irregular K28..K48 reader rungs use generic GEMV + expand/CUTLASS. The loaded set is reported by `cb_fused_kbits()` rather than duplicated in dispatch |
-| FP4-CB v2 fused mid-M prefill (dense) | **Opt-in K12..K24 optimized subset** (`PRISMAQUANT_CB_FP4_FUSED_MIDM`), contract-preserving. Its old K12..K24 evidence remains unchanged; public K1..K11/K25 use exact expand + bridge. Unsupported K26..K32 exist only in direct generic-kernel research and inherit no fused-lane speed claim |
+| FP8-CB fused decode-in-prologue prefill | The historical K28/K32/K36/K40/K44/K48 readers are **bit-exact; dispatch-eligible at M=9–128 and measured wins at M=32/64/128** on the sm12x lane; K28/K32/K36 remain optimized compatibility paths even though producers now emit only K40/K44/K48. Native transient expansion + CUTLASS serves other reader and large-M shapes. Selection is load-time auto on cc 12.0/12.1 only: SM89 never invokes the Blackwell fused loader and uses native GEMV at M≤8 / native expand+W8A8 CUTLASS above it; explicit fused-on on SM89 fails the load. The pre-release K4..K24 fused expansion was retracted and never became artifact authority. The loaded set is reported by `cb_fused_kbits()` rather than duplicated in dispatch |
+| FP4-CB v2 fused mid-M prefill (dense) | **Opt-in K12..K24 optimized subset** (`PRISMAQUANT_CB_FP4_FUSED_MIDM`), contract-preserving. Its K12..K24 evidence remains unchanged. K1..K11/K25..K32 exist only in direct generic-kernel research and inherit no fused-lane or artifact claim |
 | NVFP4-CB fused native-FP4 prefill (dense and MoE) | **Explicit opt-in**: shared `static_lsq` activation policy, optimized v2 scale decode, and occupancy-aware TileM routing. Short exact K24 quality/performance passed; long-context evidence is mixed; raw native parity, >=4B, task, MoE routed-quality, and p95 served gates remain open |
 | MoE persistent-B decode-in-mainloop prefill (FP4-CB v2 + stock FP8-CB) | **Default `auto` since 0.8.9** (`PRISMAQUANT_CB_MOE_PERSISTENT_B`; `1`/`require` keeps the fail-load A/B-integrity semantics, `0`/`off` the kill switch), ROADMAP K1.1 both payload families. Decodes each expert weight tile once and streams that expert's exact routed segment through it, eliminating the `[E,N,K]` BF16 transient and all work for unrouted experts. Weight decode bit-identical to the expanders (`torch.equal`); reduction-order-class output difference vs the bridge. Whole-routed-operator microbenchmark wins every cell (FP4 1.05–3.36×; FP8 15.8–18.4× at DSv4 shapes); served: FP4 same-session A/B kl_mean −0.051% / PPL −0.30%, plus the 0.8.9 default-state served KL/PPL leg on the shipped clean 87 GB body. Per-role FP8-CB split books are outside the FP8 arm and keep the bridge under auto (announced). **Staging vectorization proposed and REJECTED (2026-08-21)**: u32-interior copies with funnel-shift edges (odd `4k+9` phases) + whole-slot zeroing were byte-neutral per the staging theorem but measured +7…+11% whole-operator slower at the DSv4-dominant k=12 (`__noinline__` spelling worse still, +14%); the byte-granular loop remains |
 | Persistent-N large-M dense prefill | **RETIRED FROM SERVING; MEASURED NEGATIVE**: parity-green, but 2–5.7× *slower* than expand-then-GEMM at 27B shapes — the CUDA expander had already cut the dense expand tax to ~10%, removing the opportunity. The serving selector, custom op, package loader, and switch are deleted. The `.cu` remains accessible only to the explicit direct research test. The equivalent idea for **MoE** is still open and is the roadmap's next kernel |

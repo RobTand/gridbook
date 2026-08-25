@@ -1,8 +1,9 @@
-"""CPU/static guards for the v10 FP8-CB K4..K48 producer surface.
+"""CPU/static guards for the retracted low-rung FP8-CB candidate surface.
 
 Nothing in this module imports or builds a CUDA extension.  It pins the source
-laws that a later cross-compile and physical serve must exercise, including the
-K4 last-codeword shared-memory boundary that motivated the guarded word load.
+distinction between public artifacts and intentionally wider direct-kernel
+research, including the K4 last-codeword shared-memory boundary that motivated
+the guarded word load.
 """
 from __future__ import annotations
 
@@ -32,8 +33,11 @@ def _source_root(test_file: Path | None = None) -> Path:
 
 
 _ROOT = _source_root()
-_PRODUCER_RUNGS = tuple(range(4, 49, 4))
-_READER_RUNGS = (4, 8, 12, 16, 20, 24, *range(28, 49))
+_PRODUCER_RUNGS = (40, 44, 48)
+_READER_RUNGS = tuple(range(28, 49))
+_FUSED_READER_RUNGS = (28, 32, 36, 40, 44, 48)
+_DIRECT_KERNEL_RUNGS = (4, 8, 12, 16, 20, 24, *range(28, 49))
+_RETRACTED_LOW_RUNGS = (4, 8, 12, 16, 20, 24)
 
 
 def _source(relative: str) -> str:
@@ -58,14 +62,17 @@ def test_source_root_honors_installed_wheel_locator(
     assert _source_root(staged_test) == source_root.resolve()
 
 
-def test_contract_codec_and_fused_translation_unit_share_one_rung_law():
+def test_contract_and_fused_module_keep_independent_historical_surfaces():
     fp8 = next(
         row for row in load_runtime_contract()["formats"]
         if row["family"] == "FP8_CB_K"
     )
     assert tuple(fp8["rungs"]) == _READER_RUNGS
     assert tuple(fp8["producer_rungs"]) == _PRODUCER_RUNGS
-    assert codec.FP8_FUSED_KBITS == _PRODUCER_RUNGS
+    assert codec.FP8_FUSED_KBITS == _FUSED_READER_RUNGS
+    assert set(_FUSED_READER_RUNGS) <= set(_READER_RUNGS)
+    assert set((28, 32, 36)).isdisjoint(_PRODUCER_RUNGS)
+    assert set(_RETRACTED_LOW_RUNGS).isdisjoint(_READER_RUNGS)
 
     cuda = _source("gridbook/csrc/cb_fused_gemm.cu")
     macro = re.search(
@@ -74,20 +81,21 @@ def test_contract_codec_and_fused_translation_unit_share_one_rung_law():
     assert macro is not None
     compiled = tuple(int(value) for value in re.findall(r"X\((\d+)\)",
                                                         macro.group(1)))
-    assert compiled == _PRODUCER_RUNGS
-    assert "constexpr int64_t kFusedKbLo = 4;" in cuda
+    assert compiled == _FUSED_READER_RUNGS
+    assert "constexpr int64_t kFusedKbLo = 28;" in cuda
     assert "constexpr int64_t kFusedKbHi = 48;" in cuda
     assert "constexpr int64_t kFusedKbStep = 4;" in cuda
 
 
-def test_generic_fp8_word_loader_guards_every_shared_tail_read():
+def test_generic_fp8_direct_research_loader_guards_every_shared_tail_read():
     cuda = _source("gridbook/csrc/cb_gemv.cu")
-    reader_law = cuda[cuda.index("inline bool fp8_reader_kbits_supported("):
-                      cuda.index("\n}\n", cuda.index(
-                          "inline bool fp8_reader_kbits_supported(")) + 2]
-    assert "k_bits >= 4 && k_bits <= 24 && k_bits % 4 == 0" in reader_law
-    assert "k_bits >= 28 && k_bits <= 48" in reader_law
-    assert cuda.count("fp8_reader_kbits_supported(k_bits)") == 3
+    marker = "inline bool fp8_direct_kernel_kbits_supported("
+    direct_law = cuda[cuda.index(marker):
+                      cuda.index("\n}\n", cuda.index(marker)) + 2]
+    assert "k_bits >= 4 && k_bits <= 24 && k_bits % 4 == 0" in direct_law
+    assert "k_bits >= 28 && k_bits <= 48" in direct_law
+    assert cuda.count("fp8_direct_kernel_kbits_supported(k_bits)") == 3
+    assert "DIRECT KERNEL RESEARCH surface only" in cuda
 
     begin = cuda.index("DEVINL void fp8_load_codeword_words(")
     end = cuda.index("\n}\n", begin) + 2
@@ -99,7 +107,7 @@ def test_generic_fp8_word_loader_guards_every_shared_tail_read():
     # and expander call sites.  A new inline FP8 read must use this helper too.
     assert cuda.count("fp8_load_codeword_words(") == 6
 
-    for k_bits in _READER_RUNGS:
+    for k_bits in _DIRECT_KERNEL_RUNGS:
         body_words = k_bits  # 4*k bytes / sizeof(uint32_t)
         for vector in range(32):
             bitpos = vector * k_bits
@@ -128,7 +136,7 @@ def test_blackwell_fused_decoder_guards_tail_and_reserves_aligned_lut():
     header = _source(
         "gridbook/csrc/cutlass_fork/sm120_cb_fused_mma.hpp"
     )
-    assert "KBits >= 4 && KBits <= 48 && KBits % 4 == 0" in header
+    assert "KBits >= 28 && KBits <= 48 && KBits % 4 == 0" in header
     assert "CbLutLogicalBytes" in header
     assert "(CbLutLogicalBytes + 1023) / 1024" in header
     assert "(rem + CbKBits > 32) ? row32[widx + 1] : 0u" in header
@@ -141,7 +149,7 @@ def test_blackwell_fused_decoder_guards_tail_and_reserves_aligned_lut():
             r"PQ_ASSERT_SMEM\((\d+),\s*(\d+),\s*(\d+)\)", cuda
         )
     }
-    for k_bits in _PRODUCER_RUNGS:
+    for k_bits in _FUSED_READER_RUNGS:
         sub_bytes = (1 << (k_bits // 4)) * 2
         resident_128 = 4 if 4 * sub_bytes <= 16384 else 2
         logical_128 = resident_128 * sub_bytes

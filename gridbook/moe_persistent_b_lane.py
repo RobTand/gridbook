@@ -174,11 +174,12 @@ def supports(*, is_fp4: bool, is_v2: bool, n_sub: int, k_bits: int,
              type_size: int, hidden: int, inter: int) -> str | None:
     """``None`` when the lane can serve this layer, else the reason it cannot.
 
-    Applies the public K1..K25 format ceiling, then mirrors
+    Applies the public K12..K24 reader contract, then mirrors
     ``cb_moe_persistent_b_prefill``'s shape checks so an unsupported layer is
     diagnosed at model load with a readable sentence instead of aborting a
-    request.  The CUDA binding retains K26..K32 only for direct research tests;
-    low-level template coverage is not production-lane eligibility.  Every
+    request.  The CUDA binding retains K1..K32 for direct research tests;
+    low-level template coverage outside K12..K24 is not artifact or
+    production-lane eligibility.  Every
     clause is a shape/format fact known at load; nothing here reads routing or
     the device.
     """
@@ -188,8 +189,8 @@ def supports(*, is_fp4: bool, is_v2: bool, n_sub: int, k_bits: int,
         return "format is not two-tier layout v2"
     if n_sub != 2:
         return f"n_sub={n_sub} is not the product-mode 2 the decode assumes"
-    if not 1 <= k_bits <= 25:
-        return f"k={k_bits} is outside the supported FP4-CB v2 range [1, 25]"
+    if not 12 <= k_bits <= 24:
+        return f"k={k_bits} is outside the supported FP4-CB v2 range [12, 24]"
     if type_size != 4 * k_bits + 9:
         return "serialized row type_size is not FP4-CB layout v2 (4*k+9)"
     # Superblock alignment (256) is the binding constraint and it implies the
@@ -207,8 +208,11 @@ def supports_fp8(*, is_fp4: bool, n_sub: int, k_bits: int, type_size: int,
                  hidden: int, inter: int, role_split: bool) -> str | None:
     """``None`` when the FP8-CB arm can serve this layer, else the reason.
 
-    Mirrors ``cb_moe_persistent_b_prefill_fp8``'s TORCH_CHECKs, plus the one
-    layout fact the kernel cannot see: a per-role w13 split has no single
+    Applies the historical FP8 reader contract K28..K48 before mirroring
+    ``cb_moe_persistent_b_prefill_fp8``'s TORCH_CHECKs.  The C++ binding's
+    wider K1..K48 direct surface remains available for kernel research but is
+    not artifact authority.  The additional layout fact the kernel cannot see
+    is that a per-role w13 split has no single
     stacked qweight/book pair, so the lane refuses it BY NAME at model load —
     with the flag set, a role-split FP8-CB layer fails the load rather than
     silently keeping the bridge (Gridbook does not substitute a route behind
@@ -222,8 +226,8 @@ def supports_fp8(*, is_fp4: bool, n_sub: int, k_bits: int, type_size: int,
                 "splits gate/up into two books")
     if n_sub != 4:
         return f"n_sub={n_sub} is not the product-mode 4 the decode assumes"
-    if not 1 <= k_bits <= 48:
-        return f"k={k_bits} is outside the FP8-CB range [1, 48]"
+    if not 28 <= k_bits <= 48:
+        return f"k={k_bits} is outside the FP8-CB reader range [28, 48]"
     if type_size != 4 * k_bits:
         return "serialized row type_size is not FP8-CB layout (4*k)"
     if hidden % 256 or inter % 256:

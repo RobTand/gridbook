@@ -110,6 +110,7 @@ REQUIRED = [
     f"{PKG}/csrc/cb_fused_fp4_gemm.cu",
     f"{PKG}/csrc/cb_fused_fp4v2_gemm.cu",
     f"{PKG}/csrc/cb_moe_persistent_b.cu",
+    f"{PKG}/csrc/trellis_r256.cu",
     f"{PKG}/csrc/cb_grouped_common.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_mma_tma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_fused_mma.hpp",
@@ -165,6 +166,7 @@ SDIST_REQUIRED_UTILITIES = [
     "scripts/validate_moe_persistent_b_ab.py",
     "scripts/validate_moe_gemv_v2_ab.py",
     "scripts/validate_moe_fp8_gemv_v2_ab.py",
+    "scripts/bench_trellis_r256.py",
 ]
 
 _errors: list[str] = []

@@ -48,6 +48,7 @@ REQUIRED_SOURCES = [
     "csrc/cb_fused_fp4_gemm.cu",
     "csrc/cb_fused_fp4v2_gemm.cu",
     "csrc/cb_moe_persistent_b.cu",
+    "csrc/trellis_r256.cu",
     # Shared by all four fused/grouped loaders (EVT trees, AssertSmemFits, the
     # grouped host validation). Missing from the wheel until 2026-08-02.
     "csrc/cb_grouped_common.hpp",
