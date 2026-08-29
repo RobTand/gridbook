@@ -73,10 +73,17 @@ def _raw_inputs(family, q256=512, columns=256, *, rows=4):
     return cuda_ext.require_trellis_r256_ext("hostile raw-ABI test"), wire, tensors
 
 
-def _raw_block_plan(wire, values):
-    """Compact plan for the v2 ABI, honouring a hostile ``schedule`` swap."""
+def _raw_block_plan(wire):
+    """The clean compact plan for the v2 ABI, derived from the wire."""
     from gridbook.trellis_ops import wire_cuda_block_plan
     return wire_cuda_block_plan(wire)
+
+
+def _first_coded(wire):
+    """Index of the first rate-limited (u-bit carrying) column of the wire."""
+    terminal = trellis.native_bits(wire.family)
+    return next(i for i, rate in enumerate(wire.expanded_schedule)
+                if rate < terminal)
 
 
 def _raw_decode(extension, wire, tensors, **replacements):
@@ -94,11 +101,14 @@ def _raw_expand(extension, wire, tensors, **replacements):
     names = ("payload", "schedule", "column_offsets", "previous_u_offsets",
              "alphabet_lut", "scales", "family")
     values = dict(zip(names, tensors))
+    rate, offset, ordinal, meta = _raw_block_plan(wire)
+    values.update(col_rate=rate, col_bit_offset=offset, col_ordinal=ordinal,
+                  block_meta=meta)
     values.update(replacements)
-    rate, offset, ordinal, meta = _raw_block_plan(wire, values)
     return extension.trellis_r256_expand(
         values["payload"], values["schedule"], values["column_offsets"],
-        values["previous_u_offsets"], rate, offset, ordinal, meta,
+        values["previous_u_offsets"], values["col_rate"],
+        values["col_bit_offset"], values["col_ordinal"], values["block_meta"],
         values["alphabet_lut"], values["scales"],
         wire.rows, wire.columns, wire.row_stride_bytes, values["family"])
 
@@ -279,6 +289,57 @@ def test_raw_cuda_abi_rejects_noncanonical_and_oob_previous_offsets():
     previous[coded_column, 0] = wire.row_stride_bytes * 8
     with pytest.raises(RuntimeError, match="previous-u offset plan"):
         _raw_decode(extension, wire, tensors, previous_u_offsets=previous)
+
+
+# The compact plan is the v2 decoder's only bit-addressing authority, so it
+# gets the same hostile treatment as the scan-free tables it replaces: every
+# table is corrupted through the raw ABI and must be refused by
+# `validate_block_plan_kernel` before a decode thread reaches a bit address.
+# A plan that merely *disagrees* with the proven tables is already malformed --
+# these cases keep the payload legal and mutate only the derived workspace.
+@pytest.mark.parametrize("table,mutate,match", [
+    ("col_rate",
+     lambda plan, wire: plan.index_put_(
+         (torch.tensor([0], device=plan.device),),
+         torch.tensor([1], dtype=plan.dtype, device=plan.device)),
+     "schedule rate is outside"),
+    ("col_bit_offset",
+     lambda plan, wire: plan.index_put_(
+         (torch.tensor([1], device=plan.device),),
+         torch.tensor([0], dtype=plan.dtype, device=plan.device)),
+     "column offset is noncanonical"),
+    ("col_ordinal",
+     lambda plan, wire: plan.index_put_(
+         (torch.tensor([_first_coded(wire)], device=plan.device),),
+         torch.tensor([7], dtype=plan.dtype, device=plan.device)),
+     "previous-u offset plan is noncanonical"),
+])
+def test_raw_cuda_abi_rejects_hostile_compact_plan_tables(
+        table, mutate, match):
+    extension, wire, tensors = _raw_inputs(trellis.TCQ_E2M1_R256)
+    names = ("col_rate", "col_bit_offset", "col_ordinal", "block_meta")
+    plan = dict(zip(names, _raw_block_plan(wire)))
+    malformed = plan[table].clone()
+    mutate(malformed, wire)
+    assert not torch.equal(malformed, plan[table]), "mutation was a no-op"
+    with pytest.raises(RuntimeError, match=match):
+        _raw_expand(extension, wire, tensors, **{table: malformed})
+
+
+@pytest.mark.parametrize("field,value,match", [
+    (0, 8, "schedule rate is outside"),            # start_column
+    (1, 128, "schedule rate is outside"),          # columns
+    (2, 4, "previous-u offset plan is noncanonical"),   # coded_count
+    (3, 8, "column offset is noncanonical"),       # bit_offset
+    (4, 64, "column offset is noncanonical"),      # bit_length
+])
+def test_raw_cuda_abi_rejects_hostile_block_meta_fields(field, value, match):
+    extension, wire, tensors = _raw_inputs(trellis.TCQ_E2M1_R256)
+    meta = _raw_block_plan(wire)[3].clone()
+    assert int(meta[0, field]) != value, "mutation was a no-op"
+    meta[0, field] = value
+    with pytest.raises(RuntimeError, match=match):
+        _raw_expand(extension, wire, tensors, block_meta=meta)
 
 
 @pytest.mark.parametrize("name,index,reshape,match", [
