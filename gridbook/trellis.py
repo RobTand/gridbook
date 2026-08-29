@@ -761,6 +761,54 @@ def derived_decode_plan(wire: TrellisWire) -> tuple[list[int], list[list[int]]]:
     return column_offsets, previous_offsets
 
 
+def derived_block_plan(wire: TrellisWire):
+    """Return the compact per-column / per-block plan the v2 decoder stages.
+
+    The scan-free plan of :func:`derived_decode_plan` hands the kernel a
+    ``columns x MEMORY_ORDER`` table that every row re-reads.  The v2 decoder
+    instead stages one superblock's plan into shared memory and reconstructs
+    the predecessor ordinals on the fly, so it needs only:
+
+    ``col_rate``         schedule rate of each column
+    ``col_bit_offset``   body bit offset of each column within the row
+    ``col_ordinal``      index within the block's coded subsequence, ``-1``
+                         for a bypass (terminal-rate) column
+    ``block_meta``       ``(start_column, columns, coded_count, bit_offset,
+                         bit_length)`` per physical superblock
+
+    Like :func:`derived_decode_plan` this is derived workspace rebuilt from the
+    wire, never artifact side information.
+    """
+    schedule = wire.expanded_schedule
+    terminal = native_bits(wire.family)
+    col_rate = [0] * wire.columns
+    col_bit_offset = [0] * wire.columns
+    col_ordinal = [-1] * wire.columns
+    block_meta = []
+    for block, start in enumerate(range(0, wire.columns, SUPERBLOCK)):
+        stop = min(start + SUPERBLOCK, wire.columns)
+        bit_offset = wire.block_offsets_bits[block]
+        cursor = bit_offset
+        ordinal = 0
+        for column in range(start, stop):
+            rate = schedule[column]
+            col_rate[column] = rate
+            col_bit_offset[column] = cursor
+            if rate < terminal:
+                col_ordinal[column] = ordinal
+                ordinal += 1
+            cursor += rate
+        block_meta.append(
+            (start, stop - start, ordinal, bit_offset, cursor - bit_offset))
+    if any(entry[2] < MEMORY_ORDER for entry in block_meta):
+        raise ValueError(
+            f"every physical block must carry at least {MEMORY_ORDER} coded "
+            "positions; this wire violates the tail-biting rule")
+    if col_bit_offset[-1] + col_rate[-1] != wire.row_body_bits:
+        raise ValueError("derived block plan does not close on row_body_bits")
+    return col_rate, col_bit_offset, col_ordinal, block_meta
+
+
 def alphabet_lut(wire: TrellisWire) -> list[list[int]]:
     """Dense rate x 256 native-code table used by the CUDA ABI."""
     maximum = max_trellis_rate(wire.family)

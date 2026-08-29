@@ -2208,7 +2208,7 @@ _PRELOAD_FAMILIES.append(("moe_persistent_b", "get_moe_persistent_b_ext"))
 _trellis_r256 = None
 _trellis_r256_tried = False
 _trellis_r256_lock = threading.Lock()
-_TRELLIS_R256_ABI_SCHEMA = 2
+_TRELLIS_R256_ABI_SCHEMA = 3
 _TRELLIS_R256_WIRE_SCHEMA = "gridbook.trellis.wire.v1"
 _TRELLIS_R256_SYMBOLS = (
     "trellis_r256_validate_wire",

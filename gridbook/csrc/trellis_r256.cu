@@ -348,58 +348,6 @@ __global__ void decode_codes_kernel(
       *row_body_bits, error);
 }
 
-__global__ void decode_native_packed_prevalidated_kernel(
-    uint8_t const* payload, uint8_t const* schedule,
-    int64_t const* column_offsets, int64_t const* previous_u_offsets,
-    uint8_t const* alphabet_lut, uint8_t* output, int rows, int columns,
-    int output_columns, int row_stride, int family, int terminal_rate,
-    int64_t row_body_bits) {
-  int64_t const linear = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  int64_t const count = int64_t(rows) * output_columns;
-  if (linear >= count) return;
-  int const row = int(linear / output_columns);
-  int const output_column = int(linear - int64_t(row) * output_columns);
-  uint8_t const* packed_row = payload + int64_t(row) * row_stride;
-  if (family == kFamilyE2M1) {
-    int const first = output_column * 2;
-    uint8_t const low = decode_code_prevalidated(
-        packed_row, schedule, column_offsets, previous_u_offsets,
-        alphabet_lut, first, family, terminal_rate, row_body_bits);
-    uint8_t high = 0;
-    if (first + 1 < columns) {
-      high = decode_code_prevalidated(
-          packed_row, schedule, column_offsets, previous_u_offsets,
-          alphabet_lut, first + 1, family, terminal_rate, row_body_bits);
-    }
-    output[linear] = uint8_t((low & 0x0fu) | ((high & 0x0fu) << 4));
-    return;
-  }
-  output[linear] = decode_code_prevalidated(
-      packed_row, schedule, column_offsets, previous_u_offsets,
-      alphabet_lut, output_column, family, terminal_rate, row_body_bits);
-}
-
-__global__ void expand_kernel(
-    uint8_t const* payload, uint8_t const* schedule,
-    int64_t const* column_offsets, int64_t const* previous_u_offsets,
-    uint8_t const* alphabet_lut, float const* scales, float* output,
-    int rows, int columns, int row_stride, int family, int scale_stride,
-    int64_t const* row_body_bits, int* error) {
-  int64_t const linear = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  int64_t const count = int64_t(rows) * columns;
-  if (linear >= count) return;
-  if (*error != kDecodeOk) return;
-  int const row = int(linear / columns);
-  int const column = int(linear - int64_t(row) * columns);
-  uint8_t const code = decode_code(
-      payload + int64_t(row) * row_stride, schedule, column_offsets,
-      previous_u_offsets, alphabet_lut, column,
-      family, family == kFamilyE2M1 ? 4 : 8, *row_body_bits, error);
-  if (*error != kDecodeOk) return;
-  output[linear] = decoded_value(
-      code, scales, family, row, column, scale_stride);
-}
-
 __global__ void dequant_gemv_kernel(
     float const* x, uint8_t const* payload, uint8_t const* schedule,
     int64_t const* column_offsets, int64_t const* previous_u_offsets,
@@ -427,6 +375,433 @@ __global__ void dequant_gemv_kernel(
   output[linear] = total;
 }
 
+// ---------------------------------------------------------------------------
+// v2 warp-resident decode core.
+//
+// The scan-free kernels above give one THREAD one weight and re-read the
+// columns x MEMORY_ORDER predecessor table for every row.  v2 makes the decode
+// unit a WARP instead: one warp owns one (row, superblock), 32 lanes x 8
+// columns = 256 columns, the block's u-bit mask is built with ballots (warp
+// synchronous, no CTA barrier in the inner loop), and the tensor-shared plan
+// and alphabet LUT are staged into shared memory once per CTA and amortised
+// over kWarps x kRowsPerWarp rows.
+//
+// It consumes the compact plan of gridbook.trellis.derived_block_plan rather
+// than the (column_offsets, previous_u_offsets) tables; that plan is validated
+// on device against the already-validated scan-free tables by
+// validate_block_plan_kernel before any decode thread runs, so a malformed
+// raw-ABI plan still fails closed.
+//
+// The decode core is one device function with three epilogues (native code
+// tile, scaled dense transient, fused GEMV) so the three paths cannot drift
+// numerically.  Output is bit-identical to the scan-free decoder; that is a
+// gate, not an aspiration.
+
+constexpr unsigned kFull = 0xffffffffu;
+constexpr int kWarp = 32;
+constexpr int kWarps = 8;
+constexpr int kThreads = kWarp * kWarps;
+constexpr int kColsPerLane = kSuperblock / kWarp;   // 8
+constexpr int kRowsPerWarp = 8;
+constexpr int kRowsPerCta = kWarps * kRowsPerWarp;  // 64
+// 256 columns * 8 bits max = 2048 bits = 64 words, + 1 funnel-shift guard.
+constexpr int kBodyWords = 65;
+constexpr int kMaskWords = kSuperblock / 32 + 1;    // 9
+
+__device__ __forceinline__ unsigned bits_from(
+    unsigned const* words, int bit, int width) {
+  if (width <= 0) return 0u;
+  int const word = bit >> 5;
+  unsigned const value = __funnelshift_r(words[word], words[word + 1], bit & 31);
+  return value & ((1u << width) - 1u);
+}
+
+__device__ __forceinline__ unsigned history8(
+    unsigned const* mask, int at, int count) {
+  if (at >= kMemory) {
+    int const start = at - kMemory;
+    return __funnelshift_r(mask[start >> 5], mask[(start >> 5) + 1],
+                           start & 31) & 0xffu;
+  }
+  unsigned out = 0u;
+#pragma unroll
+  for (int j = 0; j < kMemory; ++j) {
+    int index = at - kMemory + j;
+    if (index < 0) index += count;
+    out |= ((mask[index >> 5] >> (index & 31)) & 1u) << j;
+  }
+  return out;
+}
+
+struct BlockPlan {
+  int start_column;
+  int columns;
+  int coded_count;
+  int bit_offset;
+  int bit_length;
+};
+
+__device__ __forceinline__ BlockPlan load_block_plan(
+    int32_t const* __restrict__ block_meta, int block) {
+  BlockPlan plan;
+  plan.start_column = block_meta[block * 5 + 0];
+  plan.columns = block_meta[block * 5 + 1];
+  plan.coded_count = block_meta[block * 5 + 2];
+  plan.bit_offset = block_meta[block * 5 + 3];
+  plan.bit_length = block_meta[block * 5 + 4];
+  return plan;
+}
+
+// Stage one row's superblock body into a per-warp buffer, bit-aligned to the
+// block's own start so relative column offsets need no further shifting.
+__device__ __forceinline__ void stage_body(
+    uint8_t const* __restrict__ payload_row, int row_stride,
+    BlockPlan const& plan, unsigned* body, int lane) {
+  int const row_words = row_stride >> 2;      // stride is 16-byte aligned
+  int const word_base = plan.bit_offset >> 5;
+  int const bit_shift = plan.bit_offset & 31;
+  int const need = ((plan.bit_length + bit_shift + 31) >> 5) + 1;
+  unsigned const* row_words_ptr =
+      reinterpret_cast<unsigned const*>(payload_row);
+  for (int w = lane; w < need && w < kBodyWords; w += kWarp) {
+    int const index = word_base + w;
+    unsigned const lo = (index < row_words) ? row_words_ptr[index] : 0u;
+    unsigned const hi =
+        (index + 1 < row_words) ? row_words_ptr[index + 1] : 0u;
+    body[w] = bit_shift ? __funnelshift_r(lo, hi, bit_shift) : lo;
+  }
+  for (int w = need + lane; w < kBodyWords; w += kWarp) body[w] = 0u;
+  __syncwarp();
+}
+
+// Materialise the block's u-bit mask with ballots.  Warp-synchronous: no
+// shared-memory atomic and no CTA barrier.  Valid only when column order and
+// coded-ordinal order coincide, i.e. the block has no bypass column.
+__device__ __forceinline__ void stage_mask(
+    BlockPlan const& plan, int terminal_rate,
+    uint8_t const* s_rate, int32_t const* s_offset,
+    unsigned const* body, unsigned* mask, int lane) {
+#pragma unroll
+  for (int k = 0; k < kColsPerLane; ++k) {
+    int const local = k * kWarp + lane;
+    unsigned u = 0u;
+    if (local < plan.columns) {
+      int const rate = int(s_rate[local]);
+      if (rate < terminal_rate) u = bits_from(body, s_offset[local], 1);
+    }
+    unsigned const word = __ballot_sync(kFull, u != 0u);
+    if (lane == 0) mask[k] = word;
+  }
+  if (lane == 0) mask[kColsPerLane] = 0u;   // funnel-shift guard
+  __syncwarp();
+}
+
+// General path: history8 indexes the mask in CODED-ORDINAL order, which
+// diverges from column order as soon as the block carries a bypass column.
+__device__ __forceinline__ void stage_mask_by_ordinal(
+    BlockPlan const& plan, int terminal_rate,
+    uint8_t const* s_rate, int32_t const* s_offset, int16_t const* s_ordinal,
+    unsigned const* body, unsigned* mask, int lane) {
+  for (int w = lane; w < kMaskWords; w += kWarp) mask[w] = 0u;
+  __syncwarp();
+#pragma unroll
+  for (int k = 0; k < kColsPerLane; ++k) {
+    int const local = k * kWarp + lane;
+    unsigned u = 0u;
+    int ordinal = -1;
+    if (local < plan.columns) {
+      int const rate = int(s_rate[local]);
+      ordinal = int(s_ordinal[local]);
+      if (rate < terminal_rate && ordinal >= 0) {
+        u = bits_from(body, s_offset[local], 1);
+      }
+    }
+    // Ordinals are strictly increasing in column order, so each lane's bit has
+    // a distinct destination; a ballot cannot be used, but the write is to
+    // shared memory the warp owns exclusively.
+    if (u) atomicOr(&mask[ordinal >> 5], 1u << (ordinal & 31));
+  }
+  __syncwarp();
+}
+
+__device__ __forceinline__ uint8_t decode_lane_column(
+    BlockPlan const& plan, int terminal_rate,
+    uint8_t const* s_rate, int32_t const* s_offset, int16_t const* s_ordinal,
+    unsigned const* body, unsigned const* mask, uint8_t const* s_lut,
+    int local) {
+  int const rate = int(s_rate[local]);
+  int const offset = s_offset[local];
+  if (rate >= terminal_rate) {
+    return uint8_t(bits_from(body, offset, terminal_rate));
+  }
+  unsigned const u = bits_from(body, offset, 1);
+  unsigned const state = history8(mask, int(s_ordinal[local]), plan.coded_count);
+  unsigned const reg = (u << kMemory) | state;
+  unsigned const subset =
+      2u * (__popc(reg & kG0) & 1u) + (__popc(reg & kG1) & 1u);
+  unsigned const point = bits_from(body, offset + 1, rate - 1);
+  return s_lut[rate * 256 + subset * (1u << (rate - 1)) + point];
+}
+
+struct CtaPlan {
+  int32_t offset[kSuperblock];
+  int16_t ordinal[kSuperblock];
+  uint8_t rate[kSuperblock];
+  uint8_t all_coded;   // 1 when the block has no bypass column
+};
+
+__device__ __forceinline__ void stage_cta_plan(
+    uint8_t const* __restrict__ col_rate,
+    int32_t const* __restrict__ col_bit_offset,
+    int16_t const* __restrict__ col_ordinal,
+    uint8_t const* __restrict__ alphabet_lut, int lut_bytes,
+    BlockPlan const& plan, CtaPlan* s_plan, uint8_t* s_lut) {
+  for (int i = threadIdx.x; i < plan.columns; i += blockDim.x) {
+    int const column = plan.start_column + i;
+    s_plan->rate[i] = col_rate[column];
+    s_plan->offset[i] = col_bit_offset[column] - plan.bit_offset;
+    s_plan->ordinal[i] = col_ordinal[column];
+  }
+  for (int i = threadIdx.x; i < lut_bytes; i += blockDim.x) {
+    s_lut[i] = alphabet_lut[i];
+  }
+  if (threadIdx.x == 0) {
+    s_plan->all_coded = uint8_t(plan.coded_count == plan.columns);
+  }
+  __syncthreads();
+}
+
+extern __shared__ unsigned char smem_raw[];
+
+struct Shared {
+  CtaPlan* plan;
+  uint8_t* lut;
+  unsigned* body;   // [kWarps][kBodyWords]
+  unsigned* mask;   // [kWarps][kMaskWords]
+};
+
+__device__ __forceinline__ Shared shared_layout(int lut_bytes) {
+  Shared s;
+  s.plan = reinterpret_cast<CtaPlan*>(smem_raw);
+  s.lut = smem_raw + sizeof(CtaPlan);
+  unsigned char* cursor = s.lut + lut_bytes;
+  // 4-byte align the word buffers
+  cursor += (4 - (reinterpret_cast<uintptr_t>(cursor) & 3)) & 3;
+  s.body = reinterpret_cast<unsigned*>(cursor);
+  s.mask = s.body + kWarps * kBodyWords;
+  return s;
+}
+
+size_t shared_bytes(int lut_bytes) {
+  return sizeof(CtaPlan) + size_t(lut_bytes) + 4
+       + size_t(kWarps) * (kBodyWords + kMaskWords) * sizeof(unsigned);
+}
+
+// Stage the per-warp body + mask for one row.  Shared by all three epilogues.
+__device__ __forceinline__ void stage_row(
+    uint8_t const* __restrict__ payload, int row, int row_stride,
+    BlockPlan const& plan, int terminal_rate, Shared const& s,
+    unsigned* body, unsigned* mask, int lane) {
+  uint8_t const* payload_row = payload + int64_t(row) * row_stride;
+  stage_body(payload_row, row_stride, plan, body, lane);
+  if (s.plan->all_coded) {
+    stage_mask(plan, terminal_rate, s.plan->rate, s.plan->offset,
+               body, mask, lane);
+  } else {
+    stage_mask_by_ordinal(plan, terminal_rate, s.plan->rate, s.plan->offset,
+                          s.plan->ordinal, body, mask, lane);
+  }
+}
+
+// The compact plan is derived workspace, but the pybind symbols are a raw ABI
+// too.  Cross-check it against the scan-free tables that
+// validate_decode_plan_kernel has already proven consistent with the payload,
+// so a malformed compact plan can never reach a bit address.
+__global__ void validate_block_plan_kernel(
+    uint8_t const* schedule,
+    int64_t const* column_offsets,
+    uint8_t const* col_rate,
+    int32_t const* col_bit_offset,
+    int16_t const* col_ordinal,
+    int32_t const* block_meta,
+    int columns, int blocks, int terminal_rate, int lut_bytes,
+    int64_t const* row_body_bits, int* error) {
+  if (*error != kDecodeOk) return;
+  if (lut_bytes < terminal_rate * 256) {
+    record_decode_error(error, kDecodeInvalidAlphabetCode);
+    return;
+  }
+  int const expected_blocks = (columns + kSuperblock - 1) / kSuperblock;
+  if (blocks != expected_blocks) {
+    record_decode_error(error, kDecodeInvalidSchedule);
+    return;
+  }
+  for (int block = 0; block < blocks; ++block) {
+    int const start = block_meta[block * 5 + 0];
+    int const count = block_meta[block * 5 + 1];
+    int const coded = block_meta[block * 5 + 2];
+    int const bit_offset = block_meta[block * 5 + 3];
+    int const bit_length = block_meta[block * 5 + 4];
+    int const expected_start = block * kSuperblock;
+    int const expected_count =
+        min(kSuperblock, columns - expected_start);
+    if (start != expected_start || count != expected_count ||
+        count <= 0 || count > kSuperblock) {
+      record_decode_error(error, kDecodeInvalidSchedule);
+      return;
+    }
+    if (bit_offset != int(column_offsets[start])) {
+      record_decode_error(error, kDecodeInvalidColumnOffset);
+      return;
+    }
+    int ordinal = 0;
+    int cursor = bit_offset;
+    for (int i = 0; i < count; ++i) {
+      int const column = start + i;
+      int const rate = int(schedule[column]);
+      if (int(col_rate[column]) != rate) {
+        record_decode_error(error, kDecodeInvalidSchedule);
+        return;
+      }
+      if (int64_t(col_bit_offset[column]) != column_offsets[column] ||
+          col_bit_offset[column] != cursor) {
+        record_decode_error(error, kDecodeInvalidColumnOffset);
+        return;
+      }
+      int const want = (rate < terminal_rate) ? ordinal : -1;
+      if (int(col_ordinal[column]) != want) {
+        record_decode_error(error, kDecodeInvalidPreviousOffset);
+        return;
+      }
+      if (rate < terminal_rate) ++ordinal;
+      cursor += rate;
+    }
+    if (ordinal != coded || coded < kMemory) {
+      record_decode_error(error, kDecodeInvalidPreviousOffset);
+      return;
+    }
+    // A full superblock at the terminal rate is 256*8 = 2048 bits, exactly the
+    // capacity the per-warp staging buffer addresses: relative offsets reach
+    // bit_length-rate, so bits_from touches at most word 64 of kBodyWords=65.
+    if (cursor - bit_offset != bit_length ||
+        bit_length > kSuperblock * terminal_rate ||
+        bit_length > (kBodyWords - 1) * 32) {
+      record_decode_error(error, kDecodeInvalidColumnOffset);
+      return;
+    }
+  }
+  int const last = columns - 1;
+  if (int64_t(col_bit_offset[last]) + int64_t(col_rate[last]) !=
+      *row_body_bits) {
+    record_decode_error(error, kDecodeInvalidColumnOffset);
+  }
+}
+
+__global__ void __launch_bounds__(kThreads)
+decode_native_v2_kernel(
+    uint8_t const* __restrict__ payload,
+    uint8_t const* __restrict__ col_rate,
+    int32_t const* __restrict__ col_bit_offset,
+    int16_t const* __restrict__ col_ordinal,
+    int32_t const* __restrict__ block_meta,
+    uint8_t const* __restrict__ alphabet_lut,
+    uint8_t* __restrict__ out,
+    int rows, int out_columns, int row_stride,
+    int family, int terminal_rate, int lut_bytes) {
+  BlockPlan const plan = load_block_plan(block_meta, blockIdx.x);
+  Shared const s = shared_layout(lut_bytes);
+  stage_cta_plan(col_rate, col_bit_offset, col_ordinal, alphabet_lut,
+                 lut_bytes, plan, s.plan, s.lut);
+
+  int const warp = int(threadIdx.x) >> 5;
+  int const lane = int(threadIdx.x) & 31;
+  unsigned* body = s.body + warp * kBodyWords;
+  unsigned* mask = s.mask + warp * kMaskWords;
+
+  int const row_begin = int(blockIdx.y) * kRowsPerCta + warp * kRowsPerWarp;
+  int const row_end = min(row_begin + kRowsPerWarp, rows);
+  for (int row = row_begin; row < row_end; ++row) {
+    stage_row(payload, row, row_stride, plan, terminal_rate, s, body, mask,
+              lane);
+#pragma unroll
+    for (int k = 0; k < kColsPerLane; ++k) {
+      int const local = k * kWarp + lane;
+      uint8_t code = 0;
+      if (local < plan.columns) {
+        code = decode_lane_column(plan, terminal_rate, s.plan->rate,
+                                  s.plan->offset, s.plan->ordinal, body, mask,
+                                  s.lut, local);
+      }
+      if (family == kFamilyE2M1) {
+        uint8_t const partner =
+            uint8_t(__shfl_down_sync(kFull, unsigned(code), 1));
+        bool const even = (lane & 1) == 0;
+        int const column = plan.start_column + local;
+        if (even && local < plan.columns) {
+          uint8_t const high =
+              (local + 1 < plan.columns) ? partner : uint8_t(0);
+          int const out_column = column >> 1;
+          if (out_column < out_columns) {
+            out[int64_t(row) * out_columns + out_column] =
+                uint8_t((code & 0x0fu) | ((high & 0x0fu) << 4));
+          }
+        }
+      } else if (local < plan.columns) {
+        out[int64_t(row) * out_columns + plan.start_column + local] = code;
+      }
+    }
+    __syncwarp();
+  }
+}
+
+__global__ void __launch_bounds__(kThreads)
+expand_v2_kernel(
+    uint8_t const* __restrict__ payload,
+    uint8_t const* __restrict__ col_rate,
+    int32_t const* __restrict__ col_bit_offset,
+    int16_t const* __restrict__ col_ordinal,
+    int32_t const* __restrict__ block_meta,
+    uint8_t const* __restrict__ alphabet_lut,
+    float const* __restrict__ scales,
+    float* __restrict__ out,
+    int rows, int columns, int row_stride,
+    int family, int terminal_rate, int lut_bytes, int scale_stride) {
+  BlockPlan const plan = load_block_plan(block_meta, blockIdx.x);
+  Shared const s = shared_layout(lut_bytes);
+  stage_cta_plan(col_rate, col_bit_offset, col_ordinal, alphabet_lut,
+                 lut_bytes, plan, s.plan, s.lut);
+
+  int const warp = int(threadIdx.x) >> 5;
+  int const lane = int(threadIdx.x) & 31;
+  unsigned* body = s.body + warp * kBodyWords;
+  unsigned* mask = s.mask + warp * kMaskWords;
+
+  int const row_begin = int(blockIdx.y) * kRowsPerCta + warp * kRowsPerWarp;
+  int const row_end = min(row_begin + kRowsPerWarp, rows);
+  for (int row = row_begin; row < row_end; ++row) {
+    stage_row(payload, row, row_stride, plan, terminal_rate, s, body, mask,
+              lane);
+#pragma unroll
+    for (int k = 0; k < kColsPerLane; ++k) {
+      int const local = k * kWarp + lane;
+      if (local >= plan.columns) continue;
+      int const column = plan.start_column + local;
+      uint8_t const code = decode_lane_column(
+          plan, terminal_rate, s.plan->rate, s.plan->offset, s.plan->ordinal,
+          body, mask, s.lut, local);
+      out[int64_t(row) * columns + column] =
+          decoded_value(code, scales, family, row, column, scale_stride);
+    }
+    __syncwarp();
+  }
+}
+
+// NOTE: the fused GEMV deliberately stays on the scan-free kernel above.  The
+// warp-resident form reduces per-superblock partials with atomicAdd, which is
+// ~2.7x faster but not run-to-run deterministic; this repo quarantines
+// irreproducible numbers, and the GEMV is a research decode rung on no serving
+// path.  A deterministic fixed-order reduction is the way to claim that speedup.
+
 int64_t checked_product(int64_t left, int64_t right, char const* name) {
   TORCH_CHECK(left >= 0 && right >= 0,
               name, " dimensions must be nonnegative");
@@ -450,6 +825,95 @@ int checked_grid_blocks(
   TORCH_CHECK(blocks <= INT_MAX,
               operation, " launch grid exceeds int32");
   return int(blocks);
+}
+
+int terminal_rate_of(int family) {
+  return family == kFamilyE2M1 ? 4 : 8;
+}
+
+// The v2 kernels tile (superblock, row-block); both grid extents are checked
+// against the device limits before launch, as the scan-free path does.
+dim3 v2_grid(torch::Tensor const& block_meta, int64_t rows, int device,
+             char const* operation) {
+  int64_t const blocks = block_meta.size(0);
+  int64_t const row_tiles = (rows + kRowsPerCta - 1) / kRowsPerCta;
+  TORCH_CHECK(blocks > 0 && row_tiles > 0,
+              operation, " launch extents must be positive");
+  cudaDeviceProp properties{};
+  C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+  TORCH_CHECK(blocks <= properties.maxGridSize[0] && blocks <= INT_MAX,
+              operation, " launch requires ", blocks,
+              " x-grid blocks, device limit is ", properties.maxGridSize[0]);
+  TORCH_CHECK(row_tiles <= properties.maxGridSize[1] && row_tiles <= INT_MAX,
+              operation, " launch requires ", row_tiles,
+              " y-grid blocks, device limit is ", properties.maxGridSize[1]);
+  TORCH_CHECK(
+      shared_bytes(0) + 8 * 256 <= properties.sharedMemPerBlock,
+      operation, " needs more shared memory than the device provides");
+  return dim3(int(blocks), int(row_tiles));
+}
+
+void validate_compact_plan(
+    torch::Tensor const& payload,
+    torch::Tensor const& col_rate,
+    torch::Tensor const& col_bit_offset,
+    torch::Tensor const& col_ordinal,
+    torch::Tensor const& block_meta,
+    int64_t columns) {
+  TCQ_CHECK_CUDA(col_rate);
+  TCQ_CHECK_CUDA(col_bit_offset);
+  TCQ_CHECK_CUDA(col_ordinal);
+  TCQ_CHECK_CUDA(block_meta);
+  TCQ_CHECK_CONTIGUOUS(col_rate);
+  TCQ_CHECK_CONTIGUOUS(col_bit_offset);
+  TCQ_CHECK_CONTIGUOUS(col_ordinal);
+  TCQ_CHECK_CONTIGUOUS(block_meta);
+  TORCH_CHECK(col_rate.scalar_type() == torch::kUInt8,
+              "col_rate must be uint8");
+  TORCH_CHECK(col_bit_offset.scalar_type() == torch::kInt32,
+              "col_bit_offset must be int32");
+  TORCH_CHECK(col_ordinal.scalar_type() == torch::kInt16,
+              "col_ordinal must be int16");
+  TORCH_CHECK(block_meta.scalar_type() == torch::kInt32,
+              "block_meta must be int32");
+  TORCH_CHECK(col_rate.dim() == 1 && col_rate.size(0) == columns,
+              "col_rate must have shape [columns]");
+  TORCH_CHECK(col_bit_offset.dim() == 1 && col_bit_offset.size(0) == columns,
+              "col_bit_offset must have shape [columns]");
+  TORCH_CHECK(col_ordinal.dim() == 1 && col_ordinal.size(0) == columns,
+              "col_ordinal must have shape [columns]");
+  int64_t const blocks = (columns + kSuperblock - 1) / kSuperblock;
+  TORCH_CHECK(block_meta.dim() == 2 && block_meta.size(0) == blocks &&
+                  block_meta.size(1) == 5,
+              "block_meta must have exact shape [blocks,5]");
+  TORCH_CHECK(payload.device() == col_rate.device() &&
+                  payload.device() == col_bit_offset.device() &&
+                  payload.device() == col_ordinal.device() &&
+                  payload.device() == block_meta.device(),
+              "all trellis tensors must be on one CUDA device");
+}
+
+void launch_block_plan_validation(
+    torch::Tensor const& schedule,
+    torch::Tensor const& column_offsets,
+    torch::Tensor const& col_rate,
+    torch::Tensor const& col_bit_offset,
+    torch::Tensor const& col_ordinal,
+    torch::Tensor const& block_meta,
+    torch::Tensor const& alphabet_lut,
+    int columns, int family,
+    torch::Tensor const& error,
+    torch::Tensor const& row_body_bits,
+    at::cuda::CUDAStream stream) {
+  int const terminal_rate = family == kFamilyE2M1 ? 4 : 8;
+  validate_block_plan_kernel<<<1, 1, 0, stream>>>(
+      schedule.data_ptr<uint8_t>(), column_offsets.data_ptr<int64_t>(),
+      col_rate.data_ptr<uint8_t>(), col_bit_offset.data_ptr<int32_t>(),
+      col_ordinal.data_ptr<int16_t>(), block_meta.data_ptr<int32_t>(),
+      columns, int(block_meta.size(0)), terminal_rate,
+      int(alphabet_lut.numel()), row_body_bits.data_ptr<int64_t>(),
+      error.data_ptr<int>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void launch_plan_validation(
@@ -630,10 +1094,14 @@ torch::Tensor decode_codes_cuda(
 torch::Tensor validate_wire_cuda(
     torch::Tensor payload, torch::Tensor schedule,
     torch::Tensor column_offsets, torch::Tensor previous_u_offsets,
+    torch::Tensor col_rate, torch::Tensor col_bit_offset,
+    torch::Tensor col_ordinal, torch::Tensor block_meta,
     torch::Tensor alphabet_lut, torch::Tensor scales,
     int64_t rows, int64_t columns, int64_t row_stride, int64_t family) {
   validate_common(payload, schedule, column_offsets, previous_u_offsets,
                   alphabet_lut, rows, columns, row_stride, family);
+  validate_compact_plan(payload, col_rate, col_bit_offset, col_ordinal,
+                        block_meta, columns);
   TCQ_CHECK_CUDA(scales);
   TCQ_CHECK_CONTIGUOUS(scales);
   TORCH_CHECK(scales.scalar_type() == torch::kFloat32,
@@ -655,57 +1123,83 @@ torch::Tensor validate_wire_cuda(
   launch_plan_validation(
       payload, schedule, column_offsets, previous_u_offsets, alphabet_lut,
       int(columns), int(row_stride), int(family), error, row_body_bits, stream);
+  launch_block_plan_validation(
+      schedule, column_offsets, col_rate, col_bit_offset, col_ordinal,
+      block_meta, alphabet_lut, int(columns), int(family), error,
+      row_body_bits, stream);
   launch_scale_validation(scales, error, stream);
   check_device_error(error, stream);
   return row_body_bits;
 }
 
 void decode_native_packed_prevalidated_out_cuda(
-    torch::Tensor payload, torch::Tensor schedule,
-    torch::Tensor column_offsets, torch::Tensor previous_u_offsets,
-    torch::Tensor alphabet_lut, torch::Tensor output,
-    int64_t rows, int64_t columns, int64_t row_stride, int64_t family,
-    int64_t row_body_bits) {
-  validate_common(payload, schedule, column_offsets, previous_u_offsets,
-                  alphabet_lut, rows, columns, row_stride, family);
+    torch::Tensor payload, torch::Tensor col_rate,
+    torch::Tensor col_bit_offset, torch::Tensor col_ordinal,
+    torch::Tensor block_meta, torch::Tensor alphabet_lut,
+    torch::Tensor output,
+    int64_t rows, int64_t columns, int64_t row_stride, int64_t family) {
+  TCQ_CHECK_CUDA(payload);
+  TCQ_CHECK_CONTIGUOUS(payload);
+  TCQ_CHECK_CUDA(alphabet_lut);
+  TCQ_CHECK_CONTIGUOUS(alphabet_lut);
+  TORCH_CHECK(payload.scalar_type() == torch::kUInt8, "payload must be uint8");
+  TORCH_CHECK(alphabet_lut.scalar_type() == torch::kUInt8,
+              "alphabet_lut must be uint8");
+  TORCH_CHECK(rows > 0 && columns > 0 && row_stride > 0,
+              "rows, columns, and row_stride must be positive");
+  TORCH_CHECK(rows <= INT_MAX && columns <= INT_MAX && row_stride <= INT_MAX,
+              "rows, columns, and row_stride must fit int32");
+  TORCH_CHECK(row_stride % 16 == 0,
+              "row_stride must preserve the wire's 16-byte alignment");
+  TORCH_CHECK(payload.dim() == 2 && payload.size(0) == rows &&
+                  payload.size(1) == row_stride,
+              "payload must have shape [rows,row_stride]");
+  TORCH_CHECK(family == kFamilyE2M1 || family == kFamilyE4M3,
+              "family must be 1 (E2M1) or 2 (E4M3)");
+  int const terminal_rate = family == kFamilyE2M1 ? 4 : 8;
+  TORCH_CHECK(alphabet_lut.dim() == 2 &&
+                  alphabet_lut.size(0) == terminal_rate &&
+                  alphabet_lut.size(1) == 256,
+              "alphabet_lut must have exact shape [native_bits,256]");
+  validate_compact_plan(payload, col_rate, col_bit_offset, col_ordinal,
+                        block_meta, columns);
   TCQ_CHECK_CUDA(output);
   TCQ_CHECK_CONTIGUOUS(output);
   TORCH_CHECK(output.scalar_type() == torch::kUInt8,
               "native packed output must be uint8");
   TORCH_CHECK(output.device() == payload.device(),
               "native packed output must be on the payload device");
-  TORCH_CHECK(row_body_bits > 0 && row_body_bits <= row_stride * 8,
-              "row_body_bits must be inside the packed row stride");
   int64_t const output_columns =
       family == kFamilyE2M1 ? (columns + 1) / 2 : columns;
   TORCH_CHECK(output.dim() == 2 && output.size(0) == rows &&
                   output.size(1) == output_columns,
               "native packed output has the wrong shape");
   c10::cuda::CUDAGuard guard(payload.device());
-  int64_t const count = checked_product(
-      rows, output_columns, "prevalidated native packed decode");
-  int const threads = 256;
-  int const blocks = checked_grid_blocks(
-      count, threads, payload.device().index(),
-      "prevalidated native packed decode");
+  checked_product(rows, output_columns, "prevalidated native packed decode");
   auto stream = at::cuda::getCurrentCUDAStream(payload.device().index());
-  decode_native_packed_prevalidated_kernel<<<blocks, threads, 0, stream>>>(
-      payload.data_ptr<uint8_t>(), schedule.data_ptr<uint8_t>(),
-      column_offsets.data_ptr<int64_t>(),
-      previous_u_offsets.data_ptr<int64_t>(),
-      alphabet_lut.data_ptr<uint8_t>(), output.data_ptr<uint8_t>(),
-      int(rows), int(columns), int(output_columns), int(row_stride),
-      int(family), family == kFamilyE2M1 ? 4 : 8, row_body_bits);
+  int const lut_bytes = int(alphabet_lut.numel());
+  decode_native_v2_kernel<<<v2_grid(block_meta, rows, payload.device().index(),
+                                   "prevalidated native packed decode"),
+                            kThreads, shared_bytes(lut_bytes), stream>>>(
+      payload.data_ptr<uint8_t>(), col_rate.data_ptr<uint8_t>(),
+      col_bit_offset.data_ptr<int32_t>(), col_ordinal.data_ptr<int16_t>(),
+      block_meta.data_ptr<int32_t>(), alphabet_lut.data_ptr<uint8_t>(),
+      output.data_ptr<uint8_t>(), int(rows), int(output_columns),
+      int(row_stride), int(family), terminal_rate, lut_bytes);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 torch::Tensor expand_cuda(
     torch::Tensor payload, torch::Tensor schedule,
     torch::Tensor column_offsets, torch::Tensor previous_u_offsets,
+    torch::Tensor col_rate, torch::Tensor col_bit_offset,
+    torch::Tensor col_ordinal, torch::Tensor block_meta,
     torch::Tensor alphabet_lut, torch::Tensor scales,
     int64_t rows, int64_t columns, int64_t row_stride, int64_t family) {
   validate_common(payload, schedule, column_offsets, previous_u_offsets,
                   alphabet_lut, rows, columns, row_stride, family);
+  validate_compact_plan(payload, col_rate, col_bit_offset, col_ordinal,
+                        block_meta, columns);
   TCQ_CHECK_CUDA(scales);
   TCQ_CHECK_CONTIGUOUS(scales);
   TORCH_CHECK(scales.scalar_type() == torch::kFloat32,
@@ -721,10 +1215,7 @@ torch::Tensor expand_cuda(
                   scales.size(1) == scale_stride64,
               "decoded scales must have exact shape [rows,scale_stride]");
   c10::cuda::CUDAGuard guard(payload.device());
-  int64_t const count = checked_product(rows, columns, "expand");
-  int const threads = 256;
-  int const blocks = checked_grid_blocks(
-      count, threads, payload.device().index(), "expand");
+  checked_product(rows, columns, "expand");
   auto output = torch::empty({rows, columns},
                              payload.options().dtype(torch::kFloat32));
   auto error = torch::zeros(
@@ -735,17 +1226,23 @@ torch::Tensor expand_cuda(
   launch_plan_validation(
       payload, schedule, column_offsets, previous_u_offsets, alphabet_lut,
       int(columns), int(row_stride), int(family), error, row_body_bits, stream);
+  launch_block_plan_validation(
+      schedule, column_offsets, col_rate, col_bit_offset, col_ordinal,
+      block_meta, alphabet_lut, int(columns), int(family), error,
+      row_body_bits, stream);
   launch_scale_validation(scales, error, stream);
-  expand_kernel<<<blocks, threads, 0, stream>>>(
-      payload.data_ptr<uint8_t>(), schedule.data_ptr<uint8_t>(),
-      column_offsets.data_ptr<int64_t>(),
-      previous_u_offsets.data_ptr<int64_t>(),
-      alphabet_lut.data_ptr<uint8_t>(), scales.data_ptr<float>(),
-      output.data_ptr<float>(), int(rows), int(columns), int(row_stride),
-      int(family), scale_stride, row_body_bits.data_ptr<int64_t>(),
-      error.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
   check_device_error(error, stream);
+  int const lut_bytes = int(alphabet_lut.numel());
+  expand_v2_kernel<<<v2_grid(block_meta, rows, payload.device().index(),
+                             "expand"),
+                     kThreads, shared_bytes(lut_bytes), stream>>>(
+      payload.data_ptr<uint8_t>(), col_rate.data_ptr<uint8_t>(),
+      col_bit_offset.data_ptr<int32_t>(), col_ordinal.data_ptr<int16_t>(),
+      block_meta.data_ptr<int32_t>(), alphabet_lut.data_ptr<uint8_t>(),
+      scales.data_ptr<float>(), output.data_ptr<float>(),
+      int(rows), int(columns), int(row_stride), int(family), terminal_rate_of(
+          int(family)), lut_bytes, scale_stride);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }
 
@@ -822,5 +1319,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("trellis_r256_wire_schema", []() {
     return std::string("gridbook.trellis.wire.v1");
   });
-  m.def("trellis_r256_abi_schema", []() { return int64_t(2); });
+  m.def("trellis_r256_abi_schema", []() { return int64_t(3); });
 }

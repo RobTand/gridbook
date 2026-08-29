@@ -17,6 +17,7 @@ from .trellis import (
     TrellisWire,
     alphabet_lut,
     decoded_scales,
+    derived_block_plan,
     derived_decode_plan,
 )
 
@@ -46,25 +47,50 @@ def wire_cuda_tensors(wire: TrellisWire, device=None):
     return payload, schedule, columns, previous, lut, scales, family
 
 
+def wire_cuda_block_plan(wire: TrellisWire, device=None):
+    """Materialize the compact per-column / per-block plan the v2 kernels stage.
+
+    Like ``wire_cuda_tensors`` this is deterministic derived workspace rebuilt
+    from the wire, shared by all rows, and never artifact side information.
+    """
+    device = torch.device("cuda" if device is None else device)
+    rate, offset, ordinal, meta = derived_block_plan(wire)
+    return (
+        torch.tensor(rate, dtype=torch.uint8, device=device),
+        torch.tensor(offset, dtype=torch.int32, device=device),
+        torch.tensor(ordinal, dtype=torch.int16, device=device),
+        torch.tensor(meta, dtype=torch.int32, device=device),
+    )
+
+
 @torch.library.custom_op("prismaquant::trellis_r256_validate_wire",
                          mutates_args=())
 def _trellis_r256_validate_wire(
     payload: torch.Tensor, schedule: torch.Tensor,
     column_offsets: torch.Tensor, previous_u_offsets: torch.Tensor,
+    col_rate: torch.Tensor, col_bit_offset: torch.Tensor,
+    col_ordinal: torch.Tensor, block_meta: torch.Tensor,
     alphabet_lut_tensor: torch.Tensor, scales: torch.Tensor,
     rows: int, columns: int, row_stride: int, family: int,
 ) -> torch.Tensor:
-    """Synchronizing load-time validation; never call from a hot path."""
+    """Synchronizing load-time validation; never call from a hot path.
+
+    Validates the scan-free tables against the payload and then the compact
+    block plan against those tables, so the v2 decode path can never reach a
+    bit address the scan-free validation has not already proven.
+    """
     from .cuda_ext import require_trellis_r256_ext
     return require_trellis_r256_ext(
         "TCQ R256 load-time wire validation").trellis_r256_validate_wire(
             payload, schedule, column_offsets, previous_u_offsets,
+            col_rate, col_bit_offset, col_ordinal, block_meta,
             alphabet_lut_tensor, scales, rows, columns, row_stride, family)
 
 
 @_trellis_r256_validate_wire.register_fake
 def _trellis_r256_validate_wire_fake(
     payload, schedule, column_offsets, previous_u_offsets,
+    col_rate, col_bit_offset, col_ordinal, block_meta,
     alphabet_lut_tensor, scales, rows, columns, row_stride, family,
 ):
     return torch.empty((1,), dtype=torch.int64, device=payload.device)
@@ -75,26 +101,24 @@ def _trellis_r256_validate_wire_fake(
     mutates_args=("output",),
 )
 def _trellis_r256_decode_native_packed_prevalidated_out(
-    payload: torch.Tensor, schedule: torch.Tensor,
-    column_offsets: torch.Tensor, previous_u_offsets: torch.Tensor,
-    alphabet_lut_tensor: torch.Tensor, output: torch.Tensor,
+    payload: torch.Tensor, col_rate: torch.Tensor,
+    col_bit_offset: torch.Tensor, col_ordinal: torch.Tensor,
+    block_meta: torch.Tensor, alphabet_lut_tensor: torch.Tensor,
+    output: torch.Tensor,
     rows: int, columns: int, row_stride: int, family: int,
-    row_body_bits: int,
 ) -> None:
     from .cuda_ext import require_trellis_r256_ext
     require_trellis_r256_ext(
         "TCQ R256 prevalidated native packed-code decode",
     ).trellis_r256_decode_native_packed_prevalidated_out(
-        payload, schedule, column_offsets, previous_u_offsets,
-        alphabet_lut_tensor, output, rows, columns, row_stride, family,
-        row_body_bits)
+        payload, col_rate, col_bit_offset, col_ordinal, block_meta,
+        alphabet_lut_tensor, output, rows, columns, row_stride, family)
 
 
 @_trellis_r256_decode_native_packed_prevalidated_out.register_fake
 def _trellis_r256_decode_native_packed_prevalidated_out_fake(
-    payload, schedule, column_offsets, previous_u_offsets,
+    payload, col_rate, col_bit_offset, col_ordinal, block_meta,
     alphabet_lut_tensor, output, rows, columns, row_stride, family,
-    row_body_bits,
 ):
     return None
 
@@ -199,10 +223,11 @@ class PreparedTrellisWireCuda:
             raise ValueError(
                 "native packed output must be contiguous uint8 with shape "
                 f"[{self.rows},{self.output_columns}] on {self.device}")
-        payload, schedule, columns, previous, lut, _scales = self.__tensors
+        (payload, _schedule, _columns, _previous, rate, offset, ordinal,
+         meta, lut, _scales) = self.__tensors
         _trellis_r256_decode_native_packed_prevalidated_out(
-            payload, schedule, columns, previous, lut, output, self.rows,
-            self.columns, self.row_stride, self.family, self.row_body_bits)
+            payload, rate, offset, ordinal, meta, lut, output, self.rows,
+            self.columns, self.row_stride, self.family)
 
     def decode_native_packed(self) -> torch.Tensor:
         output = self.empty_native_packed()
@@ -216,9 +241,11 @@ def prepare_wire_cuda(
     """Clone and device-validate a wire once for the no-sync hot path."""
     materialized = wire_cuda_tensors(wire, device)
     payload, schedule, columns, previous, lut, scales, family = materialized
+    rate, offset, ordinal, meta = wire_cuda_block_plan(wire, device)
     private = tuple(
         tensor.clone() for tensor in
-        (payload, schedule, columns, previous, lut, scales)
+        (payload, schedule, columns, previous, rate, offset, ordinal, meta,
+         lut, scales)
     )
     observed_body_bits = _trellis_r256_validate_wire(
         *private, wire.rows, wire.columns, wire.row_stride_bytes, family)
@@ -261,6 +288,8 @@ def _trellis_r256_decode_codes_fake(
 def trellis_r256_expand(
     payload: torch.Tensor, schedule: torch.Tensor,
     column_offsets: torch.Tensor, previous_u_offsets: torch.Tensor,
+    col_rate: torch.Tensor, col_bit_offset: torch.Tensor,
+    col_ordinal: torch.Tensor, block_meta: torch.Tensor,
     alphabet_lut_tensor: torch.Tensor, scales: torch.Tensor,
     rows: int, columns: int, row_stride: int, family: int,
 ) -> torch.Tensor:
@@ -269,12 +298,14 @@ def trellis_r256_expand(
     return require_trellis_r256_ext(
         "TCQ R256 transient expansion").trellis_r256_expand(
             payload, schedule, column_offsets, previous_u_offsets,
+            col_rate, col_bit_offset, col_ordinal, block_meta,
             alphabet_lut_tensor, scales, rows, columns, row_stride, family)
 
 
 @trellis_r256_expand.register_fake
 def _trellis_r256_expand_fake(
     payload, schedule, column_offsets, previous_u_offsets,
+    col_rate, col_bit_offset, col_ordinal, block_meta,
     alphabet_lut_tensor, scales, rows, columns, row_stride, family,
 ):
     return torch.empty((rows, columns), dtype=torch.float32,
@@ -317,9 +348,10 @@ def decode_wire_codes_cuda(wire: TrellisWire, device=None) -> torch.Tensor:
 def expand_wire_cuda(wire: TrellisWire, device=None) -> torch.Tensor:
     values = wire_cuda_tensors(wire, device)
     payload, schedule, columns, previous, lut, scales, family = values
+    rate, offset, ordinal, meta = wire_cuda_block_plan(wire, device)
     return trellis_r256_expand(
-        payload, schedule, columns, previous, lut, scales, wire.rows,
-        wire.columns, wire.row_stride_bytes, family)
+        payload, schedule, columns, previous, rate, offset, ordinal, meta,
+        lut, scales, wire.rows, wire.columns, wire.row_stride_bytes, family)
 
 
 def gemv_wire_cuda(x: torch.Tensor, wire: TrellisWire) -> torch.Tensor:

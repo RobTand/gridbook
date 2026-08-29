@@ -73,6 +73,12 @@ def _raw_inputs(family, q256=512, columns=256, *, rows=4):
     return cuda_ext.require_trellis_r256_ext("hostile raw-ABI test"), wire, tensors
 
 
+def _raw_block_plan(wire, values):
+    """Compact plan for the v2 ABI, honouring a hostile ``schedule`` swap."""
+    from gridbook.trellis_ops import wire_cuda_block_plan
+    return wire_cuda_block_plan(wire)
+
+
 def _raw_decode(extension, wire, tensors, **replacements):
     names = ("payload", "schedule", "column_offsets", "previous_u_offsets",
              "alphabet_lut", "scales", "family")
@@ -89,9 +95,11 @@ def _raw_expand(extension, wire, tensors, **replacements):
              "alphabet_lut", "scales", "family")
     values = dict(zip(names, tensors))
     values.update(replacements)
+    rate, offset, ordinal, meta = _raw_block_plan(wire, values)
     return extension.trellis_r256_expand(
         values["payload"], values["schedule"], values["column_offsets"],
-        values["previous_u_offsets"], values["alphabet_lut"], values["scales"],
+        values["previous_u_offsets"], rate, offset, ordinal, meta,
+        values["alphabet_lut"], values["scales"],
         wire.rows, wire.columns, wire.row_stride_bytes, values["family"])
 
 
@@ -188,8 +196,8 @@ def test_research_loader_identity_and_isolation():
 
     ext = cuda_ext.require_trellis_r256_ext("test")
     assert ext.trellis_r256_wire_schema() == trellis.SCHEMA
-    assert ext.trellis_r256_abi_schema() == 2
-    assert ext.__gridbook_jit_abi_schema__ == 2
+    assert ext.trellis_r256_abi_schema() == 3
+    assert ext.__gridbook_jit_abi_schema__ == 3
     assert len(ext.__gridbook_jit_identity__) == 64
     assert all("trellis" not in family for family, _loader
                in cuda_ext._PRELOAD_FAMILIES)
