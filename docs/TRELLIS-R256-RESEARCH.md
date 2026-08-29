@@ -91,4 +91,41 @@ took 0.5706 ms versus 0.06877 ms for `NVFP4_CB_K18`, but those outputs are not
 semantically comparable because the existing CB bridge emits scaled BF16.
 These are synthetic kernel diagnostics, not HBM or serving qualification.
 The preserved evidence is `stage_kernel_bench.json` in the campaign run root;
-the servability and bandwidth gates remain failed.
+the bandwidth gate remains failed. **The servability gate no longer does — see
+below.**
+
+## Serving lanes (2026-08-29)
+
+Both families now have a Gridbook `LinearMethod`, and **vLLM loads them**:
+`gridbook/trellis_e4m3_lane.py` (W8A8, `_scaled_mm` fp8xfp8 — the portable
+one, Ada/Hopper/AMD) and `gridbook/trellis_e2m1_lane.py` (W4A4, block-scaled
+fp4 — Blackwell only). Dispatch is `config.get_quant_method` via the
+`config_groups` vocabulary in `gridbook/trellis_scheme.py`; both lanes are
+**opt-in** behind `GRIDBOOK_TRELLIS_{E4M3,E2M1}` and require an explicit
+residency mode with no default.
+
+A checkpoint carries **one self-describing `wire_bytes` blob per Linear**
+(`TrellisWire.to_bytes`). This is not a packaging preference: the rate
+schedule, block offsets, alphabets and scale plane live in the wire header and
+exist nowhere else, so a `[rows, row_stride]` body cannot reconstruct a wire.
+Every scale is therefore **derived** from the blob; only E2M1's A-side
+`input_global_scale` is loaded, because only it is not a wire fact.
+
+Verified in `vllm/vllm-openai:qwen38-flash-next` on sparky, 4 combinations
+(2 families x 2 residency modes), each comparing the bytes the lane serves
+against the wire re-derived from the checkpoint through the reference decoder:
+**code plane and scale operand both exact** -- 4 arms x 4 Linears, all 16
+rows, receipt `dq-runs/trellis-serve-20260829/all4.log`. Generator:
+`tools/make_trellis_smoke_checkpoint.py`. Generation quality is NOT claimed:
+the smoke checkpoint has random weights.
+
+**What is still NOT qualified.** This is a load-and-value gate, not a
+device-qualification: no `runtime_contract.json` `formats` row and no
+`lane_eligibility` cell exist, so every trellis route resolves `unattested` by
+design (a cell would be a serving claim, and per principle 14 those are
+attested, never asserted). TP>1 is refused by name — a blob has no splittable
+axis and a sharded artifact needs per-rank wires. Routed MoE is untouched. The
+**activation-side quality price is unmeasured** for both lanes: every trellis
+quality number in existence is weight-only corpus SSE, which prices W*A16,
+while these lanes execute W8A8 and W4A4. And the smoke checkpoint is
+self-consistent rather than encoded — it says nothing about encoding quality.

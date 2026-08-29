@@ -60,6 +60,7 @@ from .embedding import (
     parse_declaration as _parse_embedding_declaration,
 )
 from .lane_select import device_capability as _live_device_capability
+from .trellis_scheme import is_trellis_scheme, validate_trellis_scheme
 from .nvfp4_activation_contract import (
     CONTRACT_KEY as _NVFP4_ACTIVATION_CONTRACT_KEY,
     TENSOR_SUFFIX as _NVFP4_ACTIVATION_TENSOR_SUFFIX,
@@ -501,6 +502,12 @@ class PrismaQuantConfig(QuantizationConfig):
         self.ignore: list[str] = []
         self.target_scheme: dict[str, dict] = {}    # CB module -> scheme dict
         self._cb_targets: set[str] = set()
+        # Trellis targets are kept in their OWN map, never in ``target_scheme``.
+        # CB's fused-owner resolution, its activation-contract validation and
+        # its device-capability gate all assume the CB vocabulary; a trellis
+        # scheme sharing that map would be silently claimed by every one of
+        # them.
+        self.target_trellis: dict[str, dict] = {}  # module -> trellis scheme
         self._embedding_units: dict[str, "_EmbeddingFormat"] = {}
         self.ct_config = None                        # stock CompressedTensorsConfig
         self._codebooks: dict[str, torch.Tensor] | None = None
@@ -1082,6 +1089,16 @@ class PrismaQuantConfig(QuantizationConfig):
             if not isinstance(scheme, dict):
                 raise ValueError("CB config group scheme must be an object")
             scheme_target = next(iter(group.get("targets", ())), "<no target>")
+            if is_trellis_scheme(scheme):
+                # A trellis scheme is validated against this package's own
+                # reader domain (``trellis.FAMILIES`` / ``RUNG_POLICIES``), not
+                # against the packaged runtime contract: the set of wires the
+                # reader accepts is an in-package fact, while a ``formats`` row
+                # or an eligibility cell would be a SERVING claim, and no
+                # attestation exists for these lanes. Absence resolves
+                # ``unattested``, which is the honest status.
+                validate_trellis_scheme(scheme, str(scheme_target))
+                continue
             self._validate_cb_format_scheme(
                 scheme, str(scheme_target), runtime_contract)
             for raw_target in group.get("targets", []):
@@ -1129,7 +1146,10 @@ class PrismaQuantConfig(QuantizationConfig):
         self._target_physical_name = physical_by_canonical
         stock_groups: dict = {}
         for name, g in self.config_groups.items():
-            if "scheme" in g:                        # CB group (our vocabulary)
+            if "scheme" in g and is_trellis_scheme(g["scheme"]):
+                for t in g["targets"]:
+                    self.target_trellis[t] = g["scheme"]
+            elif "scheme" in g:                      # CB group (our vocabulary)
                 for t in g["targets"]:
                     self.target_scheme[t] = g["scheme"]
                     self._cb_targets.add(t)
@@ -1253,6 +1273,7 @@ class PrismaQuantConfig(QuantizationConfig):
         # and RAISES for FP8/NVFP4, so a stock group naming the embedding would
         # not merely mis-own it -- it would refuse to load the artifact at all.
         ct_dict["ignore"] = (list(self.ignore) + sorted(self._cb_targets)
+                             + sorted(self.target_trellis)
                              + sorted(self._passthrough_units)
                              + sorted(self._embedding_units))
         ct_dict.pop("codebook_file", None)
@@ -1406,6 +1427,22 @@ class PrismaQuantConfig(QuantizationConfig):
                 if hits:
                     return hits
         return []
+
+    def _trellis_scheme_for_prefix(self, prefix: str) -> dict | None:
+        """The declared trellis scheme for *prefix*, or None.
+
+        Deliberately does NOT resolve fused shards the way
+        ``_scheme_for_prefix`` does. A vLLM fusion merges q/k/v (or gate/up)
+        into one module, and per-role trellis wires cannot be concatenated:
+        each wire carries its own alphabets, its own per-column rate schedule
+        and its own row padding, so three wires are not a wire. The supported
+        form is one wire covering the whole merged module; ``get_quant_method``
+        refuses anything else by name rather than mis-serving it.
+        """
+        for base in _candidate_bases(prefix):
+            if base in self.target_trellis:
+                return self.target_trellis[base]
+        return None
 
     def _scheme_for_prefix(self, prefix: str) -> dict | None:
         for base in _candidate_bases(prefix):
@@ -1673,6 +1710,43 @@ class PrismaQuantConfig(QuantizationConfig):
         )
         return method
 
+    def _build_trellis_method(self, prefix: str, scheme: dict):
+        """Construct the Gridbook trellis lane serving this target.
+
+        Every refusal here is at method construction, before a parameter
+        exists -- the same fail-closed moment the other Gridbook-owned
+        surfaces use.
+        """
+        from .trellis import TCQ_E2M1_R256, TCQ_E4M3_R256
+
+        # A merged module cannot be served from per-role wires (see
+        # ``_trellis_scheme_for_prefix``). Refuse by name: the alternative is
+        # a shape error three frames deeper that reads like a corrupt file.
+        if self.fused_role_owners(prefix) or self.incomplete_fused_roles(
+                prefix):
+            raise ValueError(
+                f"trellis target {prefix!r} is a vLLM-fused module with "
+                "per-role owners; per-role trellis wires cannot be "
+                "concatenated (each carries its own alphabets, rate schedule "
+                "and row padding). Export ONE wire covering the whole merged "
+                "module and declare it against this prefix.")
+        # TP>1 would have to slice a blob whose rows are bit-packed against a
+        # shared schedule; a sharded form needs per-rank wires, not a byte
+        # range. Name the surface here rather than failing on a shape later.
+        self._require_tp1_serving("Gridbook trellis dense lanes", prefix,
+                                  note="A sharded trellis artifact needs "
+                                       "per-rank wires exported per rank.")
+        family = scheme.get("family")
+        if family == TCQ_E4M3_R256:
+            from .trellis_e4m3_lane import build_trellis_e4m3_method
+            return build_trellis_e4m3_method(scheme, prefix)
+        if family == TCQ_E2M1_R256:
+            from .trellis_e2m1_lane import build_trellis_e2m1_method
+            return build_trellis_e2m1_method(scheme, prefix)
+        raise ValueError(
+            f"trellis target {prefix!r}: no Gridbook lane serves family "
+            f"{family!r}")
+
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> "QuantizeMethodBase | None":
         # Tensor-parallel policy is resolved PER ARM below, not as a blanket
@@ -1690,6 +1764,18 @@ class PrismaQuantConfig(QuantizationConfig):
                 self, "packed_modules_mapping", {}) or {}
 
         if isinstance(layer, LinearBase):
+            # 0) Trellis target — ours, and resolved BEFORE fused-role
+            #    ownership rather than beside CB. Two reasons, both learned
+            #    from getting it wrong: the two vocabularies share the
+            #    "scheme" key so only the discriminator separates them, and
+            #    the fused-owner machinery below assumes CB/source owners --
+            #    a fused trellis prefix reaching it dies on an internal
+            #    attribute instead of the named refusal
+            #    ``_build_trellis_method`` raises. The lane still refuses a
+            #    module that has per-role owners; it just gets to say so.
+            trellis_scheme = self._trellis_scheme_for_prefix(prefix)
+            if trellis_scheme is not None:
+                return self._build_trellis_method(prefix, trellis_scheme)
             # 1) A complete vLLM fusion is resolved role-by-role before the
             #    single-scheme path. The legacy merged method remains truthful
             #    when physical representation and activation metadata match.
@@ -2133,6 +2219,11 @@ class PrismaQuantConfig(QuantizationConfig):
         )
         self._cb_targets = set(
             hf_to_vllm_mapper.apply_list(sorted(self._cb_targets)))
+        # Trellis targets move with them: they are matched against serving
+        # prefixes by the same ``_candidate_bases`` rule, so a map left in the
+        # checkpoint namespace would resolve no-scheme and fall through to
+        # bf16 -- serving the WRONG kernel silently rather than refusing.
+        self.target_trellis = hf_to_vllm_mapper.apply_dict(self.target_trellis)
         if self._per_expert_serving_prefixes:
             physical = list(self._per_expert_serving_prefixes)
             served = hf_to_vllm_mapper.apply_list([
