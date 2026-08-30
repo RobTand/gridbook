@@ -700,17 +700,19 @@ def test_config_dispatch_policy_matches_the_published_split():
         assert parts, f"refusal at line {node.lineno} must name its surface"
         fragments.extend(parts)
     joined = "\n".join(fragments)
-    # Four, not six: the stacked whole-tensor CB MoE lane moved off the TP=1
+    # Five, not six: the stacked whole-tensor CB MoE lane moved off the TP=1
     # helper onto the expert-parallel gate below, and mixed-format fused
     # projections moved off it entirely — that composite owns no law of its
-    # own, so each role's existing shard gate refuses per role instead. The
-    # MIXED per-expert-format MoE site stays, which is why "CB MoE expert
-    # stacks" still appears here.
-    assert len(refusals) == 4
+    # own, so each role's existing shard gate refuses per role instead. Trellis
+    # dense is a separate opaque-blob research lane: its wire has no splittable
+    # axis, so it correctly keeps its own named TP=1 refusal. The MIXED
+    # per-expert-format MoE site also stays.
+    assert len(refusals) == 5
     for surface in (
             "source-passthrough unit format",
             "delegated stock compressed-tensors groups",
             "quantized embedding units",
+            "Gridbook trellis dense lanes",
             "CB MoE expert stacks",
     ):
         assert surface in joined, \
