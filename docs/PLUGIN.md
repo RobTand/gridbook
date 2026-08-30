@@ -172,20 +172,31 @@ second runtime tree or maintain a parallel loader table.
 
 ## Capability-scoped serving lanes
 
-Contract v11 carries `lane_eligibility` schema
-`gridbook.lane-eligibility.v2`. It does not widen the byte reader domain; it
+Contract v12 carries `lane_eligibility` schema
+`gridbook.lane-eligibility.v3`. It does not widen the byte reader domain; it
 states which exact platform/structure/regime/rung compositions have a native
 route and how far their qualification has progressed.
 
 - `platforms` maps a scalar id such as `sm_89` to one exact compute capability,
-  never a `>=` family or wildcard.
+  never a `>=` family or wildcard. GB10 is `sm_121`, a different part from the
+  RTX 50 `sm_120` rows; neither id covers the other.
 - Every `cells` row names one scalar platform, format family, structure
-  (`dense` or `routed_moe`), regime (`decode` or `batch`), non-empty subset of
-  that family's `producer_rungs`, route status, qualification, serve flags and
-  closed predicates. Absence is unbacked; an explicit `unbacked` row is invalid.
+  (`dense` or `routed_moe`), regime (`decode` or `batch`), a non-empty rung
+  set, route status, qualification, serve flags and closed predicates. Absence
+  is unbacked; an explicit `unbacked` row is invalid.
+- A cell's vocabulary follows its family's `formats` **kind**, which is why the
+  table moved from v2 to v3. A `cb_product` cell carries `rungs`, a subset of
+  that family's `producer_rungs`. A `tcq_trellis` cell instead carries
+  `rungs_q256` — body bits per 256 weights, a subset of the family's
+  `candidate_rungs_q256` — plus `activation_contract`, the A-side contract that
+  lane's `apply()` executes. A v2 reader must refuse a v3 table whole rather
+  than read the keys it recognises: it would see `rungs` as absent.
 - `route_status` is `backed`, `backed_with_serve_flag`, or `fallback`.
   `qualification` is independent: `compile_only` proves no device execution
   and is never producer-legal; `device_qualified` requires the physical gate.
+- Neither field is a quality claim. The table says which route **executes**,
+  never that the route is accurate, fast, or worth choosing. No accuracy,
+  perplexity or throughput value is representable in it at all.
 - The initial SM89 dense FP8-CB decode (`cb_gemv_fp8`) and batch
   (`cb_expand_fp8` + direct vLLM CUTLASS W8A8) rows cover K40/K44/K48
   but remain `compile_only`. This contract therefore does **not** authorize a
@@ -206,6 +217,33 @@ route and how far their qualification has progressed.
   the `fallback`. Every row remains `compile_only`. These rows make the
   validation-only dual-family AQUA candidate surface structurally explicit;
   they do not authorize an RTX 50 artifact or prefer FP8 over NVFP4.
+- The four SM121 trellis rows are the contract's first `device_qualified`
+  cells, and the only ones. On 2026-08-29 a real vLLM process on a GB10 loaded
+  synthetic trellis checkpoints in all four combinations of
+  {E4M3, E2M1} x {resident, streamed}, dispatched every declared Linear to
+  `TrellisE4M3LinearMethod` / `TrellisE2M1LinearMethod`, generated, and matched
+  each lane's held code plane and `scale_b` operand byte-for-byte against the
+  wire. Both lanes are genuine W8A8 / W4A4: `apply()` quantizes the A side and
+  calls `torch._scaled_mm` with both operands narrow, because this hardware
+  refuses a mixed bf16 pair — there is no A16 route to fall back to.
+  The rows are scoped to exactly what that run covered and no further:
+  - **dense only.** `_build_trellis_method` is reachable only under
+    `isinstance(layer, LinearBase)`, so routed MoE never gets there. No
+    `routed_moe` trellis cell exists and absence is the honest status.
+  - **one rate per family:** `TCQ_E4M3_R1152` and `TCQ_E2M1_R512`. The other
+    four E2M1 candidate rates on the ladder carry no cell and are unattested —
+    not `compile_only`, which would still be a claim.
+  - **`sm_121` only**, the capability the run reported.
+  - **TP=1 only**, capped by the `trellis_format_family` rows below, which
+    restate `_build_trellis_method`'s own refusal.
+  - **`backed_with_serve_flag`**, not `backed`: both lanes refuse construction
+    unless their opt-in flag is set, and the residency mode env var has no
+    default. A default serve does not reach these routes.
+  The checkpoint carried **random weights**, so the run attests load, dispatch
+  and byte-exactness — never model quality. The A-side quality price of either
+  lane is unmeasured, and nothing in this table claims otherwise. GEMM output
+  correctness against a reference matmul is a separate, in-repo GPU test
+  (`tests/test_trellis_*_lane.py::test_apply_matches_the_wire_contract`).
 - `python -m gridbook.sm89_preflight --build-directory <dedicated-dir>
   --receipt <receipt.json>`
   cross-compiles the production generic module with explicit
@@ -232,7 +270,7 @@ route and how far their qualification has progressed.
 
 ## Tensor-parallel capability
 
-As of contract schema `gridbook.runtime-contract.v11`, the packaged contract
+As of contract schema `gridbook.runtime-contract.v12`, the packaged contract
 carries a `tensor_parallel` section that publishes, per serving unit, what the
 runtime actually enforces. The table is an attestation: each row restates a
 refusal or admission site in this package, and
@@ -245,9 +283,14 @@ of that site.
   single number is true of every dispatch path; publishing one would assert
   more than any site enforces.
 - Each entry in `units` names one producer-addressable unit: a CB format family
-  (`NVFP4_CB_K`, `FP8_CB_K`), one source-passthrough format id, or the single
-  composite surface `mixed_fused_projection`.
-  Three claim shapes exist, matching the three enforcement shapes in the
+  (`NVFP4_CB_K`, `FP8_CB_K`), a trellis format family (`TCQ_E2M1_R256`,
+  `TCQ_E4M3_R256`), one source-passthrough format id, or the single composite
+  surface `mixed_fused_projection`. A `trellis_format_family` row publishes
+  `max_world_size: 1`, restating the refusal `config.py::_build_trellis_method`
+  raises by name: a trellis wire's rows are bit-packed against a shared
+  per-column rate schedule and carry their own alphabets, so a rank's share is
+  not a byte range of the whole and a sharded artifact needs per-rank wires.
+  Four claim shapes exist, matching the four enforcement shapes in the
   runtime:
   - **Dense CB families** publish `shard_admission` instead of a cap, because
     no dispatch path enforces a numeric ceiling for them — above one rank,
@@ -323,12 +366,12 @@ contract that omits a shipped unit, invents one, drops a mandatory field,
 caps the capless dense CB surface with a number, or publishes a numeric claim
 no enforcement site stands behind.
 
-**Compatibility rule:** `schema` and `contract_version` move together (v11 / 11),
+**Compatibility rule:** `schema` and `contract_version` move together (v12 / 12),
 and readers match the schema string exactly. A producer pinned to the previous
-schema (v10) must refuse a `gridbook.runtime-contract.v11` contract whole — no
+schema (v11) must refuse a `gridbook.runtime-contract.v12` contract whole — no
 partial parsing, no field-by-field salvage across versions — and keep producing
-against its pinned runtime until its pin is deliberately bumped. Reading a v10
-contract with a v11 reader fails the same way. Only the CURRENT schema string is
+against its pinned runtime until its pin is deliberately bumped. Reading a v11
+contract with a v12 reader fails the same way. Only the CURRENT schema string is
 spelled in full anywhere outside the changelog, so a stale pin cannot hide in
 prose.
 

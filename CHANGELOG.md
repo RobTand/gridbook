@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Trellis lanes enter the runtime contract (`gridbook.runtime-contract.v12`)
+
+- Contract schema and version move to `gridbook.runtime-contract.v12` / 12, and
+  the lane table to `gridbook.lane-eligibility.v3`. A reader pinned to v11 must
+  refuse a v12 contract whole.
+- `formats` rows gain a `kind`. The two existing rows are `cb_product` with
+  every value unchanged; two `tcq_trellis` rows join them for `TCQ_E2M1_R256`
+  and `TCQ_E4M3_R256`, restating `gridbook.trellis.RUNG_POLICIES` field for
+  field: candidate rate ladder, reader rate band, native terminal rate, and the
+  two residency modes. Rates are body bits per 256 weights, never a rounded
+  bpw and never a CB codebook K.
+- `lane_eligibility` gains platform `sm_121` and four **`device_qualified`**
+  dense trellis cells — the first in this contract. On 2026-08-29 a real vLLM
+  process on a GB10 loaded synthetic trellis checkpoints in all four
+  combinations of {E4M3, E2M1} x {resident, streamed}, dispatched every
+  declared Linear to the trellis lane class, generated, and matched each lane's
+  held code plane and `scale_b` operand byte-for-byte against the wire. Both
+  lanes are genuine W8A8 / W4A4; there is no A16 route.
+- The cells carry a typed `activation_contract` naming the A-side contract the
+  lane's `apply()` executes, taken from the lanes' own `ACTIVATION_CONTRACT`
+  constants. CB cells carry no such field: a CB lane's A side is mode-selected
+  at serve time and one value would be wrong.
+- Scope is deliberate and narrow: dense only (routed MoE never reaches
+  `_build_trellis_method`), one rate per family (`TCQ_E4M3_R1152`,
+  `TCQ_E2M1_R512`), `sm_121` only, TP=1 by a new `trellis_format_family`
+  tensor-parallel row that restates the lane's own refusal, and
+  `backed_with_serve_flag` because both lanes are opt-in with no default
+  residency mode. Everything else is unattested by absence — including the
+  other four E2M1 candidate rates, TP>1, and routed MoE.
+- The receipt used **random weights**. It attests load, dispatch and
+  byte-exactness, never model quality; no quality value is representable in
+  this table.
+- `tests/test_runtime_contract_tp.py::test_config_dispatch_policy_matches_the_published_split`
+  now expects five TP=1 refusal sites. The fifth
+  (`"Gridbook trellis dense lanes"`) landed with the trellis lanes and the test
+  was not updated at the time.
+
 ## 0.9.1 — 2026-08-24
 
 ### Pre-release broad-ladder retraction (intended 0.9.1 surface)

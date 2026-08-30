@@ -339,13 +339,52 @@ def test_research_formats_refuse_public_artifact_authority(format_id):
         trellis.refuse_public_artifact_authority(format_id)
 
 
-def test_research_ids_are_absent_from_public_runtime_contract():
+def test_contract_attests_the_route_without_blessing_the_format():
+    """Contract v12 attests which route executes; artifact authority is
+    a separate refusal and stays refused.
+
+    Before the 2026-08-29 device receipt this test asserted the family
+    names were absent from the contract entirely.  They are present now --
+    two ``tcq_trellis`` ``formats`` rows and four ``device_qualified``
+    cells -- so the boundary this test guards has moved rather than gone:
+    an attested execution route is still not a blessed public artifact
+    format, and no rung the receipt did not serve may appear anywhere in
+    the packaged table.
+    """
     from pathlib import Path
 
-    contract = (Path(trellis.__file__).with_name("runtime_contract.json")
-                .read_text())
-    assert "TCQ_E2M1" not in contract
-    assert "TCQ_E4M3" not in contract
+    text = (Path(trellis.__file__).with_name("runtime_contract.json")
+            .read_text())
+    assert "TCQ_E2M1_R256" in text
+    assert "TCQ_E4M3_R256" in text
+
+    # Only the two receipted rates are qualified; every other candidate
+    # rate stays absent from every cell, and absence resolves
+    # ``unattested``.  Checked both as a parsed fact and as a raw-text
+    # fact, so neither a stray cell nor a stray rung id can slip in.
+    import json
+
+    contract = json.loads(text)
+    for family, served in ((trellis.TCQ_E2M1_R256, 512),
+                           (trellis.TCQ_E4M3_R256, 1152)):
+        qualified = {rate
+                     for cell in contract["lane_eligibility"]["cells"]
+                     if cell.get("family") == family
+                     for rate in cell.get("rungs_q256", ())}
+        assert qualified == {served}, (
+            f"{family}: qualified {sorted(qualified)}, receipt served "
+            f"{served}")
+        for q256 in trellis.RUNG_POLICIES[family].candidate_q256:
+            if q256 == served:
+                continue
+            rung = trellis.rung_id(family, q256)
+            assert rung not in text, f"unreceipted rung {rung} in contract"
+
+    # Attestation is not authority: publishing an artifact in either
+    # family is still refused.
+    for family in (trellis.TCQ_E2M1_R256, trellis.TCQ_E4M3_R256):
+        with pytest.raises(RuntimeError, match="research-only"):
+            trellis.refuse_public_artifact_authority(family)
 
 
 def test_accounting_refuses_a_directly_constructed_invalid_wire():

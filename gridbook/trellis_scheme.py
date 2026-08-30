@@ -31,11 +31,31 @@ WHY VALIDATION LOOKS AT ``trellis.py`` AND NOT AT ``runtime_contract.json``.
 Principle 14 governs claims about *another* runtime -- what vLLM executes,
 which kernel a route lands on.  The set of wires this package's own reader
 accepts is not such a claim: ``FAMILIES`` and ``RUNG_POLICIES`` are the reader
-domain, in-package and authoritative.  Adding a ``formats`` row or a
-``lane_eligibility`` cell would instead be asserting a *serving* fact, and no
-attestation for these lanes exists yet, so no cell is added: absence already
-resolves ``unattested``, which is the honest status for a lane that has never
-been loaded by vLLM.
+domain, in-package and authoritative, and that is what the functions below
+gate against.  A ``formats`` row or a ``lane_eligibility`` cell is the other
+kind of statement -- a *serving* fact -- so it is published separately, and
+only where a receipt covers it.
+
+THAT SPLIT NOW HAS BOTH HALVES.  An earlier revision of this docstring said no
+serving attestation existed for these lanes and that absence was therefore the
+honest status.  It was, until 2026-08-29, when real vLLM
+(``vllm/vllm-openai:qwen38-flash-next``) on a GB10 loaded synthetic trellis
+checkpoints in all four combinations of {E4M3, E2M1} x {resident, streamed},
+dispatched every declared Linear to ``TrellisE4M3LinearMethod`` /
+``TrellisE2M1LinearMethod``, generated, and matched each lane's held code
+plane and ``scale_b`` operand byte-for-byte against the wire.  Contract v12
+publishes that as four ``device_qualified`` cells under platform ``sm_121``.
+
+The cells are scoped to exactly what that receipt covers and no further:
+dense Linears only, one rate per family (``TCQ_E4M3_R1152``,
+``TCQ_E2M1_R512``) out of each family's candidate ladder, ``sm_121`` only, and
+``backed_with_serve_flag`` because both lanes refuse construction unless their
+opt-in flag and residency mode are set.  Tensor-parallel size stays capped at
+1 by ``config.py::_build_trellis_method``'s own refusal, restated as a
+``trellis_format_family`` row.  Everything else -- TP>1, routed MoE, the other
+four E2M1 rates, and the A-side quality price, which the receipt's random
+weights could not have measured -- carries no cell, and absence still resolves
+``unattested``.
 """
 from __future__ import annotations
 

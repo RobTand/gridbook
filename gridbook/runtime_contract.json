@@ -1,6 +1,6 @@
 {
-  "schema": "gridbook.runtime-contract.v11",
-  "contract_version": 11,
+  "schema": "gridbook.runtime-contract.v12",
+  "contract_version": 12,
   "abi_features": {
     "dspark_construction_physical_bridge": 1,
     "routed_moe_per_role_codebook_lut": 1,
@@ -57,6 +57,7 @@
   },
   "formats": [
     {
+      "kind": "cb_product",
       "family": "NVFP4_CB_K",
       "name_pattern": "NVFP4_CB_K{k}",
       "grid": "fp4",
@@ -101,6 +102,7 @@
       ]
     },
     {
+      "kind": "cb_product",
       "family": "FP8_CB_K",
       "name_pattern": "FP8_CB_K{k}",
       "grid": "fp8",
@@ -140,10 +142,48 @@
       "moe_layout_versions": [
         1
       ]
+    },
+    {
+      "kind": "tcq_trellis",
+      "family": "TCQ_E2M1_R256",
+      "name_pattern": "TCQ_E2M1_R{k}",
+      "candidate_rungs_q256": [
+        384,
+        512,
+        640,
+        768,
+        896
+      ],
+      "reader_rate_range_q256": [
+        256,
+        1016
+      ],
+      "native_terminal_q256": 1024,
+      "residency_modes": [
+        "resident",
+        "streamed"
+      ]
+    },
+    {
+      "kind": "tcq_trellis",
+      "family": "TCQ_E4M3_R256",
+      "name_pattern": "TCQ_E4M3_R{k}",
+      "candidate_rungs_q256": [
+        1152
+      ],
+      "reader_rate_range_q256": [
+        256,
+        2040
+      ],
+      "native_terminal_q256": 2048,
+      "residency_modes": [
+        "resident",
+        "streamed"
+      ]
     }
   ],
   "lane_eligibility": {
-    "schema": "gridbook.lane-eligibility.v2",
+    "schema": "gridbook.lane-eligibility.v3",
     "platforms": {
       "sm_89": {
         "compute_capability": [
@@ -155,6 +195,12 @@
         "compute_capability": [
           12,
           0
+        ]
+      },
+      "sm_121": {
+        "compute_capability": [
+          12,
+          1
         ]
       }
     },
@@ -420,6 +466,78 @@
         "qualification": "compile_only",
         "requires_serve_flags": [],
         "predicates": []
+      },
+      {
+        "id": "trellis_e4m3_dense_sm121_decode_scaled_mm_w8a8",
+        "platform": "sm_121",
+        "family": "TCQ_E4M3_R256",
+        "structure": "dense",
+        "regime": "decode",
+        "rungs_q256": [
+          1152
+        ],
+        "activation_contract": "fp8_per_token_dynamic",
+        "route_status": "backed_with_serve_flag",
+        "qualification": "device_qualified",
+        "requires_serve_flags": [
+          "GRIDBOOK_TRELLIS_E4M3=1",
+          "GRIDBOOK_TRELLIS_E4M3_MODE=resident|streamed"
+        ],
+        "predicates": []
+      },
+      {
+        "id": "trellis_e4m3_dense_sm121_batch_scaled_mm_w8a8",
+        "platform": "sm_121",
+        "family": "TCQ_E4M3_R256",
+        "structure": "dense",
+        "regime": "batch",
+        "rungs_q256": [
+          1152
+        ],
+        "activation_contract": "fp8_per_token_dynamic",
+        "route_status": "backed_with_serve_flag",
+        "qualification": "device_qualified",
+        "requires_serve_flags": [
+          "GRIDBOOK_TRELLIS_E4M3=1",
+          "GRIDBOOK_TRELLIS_E4M3_MODE=resident|streamed"
+        ],
+        "predicates": []
+      },
+      {
+        "id": "trellis_e2m1_dense_sm121_decode_scaled_mm_w4a4",
+        "platform": "sm_121",
+        "family": "TCQ_E2M1_R256",
+        "structure": "dense",
+        "regime": "decode",
+        "rungs_q256": [
+          512
+        ],
+        "activation_contract": "e2m1_group16_ue4m3_static",
+        "route_status": "backed_with_serve_flag",
+        "qualification": "device_qualified",
+        "requires_serve_flags": [
+          "GRIDBOOK_TRELLIS_E2M1=1",
+          "GRIDBOOK_TRELLIS_E2M1_MODE=resident|streamed"
+        ],
+        "predicates": []
+      },
+      {
+        "id": "trellis_e2m1_dense_sm121_batch_scaled_mm_w4a4",
+        "platform": "sm_121",
+        "family": "TCQ_E2M1_R256",
+        "structure": "dense",
+        "regime": "batch",
+        "rungs_q256": [
+          512
+        ],
+        "activation_contract": "e2m1_group16_ue4m3_static",
+        "route_status": "backed_with_serve_flag",
+        "qualification": "device_qualified",
+        "requires_serve_flags": [
+          "GRIDBOOK_TRELLIS_E2M1=1",
+          "GRIDBOOK_TRELLIS_E2M1_MODE=resident|streamed"
+        ],
+        "predicates": []
       }
     ]
   },
@@ -506,6 +624,16 @@
           ],
           "per_role_law": "inherited"
         }
+      },
+      {
+        "unit": "TCQ_E2M1_R256",
+        "kind": "trellis_format_family",
+        "max_world_size": 1
+      },
+      {
+        "unit": "TCQ_E4M3_R256",
+        "kind": "trellis_format_family",
+        "max_world_size": 1
       }
     ]
   },

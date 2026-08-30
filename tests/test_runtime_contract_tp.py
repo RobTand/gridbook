@@ -3,7 +3,7 @@
 Since the shard-aware loading wave, dense CB Linears construct above one
 tensor-parallel rank under structural shard-alignment gates, while every
 other surface refuses by name at a numeric TP=1 ceiling.  As of schema
-``gridbook.runtime-contract.v11`` the packaged contract publishes exactly
+``gridbook.runtime-contract.v12`` the packaged contract publishes exactly
 that split as machine-readable per-unit rows, so a producer gate can branch
 on fields instead of prose (principle: an attested claim, never an asserted
 one).
@@ -132,11 +132,24 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
     assert set(units) == {
         "FP8_CB_K",
         "NVFP4_CB_K",
+        "TCQ_E2M1_R256",
+        "TCQ_E4M3_R256",
         "fp8_e4m3_ue8m0_block128",
         "mxfp4_e2m1_ue8m0_g32",
         "mxfp8_e4m3_e8m0_g32",
         "mixed_fused_projection",
     }
+    # The trellis families take the NUMERIC shape, not the CB shard laws:
+    # config.py::_build_trellis_method refuses every trellis target above one
+    # rank by name, before a parameter exists, so a cap of 1 is a number a
+    # site enforces.  There is no shard law to publish instead -- a wire's
+    # rows are bit-packed against a shared per-column rate schedule, so a
+    # rank's share is not a byte range of the whole.
+    for family in ("TCQ_E2M1_R256", "TCQ_E4M3_R256"):
+        assert units[family]["kind"] == "trellis_format_family"
+        assert units[family]["max_world_size"] == 1
+        assert "shard_admission" not in units[family]
+        assert "arms" not in units[family]
     # Dense CB units admit TP>1 subject to structural shard laws, so they
     # publish those laws instead of a numeric cap.  A cap here would be a
     # number no enforcement site stands behind.
@@ -222,9 +235,9 @@ def test_packaged_table_declares_exactly_the_enforced_capability():
 
 def test_schema_and_contract_version_move_together():
     contract = load_runtime_contract()
-    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v11"
+    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v12"
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 11
+    assert contract["contract_version"] == 12
 
 
 # --- 2. Closed-world reading: absence means REFUSED ---------------------------
@@ -700,18 +713,21 @@ def test_config_dispatch_policy_matches_the_published_split():
         assert parts, f"refusal at line {node.lineno} must name its surface"
         fragments.extend(parts)
     joined = "\n".join(fragments)
-    # Four, not six: the stacked whole-tensor CB MoE lane moved off the TP=1
+    # Five, not six: the stacked whole-tensor CB MoE lane moved off the TP=1
     # helper onto the expert-parallel gate below, and mixed-format fused
     # projections moved off it entirely — that composite owns no law of its
     # own, so each role's existing shard gate refuses per role instead. The
     # MIXED per-expert-format MoE site stays, which is why "CB MoE expert
-    # stacks" still appears here.
-    assert len(refusals) == 4
+    # stacks" still appears here. The fifth is the trellis dense lane, added
+    # with the lanes themselves: a wire's rows are bit-packed against a shared
+    # per-column rate schedule, so a rank's share is not a byte range.
+    assert len(refusals) == 5
     for surface in (
             "source-passthrough unit format",
             "delegated stock compressed-tensors groups",
             "quantized embedding units",
             "CB MoE expert stacks",
+            "Gridbook trellis dense lanes",
     ):
         assert surface in joined, \
             f"no refusal site names the {surface!r} surface"

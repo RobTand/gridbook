@@ -119,13 +119,24 @@ rows, receipt `dq-runs/trellis-serve-20260829/all4.log`. Generator:
 `tools/make_trellis_smoke_checkpoint.py`. Generation quality is NOT claimed:
 the smoke checkpoint has random weights.
 
-**What is still NOT qualified.** This is a load-and-value gate, not a
-device-qualification: no `runtime_contract.json` `formats` row and no
-`lane_eligibility` cell exist, so every trellis route resolves `unattested` by
-design (a cell would be a serving claim, and per principle 14 those are
-attested, never asserted). TP>1 is refused by name — a blob has no splittable
-axis and a sharded artifact needs per-rank wires. Routed MoE is untouched. The
-**activation-side quality price is unmeasured** for both lanes: every trellis
-quality number in existence is weight-only corpus SSE, which prices W*A16,
-while these lanes execute W8A8 and W4A4. And the smoke checkpoint is
-self-consistent rather than encoded — it says nothing about encoding quality.
+**What this receipt did qualify.** Contract schema v12 carries the first
+trellis rows: a `tcq_trellis` `formats` row per family and four
+`device_qualified` `lane_eligibility` cells (`{E4M3,E2M1}` x `{decode,batch}`,
+platform `sm_121`, `structure: dense`, `route_status:
+backed_with_serve_flag`). Each cell names exactly one rate in `rungs_q256` --
+the rate the receipt served -- so the remaining four E2M1 candidate rates stay
+absent, i.e. unattested. The cells state which route **executes**; they say
+nothing about how good it is.
+
+**What is still NOT qualified.** Every axis the receipt did not touch is still
+absent from the table, and absence resolves `unattested` by design. TP>1 is
+refused by name — a blob has no splittable axis and a sharded artifact needs
+per-rank wires; the contract restates that refusal as a
+`trellis_format_family` TP unit with `max_world_size: 1`. Routed MoE is
+untouched, and `structure: dense` is the honest scope: `_build_trellis_method`
+has exactly one call site, inside the `isinstance(layer, LinearBase)` guard.
+The **activation-side quality price is unmeasured** for both lanes: every
+trellis quality number in existence is weight-only corpus SSE, which prices
+W*A16, while these lanes execute W8A8 and W4A4. And the smoke checkpoint is
+self-consistent rather than encoded, with random weights — it says nothing
+about encoding or generation quality.

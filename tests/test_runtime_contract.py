@@ -41,7 +41,7 @@ def test_packaged_contract_loads_and_validates():
     contract = load_runtime_contract()
     assert contract == raw
     assert contract["schema"] == RUNTIME_CONTRACT_SCHEMA
-    assert contract["contract_version"] == 11
+    assert contract["contract_version"] == 12
     assert contract["abi_features"] == {
         "dspark_construction_physical_bridge": 1,
         "routed_moe_per_role_codebook_lut": 1,
@@ -133,7 +133,12 @@ def test_contract_pins_current_format_ladders_and_layout_restrictions():
     by_family = {
         item["family"]: item for item in load_runtime_contract()["formats"]
     }
-    assert set(by_family) == {"NVFP4_CB_K", "FP8_CB_K"}
+    assert set(by_family) == {
+        "NVFP4_CB_K", "FP8_CB_K", "TCQ_E2M1_R256", "TCQ_E4M3_R256",
+    }
+    # A row's kind decides its vocabulary; the two CB rows keep theirs.
+    assert by_family["NVFP4_CB_K"]["kind"] == "cb_product"
+    assert by_family["FP8_CB_K"]["kind"] == "cb_product"
     # The signed NVFP4_CB_S family was removed from the runtime (2026-08-23);
     # a row for it must not outlive its enforcement sites.
     assert "NVFP4_CB_S" not in by_family
@@ -168,10 +173,11 @@ def test_platform_lanes_pin_structural_routes_without_device_claims():
     """Cross-compilation is neither a 4090 nor RTX 50 serve qualification."""
 
     lanes = load_runtime_contract()["lane_eligibility"]
-    assert lanes["schema"] == "gridbook.lane-eligibility.v2"
+    assert lanes["schema"] == "gridbook.lane-eligibility.v3"
     assert lanes["platforms"] == {
         "sm_89": {"compute_capability": [8, 9]},
         "sm_120": {"compute_capability": [12, 0]},
+        "sm_121": {"compute_capability": [12, 1]},
     }
     assert lanes["regimes"] == ["decode", "batch"]
     assert lanes["structures"] == ["dense", "routed_moe"]
@@ -189,7 +195,13 @@ def test_platform_lanes_pin_structural_routes_without_device_claims():
         "fp8_cb_routed_sm120_decode_cuda_gemv",
         "fp8_cb_routed_sm120_batch_persistent_b",
         "fp8_cb_routed_sm120_batch_expand_bf16",
+        "trellis_e4m3_dense_sm121_decode_scaled_mm_w8a8",
+        "trellis_e4m3_dense_sm121_batch_scaled_mm_w8a8",
+        "trellis_e2m1_dense_sm121_decode_scaled_mm_w4a4",
+        "trellis_e2m1_dense_sm121_batch_scaled_mm_w4a4",
     }
+    cb_cells = [cell for cell in by_id.values()
+                if cell["platform"] != "sm_121"]
 
     sm89 = [cell for cell in by_id.values() if cell["platform"] == "sm_89"]
     assert {(cell["structure"], cell["regime"], cell["route_status"])
@@ -234,10 +246,12 @@ def test_platform_lanes_pin_structural_routes_without_device_claims():
     assert fp8_persistent["predicates"] == [
         {"fact": "role_split", "op": "equals", "value": False}
     ]
-    assert all(cell["qualification"] == "compile_only"
-               for cell in by_id.values())
-    assert all(cell["requires_serve_flags"] == []
-               for cell in by_id.values())
+    # Every CB cell stays a cross-compilation claim. The four trellis cells
+    # are the only device-qualified ones, and they are checked against their
+    # own laws in tests/test_runtime_contract_trellis.py.
+    assert all(cell["qualification"] == "compile_only" for cell in cb_cells)
+    assert all(cell["requires_serve_flags"] == [] for cell in cb_cells)
+    assert all(cell["platform"] in {"sm_89", "sm_120"} for cell in cb_cells)
 
 
 def _wrong_schema(contract):
@@ -490,7 +504,7 @@ def test_no_pin_file_carries_a_stale_schema_string():
     it is not an import error, not a test failure anywhere else, and it ships.
     """
 
-    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v11"
+    assert RUNTIME_CONTRACT_SCHEMA == "gridbook.runtime-contract.v12"
     current = int(_SCHEMA_PATTERN.fullmatch(RUNTIME_CONTRACT_SCHEMA).group(1))
 
     for name, text in _scan_for_version_pins().items():

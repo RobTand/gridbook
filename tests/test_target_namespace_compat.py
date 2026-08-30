@@ -657,8 +657,8 @@ def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
     compressed-tensors group at its choke point.
 
     This test reads the packaged table, so it pins the schema it was written
-    against.  Before ``gridbook.runtime-contract.v11`` that pin lived only in a
-    prose docstring, which no grep could see: the v8 bump left it reading "v7"
+    against.  Before contract schema v11 that pin lived only in a prose
+    docstring, which no grep could see: the v8 bump left it reading "v7"
     and nothing failed.  The assertion below is what puts this file in
     ``tests/test_runtime_contract.py::_VERSION_PIN_FILES``, so the next bump
     cannot miss it.
@@ -668,8 +668,8 @@ def test_every_contract_tp_claim_matches_the_dispatch_gate(monkeypatch):
 
     contract = json.loads(resource_files("gridbook").joinpath(
         "runtime_contract.json").read_text(encoding="utf-8"))
-    assert contract["schema"] == "gridbook.runtime-contract.v11"
-    assert contract["contract_version"] == 11
+    assert contract["schema"] == "gridbook.runtime-contract.v12"
+    assert contract["contract_version"] == 12
     table = contract["tensor_parallel"]
     assert table["axis"] == "vllm_tensor_parallel_world_size"
     assert table["semantics"] == "closed_world"

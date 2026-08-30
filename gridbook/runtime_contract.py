@@ -11,11 +11,22 @@ from importlib.resources import files
 from typing import Any, Mapping
 
 
-RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v11"
+RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v12"
 _RESOURCE_NAME = "runtime_contract.json"
 
-#: v11 keeps the historical reader domain separate from the canonical producer
-#: menu.  The broad low-rung expansion developed after v0.9.0 never shipped and
+#: A ``formats`` row's kind decides which vocabulary the rest of the row --
+#: and every lane cell naming its family -- is written in.  The two are not
+#: variants of one thing: a CB row describes a product codebook over an fp4 or
+#: fp8 grid indexed by an integer K, while a TCQ row describes a
+#: self-describing trellis wire whose ladder is a body-bit rate per 256
+#: weights.  Sharing one key set would have forced a trellis row to publish a
+#: ``grid``/``mode``/``n_sub`` it does not have, so the kinds carry different
+#: keys and each is validated against its own law.
+_FORMAT_KINDS = ("cb_product", "tcq_trellis")
+
+#: The CB reader domain, unchanged since v11: it keeps the historical reader
+#: menu separate from the canonical producer one.  The broad low-rung
+#: expansion developed after v0.9.0 never shipped and
 #: is deliberately absent here: NVFP4 reads and produces K12..K24, while FP8
 #: reads every integer K28..K48 and produces only K40/K44/K48.  Generic CUDA
 #: bindings retain wider direct-kernel ranges for research, but low-level kernel
@@ -32,7 +43,70 @@ _FORMAT_RUNGS: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
 # activation contracts; this runtime contract intentionally has no manual
 # "prefer FP8" field.
 
-_LANE_ELIGIBILITY_SCHEMA = "gridbook.lane-eligibility.v2"
+#: The TCQ trellis reader domain, restating ``gridbook.trellis.RUNG_POLICIES``
+#: field for field: the candidate ladder a producer may target, the inclusive
+#: research rate range the reader accepts, and the native terminal rate.  All
+#: rates are BODY BITS PER 256 WEIGHTS -- never a rounded decimal bpw, and
+#: never a CB codebook K.  This module stays standard-library-only, so the
+#: numbers are restated here rather than imported from ``trellis.py`` (which
+#: pulls in torch); ``tests/test_runtime_contract_trellis.py`` asserts the two
+#: agree, which is what makes this a restatement rather than a second opinion.
+_TRELLIS_RUNG_LAW: dict[str, dict[str, Any]] = {
+    "TCQ_E2M1_R256": {
+        "candidate_rungs_q256": (384, 512, 640, 768, 896),
+        "reader_rate_range_q256": (256, 1016),
+        "native_terminal_q256": 1024,
+    },
+    "TCQ_E4M3_R256": {
+        "candidate_rungs_q256": (1152,),
+        "reader_rate_range_q256": (256, 2040),
+        "native_terminal_q256": 2048,
+    },
+}
+
+#: Both trellis lanes implement the same two residency modes, and the mode is
+#: a FOOTPRINT choice rather than a numerics one -- the two are asserted
+#: bit-identical by ``tests/test_trellis_*_lane.py`` -- so it is published
+#: per family rather than per lane cell.
+_TRELLIS_RESIDENCY_MODES = ("resident", "streamed")
+
+#: What each trellis lane executes on the A side, keyed by family.  These are
+#: the lanes' own ``ACTIVATION_CONTRACT`` constants
+#: (``trellis_e4m3_lane.py``, ``trellis_e2m1_lane.py``); the trellis lane cells
+#: carry the value so a producer can compare a PRICED activation contract
+#: against the SERVED one instead of assuming they match.  Neither lane has a
+#: bf16 A-side route: ``_scaled_mm`` on this hardware refuses a mixed
+#: bf16 x fp4 / bf16 x fp8 pair outright, so W4A4 and W8A8 are the only shapes
+#: these lanes can take.  A CB cell publishes no such field because a CB lane's
+#: A side is mode-selected at serve time and one value would be wrong.
+_TRELLIS_ACTIVATION_CONTRACTS: dict[str, str] = {
+    "TCQ_E2M1_R256": "e2m1_group16_ue4m3_static",
+    "TCQ_E4M3_R256": "fp8_per_token_dynamic",
+}
+
+#: Both trellis lanes are OPT-IN and refuse construction with the flag unset
+#: (``build_trellis_*_method``), and neither mode env var has a default -- an
+#: unset mode is an error, because defaulting would pick the artifact's memory
+#: footprint for the operator silently.  A trellis cell therefore cannot be
+#: ``backed``: the route does not execute on a default serve, so the honest
+#: status is ``backed_with_serve_flag`` and these are the flags it names.
+_TRELLIS_SERVE_FLAGS: dict[str, tuple[str, ...]] = {
+    "TCQ_E2M1_R256": (
+        "GRIDBOOK_TRELLIS_E2M1=1",
+        "GRIDBOOK_TRELLIS_E2M1_MODE=resident|streamed",
+    ),
+    "TCQ_E4M3_R256": (
+        "GRIDBOOK_TRELLIS_E4M3=1",
+        "GRIDBOOK_TRELLIS_E4M3_MODE=resident|streamed",
+    ),
+}
+
+#: v3, not v2: a trellis cell carries a rate ladder in different units and an
+#: executed activation contract that a CB cell has no truthful value for, so
+#: the cell vocabulary is no longer one key set.  A consumer written against
+#: v2 must refuse this table whole rather than read the keys it recognises --
+#: it would silently mistake ``rungs_q256`` for absent rungs.
+_LANE_ELIGIBILITY_SCHEMA = "gridbook.lane-eligibility.v3"
 _LANE_STRUCTURES = ("dense", "routed_moe")
 _LANE_REGIMES = ("decode", "batch")
 _LANE_ROUTE_STATUSES = frozenset({
@@ -318,7 +392,8 @@ def _validate_version_set(value: Any, path: str) -> set[int]:
 
 
 def _validate_tensor_parallel(root: Mapping[str, Any],
-                              family_grids: Mapping[str, str]) -> None:
+                              family_grids: Mapping[str, str],
+                              trellis_families: set[str]) -> None:
     """Validate the tensor-parallel capability table.
 
     The table is ATTESTATION, not aspiration: every row must restate what a
@@ -349,6 +424,13 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
       not a format: it publishes the axis it admits and the fact that each
       role's legality is the role's own row.  Neither a cap nor a law of its
       own would be true of it.
+    * ``trellis_format_family`` units are the TCQ lanes, and they take the
+      NUMERIC shape: ``config.py::_build_trellis_method`` calls
+      ``_require_tp1_serving("Gridbook trellis dense lanes", ...)`` at method
+      construction, before a parameter exists.  A trellis wire's rows are
+      bit-packed against a shared per-column rate schedule and carry their own
+      alphabets, so a rank's slice is not a byte range of the whole; a sharded
+      artifact needs per-rank wires.  The cap restates that refusal site.
     """
 
     tp = _object(root["tensor_parallel"], "contract.tensor_parallel")
@@ -368,11 +450,30 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
     cb_units: set[str] = set()
     passthrough_units: set[str] = set()
     mixed_units: set[str] = set()
+    trellis_units: set[str] = set()
     for index, item in enumerate(units):
         path = f"contract.tensor_parallel.units[{index}]"
         row = _object(item, path)
         unit_id = _string(row["unit"], f"{path}.unit")
         kind = _string(row["kind"], f"{path}.kind")
+        if kind == "trellis_format_family":
+            trellis_units.add(unit_id)
+            _keys(row, path, {"unit", "kind", "max_world_size"})
+            if unit_id in seen:
+                _fail("contract.tensor_parallel.units",
+                      f"duplicate unit {unit_id!r}")
+            seen.add(unit_id)
+            if unit_id not in trellis_families:
+                _fail(f"{path}.unit",
+                      f"no trellis format family {unit_id!r} in "
+                      "contract.formats")
+            cap = _positive_int(row["max_world_size"],
+                                f"{path}.max_world_size")
+            if cap != 1:
+                _fail(f"{path}.max_world_size",
+                      "must be 1; config.py::_build_trellis_method refuses "
+                      "every trellis target above one rank")
+            continue
         if kind == "cb_format_family":
             cb_units.add(unit_id)
             expected = {"unit", "kind", "shard_admission"}
@@ -405,8 +506,8 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
             expected = {"unit", "kind", "shard_admission"}
         else:
             _fail(f"{path}.kind",
-                  "must be 'cb_format_family', 'source_passthrough_format' "
-                  "or 'mixed_fused_projection'")
+                  "must be 'cb_format_family', 'source_passthrough_format', "
+                  "'mixed_fused_projection' or 'trellis_format_family'")
         _keys(row, path, expected)
         if unit_id in seen:
             _fail("contract.tensor_parallel.units",
@@ -543,6 +644,12 @@ def _validate_tensor_parallel(root: Mapping[str, Any],
               f"missing "
               f"{sorted(set(_PASSTHROUGH_TP_UNITS) - passthrough_units)}, "
               f"unknown {sorted(passthrough_units - set(_PASSTHROUGH_TP_UNITS))}")
+    if trellis_units != trellis_families:
+        _fail("contract.tensor_parallel.units",
+              f"every trellis format family must carry exactly one "
+              f"'trellis_format_family' claim; missing "
+              f"{sorted(trellis_families - trellis_units)}, unknown "
+              f"{sorted(trellis_units - trellis_families)}")
 
 
 def _validate_expert_parallel(root: Mapping[str, Any],
@@ -640,17 +747,167 @@ def _validate_expert_parallel(root: Mapping[str, Any],
               f"unknown {sorted(set(refused_units) - set(_EP_REFUSED_UNITS))}")
 
 
+def _validate_trellis_format(
+    fmt: Mapping[str, Any],
+    path: str,
+    family: str,
+) -> None:
+    """Validate one TCQ trellis ``formats`` row against the reader domain.
+
+    A trellis row publishes a RATE ladder, not a codebook ladder, so it shares
+    no numeric field with a CB row.  ``candidate_rungs_q256`` is the ladder a
+    producer may target; ``reader_rate_range_q256`` is the inclusive band this
+    package's own wire reader accepts, which is far wider and is a reader fact
+    rather than a production one.  Neither is an eligibility claim: which of
+    those rates a lane has actually been seen to serve is decided cell by cell
+    in ``lane_eligibility``, and a rate on this ladder with no cell naming it
+    is unattested.
+    """
+
+    _keys(fmt, path, {
+        "kind", "family", "name_pattern", "candidate_rungs_q256",
+        "reader_rate_range_q256", "native_terminal_q256", "residency_modes",
+    })
+    law = _TRELLIS_RUNG_LAW.get(family)
+    if law is None:
+        _fail(f"{path}.family",
+              f"must be one of {sorted(_TRELLIS_RUNG_LAW)}")
+    pattern = _string(fmt["name_pattern"], f"{path}.name_pattern")
+    if pattern.count("{k}") != 1:
+        _fail(f"{path}.name_pattern", "must contain exactly one '{k}'")
+    expected_pattern = f"{family.removesuffix('_R256')}_R{{k}}"
+    if pattern != expected_pattern:
+        _fail(f"{path}.name_pattern",
+              f"must be {expected_pattern!r}: the rung id is "
+              "``trellis.rung_id``'s own spelling, and a second spelling "
+              "would name rates no receipt describes")
+
+    candidates = _sorted_unique_ints(
+        fmt["candidate_rungs_q256"], f"{path}.candidate_rungs_q256")
+    if tuple(candidates) != law["candidate_rungs_q256"]:
+        _fail(f"{path}.candidate_rungs_q256",
+              f"must equal the candidate ladder "
+              f"{list(law['candidate_rungs_q256'])} "
+              "(gridbook.trellis.RUNG_POLICIES)")
+    band = fmt["reader_rate_range_q256"]
+    if not isinstance(band, list) or len(band) != 2:
+        _fail(f"{path}.reader_rate_range_q256",
+              "must be [floor, ceiling] in body bits per 256 weights")
+    floor = _positive_int(band[0], f"{path}.reader_rate_range_q256[0]")
+    ceiling = _positive_int(band[1], f"{path}.reader_rate_range_q256[1]")
+    if (floor, ceiling) != law["reader_rate_range_q256"]:
+        _fail(f"{path}.reader_rate_range_q256",
+              f"must equal {list(law['reader_rate_range_q256'])} "
+              "(gridbook.trellis.RUNG_POLICIES)")
+    if not floor <= candidates[0] or not candidates[-1] <= ceiling:
+        _fail(f"{path}.candidate_rungs_q256",
+              "every candidate rate must lie inside the reader band")
+    terminal = _positive_int(
+        fmt["native_terminal_q256"], f"{path}.native_terminal_q256")
+    if terminal != law["native_terminal_q256"]:
+        _fail(f"{path}.native_terminal_q256",
+              f"must equal {law['native_terminal_q256']} "
+              "(gridbook.trellis.RUNG_POLICIES)")
+    modes = _unique_strings(
+        fmt["residency_modes"], f"{path}.residency_modes")
+    if tuple(modes) != _TRELLIS_RESIDENCY_MODES:
+        _fail(f"{path}.residency_modes",
+              f"must equal {list(_TRELLIS_RESIDENCY_MODES)}")
+
+
+def _validate_trellis_cell(
+    cell: Mapping[str, Any],
+    path: str,
+    family: str,
+) -> None:
+    """Validate one TCQ trellis lane cell, including what it may NOT say.
+
+    The scoping fields are the whole point of the cell, so each is checked
+    against a law rather than merely typed:
+
+    * ``rungs_q256`` must be a subset of the family's CANDIDATE ladder, in the
+      same body-bits-per-256-weights units the wire header uses.  The cell
+      names the rates a receipt covers, and every other rate on the ladder is
+      unattested by absence.
+    * ``activation_contract`` must be the lane's own executed A-side contract.
+      It records which route RAN, never that the route is good: no quality,
+      accuracy or speed claim is representable in this table at all.
+    * ``route_status`` must be ``backed_with_serve_flag`` naming the family's
+      opt-in flags, because the lane refuses construction with them unset.
+      A plain ``backed`` would claim a default serve reaches this route.
+    """
+
+    _keys(cell, path, {
+        "id", "platform", "family", "structure", "regime", "rungs_q256",
+        "activation_contract", "route_status", "qualification",
+        "requires_serve_flags", "predicates",
+    })
+    law_rungs = _TRELLIS_RUNG_LAW[family]["candidate_rungs_q256"]
+    rungs = set(_sorted_unique_ints(
+        cell["rungs_q256"], f"{path}.rungs_q256"))
+    if not rungs:
+        _fail(f"{path}.rungs_q256",
+              "must name at least one rate; an empty cell attests nothing")
+    if not rungs <= set(law_rungs):
+        _fail(f"{path}.rungs_q256",
+              "must be a subset of formats[family].candidate_rungs_q256; "
+              f"non-candidate rates {sorted(rungs - set(law_rungs))}")
+    contract = _string(
+        cell["activation_contract"], f"{path}.activation_contract")
+    expected_contract = _TRELLIS_ACTIVATION_CONTRACTS[family]
+    if contract != expected_contract:
+        _fail(f"{path}.activation_contract",
+              f"must be {expected_contract!r}: the {family} lane's apply() "
+              "takes exactly one A-side route and this table restates it")
+    flags = tuple(_unique_strings(
+        cell["requires_serve_flags"], f"{path}.requires_serve_flags"))
+    expected_flags = _TRELLIS_SERVE_FLAGS[family]
+    if flags != expected_flags:
+        _fail(f"{path}.requires_serve_flags",
+              f"must equal {list(expected_flags)}: the lane is opt-in and "
+              "its residency mode has no default")
+
+
 def _validate_lane_eligibility(
     root: Mapping[str, Any],
     family_rungs: Mapping[str, set[int]],
+    trellis_families: set[str],
 ) -> None:
     """Validate platform-scoped route facts without claiming graph support.
 
     Gridbook owns the byte layout and dispatch route, so it publishes those
-    facts here.  A producer's graph/capture policy and each physical run's
-    receipt remain outside this contract.  ``compile_only`` therefore means
-    exactly that: the cell is structurally backed but is not producer-legal
-    until a later contract can honestly publish ``device_qualified``.
+    facts here.  A producer's graph/capture policy remains outside this
+    contract: no cell says anything about CUDA-graph capture, and a consumer
+    must not read one as though it did.
+
+    ``qualification`` separates the two ways a cell can have come to exist:
+
+    * ``compile_only`` -- the route is structurally backed and its kernels
+      cross-compile, but no device has been seen to take it.  Every CB cell is
+      this, and the sm_120 rows are explicitly a cross-compilation receipt
+      rather than an RTX 50 serve.
+    * ``device_qualified`` -- a real vLLM process on that exact compute
+      capability loaded an artifact, dispatched these Linears to this lane,
+      and generated.  The four sm_121 trellis cells are the first, from the
+      2026-08-29 GB10 container receipt (4 combinations of
+      {E4M3, E2M1} x {resident, streamed}, code planes and scale operands
+      byte-exact against the wire).
+
+    What ``device_qualified`` does NOT mean, and what nothing in this table
+    can be read to mean: that the route is accurate, fast, or worth choosing.
+    ``route_status`` and ``activation_contract`` say which route EXECUTES.
+    Model quality is not representable here, and the trellis receipt was taken
+    on a synthetic checkpoint with random weights, so it could not have
+    established quality even if the schema had somewhere to put it.
+
+    Scope is carried by the cell's own typed fields and by closed-world
+    absence, never by prose -- ``detail``/``rationale`` keys are refused
+    outright.  A rung with no cell naming it, a structure with no cell, a
+    platform with no cell: all unattested.  The trellis cells are therefore
+    ``dense`` only (routed MoE never reaches ``_build_trellis_method``, which
+    is called only under ``isinstance(layer, LinearBase)``), name one rate
+    each out of their family's candidate ladder, and are pinned to TP=1 by
+    their ``tensor_parallel`` row rather than by anything said here.
     """
 
     eligibility = _object(
@@ -704,11 +961,16 @@ def _validate_lane_eligibility(
     for index, item in enumerate(cells):
         path = f"contract.lane_eligibility.cells[{index}]"
         cell = _object(item, path)
-        _keys(cell, path, {
-            "id", "platform", "family", "structure", "regime", "rungs",
-            "route_status", "qualification", "requires_serve_flags",
-            "predicates",
-        })
+        family = _string(cell.get("family", ""), f"{path}.family")
+        is_trellis = family in trellis_families
+        if is_trellis:
+            _validate_trellis_cell(cell, path, family)
+        else:
+            _keys(cell, path, {
+                "id", "platform", "family", "structure", "regime", "rungs",
+                "route_status", "qualification", "requires_serve_flags",
+                "predicates",
+            })
         cell_id = _string(cell["id"], f"{path}.id")
         if cell_id in seen_ids:
             _fail("contract.lane_eligibility.cells",
@@ -719,17 +981,18 @@ def _validate_lane_eligibility(
         if platform not in platforms:
             _fail(f"{path}.platform",
                   f"must name one of {sorted(platforms)}")
-        family = _string(cell["family"], f"{path}.family")
-        rung_law = _FORMAT_RUNGS.get(family)
-        if rung_law is None or family not in family_rungs:
-            _fail(f"{path}.family",
-                  f"must name one of {sorted(family_rungs)}")
-        producer_rungs = set(rung_law[1])
-        rungs = set(_sorted_unique_ints(cell["rungs"], f"{path}.rungs"))
-        if not rungs <= producer_rungs:
-            _fail(f"{path}.rungs",
-                  "must be a subset of formats[family].producer_rungs; "
-                  f"non-producer rungs {sorted(rungs - producer_rungs)}")
+        if not is_trellis:
+            rung_law = _FORMAT_RUNGS.get(family)
+            if rung_law is None or family not in family_rungs:
+                _fail(f"{path}.family",
+                      f"must name one of "
+                      f"{sorted(set(family_rungs) | trellis_families)}")
+            producer_rungs = set(rung_law[1])
+            rungs = set(_sorted_unique_ints(cell["rungs"], f"{path}.rungs"))
+            if not rungs <= producer_rungs:
+                _fail(f"{path}.rungs",
+                      "must be a subset of formats[family].producer_rungs; "
+                      f"non-producer rungs {sorted(rungs - producer_rungs)}")
         structure = _string(cell["structure"], f"{path}.structure")
         if structure not in _LANE_STRUCTURES:
             _fail(f"{path}.structure",
@@ -798,8 +1061,8 @@ def validate_runtime_contract(contract: Any) -> None:
         _fail("contract.schema", f"must be {RUNTIME_CONTRACT_SCHEMA!r}")
     contract_version = _positive_int(
         root["contract_version"], "contract.contract_version")
-    if contract_version != 11:
-        _fail("contract.contract_version", "must be 11 for this schema")
+    if contract_version != 12:
+        _fail("contract.contract_version", "must be 12 for this schema")
 
     features = _object(root["abi_features"], "contract.abi_features")
     _keys(features, "contract.abi_features", {
@@ -935,16 +1198,26 @@ def validate_runtime_contract(contract: Any) -> None:
         _fail("contract.formats", "must be a non-empty JSON array")
     family_grids: dict[str, str] = {}
     family_rungs: dict[str, set[int]] = {}
+    trellis_families: set[str] = set()
+    seen_families: set[str] = set()
     for index, item in enumerate(formats):
         path = f"contract.formats[{index}]"
         fmt = _object(item, path)
+        kind = _string(fmt.get("kind", ""), f"{path}.kind")
+        if kind not in _FORMAT_KINDS:
+            _fail(f"{path}.kind", f"must be one of {list(_FORMAT_KINDS)}")
+        family = _string(fmt.get("family", ""), f"{path}.family")
+        if family in seen_families:
+            _fail("contract.formats", f"duplicate family {family!r}")
+        seen_families.add(family)
+        if kind == "tcq_trellis":
+            _validate_trellis_format(fmt, path, family)
+            trellis_families.add(family)
+            continue
         _keys(fmt, path, {
-            "family", "name_pattern", "grid", "mode", "n_sub", "rungs",
+            "kind", "family", "name_pattern", "grid", "mode", "n_sub", "rungs",
             "producer_rungs", "layout_versions", "moe_layout_versions",
         })
-        family = _string(fmt["family"], f"{path}.family")
-        if family in family_grids:
-            _fail("contract.formats", f"duplicate family {family!r}")
         family_grids[family] = _string(fmt["grid"], f"{path}.grid")
         pattern = _string(fmt["name_pattern"], f"{path}.name_pattern")
         if pattern.count("{k}") != 1:
@@ -993,10 +1266,14 @@ def validate_runtime_contract(contract: Any) -> None:
 
     if set(family_grids) != set(_FORMAT_RUNGS):
         _fail("contract.formats",
-              f"format families must equal {sorted(_FORMAT_RUNGS)}")
+              f"CB format families must equal {sorted(_FORMAT_RUNGS)}")
+    if trellis_families != set(_TRELLIS_RUNG_LAW):
+        _fail("contract.formats",
+              f"trellis format families must equal "
+              f"{sorted(_TRELLIS_RUNG_LAW)}")
 
-    _validate_lane_eligibility(root, family_rungs)
-    _validate_tensor_parallel(root, family_grids)
+    _validate_lane_eligibility(root, family_rungs, trellis_families)
+    _validate_tensor_parallel(root, family_grids, trellis_families)
     _validate_expert_parallel(root, family_grids)
 
     profiles = _object(root["producer_profiles"],
