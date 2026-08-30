@@ -153,7 +153,7 @@ from gridbook.cuda_ext import (
     csrc_dir, get_bf16_grouped_ext, get_ext, get_ext_v2,
     get_fp8_source_w8a16_ext, get_fused_ext, get_fused_fp4_ext,
     get_fused_fp4v2_ext, get_moe_persistent_b_ext,
-    get_mxfp8_dense_ext,
+    get_mxfp8_dense_ext, get_trellis_r256_ext,
 )
 from gridbook.native_cutlass import (
     require_native_fp8_cutlass, require_native_moe_activation,
@@ -198,16 +198,28 @@ assert source_w8a16 is not None, \"source-FP8 W8A16 extension failed to build\"
 for symbol in (\"fp8_source_gemv\", \"fp8_source_expand_bf16\"):
     assert hasattr(source_w8a16, symbol), \
         f\"built source-W8A16 module is missing {symbol}\"
+trellis = get_trellis_r256_ext()
+assert trellis is not None, \"trellis R256 extension failed to build\"
+for symbol in (\"trellis_r256_validate_wire\",
+               \"trellis_r256_decode_native_packed_prevalidated_out\",
+               \"trellis_r256_dequant_gemv\"):
+    assert hasattr(trellis, symbol), \
+        f\"built trellis module is missing {symbol}\"
 require_native_fp8_cutlass(\"release native-op gate\")
 require_native_moe_activation(\"silu\", \"release native-op gate\")
 print(\"ok:\", m, v2, grouped, fp8_fused, fp4_fused, fp4v2_fused,
-      persistent_b, mxfp8, source_w8a16)"'
+      persistent_b, mxfp8, source_w8a16, trellis)"'
 ```
 
 This command compiles every serving-reachable packaged extension: the main and
 v2 decode/expansion modules, the required exact grouped BF16 CUTLASS quality
-bridge, all fused/persistent specializations, the direct-MXFP8 W8A8 module, and
-the source block-FP8 W8A16 module. It also attests the direct
+bridge, all fused/persistent specializations, the direct-MXFP8 W8A8 module, the
+source block-FP8 W8A16 module, and the trellis R256 module. The last one joined
+this gate in 0.9.1: `trellis_ops` reaches it through
+`require_trellis_r256_ext`, so both trellis `LinearMethod` lanes fail closed
+without it, and contract v12 publishes those lanes as `device_qualified` cells.
+A module a serving lane requires is not research scaffolding, whatever an older
+docstring calls it. It also attests the direct
 compiled vLLM FP8/CUTLASS and activation ABI that Gridbook invokes without a
 Python fallback helper. The retained `cb_persistent_tc.cu` source is not part
 of this gate: its serving selector, custom op, and package loader were deleted,

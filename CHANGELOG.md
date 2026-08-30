@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.1 — 2026-08-30
+
 ### Trellis lanes enter the runtime contract (`gridbook.runtime-contract.v12`)
 
 - Contract schema and version move to `gridbook.runtime-contract.v12` / 12, and
@@ -34,20 +36,30 @@
 - The receipt used **random weights**. It attests load, dispatch and
   byte-exactness, never model quality; no quality value is representable in
   this table.
+- **`sm_121` carries no CB cell, and that absence is deliberate.** The
+  platform enters the table with the trellis receipt and nothing else. Every
+  CB cell in v12 is `compile_only` and comes from a cross-compile preflight
+  whose capability is fixed in code -- `sm89_preflight.SM89_CAPABILITY = (8,
+  9)` and `sm120_preflight.SM120_CAPABILITY = (12, 0)` -- so no CB receipt for
+  compute 12.1 exists to publish. A consumer reading this table for a CB
+  payload on `sm_121` therefore resolves *unattested*, and it should: the
+  table is reporting a real serving gap, not hiding one.
 - `tests/test_runtime_contract_tp.py::test_config_dispatch_policy_matches_the_published_split`
   now expects five TP=1 refusal sites. The fifth
   (`"Gridbook trellis dense lanes"`) landed with the trellis lanes and the test
   was not updated at the time.
 
-## 0.9.1 — 2026-08-24
 
 ### Pre-release broad-ladder retraction (intended 0.9.1 surface)
 
-- Before the planned 0.9.1 release, Gridbook retracted the candidate public
-  ladder expansions below because no released artifact or reader-compatibility
-  need justified them. Contract schema v11 remains the authority without
-  another schema bump: NVFP4-CB reads and produces exactly K12..K24; FP8-CB
-  reads every integer K28..K48 and produces exactly K40/K44/K48.
+- Before this release, Gridbook retracted the candidate public ladder
+  expansions below because no released artifact or reader-compatibility need
+  justified them. That retraction needed no schema bump of its own: the CB
+  ladders it restores are the v11 ones, and they cross into the shipped v12
+  unchanged -- NVFP4-CB reads and produces exactly K12..K24; FP8-CB reads
+  every integer K28..K48 and produces exactly K40/K44/K48. The v12 bump this
+  release does carry is the trellis section above, which is about a different
+  payload family and touches no CB row.
 - Lane-eligibility cells describe producer-facing routes and are narrowed to
   those producer sets. Historical FP8 fused readers
   K28/K32/K36/K40/K44/K48 remain compiled, including K28/K32/K36 reader-only
