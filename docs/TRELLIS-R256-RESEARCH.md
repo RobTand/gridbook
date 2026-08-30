@@ -129,3 +129,21 @@ axis and a sharded artifact needs per-rank wires. Routed MoE is untouched. The
 quality number in existence is weight-only corpus SSE, which prices W*A16,
 while these lanes execute W8A8 and W4A4. And the smoke checkpoint is
 self-consistent rather than encoded — it says nothing about encoding quality.
+
+### QTIP-derived online transform experiment (2026-08-30)
+
+The E2M1 lane additionally understands the opt-in, research-only
+`gridbook.qtip-online-hadamard.v1` sidecar contract. It applies deterministic
+sign/normalized-block-Hadamard transforms before the existing native FP4
+activation quantizer and after `_scaled_mm`; wire decode, scale operands,
+resident/streamed modes, and the W4A4 GEMM are unchanged. A transformed
+artifact requires `GRIDBOOK_QTIP_ONLINE_HADAMARD_RESEARCH=1` in addition to the
+two E2M1 lane settings and fails closed on every metadata/digest/geometry
+mismatch. Full ABI and algebra:
+[`QTIP-NATIVE-NVFP4-RESEARCH.md`](QTIP-NATIVE-NVFP4-RESEARCH.md).
+
+The current torch FHT is intentionally a correctness reference, not a
+production kernel: it allocates intermediates, is not an opaque custom op, and
+has no graph or served-performance evidence. It therefore adds no runtime
+contract row or lane eligibility. An artifact without `online_transform`
+executes the pre-existing lane unchanged.

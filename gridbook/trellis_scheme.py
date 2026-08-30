@@ -42,6 +42,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from .trellis import FAMILIES, RUNG_POLICIES, TCQ_E2M1_R256, TrellisWire
+from .qtip_hadamard import validate_online_transform
 
 __all__ = [
     "TRELLIS_SCHEME_KEY",
@@ -111,13 +112,22 @@ def validate_trellis_scheme(scheme: Mapping, target: str) -> dict:
             f"block-scaled fp4 mainloop, so K must be a multiple of 16, got "
             f"{columns}")
     wire_bytes = _as_int(scheme, "wire_bytes", target)
-    return {
+    normalized = {
         "family": family,
         "body_rate_q256": rate,
         "rows": rows,
         "columns": columns,
         "wire_bytes": wire_bytes,
     }
+    online_transform = scheme.get("online_transform")
+    if online_transform is not None:
+        if family != TCQ_E2M1_R256:
+            raise ValueError(
+                f"trellis target {target!r}: online_transform is research-"
+                f"implemented only for {TCQ_E2M1_R256}, got {family}")
+        normalized["online_transform"] = validate_online_transform(
+            online_transform, rows=rows, columns=columns, target=target)
+    return normalized
 
 
 def parse_wire_for_scheme(blob: bytes, scheme: Mapping,

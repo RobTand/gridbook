@@ -69,6 +69,14 @@ from .trellis import TCQ_E2M1_R256
 from .trellis_ops import prepare_wire_cuda
 from .trellis_scheme import parse_wire_for_scheme, validate_trellis_scheme
 from .nvfp4_activation_contract import EXECUTION_CONTRACT, GROUP_SIZE
+from .qtip_hadamard import (
+    ONLINE_HADAMARD_FLAG,
+    TRANSFORM_SCHEMA,
+    apply_input_transform,
+    apply_inverse_output_transform,
+    online_hadamard_enabled,
+    seeded_signs,
+)
 
 __all__ = [
     "TRELLIS_E2M1_FLAG",
@@ -76,6 +84,7 @@ __all__ = [
     "MODE_RESIDENT",
     "MODE_STREAMED",
     "ACTIVATION_CONTRACT",
+    "ROTATED_ACTIVATION_CONTRACT",
     "trellis_e2m1_enabled",
     "trellis_e2m1_mode",
     "blocked_scales",
@@ -95,6 +104,9 @@ _MODES = (MODE_RESIDENT, MODE_STREAMED)
 #: ``nvfp4_activation_contract`` already owns. Stamped so a served route can be
 #: compared against a priced one instead of assumed equal.
 ACTIVATION_CONTRACT = EXECUTION_CONTRACT
+ROTATED_ACTIVATION_CONTRACT = (
+    EXECUTION_CONTRACT + "+qtip_block_hadamard_orthonormal_v1"
+)
 
 #: cuBLAS block-scaling tile. Not tunable -- it is the hardware's layout.
 _SF_ROW_TILE = 128
@@ -177,6 +189,14 @@ def build_trellis_e2m1_method(scheme, prefix: str = "<trellis>",
     rows = declared["rows"]
     columns = declared["columns"]
     wire_bytes = declared["wire_bytes"]
+    online_transform = declared.get("online_transform")
+    if online_transform is not None and not online_hadamard_enabled():
+        raise RuntimeError(
+            f"{prefix}: the checkpoint declares {TRANSFORM_SCHEMA}, but its "
+            f"research runtime is not enabled; set {ONLINE_HADAMARD_FLAG}=1 "
+            "to opt in, or use an artifact without online_transform. "
+            "Refusing rather than serving a transformed weight in the wrong "
+            "basis.")
     # ``validate_trellis_scheme`` already refuses a K the group-16 mainloop
     # cannot take; assert the invariant here so the local arithmetic below
     # cannot outlive that check if the schemes module is ever relaxed.
@@ -230,6 +250,10 @@ def build_trellis_e2m1_method(scheme, prefix: str = "<trellis>",
             layer.trellis_groups = groups
             layer.trellis_mode = self._mode
             layer.gridbook_activation_contract = ACTIVATION_CONTRACT
+            if online_transform is not None:
+                layer.gridbook_activation_contract = \
+                    ROTATED_ACTIVATION_CONTRACT
+                layer.gridbook_online_transform_contract = TRANSFORM_SCHEMA
 
         def process_weights_after_loading(self, layer) -> None:
             """Parse the blob, prepare it, block the scale plane, derive gsr.
@@ -270,6 +294,26 @@ def build_trellis_e2m1_method(scheme, prefix: str = "<trellis>",
                     device).view(rows, groups).view(torch.float8_e4m3fn)
             layer.register_buffer("scale_b", blocked_scales(plane),
                                   persistent=False)
+            if online_transform is not None:
+                # Seeds and digests were validated at sidecar parse.  The tiny
+                # sign vectors are deterministic device constants, prepared at
+                # load (never first forward); they are not another weight cache.
+                input_spec = online_transform["input"]
+                output_spec = online_transform["output"]
+                layer.register_buffer(
+                    "qtip_input_signs",
+                    seeded_signs("input", columns, input_spec["seed"],
+                                 device=device, dtype=torch.bfloat16),
+                    persistent=False,
+                )
+                layer.register_buffer(
+                    "qtip_output_signs",
+                    seeded_signs("output", rows, output_spec["seed"],
+                                 device=device, dtype=torch.bfloat16),
+                    persistent=False,
+                )
+                layer.qtip_input_block_size = input_spec["block_size"]
+                layer.qtip_output_block_size = output_spec["block_size"]
             if self._mode == MODE_RESIDENT:
                 layer.register_buffer(
                     "weight_fp4",
@@ -299,6 +343,10 @@ def build_trellis_e2m1_method(scheme, prefix: str = "<trellis>",
             x2 = x.reshape(-1, orig[-1])
             if x2.dtype != torch.bfloat16:
                 x2 = x2.to(torch.bfloat16)
+            if online_transform is not None:
+                x2 = apply_input_transform(
+                    x2, layer.qtip_input_signs,
+                    layer.qtip_input_block_size)
             # A side: static-global-scale NVFP4. Not a choice -- bf16 x fp4 is
             # refused by _scaled_mm on this hardware, so W4A4 is the only
             # native shape. native_fp4_quant already emits the 128x4 blocked
@@ -329,6 +377,10 @@ def build_trellis_e2m1_method(scheme, prefix: str = "<trellis>",
             # nvfp4_activation_contract.reciprocal_vector). ``scale_result=``
             # is NOT used: this op accepts it and does not apply it.
             y = y * layer.trellis_epilogue_scale
+            if online_transform is not None:
+                y = apply_inverse_output_transform(
+                    y, layer.qtip_output_signs,
+                    layer.qtip_output_block_size)
             if bias is not None:
                 y = y + bias
             return y.reshape(*orig[:-1], rows)

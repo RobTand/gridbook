@@ -26,6 +26,10 @@ from gridbook.trellis_e2m1_lane import (                    # noqa: E402
     TRELLIS_E2M1_FLAG, TRELLIS_E2M1_MODE_ENV)
 from gridbook.trellis_e4m3_lane import (                    # noqa: E402
     TRELLIS_E4M3_FLAG, TRELLIS_E4M3_MODE_ENV)
+from gridbook.qtip_hadamard import (                        # noqa: E402
+    ONLINE_HADAMARD_FLAG, SIGN_GENERATOR, TRANSFORM_ALGORITHM,
+    TRANSFORM_NORMALIZATION, TRANSFORM_PADDING, TRANSFORM_SCHEMA,
+    online_transform_digest, seeded_sign_digest)
 
 
 def _install_vllm_stubs():
@@ -84,9 +88,12 @@ def _fresh_flags(monkeypatch):
         monkeypatch.delenv(flag, raising=False)
     monkeypatch.delenv(TRELLIS_E2M1_MODE_ENV, raising=False)
     monkeypatch.delenv(TRELLIS_E4M3_MODE_ENV, raising=False)
+    lane_select.reset_for_tests(ONLINE_HADAMARD_FLAG)
+    monkeypatch.delenv(ONLINE_HADAMARD_FLAG, raising=False)
     yield
     for flag in (TRELLIS_E2M1_FLAG, TRELLIS_E4M3_FLAG):
         lane_select.reset_for_tests(flag)
+    lane_select.reset_for_tests(ONLINE_HADAMARD_FLAG)
 
 
 TARGET = "model.layers.0.self_attn.o_proj"
@@ -113,6 +120,25 @@ def _config(scheme=None, targets=(TARGET,)):
         },
         "ignore": [],
     }
+
+
+def _online_transform(rows=128, columns=512):
+    def side(role, dimension, block_size, seed):
+        return {
+            "dimension": dimension, "block_size": block_size, "seed": seed,
+            "sign_generator": SIGN_GENERATOR,
+            "sign_sha256": seeded_sign_digest(role, dimension, seed),
+        }
+    transform = {
+        "schema": TRANSFORM_SCHEMA,
+        "algorithm": TRANSFORM_ALGORITHM,
+        "normalization": TRANSFORM_NORMALIZATION,
+        "padding": TRANSFORM_PADDING,
+        "input": side("input", columns, 256, 11),
+        "output": side("output", rows, 128, 29),
+    }
+    transform["transform_sha256"] = online_transform_digest(transform)
+    return transform
 
 
 def _resolved(cfg=None):
@@ -155,6 +181,36 @@ def test_a_trellis_target_dispatches_to_its_lane(monkeypatch, family,
     config = _resolved(_config(_scheme(family)))
     method = config.get_quant_method(_layer(), TARGET)
     assert type(method).__name__ == expected
+
+
+def test_qtip_transform_dispatch_requires_its_second_opt_in(monkeypatch):
+    scheme = _scheme(TCQ_E2M1_R256,
+                     online_transform=_online_transform())
+    _enable(monkeypatch, TCQ_E2M1_R256)
+    config = _resolved(_config(scheme))
+    with pytest.raises(RuntimeError, match=ONLINE_HADAMARD_FLAG):
+        config.get_quant_method(_layer(), TARGET)
+
+    from gridbook import lane_select
+    lane_select.reset_for_tests(ONLINE_HADAMARD_FLAG)
+    monkeypatch.setenv(ONLINE_HADAMARD_FLAG, "1")
+    method = config.get_quant_method(_layer(), TARGET)
+    assert type(method).__name__ == "TrellisE2M1LinearMethod"
+
+
+def test_qtip_transform_scheme_mismatch_fails_at_sidecar_parse():
+    transform = _online_transform()
+    transform["input"]["dimension"] = 256
+    scheme = _scheme(TCQ_E2M1_R256, online_transform=transform)
+    with pytest.raises(ValueError, match="does not match"):
+        _resolved(_config(scheme))
+
+
+def test_qtip_transform_is_refused_on_the_e4m3_lane():
+    transform = _online_transform()
+    scheme = _scheme(TCQ_E4M3_R256, online_transform=transform)
+    with pytest.raises(ValueError, match="only for TCQ_E2M1_R256"):
+        _resolved(_config(scheme))
 
 
 def test_trellis_targets_are_kept_out_of_the_cb_map(monkeypatch):

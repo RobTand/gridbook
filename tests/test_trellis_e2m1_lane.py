@@ -50,6 +50,11 @@ from gridbook.trellis_e2m1_lane import (                        # noqa: E402
     trellis_e2m1_enabled,
     trellis_e2m1_mode,
 )
+from gridbook.qtip_hadamard import (                            # noqa: E402
+    ONLINE_HADAMARD_FLAG, SIGN_GENERATOR, TRANSFORM_ALGORITHM,
+    TRANSFORM_NORMALIZATION, TRANSFORM_PADDING, TRANSFORM_SCHEMA,
+    apply_input_transform, apply_inverse_output_transform,
+    online_transform_digest, seeded_sign_digest, seeded_signs)
 
 CUDA = torch.cuda.is_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="needs a CUDA device")
@@ -62,9 +67,12 @@ def _fresh_env(monkeypatch):
     lane_select.reset_for_tests(TRELLIS_E2M1_FLAG)
     monkeypatch.delenv(TRELLIS_E2M1_FLAG, raising=False)
     monkeypatch.delenv(TRELLIS_E2M1_MODE_ENV, raising=False)
+    lane_select.reset_for_tests(ONLINE_HADAMARD_FLAG)
+    monkeypatch.delenv(ONLINE_HADAMARD_FLAG, raising=False)
     yield
     lane_select.reset_for_tests(TRELLIS_E2M1_FLAG)
     decode_pool.reset_for_tests()
+    lane_select.reset_for_tests(ONLINE_HADAMARD_FLAG)
 
 
 # --- flags and refusals ----------------------------------------------------
@@ -219,6 +227,7 @@ def _reference_fp4_quant(x, global_scale):
     expectation is the A side the lane actually consumed, not a re-derivation.
     """
     m, k = x.shape
+    _LAST_A_DEQUANT["input"] = x.clone()
     groups = k // GROUP
     xf = x.float().view(m, groups, GROUP)
     amax = xf.abs().amax(dim=2, keepdim=True).clamp_min(1e-12)
@@ -259,6 +268,25 @@ def _scheme_for(wire):
             "wire_bytes": len(wire.to_bytes())}
 
 
+def _online_transform(rows, columns):
+    def side(role, dimension, block_size, seed):
+        return {
+            "dimension": dimension, "block_size": block_size, "seed": seed,
+            "sign_generator": SIGN_GENERATOR,
+            "sign_sha256": seeded_sign_digest(role, dimension, seed),
+        }
+    transform = {
+        "schema": TRANSFORM_SCHEMA,
+        "algorithm": TRANSFORM_ALGORITHM,
+        "normalization": TRANSFORM_NORMALIZATION,
+        "padding": TRANSFORM_PADDING,
+        "input": side("input", columns, 256, 11),
+        "output": side("output", rows, 128, 29),
+    }
+    transform["transform_sha256"] = online_transform_digest(transform)
+    return transform
+
+
 def _load_blob(layer, wire, dev, input_global_scale=4.0):
     """Do exactly what vLLM's weight loader does: fill the declared params."""
     blob = wire.to_bytes()
@@ -269,7 +297,8 @@ def _load_blob(layer, wire, dev, input_global_scale=4.0):
     layer.to(dev)
 
 
-def _drive(monkeypatch, mode, rows=256, columns=1024, q256=512, m=32, seed=0):
+def _drive(monkeypatch, mode, rows=256, columns=1024, q256=512, m=32,
+           seed=0, online_transform=False):
     """Run the lane's three hooks for real; return (got, want, layer, method)."""
     from gridbook import native_cutlass
     from gridbook.trellis_ops import prepare_wire_cuda
@@ -277,6 +306,9 @@ def _drive(monkeypatch, mode, rows=256, columns=1024, q256=512, m=32, seed=0):
     lane_select.reset_for_tests(TRELLIS_E2M1_FLAG)
     monkeypatch.setenv(TRELLIS_E2M1_FLAG, "1")
     monkeypatch.setenv(TRELLIS_E2M1_MODE_ENV, mode)
+    lane_select.reset_for_tests(ONLINE_HADAMARD_FLAG)
+    if online_transform:
+        monkeypatch.setenv(ONLINE_HADAMARD_FLAG, "1")
     _install_vllm_stubs(monkeypatch)
     monkeypatch.setattr(native_cutlass, "native_fp4_quant",
                         _reference_fp4_quant)
@@ -284,6 +316,8 @@ def _drive(monkeypatch, mode, rows=256, columns=1024, q256=512, m=32, seed=0):
     wire = _e2m1_wire(rows, columns, q256)
     dev = torch.device("cuda")
     scheme = _scheme_for(wire)
+    if online_transform:
+        scheme["online_transform"] = _online_transform(rows, columns)
     method = build_trellis_e2m1_method(scheme, "test.layer")
 
     layer = _Layer()
@@ -310,6 +344,10 @@ def _drive(monkeypatch, mode, rows=256, columns=1024, q256=512, m=32, seed=0):
     ref_w = trellis.decode_values_torch(wire, device=dev)
     a_deq = _LAST_A_DEQUANT["value"] / float(gs)
     want = (a_deq @ ref_w.t()).to(torch.bfloat16)
+    if online_transform:
+        signs = seeded_signs("output", rows, 29, device=dev,
+                             dtype=torch.bfloat16)
+        want = apply_inverse_output_transform(want, signs, 128)
     return got, want, layer, method
 
 
@@ -339,6 +377,26 @@ def test_the_two_modes_are_numerically_identical(monkeypatch):
     a, _w, _l, _m = _drive(monkeypatch, MODE_RESIDENT, seed=7)
     b, _w2, _l2, _m2 = _drive(monkeypatch, MODE_STREAMED, seed=7)
     assert torch.equal(a, b), "residency must not change the numbers"
+
+
+@requires_cuda
+@pytest.mark.parametrize("mode", [MODE_RESIDENT, MODE_STREAMED])
+def test_qtip_online_transform_wraps_native_w4a4_apply(monkeypatch, mode):
+    got, want, layer, _method = _drive(
+        monkeypatch, mode, online_transform=True)
+    assert torch.equal(got, want)
+    assert layer.gridbook_online_transform_contract == TRANSFORM_SCHEMA
+    assert layer.qtip_input_signs.shape == (layer.trellis_columns,)
+    assert layer.qtip_output_signs.shape == (layer.trellis_rows,)
+    # The quantizer must consume R_in*x, not the original BF16 activation.
+    # Reconstruct its source from the deterministic test generator.
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    original = torch.randn(
+        32, layer.trellis_columns, dtype=torch.bfloat16, device="cuda",
+        generator=generator)
+    expected_quant_input = apply_input_transform(
+        original, layer.qtip_input_signs, layer.qtip_input_block_size)
+    assert torch.equal(_LAST_A_DEQUANT["input"], expected_quant_input)
 
 
 @requires_cuda

@@ -321,6 +321,7 @@ arithmetic band and the single-seed noise band.
 | [`docs/SPEC.md`](docs/SPEC.md) | **Normative format specification** — byte layout, product-VQ, v1/v2 scale coding, codebook sidecar, config vocabulary, extensibility contract. Implementation-independent, MUST/SHOULD language. |
 | [`docs/MOTIVATION.md`](docs/MOTIVATION.md) | Why the 2–4 bpp regime needs codebooks, why serving has been the blocker, and an honest comparison to GGUF k-quant/IQ. |
 | [`docs/KERNELS.md`](docs/KERNELS.md) | Serving kernel design: native transient-expand prefill, fused act-QDQ decode GEMV, two-tier in-register scale compose, CUTLASS GEMM/grouped GEMM, fail-closed dispatch, CUDA-graph rules. |
+| [`docs/QTIP-NATIVE-NVFP4-RESEARCH.md`](docs/QTIP-NATIVE-NVFP4-RESEARCH.md) | Research-only ABI for deterministic online sign/Hadamard transforms around the native E2M1 trellis W4A4 lane. |
 | [`docs/PLUGIN.md`](docs/PLUGIN.md) | Operator reference for the plugin itself: dispatch, kernel set, environment switches. |
 | [`docs/DELEGATED-NVFP4-MOE.md`](docs/DELEGATED-NVFP4-MOE.md) | Version-scoped backend selection for a **non-CB** NVFP4 MoE group on GB10 (`sm_121`), including Marlin's generic weight-only warning and a fail/unknown preflight policy. |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | The measured results with full hardware/protocol context and caveats. |

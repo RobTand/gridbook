@@ -1099,6 +1099,15 @@ kept [`K1.1`](../ROADMAP.md#kernel-todo-canonical) open has run.
 
 ## Native-kernel availability and failure policy
 
+The QTIP-derived sign/Hadamard wrapper documented in
+[`QTIP-NATIVE-NVFP4-RESEARCH.md`](QTIP-NATIVE-NVFP4-RESEARCH.md) is explicitly
+outside this production guarantee. Its underlying E2M1 trellis decode and W4A4
+`_scaled_mm` are native and fail closed, but the current online FHT is a torch
+research reference with intermediate allocations and `log2(block_size)`
+stages. It is separately opt-in, carries no runtime-contract eligibility, and
+cannot be promoted until a native opaque graph-safe implementation clears the
+measurement and exact-artifact gates.
+
 Every production Gridbook operation has a native CUDA/CUTLASS implementation.
 Capability probes may return "unavailable" while inspecting an installation,
 but a serving call that needs that operation raises immediately with the source,
