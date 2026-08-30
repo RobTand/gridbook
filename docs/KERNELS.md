@@ -1102,11 +1102,14 @@ kept [`K1.1`](../ROADMAP.md#kernel-todo-canonical) open has run.
 The QTIP-derived sign/Hadamard wrapper documented in
 [`QTIP-NATIVE-NVFP4-RESEARCH.md`](QTIP-NATIVE-NVFP4-RESEARCH.md) is explicitly
 outside this production guarantee. Its underlying E2M1 trellis decode and W4A4
-`_scaled_mm` are native and fail closed, but the current online FHT is a torch
-research reference with intermediate allocations and `log2(block_size)`
-stages. It is separately opt-in, carries no runtime-contract eligibility, and
-cannot be promoted until a native opaque graph-safe implementation clears the
-measurement and exact-artifact gates.
+`_scaled_mm` are native and fail closed. CUDA BF16/block-128 transforms now use
+the isolated `qtip_hadamard_warp128.cu` opaque custom op, prepared before first
+forward; CPU, non-BF16, and non-128 calls retain the torch research reference.
+The standalone op has passed its direct graph capture/replay test but is not
+fused with activation quantization or the FP4 epilogue. It is separately
+opt-in, carries no runtime-contract eligibility, and cannot be promoted until
+the matched profiler, both-box Netdata/work-per-joule, exact-artifact serving,
+fusion, throughput, and quality gates in the research document clear.
 
 Every production Gridbook operation has a native CUDA/CUTLASS implementation.
 Capability probes may return "unavailable" while inspecting an installation,

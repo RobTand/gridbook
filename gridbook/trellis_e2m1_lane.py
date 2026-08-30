@@ -75,6 +75,7 @@ from .qtip_hadamard import (
     apply_input_transform,
     apply_inverse_output_transform,
     online_hadamard_enabled,
+    prepare_qtip_hadamard_model_load,
     seeded_signs,
 )
 
@@ -300,6 +301,10 @@ def build_trellis_e2m1_method(scheme, prefix: str = "<trellis>",
                 # load (never first forward); they are not another weight cache.
                 input_spec = online_transform["input"]
                 output_spec = online_transform["output"]
+                # The helper keys only from EXPLICIT sidecar geometry. It
+                # never rewrites an H256 producer declaration to H128.
+                prepare_qtip_hadamard_model_load(
+                    input_spec["block_size"], output_spec["block_size"])
                 layer.register_buffer(
                     "qtip_input_signs",
                     seeded_signs("input", columns, input_spec["seed"],

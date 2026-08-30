@@ -75,6 +75,8 @@ PKG = "gridbook"
 #                            (contract-preserving fused FP4-v2 quality lane)
 #   cb_moe_persistent_b.cu -> cuda_ext.get_moe_persistent_b_ext()
 #                            (persistent-B grouped MoE decode-in-mainloop)
+#   qtip_hadamard_warp128.cu -> cuda_ext.get_qtip_hadamard_warp128_ext()
+#                              (opt-in BF16/H128 online transform)
 # cb_fused_gemm.cu #includes the three cutlass_fork headers listed below.
 # cb_fused_fp4_gemm.cu #includes sm120_cb_fused_fp4_mma.hpp; both are also
 # JIT-identity inputs and therefore belong on this non-vacuous floor.
@@ -96,10 +98,12 @@ PKG = "gridbook"
 # runtime-floor failure rather than a generic drift report.
 # A serving-reachable opt-in specialization still belongs on this floor: check
 # 3 (drift) would also notice it missing, but only while the file exists in the
-# checkout the CI job happens to be run against. Source-only research kernels
-# do not belong on the runtime floor. They are nevertheless packaged while
-# present because check 3 covers every native checkout source; in particular,
-# retained ``cb_persistent_tc.cu`` is not reachable from the package runtime.
+# checkout the CI job happens to be run against. An opt-in research kernel
+# reached by a package runtime lane (trellis_r256 and qtip_hadamard_warp128)
+# still belongs on the floor. Source-only offline kernels do not; they are
+# nevertheless packaged while present because check 3 covers every native
+# checkout source. In particular, retained ``cb_persistent_tc.cu`` is not
+# reachable from the package runtime.
 REQUIRED = [
     f"{PKG}/csrc/cb_gemv.cu",
     f"{PKG}/csrc/cb_gemv_v2.cu",
@@ -111,6 +115,7 @@ REQUIRED = [
     f"{PKG}/csrc/cb_fused_fp4v2_gemm.cu",
     f"{PKG}/csrc/cb_moe_persistent_b.cu",
     f"{PKG}/csrc/trellis_r256.cu",
+    f"{PKG}/csrc/qtip_hadamard_warp128.cu",
     f"{PKG}/csrc/cb_grouped_common.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_mma_tma.hpp",
     f"{PKG}/csrc/cutlass_fork/sm120_cb_fused_mma.hpp",
@@ -167,6 +172,7 @@ SDIST_REQUIRED_UTILITIES = [
     "scripts/validate_moe_gemv_v2_ab.py",
     "scripts/validate_moe_fp8_gemv_v2_ab.py",
     "scripts/bench_trellis_r256.py",
+    "scripts/bench_qtip_hadamard.py",
 ]
 
 _errors: list[str] = []

@@ -268,7 +268,7 @@ def _scheme_for(wire):
             "wire_bytes": len(wire.to_bytes())}
 
 
-def _online_transform(rows, columns):
+def _online_transform(rows, columns, *, input_block=256, output_block=128):
     def side(role, dimension, block_size, seed):
         return {
             "dimension": dimension, "block_size": block_size, "seed": seed,
@@ -280,8 +280,8 @@ def _online_transform(rows, columns):
         "algorithm": TRANSFORM_ALGORITHM,
         "normalization": TRANSFORM_NORMALIZATION,
         "padding": TRANSFORM_PADDING,
-        "input": side("input", columns, 256, 11),
-        "output": side("output", rows, 128, 29),
+        "input": side("input", columns, input_block, 11),
+        "output": side("output", rows, output_block, 29),
     }
     transform["transform_sha256"] = online_transform_digest(transform)
     return transform
@@ -298,7 +298,7 @@ def _load_blob(layer, wire, dev, input_global_scale=4.0):
 
 
 def _drive(monkeypatch, mode, rows=256, columns=1024, q256=512, m=32,
-           seed=0, online_transform=False):
+           seed=0, online_transform=False, online_blocks=(256, 128)):
     """Run the lane's three hooks for real; return (got, want, layer, method)."""
     from gridbook import native_cutlass
     from gridbook.trellis_ops import prepare_wire_cuda
@@ -317,7 +317,9 @@ def _drive(monkeypatch, mode, rows=256, columns=1024, q256=512, m=32,
     dev = torch.device("cuda")
     scheme = _scheme_for(wire)
     if online_transform:
-        scheme["online_transform"] = _online_transform(rows, columns)
+        scheme["online_transform"] = _online_transform(
+            rows, columns, input_block=online_blocks[0],
+            output_block=online_blocks[1])
     method = build_trellis_e2m1_method(scheme, "test.layer")
 
     layer = _Layer()
@@ -347,7 +349,7 @@ def _drive(monkeypatch, mode, rows=256, columns=1024, q256=512, m=32,
     if online_transform:
         signs = seeded_signs("output", rows, 29, device=dev,
                              dtype=torch.bfloat16)
-        want = apply_inverse_output_transform(want, signs, 128)
+        want = apply_inverse_output_transform(want, signs, online_blocks[1])
     return got, want, layer, method
 
 
@@ -397,6 +399,27 @@ def test_qtip_online_transform_wraps_native_w4a4_apply(monkeypatch, mode):
     expected_quant_input = apply_input_transform(
         original, layer.qtip_input_signs, layer.qtip_input_block_size)
     assert torch.equal(_LAST_A_DEQUANT["input"], expected_quant_input)
+
+
+@requires_cuda
+@pytest.mark.parametrize("declared", [(256, 256), (128, 256), (256, 128)])
+def test_model_load_preparation_receives_exact_sidecar_geometry(
+        monkeypatch, declared):
+    from gridbook import trellis_e2m1_lane as lane_module
+
+    seen = []
+    original = lane_module.prepare_qtip_hadamard_model_load
+
+    def spy(input_block, output_block):
+        seen.append((input_block, output_block))
+        return original(input_block, output_block)
+
+    monkeypatch.setattr(
+        lane_module, "prepare_qtip_hadamard_model_load", spy)
+    _drive(
+        monkeypatch, MODE_STREAMED, rows=256, columns=256, m=1,
+        online_transform=True, online_blocks=declared)
+    assert seen == [declared]
 
 
 @requires_cuda

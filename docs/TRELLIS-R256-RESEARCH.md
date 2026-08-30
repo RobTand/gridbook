@@ -142,8 +142,12 @@ two E2M1 lane settings and fails closed on every metadata/digest/geometry
 mismatch. Full ABI and algebra:
 [`QTIP-NATIVE-NVFP4-RESEARCH.md`](QTIP-NATIVE-NVFP4-RESEARCH.md).
 
-The current torch FHT is intentionally a correctness reference, not a
-production kernel: it allocates intermediates, is not an opaque custom op, and
-has no graph or served-performance evidence. It therefore adds no runtime
-contract row or lane eligibility. An artifact without `online_transform`
-executes the pre-existing lane unchanged.
+CUDA BF16/block-128 calls now use the isolated one-warp-per-block
+`qtip_hadamard_warp128.cu` custom op; model load prepares the source-keyed
+module before capture and refuses if it is unavailable. Other dtypes/devices
+and block sizes keep the transparent torch correctness reference. This is a
+standalone phase-1 primitive, not fusion with native FP4 activation quantization
+or the GEMM epilogue, and no before/after profiler plus both-box Netdata result
+has been recorded. It therefore adds no runtime contract row or lane
+eligibility. An artifact without `online_transform` executes the pre-existing
+lane unchanged.

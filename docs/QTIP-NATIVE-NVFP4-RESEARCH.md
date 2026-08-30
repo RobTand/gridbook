@@ -3,6 +3,10 @@
 Status: **research-only, opt-in, and not runtime-contract eligible**. This is
 an execution ABI for experiments, not a production format or a serving claim.
 The method lineage is QTIP. EXL3 is not a dependency or selectable runtime.
+The one-warp-per-128-values implementation strategy was studied from EXL3's
+MIT-licensed `hadamard_inner.cuh` at pinned commit
+`0c49587a7c235e6303a6bbedc8b665272ad3a2ea`; Gridbook contains its own BF16
+implementation and imports or links no EXL3 code.
 
 The implementation extends the existing `TCQ_E2M1_R256` W4A4 lane. It does
 not add a weight carrier, cache, decoder, or GEMM: the trellis wire still
@@ -111,28 +115,63 @@ not change the old lane: no sign buffers are created and neither transform is
 called.
 
 Signs are small deterministic buffers created at load. They do not replace or
-duplicate the trellis decode residency. The current FHT is a transparent torch
-reference: it computes stages in FP32, rounds the transformed activation to
-BF16 before the native FP4 quantizer, and rounds the inverse-transformed result
-to BF16 before bias. There is no BF16 GEMM fallback and no PrismaQuant import.
+duplicate the trellis decode residency. CUDA BF16 tensors with block size 128
+dispatch to the source-identity-keyed `qtip_hadamard_warp128.cu` custom op. One
+warp owns one 128-value block: every lane vector-loads four adjacent BF16
+values, computes H4 in registers, completes H128 through five shuffle stages,
+and vector-stores four BF16 values. Valid contiguous views whose storage offset
+is not 8-byte aligned take a safe scalar-load variant. Both variants accumulate
+in FP32 and round once to BF16.
+
+The native module is prepared and its symbols/ABI schema are checked during
+E2M1 model load, before first forward or graph capture. If that module cannot
+build, the CUDA BF16/block-128 cell fails model load; it never silently changes
+to the multi-launch reference. CPU, non-BF16, and non-128 calls retain the
+transparent torch reference with the same `x D H` / `y H D` order. There is no
+BF16 GEMM fallback and no PrismaQuant import.
 
 ## Evidence and promotion boundary
 
 `tests/test_qtip_hadamard.py` pins the sign generator, fail-closed schema, row
-orientation, and end-to-end orthogonal algebra against explicit matrices.
+orientation, transparent-reference dispatch, malformed inputs, and end-to-end
+orthogonal algebra against explicit matrices.
+`tests/test_qtip_hadamard_cuda.py` checks native/reference equality across
+multiple blocks, raw-ABI refusals, aligned and unaligned loads, exact dispatch,
+fail-closed extension absence, non-default-stream execution, full-graph custom
+op tracing, and actual CUDA graph capture/replay with mutated input.
 `tests/test_trellis_dispatch.py` gates config dispatch and opt-in refusal.
 `tests/test_trellis_e2m1_lane.py` drives both resident and streamed native W4A4
 paths, proving the quantizer receives the transformed activation and the
 post-GEMM result receives the inverse output transform.
 
-The torch FHT allocates intermediates and launches one elementwise stage per
-`log2(block_size)`. It is not an opaque custom op, performant FHT, or
-CUDA-graph-qualified implementation. Consequently this ABI has no
+This is phase 1: a standalone graph-capturable transform. It does **not** fuse
+the input FHT into `native_fp4_quant`, does **not** fuse the output FHT into the
+native FP4 epilogue, and therefore makes no claim about eliminating launch or
+round-trip cost around `_scaled_mm`. Consequently this ABI still has no
 `runtime_contract.json` format row or lane-eligibility cell and must not be
 described as production serving support.
 
-`scripts/bench_qtip_hadamard.py` records CUDA-event samples and a
-`torch.profiler` trace for the reference implementation. Promotion requires a
-native graph-safe FHT/fusion, before/after in-process and box telemetry,
-work-per-joule, exact-artifact load and graph replay, matched quality, and
-prefill/decode throughput against the untransformed W4A4 lane.
+`scripts/bench_qtip_hadamard.py` can record matched CUDA-event samples and a
+`torch.profiler` trace for the transparent reference and native primitive. It
+deliberately computes no speedup. The exact remaining measurement/promotion
+gate is:
+
+The native dispatch cell is only an artifact that explicitly declares
+`block_size=128`. The earlier reference timing used block 256, and the Arm E
+campaign geometry uses input blocks up to 4096 with output block 256; neither
+is a valid before arm for this H128 kernel. Gridbook never rewrites those
+producer declarations. A comparison must encode or select a matched H128
+artifact and run both the reference and native implementation at H128.
+
+1. Capture matched before/after `torch.profiler` or `nsys` traces for the same
+   artifact, M/K/N, residency mode, warmup, and CUDA-graph replay mode.
+2. Capture time-aligned Netdata power series on **both Sparky and Sparklina**
+   for both arms, and report work per joule against each box's approximately
+   140 W envelope. GPU utilization is not accepted as a substitute.
+3. Load the exact artifact through vLLM, capture and replay its serving graph,
+   and measure prefill/decode throughput against the untransformed native W4A4
+   lane under the same calibration and residency contract.
+4. Implement and separately profile the next fusion gate: input sign/H128 in
+   `native_fp4_quant`, then output H128/sign in the native FP4 epilogue. No
+   benefit from those future fusions is credited to this standalone kernel.
+5. Re-run matched quality/KL and bpp accounting before any promotion.

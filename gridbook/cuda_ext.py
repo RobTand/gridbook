@@ -21,15 +21,16 @@ cb-ext``. EVERY module builds in its own subdirectory of that root — ``main``,
 ``fused_fp4/<identity>``, ``fused_fp4v2/<identity>``,
 ``mxfp8_dense/<identity>``, ``fp8_source_w8a16/<identity>``,
 ``moe_persistent_b/<identity>`` and research-only
-``trellis_r256/<identity>``, ten in all — so no two ninja workspaces share
-artefacts. Inside the container the root is ephemeral, so a cold start
-pays ONE build per module it actually reaches; mount a host dir over it to
-persist those builds across restarts. Never ``/tmp``. There is deliberately no
+``trellis_r256/<identity>`` and ``qtip_hadamard_warp128/<identity>``, eleven
+in all — so no two ninja workspaces share artefacts. Inside the container the
+root is ephemeral, so a cold start pays ONE build per module it actually
+reaches; mount a host dir over it to persist those builds across restarts.
+Never ``/tmp``. There is deliberately no
 single build-time figure here: the modules differ by more than an order of
 magnitude in compile cost (the CUTLASS collectives dominate the hand-written
 CUDA), what a given serve reaches depends on format and opt-in flags, and the
 one measurement this docstring used to quote was taken against a single module
-before eight of the ten existed. ``docs/CONTAINER.md`` carries the measured
+before nine of the eleven existed. ``docs/CONTAINER.md`` carries the measured
 image-build numbers.
 
 Architecture: every module is compiled for exactly the live device's compute
@@ -48,13 +49,14 @@ module. Strict call contracts use :func:`_require_symbols`; fused FP4 uses
 independent symbol families because its dense and grouped call sites are
 separately guarded. An incompatible module would otherwise fail with
 ``AttributeError`` mid-forward, or silently disable a probed fast path. The
-eight digest-keyed modules — ``fused`` (FP8), ``fused_fp4``, ``bf16_grouped``,
+nine digest-keyed modules — ``fused`` (FP8), ``fused_fp4``, ``bf16_grouped``,
 ``fused_fp4v2``, ``mxfp8_dense``, ``fp8_source_w8a16`` and
-``moe_persistent_b`` and research-only ``trellis_r256`` — additionally hash
-their packaged
-sources, Gridbook headers (transitively: a header reached only through another
-Gridbook header counts), target, compiled-in lane macros and toolchain ABI
-into the module name and build directory, so a loaded module of those eight is
+``moe_persistent_b`` and research-only ``trellis_r256`` and
+``qtip_hadamard_warp128`` — additionally hash
+their packaged sources, Gridbook headers (transitively: a header reached only
+through another Gridbook header counts), target, compiled-in lane macros and
+toolchain ABI
+into the module name and build directory, so a loaded module of those nine is
 always built from the current sources. ``main`` and ``v2`` are not keyed that
 way: they include no Gridbook header, so torch's own versioner over the
 ``.cu`` is already complete for them.
@@ -2317,4 +2319,127 @@ def _load_trellis_r256_ext_locked():
 
 # ===========================================================================
 # END ADDITIVE BLOCK — research-only TCQ R256 decoder/dequant-GEMV
+# ===========================================================================
+
+# ===========================================================================
+# BEGIN ADDITIVE BLOCK — research-only QTIP sign/Hadamard warp-128 primitive
+#
+# Like the trellis decoder, this is intentionally outside _PRELOAD_FAMILIES
+# and runtime_contract.json. The E2M1 research lane explicitly prepares it at
+# model load when (and only when) a block_size=128 online transform is present;
+# a direct low-level caller may probe it lazily. No first forward is allowed to
+# become a compiler invocation.
+# ===========================================================================
+_qtip_hadamard_warp128 = None
+_qtip_hadamard_warp128_tried = False
+_qtip_hadamard_warp128_lock = threading.Lock()
+_QTIP_HADAMARD_WARP128_ABI_SCHEMA = 1
+_QTIP_HADAMARD_WARP128_SYMBOLS = (
+    "qtip_hadamard_warp128",
+    "qtip_hadamard_abi_schema",
+)
+
+
+def _qtip_hadamard_warp128_build_identity(
+        torch, *, source: str, capability: tuple[int, int]):
+    """Source/toolchain identity for the isolated research primitive."""
+    payload = {
+        "abi_schema": _QTIP_HADAMARD_WARP128_ABI_SCHEMA,
+        "source_sha256": _sha256_file(source),
+        "capability": list(capability),
+        "torch": getattr(torch, "__version__", None),
+        "torch_cuda": getattr(getattr(torch, "version", None), "cuda", None),
+        "python_soabi": sysconfig.get_config_var("SOABI"),
+        "cxx": _compiler_identity(os.environ.get("CXX") or "c++"),
+        "nvcc": _compiler_identity(
+            os.environ.get("CUDACXX") or os.environ.get("NVCC") or "nvcc"),
+        "symbols": list(_QTIP_HADAMARD_WARP128_SYMBOLS),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest(), payload
+
+
+def get_qtip_hadamard_warp128_ext():
+    """Return the research QTIP warp-128 module, or ``None`` if unavailable."""
+    if _qtip_hadamard_warp128_tried:
+        return _qtip_hadamard_warp128
+    with _qtip_hadamard_warp128_lock:
+        if _qtip_hadamard_warp128_tried:
+            return _qtip_hadamard_warp128
+        return _load_qtip_hadamard_warp128_ext_locked()
+
+
+def require_qtip_hadamard_warp128_ext(operation: str = "this operation"):
+    """Return the dedicated research QTIP module or fail closed."""
+    ext = get_qtip_hadamard_warp128_ext()
+    if ext is None:
+        raise NativeKernelUnavailableError(
+            f"{operation} requires Gridbook's research-only BF16 QTIP "
+            "sign/Hadamard CUDA extension (qtip_hadamard_warp128.cu), but "
+            "it is unavailable. The CUDA BF16/block_size=128 path does not "
+            f"fall back to the torch FHT. To enable it: {_NVCC_HINT}.")
+    return ext
+
+
+def _load_qtip_hadamard_warp128_ext_locked():
+    global _qtip_hadamard_warp128, _qtip_hadamard_warp128_tried
+    build_dir = "<unresolved>"
+    try:
+        import torch
+        from torch.utils.cpp_extension import load
+
+        src_dir = _require_csrc("qtip_hadamard_warp128.cu")
+        source = os.path.join(src_dir, "qtip_hadamard_warp128.cu")
+        cc = _target_capability(
+            "the research QTIP warp-128 extension "
+            "(qtip_hadamard_warp128.cu)")
+        if cc < (8, 0):
+            raise RuntimeError(
+                "the research BF16 QTIP warp-128 extension requires compute "
+                f"capability >= 8.0, got {cc[0]}.{cc[1]}")
+        identity, _payload = _qtip_hadamard_warp128_build_identity(
+            torch, source=source, capability=cc)
+        module_name = f"gridbook_qtip_hadamard_warp128_{identity}"
+        build_root = os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
+            os.path.expanduser("~"), ".cache", "prismaquant-cb-ext")
+        build_dir = os.path.join(
+            build_root, "qtip_hadamard_warp128", identity)
+        os.makedirs(build_dir, exist_ok=True)
+        mod = load(
+            name=module_name, sources=[source], build_directory=build_dir,
+            extra_cuda_cflags=[
+                "-O3", _gencode_flag(cc, accelerated=False)], verbose=False)
+        mod = _require_symbols(
+            mod, _QTIP_HADAMARD_WARP128_SYMBOLS, build_dir=build_dir,
+            source="qtip_hadamard_warp128.cu")
+        if (mod.qtip_hadamard_abi_schema()
+                != _QTIP_HADAMARD_WARP128_ABI_SCHEMA):
+            raise StaleExtensionError(_mismatch_message(
+                mod, build_dir=build_dir,
+                source="qtip_hadamard_warp128.cu",
+                requirement="native ABI schema identity mismatch"))
+        mod.__gridbook_jit_identity__ = identity
+        mod.__gridbook_jit_capability__ = tuple(cc)
+        mod.__gridbook_jit_abi_schema__ = \
+            _QTIP_HADAMARD_WARP128_ABI_SCHEMA
+        _qtip_hadamard_warp128 = mod
+    except StaleExtensionError as exc:
+        print("[gridbook-qtip] ERROR: incompatible research QTIP warp-128 "
+              f"extension — {exc}", file=sys.stderr, flush=True)
+        _qtip_hadamard_warp128 = None
+    except IncompleteInstallError as exc:
+        print(f"[gridbook-qtip] ERROR: broken gridbook install — {exc}",
+              file=sys.stderr, flush=True)
+        _qtip_hadamard_warp128 = None
+    except Exception as exc:  # noqa: BLE001 — explicit research probe is soft
+        print("[gridbook-qtip] WARNING: research QTIP warp-128 extension "
+              f"unavailable ({type(exc).__name__}: {exc}). To build it: "
+              f"{_NVCC_HINT}.", file=sys.stderr, flush=True)
+        _qtip_hadamard_warp128 = None
+    finally:
+        _qtip_hadamard_warp128_tried = True
+    return _qtip_hadamard_warp128
+
+# ===========================================================================
+# END ADDITIVE BLOCK — research-only QTIP sign/Hadamard warp-128 primitive
 # ===========================================================================

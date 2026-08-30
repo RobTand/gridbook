@@ -8,11 +8,14 @@ the activation side applies ``R_in`` before native FP4 quantization and the
 output side applies ``R_out.T`` after ``_scaled_mm``.  With row-major batches
 those operations are, respectively, ``x D H`` and ``y H D``.
 
-This module deliberately contains only a transparent torch reference FHT.  It
-allocates intermediates and launches ``log2(block_size)`` elementwise stages,
-so it is not a production or CUDA-graph-qualified implementation.  Keeping it
-here, rather than disguising it as a kernel, makes the research boundary
-machine-readable while the wire and the tensor-core GEMM remain native.
+CUDA BF16 tensors with ``block_size=128`` use an isolated opaque CUDA op: one
+warp owns each 128-value block, performs H4 in registers, and completes H128
+with warp shuffles.  The op is graph-safe after its source-identity-keyed JIT
+module has been prepared at model load.  CPU, non-BF16 and non-128 calls retain
+the transparent torch reference.  A matching CUDA BF16/128 call fails closed
+when the native module is unavailable rather than silently changing its
+execution contract.  Both paths remain research-only; the native primitive is
+not a claim of fusion with activation quantization or the GEMM epilogue.
 """
 from __future__ import annotations
 
@@ -37,6 +40,8 @@ __all__ = [
     "seeded_signs",
     "online_transform_digest",
     "validate_online_transform",
+    "prepare_qtip_hadamard_cuda",
+    "prepare_qtip_hadamard_model_load",
     "apply_input_transform",
     "apply_inverse_output_transform",
 ]
@@ -56,6 +61,50 @@ _SIDE_FIELDS = frozenset({
     "dimension", "block_size", "seed", "sign_generator", "sign_sha256",
 })
 _SIGN_DOMAIN = (TRANSFORM_SCHEMA + "/signs\0").encode("ascii")
+_NATIVE_BLOCK_SIZE = 128
+
+
+@torch.library.custom_op(
+    "prismaquant::qtip_hadamard_warp128", mutates_args=())
+def _qtip_hadamard_warp128(
+    value: torch.Tensor, signs: torch.Tensor, sign_before: bool,
+) -> torch.Tensor:
+    """Opaque research CUDA primitive; public wrappers own dispatch policy."""
+    from .cuda_ext import require_qtip_hadamard_warp128_ext
+
+    return require_qtip_hadamard_warp128_ext(
+        "QTIP online block-128 sign/Hadamard transform",
+    ).qtip_hadamard_warp128(value, signs, sign_before)
+
+
+@_qtip_hadamard_warp128.register_fake
+def _qtip_hadamard_warp128_fake(value, signs, sign_before):
+    return torch.empty_like(value, dtype=torch.bfloat16)
+
+
+def prepare_qtip_hadamard_cuda() -> None:
+    """Build/validate the research native module outside first forward.
+
+    The E2M1 lane calls this during model load for every transformed artifact
+    whose input or output block size is 128. Direct research callers that plan
+    to capture a CUDA graph must call it before entering the capture region.
+    """
+    from .cuda_ext import require_qtip_hadamard_warp128_ext
+
+    require_qtip_hadamard_warp128_ext(
+        "QTIP online block-128 model-load preparation")
+
+
+def prepare_qtip_hadamard_model_load(
+        input_block_size: int, output_block_size: int) -> None:
+    """Prepare native code iff the artifact explicitly declares H128.
+
+    This is a dispatch decision only: it never rewrites producer block
+    geometry. H256 and every other valid size continue to the torch reference.
+    """
+    if input_block_size == _NATIVE_BLOCK_SIZE \
+            or output_block_size == _NATIVE_BLOCK_SIZE:
+        prepare_qtip_hadamard_cuda()
 
 
 def online_hadamard_enabled() -> bool:
@@ -255,6 +304,10 @@ def _normalized_block_hadamard_rows(x: torch.Tensor,
     """Apply block-diagonal, orthonormal Sylvester Hadamards to row vectors."""
     if x.dim() != 2:
         raise ValueError(f"Hadamard input must be 2-D, got {tuple(x.shape)}")
+    if (isinstance(block_size, bool) or not isinstance(block_size, int)
+            or block_size <= 0 or block_size & (block_size - 1)):
+        raise ValueError(
+            f"block_size must be a positive power of two, got {block_size!r}")
     dimension = x.shape[1]
     if dimension % block_size:
         raise ValueError(
@@ -271,25 +324,57 @@ def _normalized_block_hadamard_rows(x: torch.Tensor,
     return work.mul_(block_size ** -0.5).reshape(x.shape)
 
 
+def _validate_application(value: torch.Tensor, signs: torch.Tensor, *,
+                          block_size: int, role: str,
+                          value_name: str) -> None:
+    if value.dim() != 2:
+        raise ValueError(
+            f"{role} Hadamard input must be 2-D, got {tuple(value.shape)}")
+    if signs.dim() != 1 or signs.numel() != value.shape[1]:
+        raise ValueError(
+            f"{role} signs shape {tuple(signs.shape)} does not bind "
+            f"{value_name} shape {tuple(value.shape)}")
+    if (isinstance(block_size, bool) or not isinstance(block_size, int)
+            or block_size <= 0 or block_size & (block_size - 1)):
+        raise ValueError(
+            f"block_size must be a positive power of two, got {block_size!r}")
+    if value.shape[1] % block_size:
+        raise ValueError(
+            f"block_size={block_size} does not divide "
+            f"dimension={value.shape[1]}")
+    if value.shape[1] == 0:
+        raise ValueError(f"{role} dimension must be positive")
+
+
+def _use_native_warp128(value: torch.Tensor, block_size: int) -> bool:
+    """The exact, deliberately narrow research dispatch cell."""
+    return (value.is_cuda and value.dtype == torch.bfloat16
+            and block_size == _NATIVE_BLOCK_SIZE)
+
+
 def apply_input_transform(x: torch.Tensor, signs: torch.Tensor,
                           block_size: int) -> torch.Tensor:
     """Apply ``R_in`` to column activations (row form: ``x D H``)."""
-    if signs.dim() != 1 or signs.numel() != x.shape[-1]:
-        raise ValueError(
-            f"input signs shape {tuple(signs.shape)} does not bind x shape "
-            f"{tuple(x.shape)}")
+    _validate_application(
+        x, signs, block_size=block_size, role="input", value_name="x")
+    prepared_signs = signs.to(device=x.device, dtype=x.dtype)
+    if _use_native_warp128(x, block_size):
+        return _qtip_hadamard_warp128(
+            x.contiguous(), prepared_signs.contiguous(), True)
     return _normalized_block_hadamard_rows(
-        x * signs.to(device=x.device, dtype=x.dtype), block_size
+        x * prepared_signs, block_size
     ).to(torch.bfloat16)
 
 
 def apply_inverse_output_transform(y: torch.Tensor, signs: torch.Tensor,
                                    block_size: int) -> torch.Tensor:
     """Apply ``R_out.T`` to column outputs (row form: ``y H D``)."""
-    if signs.dim() != 1 or signs.numel() != y.shape[-1]:
-        raise ValueError(
-            f"output signs shape {tuple(signs.shape)} does not bind y shape "
-            f"{tuple(y.shape)}")
+    _validate_application(
+        y, signs, block_size=block_size, role="output", value_name="y")
+    prepared_signs = signs.to(device=y.device, dtype=y.dtype)
+    if _use_native_warp128(y, block_size):
+        return _qtip_hadamard_warp128(
+            y.contiguous(), prepared_signs.contiguous(), False)
     transformed = _normalized_block_hadamard_rows(y, block_size)
     return (transformed * signs.to(
         device=y.device, dtype=transformed.dtype)).to(torch.bfloat16)
