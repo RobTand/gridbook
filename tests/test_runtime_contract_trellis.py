@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import os
 from pathlib import Path
 
 import pytest
@@ -112,8 +113,29 @@ def _formats() -> dict[str, dict]:
     return {row["family"]: row for row in load_runtime_contract()["formats"]}
 
 
+def _repo_root() -> Path:
+    """The source checkout whose dispatch site this file reads.
+
+    In-tree that is this file's grandparent. The installed-wheel release gate
+    stages ``tests/`` outside the checkout so the local package cannot shadow
+    the wheel, and exports ``GRIDBOOK_SOURCE_ROOT`` as a data-file locator
+    (never on ``PYTHONPATH``); ``GITHUB_WORKSPACE`` is the CI spelling. Same
+    resolution order as ``test_runtime_contract_tp.py``.
+    """
+    roots = [Path(__file__).resolve().parents[1]]
+    for variable in ("GRIDBOOK_SOURCE_ROOT", "GITHUB_WORKSPACE"):
+        value = os.environ.get(variable)
+        if value:
+            roots.append(Path(value).expanduser())
+    for root in roots:
+        if (root / "gridbook" / "config.py").is_file():
+            return root.resolve()
+    raise FileNotFoundError(
+        "no Gridbook source checkout: run in-tree or set GRIDBOOK_SOURCE_ROOT")
+
+
 def _config_source() -> tuple[str, ast.Module]:
-    path = Path(__file__).resolve().parents[1] / "gridbook" / "config.py"
+    path = _repo_root() / "gridbook" / "config.py"
     text = path.read_text(encoding="utf-8")
     return text, ast.parse(text)
 
