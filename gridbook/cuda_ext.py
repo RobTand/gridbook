@@ -2353,17 +2353,33 @@ def _qtip_hadamard_warp128_build_identity(
         cuda_home = getattr(cpp_extension, "CUDA_HOME", None)
         nvcc = (os.path.join(os.fspath(cuda_home), "bin", "nvcc")
                 if cuda_home else None)
+    # PyTorch's get_cxx_compiler uses getenv("CXX", "c++"): presence is
+    # significant, so an explicit empty override must not collapse to the
+    # default compiler's cache identity.
+    cxx = os.environ.get("CXX", "c++")
     cuda_flags = ["-O3", _gencode_flag(capability, accelerated=False)]
+    # On non-Windows hosts cpp_extension prepends ``-ccbin $CC`` whenever
+    # CC is present, including the explicitly empty-string corner.  It is an
+    # implicit nvcc input rather than an ``extra_cuda_cflags`` member, but it
+    # changes the compiled binary and therefore must move the JIT cache key.
+    cc_present = "CC" in os.environ
+    cc_env = os.environ.get("CC")
+    implicit_cuda_cflags = ["-ccbin", cc_env] if cc_present else []
     payload = {
-        "build_identity_schema": 2,
+        "build_identity_schema": 3,
         "abi_schema": _QTIP_HADAMARD_WARP128_ABI_SCHEMA,
         "source_sha256": _sha256_file(source),
         "capability": list(capability),
         "torch": getattr(torch, "__version__", None),
         "torch_cuda": getattr(getattr(torch, "version", None), "cuda", None),
         "python_soabi": sysconfig.get_config_var("SOABI"),
-        "cxx": _compiler_identity(os.environ.get("CXX") or "c++"),
+        "cxx": _compiler_identity(cxx),
         "nvcc": _compiler_identity(nvcc),
+        "nvcc_host_compiler": {
+            "cc_environment_present": cc_present,
+            "identity": _compiler_identity(cc_env),
+        },
+        "implicit_cuda_cflags": implicit_cuda_cflags,
         "extra_cuda_cflags": cuda_flags,
         "symbols": list(_QTIP_HADAMARD_WARP128_SYMBOLS),
     }

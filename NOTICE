@@ -1,6 +1,6 @@
 Gridbook includes an independently adapted warp-level Hadamard implementation
 whose organization was informed by EXL3 at commit
-0c49587f16c2154690edfa788b6fbb7deee8e45a.
+0c49587a7c235e6303a6bbedc8b665272ad3a2ea.
 
 EXL3 is distributed under the following license:
 

@@ -55,6 +55,8 @@ def test_warp128_jit_identity_tracks_pytorch_nvcc_and_exact_flags(
     fake_torch = SimpleNamespace(
         __version__="2.test", version=SimpleNamespace(cuda="13.test"))
     fake_cpp_extension = SimpleNamespace(CUDA_HOME="/toolkit")
+    monkeypatch.delenv("CC", raising=False)
+    monkeypatch.delenv("CXX", raising=False)
 
     monkeypatch.setenv("PYTORCH_NVCC", "/compiler/A")
     digest_a, payload_a = cuda_ext._qtip_hadamard_warp128_build_identity(
@@ -70,6 +72,73 @@ def test_warp128_jit_identity_tracks_pytorch_nvcc_and_exact_flags(
     assert payload_b["nvcc"]["argv"] == ["/compiler/B"]
     assert payload_a["extra_cuda_cflags"] == [
         "-O3", "-gencode=arch=compute_121,code=sm_121"]
+    assert payload_a["implicit_cuda_cflags"] == []
+
+
+def test_warp128_jit_identity_tracks_implicit_nvcc_host_compiler(
+        tmp_path, monkeypatch):
+    source = tmp_path / "kernel.cu"
+    source.write_text("// identity fixture\n")
+    fake_torch = SimpleNamespace(
+        __version__="2.test", version=SimpleNamespace(cuda="13.test"))
+    fake_cpp_extension = SimpleNamespace(CUDA_HOME="/toolkit")
+    monkeypatch.delenv("PYTORCH_NVCC", raising=False)
+    monkeypatch.delenv("CXX", raising=False)
+
+    monkeypatch.setenv("CC", "/compiler/A")
+    digest_a, payload_a = cuda_ext._qtip_hadamard_warp128_build_identity(
+        fake_torch, fake_cpp_extension, source=str(source),
+        capability=(12, 1))
+    monkeypatch.setenv("CC", "/compiler/B")
+    digest_b, payload_b = cuda_ext._qtip_hadamard_warp128_build_identity(
+        fake_torch, fake_cpp_extension, source=str(source),
+        capability=(12, 1))
+
+    assert digest_a != digest_b
+    assert payload_a["implicit_cuda_cflags"] == ["-ccbin", "/compiler/A"]
+    assert payload_b["implicit_cuda_cflags"] == ["-ccbin", "/compiler/B"]
+    assert payload_a["nvcc_host_compiler"]["identity"]["argv"] == [
+        "/compiler/A"]
+
+    monkeypatch.delenv("CC")
+    digest_absent, payload_absent = \
+        cuda_ext._qtip_hadamard_warp128_build_identity(
+            fake_torch, fake_cpp_extension, source=str(source),
+            capability=(12, 1))
+    monkeypatch.setenv("CC", "")
+    digest_empty, payload_empty = \
+        cuda_ext._qtip_hadamard_warp128_build_identity(
+            fake_torch, fake_cpp_extension, source=str(source),
+            capability=(12, 1))
+    assert digest_absent != digest_empty
+    assert payload_absent["implicit_cuda_cflags"] == []
+    assert payload_empty["implicit_cuda_cflags"] == ["-ccbin", ""]
+
+
+def test_warp128_jit_identity_preserves_empty_cxx_override(
+        tmp_path, monkeypatch):
+    source = tmp_path / "kernel.cu"
+    source.write_text("// identity fixture\n")
+    fake_torch = SimpleNamespace(
+        __version__="2.test", version=SimpleNamespace(cuda="13.test"))
+    fake_cpp_extension = SimpleNamespace(CUDA_HOME="/toolkit")
+    monkeypatch.delenv("PYTORCH_NVCC", raising=False)
+    monkeypatch.delenv("CC", raising=False)
+
+    monkeypatch.delenv("CXX", raising=False)
+    digest_default, payload_default = \
+        cuda_ext._qtip_hadamard_warp128_build_identity(
+            fake_torch, fake_cpp_extension, source=str(source),
+            capability=(12, 1))
+    monkeypatch.setenv("CXX", "")
+    digest_empty, payload_empty = \
+        cuda_ext._qtip_hadamard_warp128_build_identity(
+            fake_torch, fake_cpp_extension, source=str(source),
+            capability=(12, 1))
+
+    assert digest_default != digest_empty
+    assert payload_default["cxx"]["argv"] == ["c++"]
+    assert payload_empty["cxx"]["argv"] == []
 
 
 def test_warp128_jit_identity_uses_torch_cuda_home_not_nvcc_aliases(
@@ -79,6 +148,8 @@ def test_warp128_jit_identity_uses_torch_cuda_home_not_nvcc_aliases(
     fake_torch = SimpleNamespace(
         __version__="2.test", version=SimpleNamespace(cuda="13.test"))
     fake_cpp_extension = SimpleNamespace(CUDA_HOME="/actual/cuda")
+    monkeypatch.delenv("CC", raising=False)
+    monkeypatch.delenv("CXX", raising=False)
     monkeypatch.delenv("PYTORCH_NVCC", raising=False)
     monkeypatch.setenv("CUDACXX", "/ignored/cudacxx")
     monkeypatch.setenv("NVCC", "/ignored/nvcc")
