@@ -9,6 +9,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from gridbook import qtip_hadamard as qtip_module  # noqa: E402
+from gridbook import cuda_ext  # noqa: E402
 from gridbook.qtip_hadamard import (  # noqa: E402
     SIGN_GENERATOR,
     TRANSFORM_ALGORITHM,
@@ -45,6 +46,58 @@ def _contract(rows=8, columns=16) -> dict:
     }
     contract["transform_sha256"] = online_transform_digest(contract)
     return contract
+
+
+def test_warp128_jit_identity_tracks_pytorch_nvcc_and_exact_flags(
+        tmp_path, monkeypatch):
+    source = tmp_path / "kernel.cu"
+    source.write_text("// identity fixture\n")
+    fake_torch = SimpleNamespace(
+        __version__="2.test", version=SimpleNamespace(cuda="13.test"))
+    fake_cpp_extension = SimpleNamespace(CUDA_HOME="/toolkit")
+
+    monkeypatch.setenv("PYTORCH_NVCC", "/compiler/A")
+    digest_a, payload_a = cuda_ext._qtip_hadamard_warp128_build_identity(
+        fake_torch, fake_cpp_extension, source=str(source),
+        capability=(12, 1))
+    monkeypatch.setenv("PYTORCH_NVCC", "/compiler/B")
+    digest_b, payload_b = cuda_ext._qtip_hadamard_warp128_build_identity(
+        fake_torch, fake_cpp_extension, source=str(source),
+        capability=(12, 1))
+
+    assert digest_a != digest_b
+    assert payload_a["nvcc"]["argv"] == ["/compiler/A"]
+    assert payload_b["nvcc"]["argv"] == ["/compiler/B"]
+    assert payload_a["extra_cuda_cflags"] == [
+        "-O3", "-gencode=arch=compute_121,code=sm_121"]
+
+
+def test_warp128_jit_identity_uses_torch_cuda_home_not_nvcc_aliases(
+        tmp_path, monkeypatch):
+    source = tmp_path / "kernel.cu"
+    source.write_text("// identity fixture\n")
+    fake_torch = SimpleNamespace(
+        __version__="2.test", version=SimpleNamespace(cuda="13.test"))
+    fake_cpp_extension = SimpleNamespace(CUDA_HOME="/actual/cuda")
+    monkeypatch.delenv("PYTORCH_NVCC", raising=False)
+    monkeypatch.setenv("CUDACXX", "/ignored/cudacxx")
+    monkeypatch.setenv("NVCC", "/ignored/nvcc")
+
+    _digest, payload = cuda_ext._qtip_hadamard_warp128_build_identity(
+        fake_torch, fake_cpp_extension, source=str(source),
+        capability=(12, 1))
+
+    assert payload["nvcc"]["argv"] == ["/actual/cuda/bin/nvcc"]
+
+    # PyTorch tests presence, not truthiness: an explicitly empty override
+    # writes an empty ninja compiler and must not share the valid cache key.
+    monkeypatch.setenv("PYTORCH_NVCC", "")
+    empty_digest, empty_payload = \
+        cuda_ext._qtip_hadamard_warp128_build_identity(
+            fake_torch, fake_cpp_extension, source=str(source),
+            capability=(12, 1))
+    assert empty_digest != _digest
+    assert empty_payload["nvcc"]["argv"] == []
 
 
 def _block_hadamard(dimension: int, block_size: int) -> torch.Tensor:

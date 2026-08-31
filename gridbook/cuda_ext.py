@@ -2341,9 +2341,21 @@ _QTIP_HADAMARD_WARP128_SYMBOLS = (
 
 
 def _qtip_hadamard_warp128_build_identity(
-        torch, *, source: str, capability: tuple[int, int]):
+        torch, cpp_extension, *, source: str,
+        capability: tuple[int, int]):
     """Source/toolchain identity for the isolated research primitive."""
+    # Match torch.utils.cpp_extension's compiler selection exactly.  In
+    # particular, PYTORCH_NVCC overrides CUDA_HOME/bin/nvcc when ninja is
+    # written; CUDACXX/NVCC are not consulted by that code path.
+    if "PYTORCH_NVCC" in os.environ:
+        nvcc = os.environ.get("PYTORCH_NVCC")
+    else:
+        cuda_home = getattr(cpp_extension, "CUDA_HOME", None)
+        nvcc = (os.path.join(os.fspath(cuda_home), "bin", "nvcc")
+                if cuda_home else None)
+    cuda_flags = ["-O3", _gencode_flag(capability, accelerated=False)]
     payload = {
+        "build_identity_schema": 2,
         "abi_schema": _QTIP_HADAMARD_WARP128_ABI_SCHEMA,
         "source_sha256": _sha256_file(source),
         "capability": list(capability),
@@ -2351,8 +2363,8 @@ def _qtip_hadamard_warp128_build_identity(
         "torch_cuda": getattr(getattr(torch, "version", None), "cuda", None),
         "python_soabi": sysconfig.get_config_var("SOABI"),
         "cxx": _compiler_identity(os.environ.get("CXX") or "c++"),
-        "nvcc": _compiler_identity(
-            os.environ.get("CUDACXX") or os.environ.get("NVCC") or "nvcc"),
+        "nvcc": _compiler_identity(nvcc),
+        "extra_cuda_cflags": cuda_flags,
         "symbols": list(_QTIP_HADAMARD_WARP128_SYMBOLS),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -2386,7 +2398,7 @@ def _load_qtip_hadamard_warp128_ext_locked():
     build_dir = "<unresolved>"
     try:
         import torch
-        from torch.utils.cpp_extension import load
+        from torch.utils import cpp_extension
 
         src_dir = _require_csrc("qtip_hadamard_warp128.cu")
         source = os.path.join(src_dir, "qtip_hadamard_warp128.cu")
@@ -2398,17 +2410,16 @@ def _load_qtip_hadamard_warp128_ext_locked():
                 "the research BF16 QTIP warp-128 extension requires compute "
                 f"capability >= 8.0, got {cc[0]}.{cc[1]}")
         identity, _payload = _qtip_hadamard_warp128_build_identity(
-            torch, source=source, capability=cc)
+            torch, cpp_extension, source=source, capability=cc)
         module_name = f"gridbook_qtip_hadamard_warp128_{identity}"
         build_root = os.environ.get("PRISMAQUANT_CB_EXT_DIR") or os.path.join(
             os.path.expanduser("~"), ".cache", "prismaquant-cb-ext")
         build_dir = os.path.join(
             build_root, "qtip_hadamard_warp128", identity)
         os.makedirs(build_dir, exist_ok=True)
-        mod = load(
+        mod = cpp_extension.load(
             name=module_name, sources=[source], build_directory=build_dir,
-            extra_cuda_cflags=[
-                "-O3", _gencode_flag(cc, accelerated=False)], verbose=False)
+            extra_cuda_cflags=_payload["extra_cuda_cflags"], verbose=False)
         mod = _require_symbols(
             mod, _QTIP_HADAMARD_WARP128_SYMBOLS, build_dir=build_dir,
             source="qtip_hadamard_warp128.cu")
