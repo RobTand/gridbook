@@ -140,3 +140,42 @@ trellis quality number in existence is weight-only corpus SSE, which prices
 W*A16, while these lanes execute W8A8 and W4A4. And the smoke checkpoint is
 self-consistent rather than encoded, with random weights — it says nothing
 about encoding or generation quality.
+
+## Route telemetry (2026-08-31) — WO-E1
+
+Both lanes now publish a dispatch route record via the **existing**
+`nvfp4_activation_contract.emit_route` / `read_route` surface on every
+forward, using no second telemetry channel, no new counter namespace, and
+without changing `read_route`'s shape: PrismaQuant's
+`validate_native_export` is pinned against the current one.
+
+The record distinguishes, at minimum:
+
+- the family (`TCQ_E2M1_R256` / `TCQ_E4M3_R256`) — via `policy` prefix
+  (`TCQ_E2M1_R256:resident`, `TCQ_E4M3_R256:streamed`, …);
+- the **executed activation contract** — `e2m1_group16_ue4m3_static` /
+  `fp8_per_token_dynamic`, the same strings the packaged
+  `runtime_contract.json` `lane_eligibility` cells publish, via `contract`.
+  The lane derives it from `layer.gridbook_activation_contract` (which IS
+  `ACTIVATION_CONTRACT`), so no second spelling of one runtime fact exists;
+- the residency mode actually taken (`resident` / `streamed`) — via `policy`
+  suffix, taken from `layer.trellis_mode`;
+- the problem shape `M:N:K` and the kernel symbol `torch._scaled_mm` —
+  via `shape` and `symbol` (kind `dense`, `state: served`).
+
+WHAT A CONSUMER MAY CONCLUDE. Which family and which activation contract
+actually RAN, and which residency mode was taken, without assuming the priced
+contract equals the served one. `read_route` returning `None` is a probe
+error, not a silent pass — Gridbook emits exactly one record per dispatch
+and never before dispatch.
+
+WHAT IT MAY NOT. Regime (`decode` vs `batch`) is **not** separately
+distinguished. One `torch._scaled_mm` mainloop serves every `M`, so the
+record's `shape` is the only `M`-bearing field. The contract publishes
+separate `decode`/`batch` cells per family; this lane's single kernel
+satisfies both, and a reader must not mistake one code path for two. The
+record also says nothing about quality, speed, or TP>1 support, and adding
+telemetry is not an attestation of a new serving fact: no `lane_eligibility`
+cell or `formats` row is added here, and the cells remain release-keyed.
+
+Telemetry never breaks a request.

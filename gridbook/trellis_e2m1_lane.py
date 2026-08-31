@@ -68,7 +68,7 @@ from .lane_select import latched_bool
 from .trellis import TCQ_E2M1_R256
 from .trellis_ops import prepare_wire_cuda
 from .trellis_scheme import parse_wire_for_scheme, validate_trellis_scheme
-from .nvfp4_activation_contract import EXECUTION_CONTRACT, GROUP_SIZE
+from .nvfp4_activation_contract import EXECUTION_CONTRACT, GROUP_SIZE, emit_route
 
 __all__ = [
     "TRELLIS_E2M1_FLAG",
@@ -229,6 +229,7 @@ def build_trellis_e2m1_method(scheme, prefix: str = "<trellis>",
             layer.trellis_columns = columns
             layer.trellis_groups = groups
             layer.trellis_mode = self._mode
+            layer.trellis_family = TCQ_E2M1_R256
             layer.gridbook_activation_contract = ACTIVATION_CONTRACT
 
         def process_weights_after_loading(self, layer) -> None:
@@ -329,6 +330,46 @@ def build_trellis_e2m1_method(scheme, prefix: str = "<trellis>",
             # nvfp4_activation_contract.reciprocal_vector). ``scale_result=``
             # is NOT used: this op accepts it and does not apply it.
             y = y * layer.trellis_epilogue_scale
+            # -- K0.4 route telemetry: the record PrismaQuant's
+            # -- validate_native_export reads via read_route ----------
+            # Every dispatch publishes ONE route record through the
+            # existing nvfp4_activation_contract.emit_route surface.
+            # No second telemetry channel, no new counter namespace,
+            # and read_route's shape is untouched: the consumer is
+            # pinned against it. The record must let a priced artifact
+            # be compared against what SERVED instead of assumed.
+            #
+            # WHAT A CONSUMER MAY CONCLUDE. Family (TCQ_E2M1_R256),
+            # the executed activation contract
+            # (layer.gridbook_activation_contract, which IS
+            # ACTIVATION_CONTRACT and therefore EXECUTION_CONTRACT),
+            # the residency mode actually taken, and the problem shape
+            # (M:N:K) are each first-class.
+            #
+            # WHAT IT MAY NOT. Regime (decode vs batch) is NOT
+            # distinguished by this lane: one torch._scaled_mm kernel
+            # serves every M, so the shape's M is the only M-bearing
+            # field. The contract publishes separate decode/batch cells;
+            # this lane's single kernel satisfies both. See
+            # WO-E1-FINDINGS.md and docs/TRELLIS-R256-RESEARCH.md.
+            # Telemetry never breaks the request.
+            try:
+                _m = int(x2.shape[0])
+                _rows = int(layer.trellis_rows)
+                _cols = int(layer.trellis_columns)
+                emit_route(
+                    layer,
+                    kind="dense",
+                    policy=f"{TCQ_E2M1_R256}:{layer.trellis_mode}",
+                    symbol="torch._scaled_mm",
+                    tile_m=0,
+                    shape=f"M{_m}:N{_rows}:K{_cols}",
+                    contract=layer.gridbook_activation_contract,
+                    state="served",
+                    reason=None,
+                )
+            except Exception:  # noqa: BLE001 -- telemetry never breaks a request
+                pass
             if bias is not None:
                 y = y + bias
             return y.reshape(*orig[:-1], rows)

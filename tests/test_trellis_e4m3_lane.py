@@ -412,3 +412,100 @@ def test_scale_b_is_derived_from_the_wire_not_loaded(monkeypatch):
     want = torch.tensor([row[0] for row in trellis.decoded_scales(wire)],
                         dtype=torch.float32, device=layer.scale_b.device)
     assert torch.equal(layer.scale_b.reshape(-1), want)
+
+
+# -- route telemetry (WO-E1) -------------------------------------------------
+
+@requires_cuda
+@pytest.mark.parametrize("mode", [MODE_RESIDENT, MODE_STREAMED])
+def test_route_record_emitted_per_dispatch(monkeypatch, mode):
+    """Every forward through the E4M3 lane publishes one route record."""
+    from gridbook.nvfp4_activation_contract import read_route
+    from gridbook.trellis_e4m3_lane import ACTIVATION_CONTRACT
+
+    got, want, layer, method = _drive(monkeypatch, mode)
+    record = read_route(layer)
+    assert record is not None, "read_route must return the dispatch record"
+    assert record["contract"] == ACTIVATION_CONTRACT
+    assert record["contract"] == layer.gridbook_activation_contract
+    assert trellis.TCQ_E4M3_R256 in record["policy"]
+    assert mode in record["policy"]
+    assert record["kind"] == "dense"
+    assert record["symbol"] == "torch._scaled_mm"
+    assert record["state"] == "served"
+    assert record["shape"].startswith("M")
+    x2 = torch.randn(7, layer.trellis_columns, dtype=torch.bfloat16,
+                     device=layer.scale_b.device)
+    method.apply(layer, x2)
+    record2 = read_route(layer)
+    assert record2 is not None
+    assert record2["shape"] != record["shape"]
+    assert record2["policy"] == record["policy"]
+
+
+@requires_cuda
+@pytest.mark.parametrize("mode", [MODE_RESIDENT, MODE_STREAMED])
+def test_route_contract_matches_packaged_runtime_contract(monkeypatch, mode):
+    """The emitted contract must equal the packaged runtime_contract.json."""
+    from gridbook.nvfp4_activation_contract import read_route
+    from gridbook.runtime_contract import load_runtime_contract
+    from gridbook.trellis import TCQ_E4M3_R256 as FAMILY
+
+    _, _, layer, _ = _drive(monkeypatch, mode)
+    record = read_route(layer)
+    assert record is not None
+    contract = load_runtime_contract()
+    cells = [c for c in contract["lane_eligibility"]["cells"]
+             if c["family"] == FAMILY]
+    assert cells, f"no lane_eligibility cells for {FAMILY}"
+    expected = cells[0]["activation_contract"]
+    assert all(c["activation_contract"] == expected for c in cells), (
+        "packaged cells disagree on activation_contract")
+    assert record["contract"] == expected, (
+        f"emitted {record['contract']!r} != packaged {expected!r}")
+    assert record["contract"] != "invented_contract_that_should_fail"
+
+
+@requires_cuda
+def test_route_residency_survives(monkeypatch):
+    """Streamed and resident forwards must not be recorded as each other."""
+    from gridbook.nvfp4_activation_contract import read_route
+
+    _, _, resident, _ = _drive(monkeypatch, MODE_RESIDENT)
+    _, _, streamed, _ = _drive(monkeypatch, MODE_STREAMED)
+    r_res = read_route(resident)
+    r_stm = read_route(streamed)
+    assert r_res is not None and r_stm is not None
+    assert MODE_RESIDENT in r_res["policy"]
+    assert MODE_STREAMED in r_stm["policy"]
+    assert MODE_STREAMED not in r_res["policy"], (
+        "resident record was recorded as streamed")
+    assert MODE_RESIDENT not in r_stm["policy"], (
+        "streamed record was recorded as resident")
+    assert trellis.TCQ_E4M3_R256 in r_res["policy"]
+    assert trellis.TCQ_E4M3_R256 in r_stm["policy"]
+
+
+@requires_cuda
+def test_no_route_when_not_exercised(monkeypatch):
+    """No record must exist before the lane is dispatched."""
+    from gridbook import native_cutlass
+    from gridbook.nvfp4_activation_contract import read_route
+
+    lane_select.reset_for_tests(TRELLIS_E4M3_FLAG)
+    monkeypatch.setenv(TRELLIS_E4M3_FLAG, "1")
+    monkeypatch.setenv(TRELLIS_E4M3_MODE_ENV, MODE_RESIDENT)
+    _install_vllm_stubs(monkeypatch)
+    monkeypatch.setattr(native_cutlass, "native_fp8_quant", _reference_quant)
+    wire = _e4m3_wire(128, 512, 512)
+    dev = torch.device("cuda")
+    method = build_trellis_e4m3_method(_scheme_for(wire), "test.layer")
+    layer = _Layer()
+    method.create_weights(
+        layer, input_size_per_partition=wire.columns,
+        output_partition_sizes=[wire.rows], input_size=wire.columns,
+        output_size=wire.rows, params_dtype=torch.bfloat16)
+    _load_blob(layer, wire, dev)
+    method.process_weights_after_loading(layer)
+    assert read_route(layer) is None, (
+        "route record must not be emitted before dispatch")
