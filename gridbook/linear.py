@@ -1367,7 +1367,8 @@ class PrismaQuantCBLinearMethod(LinearMethodBase):
         # cast pass) — byte-identical to the old bf16-expand + cast, at a third
         # of the expand-side HBM traffic.
         # INV-1: the [N,K] tile is bounded to one layer (expand -> GEMM ->
-        # free), never resident/model-wide (the NVINT2 OOM trap). `ops` is
+        # free), never resident/model-wide (the OOM trap that killed the
+        # retired low-bit lane). `ops` is
         # imported lazily so the module still imports without vLLM (venv tests).
         x2 = x.reshape(-1, K)
         xq, sa = native_fp8_quant(x2)
